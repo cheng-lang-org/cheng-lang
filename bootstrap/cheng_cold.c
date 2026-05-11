@@ -7950,7 +7950,11 @@ static int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *local
       }
     }
     if (parser->import_mode && fn_index < 0) {
-        die("unresolved cold import function call");
+        /* Unresolved call in import mode: skip it, return a zero I32 slot */
+        int32_t slot = body_slot(body, SLOT_I32, 4);
+        body_op(body, BODY_OP_I32_CONST, slot, 0, 0);
+        if (kind_out) *kind_out = SLOT_I32;
+        return slot;
     }
     FnDef *fn = &parser->symbols->functions[fn_index];
     cold_validate_call_args(body, fn, arg_start, arg_count);
@@ -7972,7 +7976,8 @@ static int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *local
 
 static int32_t parse_call_from_args_span(Parser *owner, BodyIR *body, Locals *locals,
                                          Span name, Span args, int32_t *kind_out) {
-    Parser arg_parser = {args, 0, owner->arena, owner->symbols};
+    Parser arg_parser = {args, 0, owner->arena, owner->symbols,
+                         owner->import_mode, owner->import_alias};
     int32_t arg_slots[COLD_MAX_I32_PARAMS];
     int32_t arg_count = 0;
     parser_ws(&arg_parser);
@@ -11035,11 +11040,11 @@ static int32_t parse_postfix(Parser *parser, BodyIR *body, Locals *locals,
                     index_slot = body_slot(body, SLOT_I32, 4);
                     body_op(body, BODY_OP_I32_CONST, index_slot, span_i32(index), 0);
                 } else {
-                    Parser index_parser = {index, 0, parser->arena, parser->symbols};
+                    Parser index_parser = {index, 0, parser->arena, parser->symbols,
+                                           parser->import_mode, parser->import_alias};
                     index_slot = parse_expr(&index_parser, body, locals, &index_kind);
                     parser_ws(&index_parser);
                     if (index_parser.pos != index_parser.source.len) {
-                        if (parser->import_mode) { *kind = SLOT_I32; return 0; }
                         die("unsupported str index expression");
                     }
                 }
@@ -11057,15 +11062,15 @@ static int32_t parse_postfix(Parser *parser, BodyIR *body, Locals *locals,
                     index_slot = body_slot(body, SLOT_I32, 4);
                     body_op(body, BODY_OP_I32_CONST, index_slot, span_i32(index), 0);
                 } else {
-                    Parser index_parser = {index, 0, parser->arena, parser->symbols};
+                    Parser index_parser = {index, 0, parser->arena, parser->symbols,
+                                           parser->import_mode, parser->import_alias};
                     index_slot = parse_expr(&index_parser, body, locals, &index_kind);
                     parser_ws(&index_parser);
                     if (index_parser.pos != index_parser.source.len) {
-                        if (parser->import_mode) { *kind = SLOT_STR; return 0; }
                         die("unsupported str[] index expression");
                     }
                 }
-                if (index_kind != SLOT_I32) { index_slot = 0; /* skip non-int32 index */ }
+                if (index_kind != SLOT_I32) die("str[] index expression must be int32");
                 int32_t dst = body_slot(body, SLOT_STR, COLD_STR_SLOT_SIZE);
                 body_op(body, BODY_OP_SEQ_STR_INDEX_DYNAMIC, dst, slot, index_slot);
                 slot = dst;
@@ -11078,11 +11083,11 @@ static int32_t parse_postfix(Parser *parser, BodyIR *body, Locals *locals,
                 if (span_is_i32(index)) {
                     body_op(body, BODY_OP_I32_CONST, index_slot, span_i32(index), 0);
                 } else {
-                    Parser index_parser = {index, 0, parser->arena, parser->symbols};
+                    Parser index_parser = {index, 0, parser->arena, parser->symbols,
+                                           parser->import_mode, parser->import_alias};
                     index_slot = parse_expr(&index_parser, body, locals, &index_kind);
                     parser_ws(&index_parser);
                     if (index_parser.pos != index_parser.source.len) {
-                        if (parser->import_mode) { *kind = SLOT_I32; return 0; }
                         die("unsupported opaque[] index expression");
                     }
                 }
@@ -11381,7 +11386,6 @@ static int32_t parse_compare_expr(Parser *parser, BodyIR *body, Locals *locals, 
                 (right_kind == SLOT_I32 || right_kind == SLOT_VARIANT)) {
                 /* fall through to tag comparison */
             } else {
-                if (parser->import_mode) { return 0; }
                 die("variant comparison operands must both be variants");
             }
         }
@@ -11993,11 +11997,9 @@ static int32_t parse_match_arm(Parser *parser, BodyIR *body, Locals *locals,
     Span bind_names[COLD_MAX_VARIANT_FIELDS];
     int32_t bind_count = parse_match_bindings(parser, bind_names, COLD_MAX_VARIANT_FIELDS);
     if (bind_count != variant->field_count) {
-        if (parser->import_mode) return 0;
         die("match arm payload binding count mismatch");
     }
     if (!parser_take(parser, "=>")) {
-        if (parser->import_mode) return 0;
         die("expected => in match arm");
     }
 
@@ -18598,6 +18600,7 @@ static void cold_mark_reachable_functions(Symbols *symbols,
         if (fn_index < 0 || fn_index >= function_count) die("reachable cold function index out of range");
         BodyIR *body = function_bodies[fn_index];
         if (!cold_body_codegen_ready(body)) {
+            if (symbols->functions[fn_index].is_external) continue;
             cold_die_missing_reachable_body(symbols, fn_index);
         }
         for (int32_t op = 0; op < body->op_count; op++) {
@@ -19853,6 +19856,197 @@ static int32_t cold_compile_one_import_direct(Symbols *symbols, const char *path
     return compiled;
 }
 
+typedef struct {
+    Span alias;
+    char path[PATH_MAX];
+} ColdImportSource;
+
+static int32_t cold_collect_direct_import_sources(Span entry_source,
+                                                  ColdImportSource *imports,
+                                                  int32_t import_cap) {
+    int32_t count = 0;
+    int32_t pos = 0;
+    bool in_triple = false;
+    while (pos < entry_source.len) {
+        int32_t start = pos;
+        while (pos < entry_source.len && entry_source.ptr[pos] != '\n') pos++;
+        int32_t end = pos;
+        if (pos < entry_source.len) pos++;
+        Span line = span_sub(entry_source, start, end);
+        if (in_triple) {
+            if (cold_line_has_triple_quote(line)) in_triple = false;
+            continue;
+        }
+        if (!cold_line_top_level(line)) {
+            if (cold_line_has_triple_quote(line)) in_triple = true;
+            continue;
+        }
+        Span module_path = {0};
+        Span alias = {0};
+        if (!cold_parse_import_line(span_trim(line), &module_path, &alias)) continue;
+        if (count >= import_cap) die("too many cold direct imports");
+        if (!cold_import_source_path(module_path, imports[count].path,
+                                     sizeof(imports[count].path))) {
+            die("cold import path is not resolvable");
+        }
+        imports[count].alias = alias;
+        count++;
+    }
+    return count;
+}
+
+static bool cold_import_symbol_parts(Span qualified_name, Span *alias, Span *local_name) {
+    int32_t dot = cold_span_find_char(qualified_name, '.');
+    if (dot <= 0 || dot + 1 >= qualified_name.len) return false;
+    *alias = span_sub(qualified_name, 0, dot);
+    *local_name = span_sub(qualified_name, dot + 1, qualified_name.len);
+    return true;
+}
+
+static ColdImportSource *cold_find_import_source_for_alias(ColdImportSource *imports,
+                                                           int32_t import_count,
+                                                           Span alias) {
+    for (int32_t i = 0; i < import_count; i++) {
+        if (span_same(imports[i].alias, alias)) return &imports[i];
+    }
+    return 0;
+}
+
+static bool cold_import_function_symbol_matches(Symbols *symbols,
+                                                ColdImportSource *import_source,
+                                                ColdFunctionSymbol *symbol,
+                                                int32_t target_fn) {
+    Span names[COLD_MAX_I32_PARAMS];
+    int32_t kinds[COLD_MAX_I32_PARAMS];
+    int32_t sizes[COLD_MAX_I32_PARAMS];
+    int32_t arity = cold_imported_param_specs(symbols, import_source->alias,
+                                              symbol->params, names, kinds, sizes,
+                                              COLD_MAX_I32_PARAMS);
+    (void)names;
+    Span qualified_name = cold_arena_join3(symbols->arena, import_source->alias,
+                                           ".", symbol->name);
+    Span qualified_ret = cold_qualify_import_type(symbols->arena, import_source->alias,
+                                                  symbol->return_type);
+    int32_t resolved = symbols_find_fn(symbols, qualified_name, arity, kinds, sizes,
+                                       qualified_ret);
+    return resolved == target_fn;
+}
+
+static void cold_compile_import_function_direct(Symbols *symbols,
+                                                ColdImportSource *imports,
+                                                int32_t import_count,
+                                                BodyIR **function_bodies,
+                                                int32_t body_cap,
+                                                int32_t target_fn) {
+    if (target_fn < 0 || target_fn >= symbols->function_count) {
+        die("cold import target function out of range");
+    }
+    if (target_fn >= body_cap) die("cold import target exceeds body table");
+    if (function_bodies[target_fn]) return;
+
+    FnDef *fn = &symbols->functions[target_fn];
+    if (fn->is_external) return;
+
+    Span alias = {0};
+    Span local_name = {0};
+    if (!cold_import_symbol_parts(fn->name, &alias, &local_name)) {
+        cold_die_missing_reachable_body(symbols, target_fn);
+    }
+    ColdImportSource *import_source = cold_find_import_source_for_alias(imports,
+                                                                        import_count,
+                                                                        alias);
+    if (!import_source) {
+        cold_die_missing_reachable_body(symbols, target_fn);
+    }
+
+    Span source = source_open(import_source->path);
+    if (source.len <= 0) die("cold import source open failed");
+    int32_t pos = 0;
+    int32_t line_no = 0;
+    bool in_triple = false;
+    while (pos < source.len) {
+        int32_t start = pos;
+        while (pos < source.len && source.ptr[pos] != '\n') pos++;
+        int32_t end = pos;
+        if (pos < source.len) pos++;
+        line_no++;
+        Span line = span_sub(source, start, end);
+        if (in_triple) {
+            if (cold_line_has_triple_quote(line)) in_triple = false;
+            continue;
+        }
+        if (!cold_line_top_level(line)) {
+            if (cold_line_has_triple_quote(line)) in_triple = true;
+            continue;
+        }
+        Span trimmed = span_trim(line);
+        if (!cold_span_starts_with(trimmed, "fn ")) continue;
+        ColdFunctionSymbol symbol;
+        if (!cold_parse_function_symbol_at(source, start, line_no, &symbol)) {
+            die("cannot parse cold imported function symbol");
+        }
+        if (!span_same(symbol.name, local_name)) continue;
+        if (!cold_import_function_symbol_matches(symbols, import_source, &symbol,
+                                                target_fn)) {
+            continue;
+        }
+        if (!symbol.has_body) die("reachable cold import function has no body");
+        Parser parser = {symbol.source_span, 0, symbols->arena, symbols,
+                         true /* import_mode */, import_source->alias};
+        int32_t parsed_index = -1;
+        BodyIR *body = parse_fn(&parser, &parsed_index);
+        if (!body) die("reachable cold import function parse failed");
+        function_bodies[target_fn] = body;
+        return;
+    }
+    munmap((void *)source.ptr, (size_t)source.len);
+    cold_die_missing_reachable_body(symbols, target_fn);
+}
+
+static void cold_compile_reachable_import_bodies(Symbols *symbols,
+                                                 BodyIR **function_bodies,
+                                                 int32_t body_cap,
+                                                 int32_t entry_function,
+                                                 ColdImportSource *imports,
+                                                 int32_t import_count) {
+    if (entry_function < 0 || entry_function >= symbols->function_count) {
+        die("cold reachable import entry out of range");
+    }
+    int32_t function_count = symbols->function_count;
+    bool *reachable = arena_alloc(symbols->arena, (size_t)function_count * sizeof(bool));
+    int32_t *stack = arena_alloc(symbols->arena, (size_t)function_count * sizeof(int32_t));
+    for (int32_t i = 0; i < function_count; i++) reachable[i] = false;
+    int32_t stack_count = 0;
+    reachable[entry_function] = true;
+    stack[stack_count++] = entry_function;
+    while (stack_count > 0) {
+        int32_t fn_index = stack[--stack_count];
+        if (fn_index < 0 || fn_index >= function_count) die("cold reachable import index out of range");
+        if (!function_bodies[fn_index]) {
+            cold_compile_import_function_direct(symbols, imports, import_count,
+                                                function_bodies, body_cap, fn_index);
+        }
+        BodyIR *body = function_bodies[fn_index];
+        if (!cold_body_codegen_ready(body)) {
+            if (symbols->functions[fn_index].is_external) continue;
+            cold_die_missing_reachable_body(symbols, fn_index);
+        }
+        for (int32_t op = 0; op < body->op_count; op++) {
+            int32_t target = -1;
+            if (body->op_kind[op] == BODY_OP_CALL_I32 ||
+                body->op_kind[op] == BODY_OP_CALL_COMPOSITE ||
+                body->op_kind[op] == BODY_OP_FN_ADDR) {
+                target = body->op_a[op];
+            }
+            if (target < 0) continue;
+            if (target >= function_count) die("cold reachable import target out of range");
+            if (reachable[target]) continue;
+            reachable[target] = true;
+            stack[stack_count++] = target;
+        }
+    }
+}
+
 __attribute__((unused))
 static int32_t cold_compile_imported_bodies_no_recurse(Symbols *symbols, Span entry_source,
                                                        BodyIR **function_bodies, int32_t body_cap) {
@@ -19981,10 +20175,15 @@ static bool cold_compile_source_path_to_macho(const char *out_path,
     int32_t first_function = -1;
     BodyIR *demo_body = 0;
     Span mapped_source = {0};
+    ColdImportSource import_sources[64];
+    int32_t import_source_count = 0;
 
     if (src_path && src_path[0] != '\0') {
         mapped_source = source_open(src_path);
         if (mapped_source.len <= 0) return false;
+        import_source_count = cold_collect_direct_import_sources(mapped_source,
+                                                                 import_sources,
+                                                                 64);
         cold_collect_imported_function_signatures(symbols, mapped_source);
         cold_collect_function_signatures(symbols, mapped_source);
         { char ws_root[PATH_MAX] = {0};
@@ -19999,28 +20198,7 @@ static bool cold_compile_source_path_to_macho(const char *out_path,
         if (body_cap < 256) body_cap = 256;
         function_bodies = arena_alloc(arena, (size_t)body_cap * sizeof(BodyIR *));
         memset(function_bodies, 0, (size_t)body_cap * sizeof(BodyIR *));
-        /* Import body compilation: skip if CHENG_NO_IMPORT_BODIES=1 */
-        if (!getenv("CHENG_NO_IMPORT_BODIES")) {
-            ColdErrorRecoveryEnabled = true;
-            if (setjmp(ColdErrorJumpBuf) == 0) {
-                cold_compile_imported_bodies_no_recurse(symbols, mapped_source, function_bodies, body_cap);
-            }
-            ColdErrorRecoveryEnabled = false;
-        }
-        /* body_cap may have changed after import compilation (symbol resize) */
-        if (symbols->function_cap > body_cap) body_cap = symbols->function_cap;
-        /* If any import had SEGV, skip import body compilation results.
-           Per-function setjmp recovery already skipped individual bad functions;
-           this clears the rest because the arena may be corrupted globally. */
-        if (ColdImportSegvSaw) {
-            ColdImportSegvSaw = 0;
-            /* Only clear function bodies at indices >= the entry module's function
-               count (import signatures start after entry signatures). */
-            for (int32_t i = symbols->function_count; i < body_cap; i++) {
-                function_bodies[i] = NULL;
-            }
-        }
-    Parser parser = {mapped_source, 0, arena, symbols};
+        Parser parser = {mapped_source, 0, arena, symbols};
         while (parser.pos < mapped_source.len) {
             parser_ws(&parser);
             if (parser.pos >= mapped_source.len) break;
@@ -20084,6 +20262,9 @@ static bool cold_compile_source_path_to_macho(const char *out_path,
         function_patches.arena = arena;
         codegen_func(code, demo_body, symbols, &function_patches);
     } else {
+        cold_compile_reachable_import_bodies(symbols, function_bodies, body_cap,
+                                             main_function, import_sources,
+                                             import_source_count);
         codegen_program(code, function_bodies, symbols->function_count, main_function, symbols);
     }
 
