@@ -276,6 +276,7 @@ static bool macho_write_exec(const char *path, const uint32_t *code, int32_t cod
 
 #define N_SECT 0x0E
 #define N_EXT  0x01
+#define N_UNDF 0x00
 
 typedef struct {
     uint32_t n_strx;
@@ -290,34 +291,61 @@ static bool macho_write_object(const char *path,
                                const char **names, const int32_t *offsets,
                                int32_t name_count, int32_t global_count) {
     int32_t code_sz = code_words * 4;
+    if (code_sz < 0 || name_count < 0 || !names || !offsets) return false;
     if (global_count < 0) global_count = 0;
     if (global_count > name_count) global_count = name_count;
 
     /* Build string table first to know its size */
-    char strtab[4096];
-    int32_t str_off = 1; /* first byte is \0 */
-    int32_t name_stroff[128];
-    for (int32_t i = 0; i < name_count && i < 128; i++) {
-        name_stroff[i] = str_off;
+    int64_t str_cap64 = 2;
+    for (int32_t i = 0; i < name_count; i++) {
+        if (!names[i]) return false;
         int32_t nl = (int32_t)strlen(names[i]);
-        if (str_off + nl + 2 < (int32_t)sizeof(strtab)) {
-            strtab[str_off++] = '_';
-            memcpy(strtab + str_off, names[i], nl);
-            str_off += nl;
-            strtab[str_off++] = '\0';
+        if (nl < 0 || str_cap64 > INT32_MAX - (int64_t)nl - 2) return false;
+        str_cap64 += (int64_t)nl + 2; /* leading '_' plus trailing NUL */
+    }
+    if (str_cap64 > INT32_MAX) return false;
+    if (name_count > INT32_MAX / (int32_t)sizeof(nlist_64_t)) return false;
+    int32_t str_cap = (int32_t)str_cap64;
+    char *strtab = (char *)calloc(1, (size_t)str_cap);
+    int32_t *name_stroff = name_count > 0
+        ? (int32_t *)calloc((size_t)name_count, sizeof(int32_t))
+        : NULL;
+    nlist_64_t *syms = name_count > 0
+        ? (nlist_64_t *)calloc((size_t)name_count, sizeof(nlist_64_t))
+        : NULL;
+    if (!strtab || (name_count > 0 && (!name_stroff || !syms))) {
+        free(strtab);
+        free(name_stroff);
+        free(syms);
+        return false;
+    }
+    int32_t str_off = 1; /* first byte is \0 */
+    for (int32_t i = 0; i < name_count; i++) {
+        int32_t nl = (int32_t)strlen(names[i]);
+        if (str_off > str_cap - nl - 2) {
+            free(strtab);
+            free(name_stroff);
+            free(syms);
+            return false;
         }
+        name_stroff[i] = str_off;
+        strtab[str_off++] = '_';
+        memcpy(strtab + str_off, names[i], (size_t)nl);
+        str_off += nl;
+        strtab[str_off++] = '\0';
     }
     strtab[str_off++] = '\0';
 
     /* Build nlist entries */
-    nlist_64_t syms[128];
-    int32_t nsyms = name_count > 128 ? 128 : name_count;
+    int32_t nsyms = name_count;
     for (int32_t i = 0; i < nsyms; i++) {
         syms[i].n_strx  = name_stroff[i];
-        syms[i].n_type  = (uint8_t)((i < global_count) ? (N_SECT | N_EXT) : N_SECT);
-        syms[i].n_sect  = 1; /* section 1 = __text */
+        syms[i].n_type  = (uint8_t)(offsets[i] >= 0
+                                  ? ((i < global_count) ? (N_SECT | N_EXT) : N_SECT)
+                                  : (N_UNDF | N_EXT));
+        syms[i].n_sect  = (uint8_t)(offsets[i] >= 0 ? 1 : 0); /* section 1 = __text */
         syms[i].n_desc  = 0;
-        syms[i].n_value = (uint64_t)(offsets[i] * 4);
+        syms[i].n_value = offsets[i] >= 0 ? (uint64_t)((uint32_t)offsets[i] * 4u) : 0;
     }
     int32_t sym_size = nsyms * (int32_t)sizeof(nlist_64_t);
 
@@ -328,13 +356,42 @@ static bool macho_write_object(const char *path,
     int32_t symtab_cmd_sz = 24;           /* LC_SYMTAB */
     int32_t cmd_sz = seg_cmd_sz + build_ver_cmd_sz + symtab_cmd_sz;
     int32_t ncmds = 3;
+    if (hdr_sz > INT32_MAX - cmd_sz) {
+        free(strtab);
+        free(name_stroff);
+        free(syms);
+        return false;
+    }
     int32_t code_off = hdr_sz + cmd_sz;
+    if (code_off > INT32_MAX - code_sz) {
+        free(strtab);
+        free(name_stroff);
+        free(syms);
+        return false;
+    }
     int32_t sym_off = code_off + code_sz;
+    if (sym_off > INT32_MAX - sym_size) {
+        free(strtab);
+        free(name_stroff);
+        free(syms);
+        return false;
+    }
     int32_t str_off_file = sym_off + sym_size;
+    if (str_off_file > INT32_MAX - str_off) {
+        free(strtab);
+        free(name_stroff);
+        free(syms);
+        return false;
+    }
     int32_t total_sz = str_off_file + str_off;
 
-    uint8_t *buf = (uint8_t *)calloc(1, total_sz);
-    if (!buf) return false;
+    uint8_t *buf = (uint8_t *)calloc(1, (size_t)total_sz);
+    if (!buf) {
+        free(strtab);
+        free(name_stroff);
+        free(syms);
+        return false;
+    }
     uint32_t *w = (uint32_t *)buf;
 
     /* Header */
@@ -396,16 +453,43 @@ static bool macho_write_object(const char *path,
     st[5] = (uint32_t)str_off;
 
     /* Code */
-    memcpy(buf + code_off, code, code_sz);
+    if (code_sz > 0) memcpy(buf + code_off, code, (size_t)code_sz);
     /* Symbol table */
-    memcpy(buf + sym_off, syms, sym_size);
+    if (sym_size > 0) memcpy(buf + sym_off, syms, (size_t)sym_size);
     /* String table */
-    memcpy(buf + str_off_file, strtab, str_off);
+    memcpy(buf + str_off_file, strtab, (size_t)str_off);
 
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) { free(buf); return false; }
-    write(fd, buf, total_sz);
-    close(fd);
+    if (fd < 0) {
+        free(buf);
+        free(strtab);
+        free(name_stroff);
+        free(syms);
+        return false;
+    }
+    int32_t written = 0;
+    while (written < total_sz) {
+        ssize_t n = write(fd, buf + written, (size_t)(total_sz - written));
+        if (n <= 0) {
+            close(fd);
+            free(buf);
+            free(strtab);
+            free(name_stroff);
+            free(syms);
+            return false;
+        }
+        written += (int32_t)n;
+    }
+    if (close(fd) != 0) {
+        free(buf);
+        free(strtab);
+        free(name_stroff);
+        free(syms);
+        return false;
+    }
     free(buf);
+    free(strtab);
+    free(name_stroff);
+    free(syms);
     return true;
 }

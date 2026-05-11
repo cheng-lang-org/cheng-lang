@@ -5093,6 +5093,11 @@ typedef struct {
 } ConstDef;
 
 typedef struct {
+    Span name;
+    Span target;
+} TypeAlias;
+
+typedef struct {
     FnDef *functions;
     int32_t function_count;
     int32_t function_cap;
@@ -5105,6 +5110,9 @@ typedef struct {
     ConstDef *consts;
     int32_t const_count;
     int32_t const_cap;
+    TypeAlias *aliases;
+    int32_t alias_count;
+    int32_t alias_cap;
     Arena *arena;
 } Symbols;
 
@@ -5130,11 +5138,41 @@ static Symbols *symbols_new(Arena *arena) {
     symbols->type_cap = 16;
     symbols->object_cap = 16;
     symbols->const_cap = 16;
+    symbols->alias_cap = 16;
     symbols->functions = arena_alloc(arena, (size_t)symbols->function_cap * sizeof(FnDef));
     symbols->types = arena_alloc(arena, (size_t)symbols->type_cap * sizeof(TypeDef));
     symbols->objects = arena_alloc(arena, (size_t)symbols->object_cap * sizeof(ObjectDef));
     symbols->consts = arena_alloc(arena, (size_t)symbols->const_cap * sizeof(ConstDef));
+    symbols->aliases = arena_alloc(arena, (size_t)symbols->alias_cap * sizeof(TypeAlias));
     return symbols;
+}
+
+static TypeAlias *symbols_find_alias(Symbols *symbols, Span name) {
+    if (!symbols) return 0;
+    name = span_trim(name);
+    for (int32_t i = 0; i < symbols->alias_count; i++) {
+        if (span_same(symbols->aliases[i].name, name)) return &symbols->aliases[i];
+    }
+    return 0;
+}
+
+static void symbols_add_alias(Symbols *symbols, Span name, Span target) {
+    if (!symbols || name.len <= 0 || target.len <= 0) return;
+    TypeAlias *existing = symbols_find_alias(symbols, name);
+    if (existing) {
+        existing->target = cold_arena_span_copy(symbols->arena, span_trim(target));
+        return;
+    }
+    if (symbols->alias_count >= symbols->alias_cap) {
+        int32_t next = symbols->alias_cap * 2;
+        TypeAlias *fresh = arena_alloc(symbols->arena, (size_t)next * sizeof(TypeAlias));
+        memcpy(fresh, symbols->aliases, (size_t)symbols->alias_count * sizeof(TypeAlias));
+        symbols->aliases = fresh;
+        symbols->alias_cap = next;
+    }
+    TypeAlias *alias = &symbols->aliases[symbols->alias_count++];
+    alias->name = cold_arena_span_copy(symbols->arena, span_trim(name));
+    alias->target = cold_arena_span_copy(symbols->arena, span_trim(target));
 }
 
 static ConstDef *symbols_find_const(Symbols *symbols, Span name) {
@@ -5700,6 +5738,19 @@ static bool cold_type_has_qualified_name(Span type) {
     return false;
 }
 
+static bool cold_type_is_pointer_like(Symbols *symbols, Span type) {
+    bool is_var = false;
+    type = span_trim(cold_type_strip_var(type, &is_var));
+    if (span_eq(type, "ptr")) return true;
+    for (int32_t depth = 0; symbols && depth < 8; depth++) {
+        TypeAlias *alias = symbols_find_alias(symbols, type);
+        if (!alias) break;
+        type = span_trim(alias->target);
+        if (span_eq(type, "ptr")) return true;
+    }
+    return type.len > 1 && type.ptr[type.len - 1] == '*';
+}
+
 static int32_t cold_slot_kind_from_type_with_symbols(Symbols *symbols, Span type) {
     bool is_var = false;
     type = cold_type_strip_var(type, &is_var);
@@ -5723,6 +5774,7 @@ static int32_t cold_slot_kind_from_type_with_symbols(Symbols *symbols, Span type
     if (cold_parse_opaque_seq_type(type)) return SLOT_SEQ_OPAQUE;
     if (span_eq(type, "str") || span_eq(type, "cstring") || span_eq(type, "s")) return SLOT_STR;
     if (span_eq(type, "int64") || span_eq(type, "uint64")) return SLOT_I64;
+    if (cold_type_is_pointer_like(symbols, type)) return SLOT_PTR;
     if (span_eq(type, "int32") || span_eq(type, "int") || span_eq(type, "i") ||
         span_eq(type, "bool") ||
         span_eq(type, "uint8") || span_eq(type, "char") ||
@@ -5731,7 +5783,6 @@ static int32_t cold_slot_kind_from_type_with_symbols(Symbols *symbols, Span type
     if (known_enum) return SLOT_I32;
     if (span_eq(type, "v")) return SLOT_VARIANT;
     if (span_eq(type, "o")) return SLOT_OPAQUE;
-    if (span_eq(type, "ptr")) return SLOT_OPAQUE;
     if (symbols) {
         ObjectDef *obj = symbols_resolve_object(symbols, type);
         if (obj) return obj->is_ref ? SLOT_PTR : SLOT_OBJECT;
@@ -5837,7 +5888,7 @@ static int32_t cold_return_kind_from_span(Symbols *symbols, Span ret) {
     if (known_type) return known_type->is_enum ? SLOT_I32 : SLOT_VARIANT;
     ObjectDef *ret_obj = symbols_resolve_object(symbols, ret);
     if (ret_obj) return ret_obj->is_ref ? SLOT_PTR : SLOT_OBJECT;
-    if (span_eq(ret, "ptr")) return SLOT_OPAQUE;
+    if (cold_type_is_pointer_like(symbols, ret)) return SLOT_PTR;
     if (cold_type_has_qualified_name(ret)) return SLOT_OPAQUE;
     /* Treat unknown uppercase types and camelCase types as opaque objects */
     if (ret.len > 0 && ((ret.ptr[0] >= 'A' && ret.ptr[0] <= 'Z') ||
@@ -6128,12 +6179,6 @@ static Span parser_token(Parser *parser) {
         parser->pos += 2;
         return span_sub(parser->source, start, parser->pos);
     }
-    if (c == '-' && parser->pos + 1 < parser->source.len &&
-        parser->source.ptr[parser->pos + 1] == '>') {
-        int32_t start = parser->pos;
-        parser->pos += 2;
-        return span_sub(parser->source, start, parser->pos);
-    }
     if ((c == '=' || c == '!' || c == '<' || c == '>') &&
         parser->pos + 1 < parser->source.len &&
         parser->source.ptr[parser->pos + 1] == '=') {
@@ -6227,7 +6272,8 @@ static int32_t cold_param_kind_from_type(Span type) {
     if (cold_parse_i32_seq_type(type)) return SLOT_SEQ_I32;
     if (cold_parse_str_seq_type(type)) return SLOT_SEQ_STR;
     if (cold_parse_opaque_seq_type(type)) return SLOT_SEQ_OPAQUE;
-    if (span_eq(type, "ptr")) return SLOT_OPAQUE;
+    if (span_eq(type, "ptr") ||
+        (type.len > 1 && type.ptr[type.len - 1] == '*')) return SLOT_PTR;
     if (span_eq(type, "o") || cold_type_has_qualified_name(type)) return SLOT_OPAQUE;
     if (type.len > 1 && type.ptr[0] >= 'A' && type.ptr[0] <= 'Z') return SLOT_VARIANT;
     if (cold_parse_i32_array_type(type, 0)) return SLOT_ARRAY_I32;
@@ -6241,6 +6287,7 @@ static int32_t cold_param_size_from_type(Symbols *symbols, Span type, int32_t ki
     type = cold_type_strip_var(type, &is_var);
     if (kind == SLOT_I32) return 4;
     if (kind == SLOT_I64) return 8;
+    if (kind == SLOT_PTR) return 8;
     if (kind == SLOT_STR) return COLD_STR_SLOT_SIZE;
     if (kind == SLOT_I32_REF || kind == SLOT_I64_REF ||
         kind == SLOT_SEQ_I32_REF || kind == SLOT_OBJECT_REF ||
@@ -6836,15 +6883,6 @@ static void cold_collect_function_signatures(Symbols *symbols, Span source) {
 
 static void parse_type(Parser *parser);
 
-static bool cold_parse_pointer_alias_rhs(Span rhs, Span *target_out) {
-    rhs = span_trim(rhs);
-    if (rhs.len < 2 || rhs.ptr[rhs.len - 1] != '*') return false;
-    Span target = span_trim(span_sub(rhs, 0, rhs.len - 1));
-    if (target.len <= 0) return false;
-    if (target_out) *target_out = target;
-    return true;
-}
-
 static Span cold_normalize_grouped_type_member(Arena *arena, Span member, int32_t group_indent) {
     uint8_t *out = arena_alloc(arena, (size_t)member.len + 1);
     int32_t count = 0;
@@ -6992,12 +7030,6 @@ static void parse_type(Parser *parser) {
     }
 
     Span rhs_check = span_trim(span_sub(line.source, line.pos, line.source.len));
-    Span alias_target = {0};
-    if (cold_parse_pointer_alias_rhs(rhs_check, &alias_target)) {
-        symbols_add_alias(parser->symbols, type_name, alias_target);
-        parser->pos = line_end;
-        return;
-    }
     if (cold_span_starts_with(rhs_check, "enum")) {
         if (generic_count > 0) die("cold enum cannot be generic");
         Parser enum_parser = {rhs_check, 0, parser->arena, parser->symbols};
@@ -8509,56 +8541,6 @@ static bool cold_is_scalar_identity_cast(Span token) {
            span_eq(token, "uint64") || span_eq(token, "Uint64") ||
            span_eq(token, "UInt64") ||
            span_eq(token, "int64") || span_eq(token, "Int64");
-}
-
-static bool cold_is_field_access_token(Span token) {
-    return span_eq(token, ".") || span_eq(token, "->");
-}
-
-static Span cold_resolve_alias_target(Symbols *symbols, Span type) {
-    type = span_trim(type);
-    for (int32_t depth = 0; depth < 8; depth++) {
-        TypeAlias *alias = symbols_find_alias(symbols, type);
-        if (!alias) break;
-        type = span_trim(alias->target);
-    }
-    if (type.len > 1 && type.ptr[type.len - 1] == '*') {
-        type = span_trim(span_sub(type, 0, type.len - 1));
-    }
-    return type;
-}
-
-static bool cold_is_pointer_cast_token(Parser *parser, Span token) {
-    if (span_eq(token, "ptr")) return true;
-    return symbols_find_alias(parser ? parser->symbols : 0, token) != 0;
-}
-
-static bool cold_str_field_info(Span field_name, int32_t *offset, int32_t *kind, int32_t *size) {
-    if (span_eq(field_name, "data")) {
-        if (offset) *offset = COLD_STR_DATA_OFFSET;
-        if (kind) *kind = SLOT_PTR;
-        if (size) *size = 8;
-        return true;
-    }
-    if (span_eq(field_name, "len")) {
-        if (offset) *offset = COLD_STR_LEN_OFFSET;
-        if (kind) *kind = SLOT_I32;
-        if (size) *size = 4;
-        return true;
-    }
-    if (span_eq(field_name, "store_id") || span_eq(field_name, "storeId")) {
-        if (offset) *offset = COLD_STR_STORE_ID_OFFSET;
-        if (kind) *kind = SLOT_I32;
-        if (size) *size = 4;
-        return true;
-    }
-    if (span_eq(field_name, "flags")) {
-        if (offset) *offset = COLD_STR_FLAGS_OFFSET;
-        if (kind) *kind = SLOT_I32;
-        if (size) *size = 4;
-        return true;
-    }
-    return false;
 }
 
 static bool cold_is_i32_to_str_intrinsic(Span name) {
@@ -10209,7 +10191,7 @@ static int32_t parse_scalar_identity_cast(Parser *parser, BodyIR *body,
         int32_t value_slot = parse_expr(&arg_parser, body, locals, &value_kind);
         parser_ws(&arg_parser);
         if (arg_parser.pos != arg_parser.source.len) return 0; /* skip unsupported cast */;
-        if (value_kind == SLOT_I64 || value_kind == SLOT_PTR) {
+        if (value_kind == SLOT_I64) {
             *kind = SLOT_I64;
             return value_slot;
         }
@@ -10236,85 +10218,6 @@ static int32_t parse_scalar_identity_cast(Parser *parser, BodyIR *body,
     if (!parser_take(parser, ")")) return 0; /* skip malformed cast */;
     *kind = SLOT_I32;
     return value_slot;
-}
-
-static int32_t parse_pointer_alias_cast(Parser *parser, BodyIR *body,
-                                        Locals *locals, Span cast_token,
-                                        int32_t *kind) {
-    if (!parser_take(parser, "(")) die("expected ( after pointer cast");
-    int32_t value_kind = SLOT_I32;
-    int32_t value_slot = parse_expr(parser, body, locals, &value_kind);
-    if (!parser_take(parser, ")")) die("expected ) after pointer cast");
-
-    Span target_type = {0};
-    TypeAlias *alias = symbols_find_alias(parser->symbols, cast_token);
-    if (alias) target_type = cold_resolve_alias_target(parser->symbols, alias->target);
-
-    int32_t dst = body_slot(body, SLOT_PTR, 8);
-    body_slot_set_type(body, dst, target_type);
-    if (value_kind == SLOT_STR || value_kind == SLOT_STR_REF) {
-        body_op3(body, BODY_OP_PAYLOAD_LOAD, dst, value_slot, COLD_STR_DATA_OFFSET, 8);
-    } else if (value_kind == SLOT_I32) {
-        body_op(body, BODY_OP_I64_FROM_I32, dst, value_slot, 0);
-    } else if (value_kind == SLOT_I64 || value_kind == SLOT_PTR ||
-               value_kind == SLOT_OPAQUE || value_kind == SLOT_OPAQUE_REF ||
-               value_kind == SLOT_OBJECT_REF || value_kind == SLOT_STR_REF ||
-               value_kind == SLOT_SEQ_I32_REF || value_kind == SLOT_SEQ_STR_REF ||
-               value_kind == SLOT_I64_REF) {
-        body_op(body, BODY_OP_COPY_I64, dst, value_slot, 0);
-    } else {
-        die("pointer cast expects pointer-sized value");
-    }
-    *kind = SLOT_PTR;
-    return dst;
-}
-
-static int32_t cold_deref_pointer(Parser *parser, BodyIR *body,
-                                  int32_t ptr_slot, int32_t *kind) {
-    if (*kind != SLOT_PTR && *kind != SLOT_I64 && *kind != SLOT_OPAQUE &&
-        *kind != SLOT_OPAQUE_REF && *kind != SLOT_OBJECT_REF) {
-        die("dereference expects pointer value");
-    }
-    Span target = cold_resolve_alias_target(parser->symbols, body->slot_type[ptr_slot]);
-    if (span_eq(target, "uint8") || span_eq(target, "char")) {
-        int32_t dst = body_slot(body, SLOT_I32, 4);
-        body_op(body, BODY_OP_PTR_LOAD_U8, dst, ptr_slot, 0);
-        *kind = SLOT_I32;
-        return dst;
-    }
-    if (span_eq(target, "int64") || span_eq(target, "uint64")) {
-        int32_t dst = body_slot(body, SLOT_I64, 8);
-        body_op(body, BODY_OP_PTR_LOAD_I64, dst, ptr_slot, 0);
-        *kind = SLOT_I64;
-        return dst;
-    }
-    if (span_eq(target, "ptr") || symbols_find_alias(parser->symbols, target) ||
-        (target.len > 1 && target.ptr[target.len - 1] == '*')) {
-        int32_t dst = body_slot(body, SLOT_PTR, 8);
-        body_op(body, BODY_OP_PTR_LOAD_I64, dst, ptr_slot, 0);
-        body_slot_set_type(body, dst, cold_resolve_alias_target(parser->symbols, target));
-        *kind = SLOT_PTR;
-        return dst;
-    }
-    if (span_eq(target, "str") || span_eq(target, "cstring")) {
-        int32_t dst = body_slot(body, SLOT_STR, COLD_STR_SLOT_SIZE);
-        body_slot_set_type(body, dst, target);
-        body_op3(body, BODY_OP_PAYLOAD_LOAD, dst, ptr_slot, 0, COLD_STR_SLOT_SIZE);
-        *kind = SLOT_STR;
-        return dst;
-    }
-    ObjectDef *object = symbols_resolve_object(parser->symbols, target);
-    if (object) {
-        int32_t dst = body_slot(body, SLOT_OBJECT, object->slot_size);
-        body_slot_set_type(body, dst, target);
-        body_op3(body, BODY_OP_PAYLOAD_LOAD, dst, ptr_slot, 0, object->slot_size);
-        *kind = SLOT_OBJECT;
-        return dst;
-    }
-    int32_t dst = body_slot(body, SLOT_I32, 4);
-    body_op(body, BODY_OP_PTR_LOAD_I32, dst, ptr_slot, 0);
-    *kind = SLOT_I32;
-    return dst;
 }
 
 static int32_t parse_postfix(Parser *parser, BodyIR *body, Locals *locals,
