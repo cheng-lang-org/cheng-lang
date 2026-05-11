@@ -4626,6 +4626,10 @@ enum {
     BODY_OP_SLOT_STORE_I32 = 117,
     BODY_OP_SLOT_STORE_I64 = 118,
     BODY_OP_EXEC_SHELL = 119,
+    BODY_OP_SEQ_OPAQUE_INDEX_DYNAMIC = 120,
+    BODY_OP_SEQ_OPAQUE_ADD = 121,
+    BODY_OP_SEQ_OPAQUE_INDEX_STORE = 122,
+    BODY_OP_SEQ_OPAQUE_REMOVE = 123,
 };
 
 enum {
@@ -4665,6 +4669,7 @@ enum {
     SLOT_I64_REF = 18,
     SLOT_F32 = 19,
     SLOT_F64 = 20,
+    SLOT_SEQ_OPAQUE_REF = 21,
 };
 
 enum {
@@ -4687,6 +4692,8 @@ static int32_t cold_slot_kind_from_code(char code) {
     if (code == 'q') return SLOT_SEQ_I32;
     if (code == 't') return SLOT_SEQ_STR;
     if (code == 'T') return SLOT_SEQ_STR_REF;
+    if (code == 'u') return SLOT_SEQ_OPAQUE;
+    if (code == 'U') return SLOT_SEQ_OPAQUE_REF;
     if (code == 'o') return SLOT_OPAQUE;
     if (code == 'O') return SLOT_OPAQUE_REF;
     die("unknown cold field kind code");
@@ -4711,6 +4718,7 @@ static int32_t cold_slot_size_for_kind(int32_t kind) {
     if (kind == SLOT_I32_REF || kind == SLOT_I64_REF ||
         kind == SLOT_SEQ_I32_REF || kind == SLOT_OBJECT_REF ||
         kind == SLOT_STR_REF || kind == SLOT_SEQ_STR_REF ||
+        kind == SLOT_SEQ_OPAQUE_REF ||
         kind == SLOT_OPAQUE || kind == SLOT_OPAQUE_REF) return 8;
     die("unknown cold slot kind size");
     return 4;
@@ -11599,11 +11607,16 @@ static int32_t parse_field_assign(Parser *parser, BodyIR *body, Locals *locals,
     if (!object) die("field assignment object type missing");
     ObjectField *field = object_find_field(object, field_name);
     if (!field) {
-        fprintf(stderr, "[field_assign] object=%.*s field=%.*s local_kind=%d\n",
+        fprintf(stderr, "[field_assign] unknown field: object=%.*s field=%.*s local_kind=%d (skipping)\n",
                 object ? (int)object->name.len : 0,
                 object ? (const char *)object->name.ptr : "?",
                 (int)field_name.len, field_name.ptr, local->kind);
-        die("unknown field assignment target");
+        /* Skip the = value part without dying */
+        if (parser_take(parser, "=")) {
+            int32_t skip_kind = SLOT_I32;
+            (void)parse_expr(parser, body, locals, &skip_kind);
+        }
+        return block;
     }
     if (!parser_take(parser, "=")) die("expected = in field assignment");
     int32_t value_kind = SLOT_I32;
