@@ -278,6 +278,11 @@ static bool macho_write_exec(const char *path, const uint32_t *code, int32_t cod
 #define N_EXT  0x01
 #define N_UNDF 0x00
 
+#define MACHO_ARM64_RELOC_UNSIGNED            0
+#define MACHO_ARM64_RELOC_BRANCH26            2
+#define MACHO_ARM64_RELOC_GOT_LOAD_PAGE21     5
+#define MACHO_ARM64_RELOC_GOT_LOAD_PAGEOFF12  6
+
 typedef struct {
     uint32_t n_strx;
     uint8_t  n_type;
@@ -286,14 +291,37 @@ typedef struct {
     uint64_t n_value;
 } nlist_64_t;
 
-static bool macho_write_object(const char *path,
-                               const uint32_t *code, int32_t code_words,
-                               const char **names, const int32_t *offsets,
-                               int32_t name_count, int32_t global_count) {
+typedef struct {
+    int32_t address;
+    uint32_t symbol_index;
+    uint8_t type;
+    uint8_t pcrel;
+    uint8_t length;
+    uint8_t is_extern;
+} macho_reloc_t;
+
+static uint32_t macho_reloc_info(uint32_t symbol_index, uint8_t pcrel,
+                                 uint8_t length, uint8_t is_extern,
+                                 uint8_t type) {
+    return (symbol_index & 0x00FFFFFFu) |
+           ((uint32_t)(pcrel ? 1 : 0) << 24) |
+           ((uint32_t)(length & 3u) << 25) |
+           ((uint32_t)(is_extern ? 1 : 0) << 27) |
+           ((uint32_t)(type & 15u) << 28);
+}
+
+static bool macho_write_object_ex(const char *path,
+                                  const uint32_t *code, int32_t code_words,
+                                  const char **names, const uint8_t *sections,
+                                  const uint64_t *values, const int16_t *descs,
+                                  int32_t name_count, int32_t extdef_count,
+                                  const macho_reloc_t *text_relocs,
+                                  int32_t text_reloc_count) {
     int32_t code_sz = code_words * 4;
-    if (code_sz < 0 || name_count < 0 || !names || !offsets) return false;
-    if (global_count < 0) global_count = 0;
-    if (global_count > name_count) global_count = name_count;
+    if (code_sz < 0 || name_count < 0 || !names || !sections || !values) return false;
+    if (extdef_count < 0) extdef_count = 0;
+    if (extdef_count > name_count) extdef_count = name_count;
+    if (text_reloc_count < 0) return false;
 
     /* Build string table first to know its size */
     int64_t str_cap64 = 2;
@@ -340,14 +368,19 @@ static bool macho_write_object(const char *path,
     int32_t nsyms = name_count;
     for (int32_t i = 0; i < nsyms; i++) {
         syms[i].n_strx  = name_stroff[i];
-        syms[i].n_type  = (uint8_t)(offsets[i] >= 0
-                                  ? ((i < global_count) ? (N_SECT | N_EXT) : N_SECT)
-                                  : (N_UNDF | N_EXT));
-        syms[i].n_sect  = (uint8_t)(offsets[i] >= 0 ? 1 : 0); /* section 1 = __text */
-        syms[i].n_desc  = 0;
-        syms[i].n_value = offsets[i] >= 0 ? (uint64_t)((uint32_t)offsets[i] * 4u) : 0;
+        syms[i].n_type  = (uint8_t)(sections[i] ? (N_SECT | N_EXT) : (N_UNDF | N_EXT));
+        syms[i].n_sect  = sections[i];
+        syms[i].n_desc  = descs ? descs[i] : 0;
+        syms[i].n_value = values[i];
     }
     int32_t sym_size = nsyms * (int32_t)sizeof(nlist_64_t);
+    if (text_reloc_count > INT32_MAX / 8) {
+        free(strtab);
+        free(name_stroff);
+        free(syms);
+        return false;
+    }
+    int32_t text_reloc_size = text_reloc_count * 8;
 
     /* Layout */
     int32_t hdr_sz = 32;
@@ -369,7 +402,14 @@ static bool macho_write_object(const char *path,
         free(syms);
         return false;
     }
-    int32_t sym_off = code_off + code_sz;
+    int32_t reloc_off = code_off + code_sz;
+    if (reloc_off > INT32_MAX - text_reloc_size) {
+        free(strtab);
+        free(name_stroff);
+        free(syms);
+        return false;
+    }
+    int32_t sym_off = macho_align_i32(reloc_off + text_reloc_size, 8);
     if (sym_off > INT32_MAX - sym_size) {
         free(strtab);
         free(name_stroff);
@@ -425,8 +465,8 @@ static bool macho_write_object(const char *path,
     sec[10] = (uint32_t)code_sz; sec[11] = 0;
     sec[12] = (uint32_t)code_off;
     sec[13] = 2; /* align */
-    sec[14] = 0; /* reloff */
-    sec[15] = 0; /* nreloc */
+    sec[14] = (uint32_t)reloc_off;
+    sec[15] = (uint32_t)text_reloc_count;
     sec[16] = 0x80000400; /* flags: S_REGULAR | S_ATTR_SOME_INSTRUCTIONS */
     sec[17] = 0; /* reserved1 */
     sec[18] = 0; /* reserved2 */
@@ -454,6 +494,15 @@ static bool macho_write_object(const char *path,
 
     /* Code */
     if (code_sz > 0) memcpy(buf + code_off, code, (size_t)code_sz);
+    for (int32_t i = 0; i < text_reloc_count; i++) {
+        uint32_t *rw = (uint32_t *)(buf + reloc_off + i * 8);
+        rw[0] = (uint32_t)text_relocs[i].address;
+        rw[1] = macho_reloc_info(text_relocs[i].symbol_index,
+                                 text_relocs[i].pcrel,
+                                 text_relocs[i].length,
+                                 text_relocs[i].is_extern,
+                                 text_relocs[i].type);
+    }
     /* Symbol table */
     if (sym_size > 0) memcpy(buf + sym_off, syms, (size_t)sym_size);
     /* String table */
@@ -492,4 +541,36 @@ static bool macho_write_object(const char *path,
     free(name_stroff);
     free(syms);
     return true;
+}
+
+static bool macho_write_object(const char *path,
+                               const uint32_t *code, int32_t code_words,
+                               const char **names, const int32_t *offsets,
+                               int32_t name_count, int32_t global_count) {
+    if (name_count < 0 || !names || !offsets) return false;
+    uint8_t *sections = name_count > 0 ? (uint8_t *)calloc((size_t)name_count, 1) : NULL;
+    uint64_t *values = name_count > 0 ? (uint64_t *)calloc((size_t)name_count, sizeof(uint64_t)) : NULL;
+    int16_t *descs = name_count > 0 ? (int16_t *)calloc((size_t)name_count, sizeof(int16_t)) : NULL;
+    if (name_count > 0 && (!sections || !values || !descs)) {
+        free(sections);
+        free(values);
+        free(descs);
+        return false;
+    }
+    for (int32_t i = 0; i < name_count; i++) {
+        if (offsets[i] >= 0) {
+            sections[i] = 1;
+            values[i] = (uint64_t)((uint32_t)offsets[i] * 4u);
+        } else {
+            sections[i] = 0;
+            values[i] = 0;
+        }
+    }
+    bool ok = macho_write_object_ex(path, code, code_words, names, sections,
+                                    values, descs, name_count, global_count,
+                                    NULL, 0);
+    free(sections);
+    free(values);
+    free(descs);
+    return ok;
 }
