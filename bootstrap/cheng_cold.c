@@ -11544,7 +11544,13 @@ static int32_t parse_field_assign(Parser *parser, BodyIR *body, Locals *locals,
     }
     if (!object) die("field assignment object type missing");
     ObjectField *field = object_find_field(object, field_name);
-    if (!field) die("unknown field assignment target");
+    if (!field) {
+        fprintf(stderr, "[field_assign] object=%.*s field=%.*s local_kind=%d\n",
+                object ? (int)object->name.len : 0,
+                object ? (const char *)object->name.ptr : "?",
+                (int)field_name.len, field_name.ptr, local->kind);
+        die("unknown field assignment target");
+    }
     if (!parser_take(parser, "=")) die("expected = in field assignment");
     int32_t value_kind = SLOT_I32;
     int32_t value_slot = parse_expr(parser, body, locals, &value_kind);
