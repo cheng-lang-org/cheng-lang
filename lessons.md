@@ -76,6 +76,7 @@
 - cold import-mode 调用解析有 `parse_call` 和 `parse_call_from_args_span` 两条路径；两条都必须对未解析调用 hard-fail，任何返回 0 slot 都是假成功。
 - cold `build-backend-driver` 不能接受 compile 非零退出，也不能在失败后扫描 `.o` 再用 `cc` 链接；冷 linkerless 编译失败必须直接失败。
 - 替换 `artifacts/backend_driver/cheng` 前必须先跑候选门禁，再覆盖后跑正式入口同一组门禁；只验证候选旁路文件不算完成。
+- cold bootstrap seed 只承诺浅导入；深层导入闭包走 Cheng 工具链。import body 内调用必须严格裸名精确查找，禁止自动加 `import_alias.` 前缀，也禁止 bare-name fallback。
 
 ## Resolved
 
