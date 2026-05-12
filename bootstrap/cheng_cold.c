@@ -11882,6 +11882,15 @@ static int32_t parse_seq_lvalue_from_span(Parser *owner, BodyIR *body, Locals *l
     if (name.len <= 0) die("add target must name an int32[]");
     Local *local = locals_find(locals, name);
     if (!local) {
+        fprintf(stderr, "[add_debug] target=%.*s locals_count=%d\n",
+                (int)name.len, name.ptr, locals->count);
+        fprintf(stderr, "[add_debug] body->debug_name=%.*s param_count=%d\n",
+                (int)body->debug_name.len, body->debug_name.ptr, body->param_count);
+        for (int32_t li = 0; li < locals->count && li < 20; li++) {
+            fprintf(stderr, "  local[%d]=%.*s kind=%d slot=%d\n",
+                    li, (int)locals->items[li].name.len, locals->items[li].name.ptr,
+                    locals->items[li].kind, locals->items[li].slot);
+        }
         die("add target must be a local sequence");
     }
     int32_t slot = local->slot;
