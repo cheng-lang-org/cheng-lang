@@ -12001,7 +12001,7 @@ static int32_t parse_let_binding(Parser *parser, BodyIR *body, Locals *locals,
             }
             if (kind == SLOT_SEQ_OPAQUE)
                 body_slot_set_seq_opaque_type(body, parser->symbols, slot, type);
-            else
+            else if (body->slot_type[slot].len <= 0)
                 body_slot_set_type(body, slot, type);
         }
     if (kind == SLOT_I32 || kind == SLOT_I64 || kind == SLOT_F32 || kind == SLOT_F64)
