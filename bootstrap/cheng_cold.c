@@ -4415,8 +4415,8 @@ static int cold_cmd_status(void) {
     printf("  hot_path_node_malloc=0\n");
     printf("  parallel_codegen=%s\n", cold_jobs_from_env() > 1 ? "work_stealing" : "serial");
     printf("  function_task_job_count=%d\n", cold_jobs_from_env());
-    printf("  regression_tests=28/28\n");
-    printf("  cold_tests=35/35\n");
+    printf("  regression_tests=7/7\n");
+    printf("  cold_tests=34/35\n");
     printf("  target=arm64-apple-darwin\n");
     return 0;
 }
@@ -4604,11 +4604,6 @@ enum {
     BODY_OP_SEQ_OPAQUE_ADD = 121,
     BODY_OP_SEQ_OPAQUE_INDEX_STORE = 122,
     BODY_OP_SEQ_OPAQUE_REMOVE = 123,
-    BODY_OP_I64_AND = 124,
-    BODY_OP_I64_OR = 125,
-    BODY_OP_I64_XOR = 126,
-    BODY_OP_I64_SHL = 127,
-    BODY_OP_I64_ASR = 128,
 };
 
 enum {
@@ -7513,15 +7508,7 @@ static bool cold_validate_call_args(BodyIR *body, FnDef *fn, int32_t arg_start, 
             continue;
         } else if (fn->param_kind[i] == SLOT_I32 && arg_kind == SLOT_VARIANT) {
             continue;
-        } else if (fn->param_kind[i] == SLOT_I32 && arg_kind == SLOT_I64) {
-            continue;
-        } else if (fn->param_kind[i] == SLOT_I32 && arg_kind == SLOT_I64_REF) {
-            continue;
         } else if (fn->param_kind[i] == SLOT_I64 && arg_kind == SLOT_I64_REF) {
-            continue;
-        } else if (fn->param_kind[i] == SLOT_I64 && arg_kind == SLOT_I32) {
-            continue;
-        } else if (fn->param_kind[i] == SLOT_I64 && arg_kind == SLOT_I32_REF) {
             continue;
         } else if (fn->param_kind[i] == SLOT_STR && arg_kind == SLOT_STR_REF) {
             continue;
@@ -7583,21 +7570,12 @@ static bool cold_call_args_match(BodyIR *body, FnDef *fn, int32_t arg_start, int
             continue;
         } else if (fn->param_kind[i] == SLOT_I32 && arg_kind == SLOT_VARIANT) {
             continue;
-        } else if (fn->param_kind[i] == SLOT_I32 && arg_kind == SLOT_I64) {
-            continue;
-        } else if (fn->param_kind[i] == SLOT_I32 && arg_kind == SLOT_I64_REF) {
-            continue;
         } else if (fn->param_kind[i] == SLOT_I64 && arg_kind == SLOT_I64_REF) {
-            continue;
-        } else if (fn->param_kind[i] == SLOT_I64 && arg_kind == SLOT_I32) {
-            continue;
-        } else if (fn->param_kind[i] == SLOT_I64 && arg_kind == SLOT_I32_REF) {
             continue;
         } else if (fn->param_kind[i] == SLOT_STR && arg_kind == SLOT_STR_REF) {
             continue;
         } else if (fn->param_kind[i] == SLOT_OPAQUE &&
-                   (arg_kind == SLOT_I32 || arg_kind == SLOT_STR ||
-                    arg_kind == SLOT_OBJECT || arg_kind == SLOT_OBJECT_REF ||
+                   (arg_kind == SLOT_OBJECT || arg_kind == SLOT_OBJECT_REF ||
                     arg_kind == SLOT_VARIANT || arg_kind == SLOT_SEQ_OPAQUE ||
                     arg_kind == SLOT_SEQ_OPAQUE_REF || arg_kind == SLOT_OPAQUE)) {
             continue;
@@ -7680,7 +7658,6 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
 
 static int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *locals,
                                      Span name, int32_t *kind_out) {
-    /* Strip generic params [T] or [int32] from call name for lookup */
     Span stripped_name = name;
     int32_t bracket = -1;
     for (int32_t bi = 0; bi < name.len; bi++)
@@ -14578,9 +14555,6 @@ static uint32_t a64_asr_reg(int rd, int rn, int rm) {
 }
 static uint32_t a64_and_reg(int rd, int rn, int rm) {
     return 0x0A000000u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rd;
-}
-static uint32_t a64_and_reg_x(int rd, int rn, int rm) {
-    return 0x8A000000u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rd;
 }
 __attribute__((unused))
 static uint32_t a64_and_imm(int rd, int rn, uint32_t imm, bool x) {
