@@ -78,6 +78,7 @@
 - 替换 `artifacts/backend_driver/cheng` 前必须先跑候选门禁，再覆盖后跑正式入口同一组门禁；只验证候选旁路文件不算完成。
 - cold bootstrap seed 只承诺浅导入；深层导入闭包走 Cheng 工具链。import body 内调用必须严格裸名精确查找，禁止自动加 `import_alias.` 前缀，也禁止 bare-name fallback。
 - provider 编译器选择必须先尊重 `CHENG_NO_BACKEND_DRIVER_HANDOFF`，runtime provider 必须显式走 stage3/stage0；不能先取 argv0，否则生成候选会递归调用自身编译 runtime provider 并 hang。
+- provider export roots 必须按模块所有权和 primary undefined symbols 精确选择；线程 root 只在真实引用时加入，CPU bridge 属于 `runtime/core_runtime`，provider 自身生成代码引用的 `cheng_bounds_check` 必须由 `runtime/program_support` 导出。
 
 ## Resolved
 
