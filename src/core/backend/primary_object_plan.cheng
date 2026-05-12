@@ -87,6 +87,11 @@ type
         dataRelocWordOffsets: int32[]
         dataRelocTargetSymbols: str[]
         reachableFunctionCount: int32
+        typedIrTypeLayoutCount: int32
+        typedIrTypeFieldCount: int32
+        typedIrColdCsgTypeRowCount: int32
+        typedIrLocalBindingCount: int32
+        typedIrChengMemHeaderRcFieldCount: int32
         error: PrimaryObjectError
         missingReasons: str[]
         pipelineStage: str
@@ -577,6 +582,11 @@ fn PrimaryBodyIrPointeeTypeText(typeRaw: str): str =
         return ""
     if len(typeText) > 0 && typeText[len(typeText) - 1] == '*':
         return strutil.Strip(strings.SliceBytes(typeText, 0, len(typeText) - 1))
+    if len(typeText) > 3 &&
+       strings.SliceBytes(typeText, 0, 3) == "ref" &&
+       typeText[3] >= 'A' &&
+       typeText[3] <= 'Z':
+        return strutil.Strip(strings.SliceBytes(typeText, 3, len(typeText) - 3))
     var leafStart: int32
     for i in 0..<len(typeText):
         if typeText[i] == '.':
@@ -587,6 +597,10 @@ fn PrimaryBodyIrPointeeTypeText(typeRaw: str): str =
     if len(leaf) > 3 && strings.SliceBytes(leaf, len(leaf) - 3, 3) == "Ptr":
         return strings.SliceBytes(leaf, 0, len(leaf) - 3)
     return ""
+
+fn PrimaryBodyIrTypeTextIsGenericPointer(typeRaw: str): bool =
+    let typeText = texpr.TypedExprNormalizeTypeText(typeRaw)
+    return typeText == "ptr" || typeText == "void*"
 
 fn PrimaryBodyIrTypeShapeFromText(typedIr: texpr.TypedExprIr,
                                    sourcePath: str,
@@ -867,6 +881,13 @@ fn PrimaryBodyIrBindingTypeForName(typedIr: texpr.TypedExprIr,
             continue
         if irFunction.paramNames[i] == name:
             return irFunction.paramTypes[i]
+    let localBindingType = texpr.TypedExprIrLookupLocalBindingType(typedIr,
+                                                                   typedFn.sourcePath,
+                                                                   typedFn.functionName,
+                                                                   lineNumber,
+                                                                   name)
+    if localBindingType != "":
+        return localBindingType
     var stmtEnd = typedFn.statementStart + typedFn.statementCount
     if stmtEnd > typedIr.statements.len:
         stmtEnd = typedIr.statements.len
@@ -880,6 +901,10 @@ fn PrimaryBodyIrBindingTypeForName(typedIr: texpr.TypedExprIr,
         if stmt.resultType != "" &&
            stmt.resultType != "unknown" &&
            stmt.resultType != "call_expr":
+            if foundType != "" &&
+               !PrimaryBodyIrTypeTextIsGenericPointer(foundType) &&
+               PrimaryBodyIrTypeTextIsGenericPointer(stmt.resultType):
+                continue
             foundType = stmt.resultType
     return foundType
 
@@ -1745,28 +1770,43 @@ fn PrimaryBodyIrAddressSlotForName(bodyIR: var coreir.BodyIR,
                                     sourcePath: str,
                                     lineNumber: int32,
                                     nameRaw: str,
+                                    rootTypeHintName: str,
+                                    rootTypeHint: str,
                                     addressPassKind: var int32): int32 =
     let name = strutil.Strip(nameRaw)
     addressPassKind = coreir.BodyCallPassParamAddressTag
     if name == "":
+        addressPassKind = -1
         return -1
     if texpr.TypedExprTextIsSimpleFieldPath(name):
         let rootName = texpr.TypedExprAssignLhsRootName(name)
         let fieldPath = texpr.TypedExprAssignFieldPath(name)
         if rootName == "" || fieldPath == "":
+            addressPassKind = -2
             return -1
-        let rootType = PrimaryBodyIrBindingTypeForName(typedIr,
+        var rootType = ""
+        if rootTypeHintName == rootName && rootTypeHint != "":
+            rootType = rootTypeHint
+        if rootType == "":
+            rootType = PrimaryBodyIrBindingTypeForName(typedIr,
                                                        typedFn,
                                                        irFunction,
                                                        lineNumber,
                                                        rootName)
         if rootType == "":
+            addressPassKind = -3
+            return -1
+        if PrimaryBodyIrTypeTextIsGenericPointer(rootType):
+            addressPassKind = -10
             return -1
         var ownerType = rootType
         let pointeeType = PrimaryBodyIrPointeeTypeText(rootType)
         let passRootPointer = pointeeType != ""
         if passRootPointer:
             ownerType = pointeeType
+            if ownerType == "":
+                addressPassKind = -11
+                return -1
         var fieldType = ""
         var fieldOffsetBytes: int32
         var fieldSizeBytes: int32
@@ -1779,8 +1819,10 @@ fn PrimaryBodyIrAddressSlotForName(bodyIR: var coreir.BodyIR,
                                                  fieldOffsetBytes,
                                                  fieldSizeBytes,
                                                  fieldAlignBytes):
+            addressPassKind = -4
             return -1
         if fieldOffsetBytes != 0:
+            addressPassKind = -5
             return -1
         let rootSlot = PrimaryBodyIrFindOrCreateFieldBaseSlot(bodyIR,
                                                               slotNames,
@@ -1789,9 +1831,11 @@ fn PrimaryBodyIrAddressSlotForName(bodyIR: var coreir.BodyIR,
                                                               rootName,
                                                               rootType)
         if rootSlot < 0 || rootSlot >= bodyIR.localSlots.len:
+            addressPassKind = -6
             return -1
         if passRootPointer:
             if PrimaryBodyIrSlotType(bodyIR, rootSlot) != coreir.LocalPtrTag:
+                addressPassKind = -7
                 return -1
             addressPassKind = coreir.BodyCallPassStackValueTag
         return rootSlot
@@ -1823,9 +1867,11 @@ fn PrimaryBodyIrAddressSlotForName(bodyIR: var coreir.BodyIR,
         return functionSlot
     let globalType = PrimaryBodyIrTypedGlobalType(typedIr, sourcePath, name)
     if globalType == "":
+        addressPassKind = -8
         return -1
     let globalSlotName = PrimaryBodyIrTypedGlobalSlotName(typedIr, sourcePath, name)
     if globalSlotName == "":
+        addressPassKind = -9
         return -1
     var typeKind: int32
     var sizeBytes: int32
@@ -2245,6 +2291,31 @@ fn PrimaryBodyIrAppendCallArgs(bodyIR: var coreir.BodyIR,
                 failureDetail1 = argIndex
                 return false
             let addressName = PrimaryBodyIrPtrAddressArgName(argName)
+            if texpr.TypedExprTextIsSimpleFieldPath(addressName):
+                let addressRootName = texpr.TypedExprAssignLhsRootName(addressName)
+                let addressFieldPath = texpr.TypedExprAssignFieldPath(addressName)
+                if addressRootName == stmt.assignRootName &&
+                   addressFieldPath == stmt.assignFieldName &&
+                   stmt.assignRootType != "" &&
+                   stmt.assignFieldOffsetBytes == 0:
+                    let rootSlot = PrimaryBodyIrFindOrCreateFieldBaseSlot(bodyIR,
+                                                                          slotNames,
+                                                                          typedIr,
+                                                                          stmt.sourcePath,
+                                                                          stmt.assignRootName,
+                                                                          stmt.assignRootType)
+                    if rootSlot < 0 || rootSlot >= bodyIR.localSlots.len:
+                        failureDetail0 = 241
+                        failureDetail1 = argIndex
+                        return false
+                    if PrimaryBodyIrPointeeTypeText(stmt.assignRootType) != "":
+                        add(call.argSlots, rootSlot)
+                        add(call.argPassKinds, coreir.BodyCallPassStackValueTag)
+                    else:
+                        add(call.argSlots, coreir.CallArgSlotAddress(rootSlot))
+                        add(call.argPassKinds, coreir.BodyCallPassParamAddressTag)
+                    continue
+            var addressPassKind: int32
             let addressSlot = PrimaryBodyIrAddressSlotForName(bodyIR,
                                                               slotNames,
                                                               lowering,
@@ -2253,12 +2324,21 @@ fn PrimaryBodyIrAppendCallArgs(bodyIR: var coreir.BodyIR,
                                                               irFunction,
                                                               stmt.sourcePath,
                                                               stmt.lineNumber,
-                                                              addressName)
+                                                              addressName,
+                                                              stmt.assignRootName,
+                                                              stmt.assignRootType,
+                                                              addressPassKind)
             if addressSlot < 0 || addressSlot >= bodyIR.localSlots.len:
-                failureDetail0 = 24
+                if addressPassKind < 0:
+                    failureDetail0 = 2400 - addressPassKind
+                else:
+                    failureDetail0 = 24
                 failureDetail1 = argIndex
                 return false
-            if bodyIR.localSlots[addressSlot].placeKind == coreir.BodyPlaceGlobalAddressTag:
+            if addressPassKind == coreir.BodyCallPassStackValueTag:
+                add(call.argSlots, addressSlot)
+                add(call.argPassKinds, coreir.BodyCallPassStackValueTag)
+            elif bodyIR.localSlots[addressSlot].placeKind == coreir.BodyPlaceGlobalAddressTag:
                 add(call.argSlots, addressSlot)
                 add(call.argPassKinds, coreir.BodyCallPassGlobalAddressTag)
             else:
@@ -6309,6 +6389,18 @@ fn PrimaryObjectMissingReasons(linkPlan: slplan.SystemLinkPlanStub,
         add(missing, "primary_object_entry_symbol_missing")
     return missing
 
+fn PrimaryObjectTypedIrFieldCount(typedIr: texpr.TypedExprIr,
+                                   ownerType: str,
+                                   fieldName: str): int32 =
+    var count: int32
+    for i in 0..<typedIr.typeFieldOwnerTypes.len:
+        if i >= typedIr.typeFieldNames.len:
+            continue
+        if typedIr.typeFieldOwnerTypes[i] == ownerType &&
+           typedIr.typeFieldNames[i] == fieldName:
+            count = count + 1
+    return count
+
 fn PrimaryObjectMissingLineNumber(lowering: lower.LoweringPlanStub,
                                    irIndex: int32): int32 =
     if irIndex < 0 || irIndex >= lowering.primaryObjectIr.functions.len:
@@ -7116,6 +7208,10 @@ fn PrimaryObjectPlanFillAndCheckPhase(state: var PrimaryObjectPlanPhaseState,
                plan.instructionWords[wordIndex] == 0:
                 replacedZero = true
         if replacedZero:
+            for wordIndex in startWord..<endWord:
+                if wordIndex >= 0 && wordIndex < plan.instructionWords.len &&
+                   plan.instructionWords[wordIndex] == 0:
+                    plan.instructionWords[wordIndex] = a64.A64EncRet()
             state.bodySemanticsMissing = true
             if len(plan.error.functionName) <= 0:
                 plan.error.functionName = state.symbolNames[functionIndex]
@@ -7197,6 +7293,13 @@ fn PrimaryObjectPlanDiagnoseAndFinalizePhase(state: var PrimaryObjectPlanPhaseSt
     plan.error.callTargetOrdinal = state.error.callTargetOrdinal
     plan.error.callTarget = state.error.callTarget
     plan.error.callTargetSourcePath = state.error.callTargetSourcePath
+    plan.typedIrTypeLayoutCount = lowering.typedIr.typeLayoutNames.len
+    plan.typedIrTypeFieldCount = lowering.typedIr.typeFieldOwnerTypes.len
+    plan.typedIrColdCsgTypeRowCount = lowering.typedIr.coldCsgTypeRows.len
+    plan.typedIrLocalBindingCount = lowering.typedIr.localBindingNames.len
+    plan.typedIrChengMemHeaderRcFieldCount = PrimaryObjectTypedIrFieldCount(lowering.typedIr,
+                                                                            "ChengMemHeader",
+                                                                            "rc")
     plan.missingReasons = PrimaryObjectMissingReasons(linkPlan,
                                                         lowering,
                                                         state.itemIds,
@@ -7273,6 +7376,11 @@ fn PrimaryObjectPlanReport(plan: PrimaryObjectPlan): str =
     PrimaryObjectPlanAppendLine(out, "primary_object_reloc_count", strings.IntToStr(plan.relocSourceItemIds.len))
     PrimaryObjectPlanAppendLine(out, "primary_object_data_reloc_count", strings.IntToStr(plan.dataRelocSourceItemIds.len))
     PrimaryObjectPlanAppendLine(out, "primary_object_entry_function_symbol", plan.entryFunctionSymbol)
+    PrimaryObjectPlanAppendLine(out, "primary_object_typed_ir_type_layout_count", strings.IntToStr(plan.typedIrTypeLayoutCount))
+    PrimaryObjectPlanAppendLine(out, "primary_object_typed_ir_type_field_count", strings.IntToStr(plan.typedIrTypeFieldCount))
+    PrimaryObjectPlanAppendLine(out, "primary_object_typed_ir_cold_csg_type_row_count", strings.IntToStr(plan.typedIrColdCsgTypeRowCount))
+    PrimaryObjectPlanAppendLine(out, "primary_object_typed_ir_local_binding_count", strings.IntToStr(plan.typedIrLocalBindingCount))
+    PrimaryObjectPlanAppendLine(out, "primary_object_typed_ir_cheng_mem_header_rc_field_count", strings.IntToStr(plan.typedIrChengMemHeaderRcFieldCount))
     PrimaryObjectPlanAppendLine(out, "primary_object_first_missing_function", firstMissingFunction)
     PrimaryObjectPlanAppendLine(out, "primary_object_first_missing_body_kind", firstMissingBodyKind)
     PrimaryObjectPlanAppendLine(out, "primary_object_first_missing_typed_ir_kind", firstMissingTypedIrKind)
