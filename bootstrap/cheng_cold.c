@@ -4171,7 +4171,7 @@ static int cold_cmd_build_backend_driver(int argc, char **argv, const char *self
             return 1;
         }
     } else {
-        if (!out_dir_arg || out_dir_arg[0] == '\0') out_dir_arg = "artifacts/backend_driver-cold";
+        if (!out_dir_arg || out_dir_arg[0] == '\0') out_dir_arg = "artifacts/backend_driver";
         cold_absolute_path(out_dir_arg, abs_out_dir, sizeof(abs_out_dir));
         if (!cold_mkdir_p(abs_out_dir)) {
             fprintf(stderr, "[cheng_cold] failed to create out dir: %s\n", abs_out_dir);
@@ -7640,6 +7640,22 @@ static int32_t symbols_find_fn_for_call(Symbols *symbols, Span name,
         if (!match) continue;
         if (found >= 0) continue;
         found = i;
+    }
+    /* Third pass: base-name match for imported functions.
+       If call `Assert(...)` doesn't match, try matching
+       against `system.Assert(...)`, `foo.Assert(...)`, etc. */
+    if (found < 0) {
+        for (int32_t i = 0; i < symbols->function_count; i++) {
+            FnDef *fn = &symbols->functions[i];
+            if (fn->arity != arg_count) continue;
+            int32_t dot = cold_span_find_char(fn->name, '.');
+            if (dot < 0) continue;
+            Span base = span_sub(fn->name, dot + 1, fn->name.len);
+            if (!span_same(base, name)) continue;
+            if (!cold_call_args_match(body, fn, arg_start, arg_count)) continue;
+            found = i;
+            break;
+        }
     }
     return found;
 }
