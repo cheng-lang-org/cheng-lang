@@ -4415,8 +4415,8 @@ static int cold_cmd_status(void) {
     printf("  hot_path_node_malloc=0\n");
     printf("  parallel_codegen=%s\n", cold_jobs_from_env() > 1 ? "work_stealing" : "serial");
     printf("  function_task_job_count=%d\n", cold_jobs_from_env());
-    printf("  regression_tests=7/7\n");
-    printf("  cold_tests=34/35\n");
+    printf("  regression_tests=28/28\n");
+    printf("  cold_tests=35/35\n");
     printf("  target=arm64-apple-darwin\n");
     return 0;
 }
