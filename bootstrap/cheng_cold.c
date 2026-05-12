@@ -6921,6 +6921,12 @@ static void cold_collect_import_module_signatures(Symbols *symbols, Span alias,
 }
 
 static void cold_collect_imported_function_signatures(Symbols *symbols, Span source) {
+    /* De-duplication: track visited module paths to avoid re-parsing
+       the same source file when multiple imports reference it (e.g.
+       different aliases for the same module, or transitive re-imports). */
+    char visited_paths[64][PATH_MAX];
+    int32_t visited_count = 0;
+
     int32_t pos = 0;
     bool in_triple = false;
     while (pos < source.len) {
@@ -6940,10 +6946,22 @@ static void cold_collect_imported_function_signatures(Symbols *symbols, Span sou
         Span module_path = {0};
         Span alias = {0};
         if (!cold_parse_import_line(span_trim(line), &module_path, &alias)) continue;
+        char path_buf[PATH_MAX];
+        if (!cold_import_source_path(module_path, path_buf, sizeof(path_buf))) continue;
+        bool seen = false;
+        for (int32_t vi = 0; vi < visited_count; vi++) {
+            if (strcmp(visited_paths[vi], path_buf) == 0) { seen = true; break; }
+        }
+        if (seen) continue;
+        if (visited_count < 64) {
+            strncpy(visited_paths[visited_count++], path_buf, PATH_MAX - 1);
+        }
         cold_collect_import_module_types_from_path(symbols, alias, module_path);
     }
     symbols_refine_object_layouts(symbols);
 
+    /* Reset visited for pass 2 (function signatures) */
+    visited_count = 0;
     pos = 0;
     in_triple = false;
     while (pos < source.len) {
@@ -6963,6 +6981,16 @@ static void cold_collect_imported_function_signatures(Symbols *symbols, Span sou
         Span module_path = {0};
         Span alias = {0};
         if (!cold_parse_import_line(span_trim(line), &module_path, &alias)) continue;
+        char path_buf[PATH_MAX];
+        if (!cold_import_source_path(module_path, path_buf, sizeof(path_buf))) continue;
+        bool seen = false;
+        for (int32_t vi = 0; vi < visited_count; vi++) {
+            if (strcmp(visited_paths[vi], path_buf) == 0) { seen = true; break; }
+        }
+        if (seen) continue;
+        if (visited_count < 64) {
+            strncpy(visited_paths[visited_count++], path_buf, PATH_MAX - 1);
+        }
         cold_collect_import_module_signatures(symbols, alias, module_path);
     }
 }
@@ -8121,7 +8149,7 @@ static int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *local
     int32_t ret_kind = cold_return_kind_from_span(parser->symbols, fn->ret);
     int32_t slot = body_slot(body, ret_kind, cold_return_slot_size(parser->symbols, fn->ret, ret_kind));
     body_slot_set_type(body, slot, fn->ret);
-    bool has_composite = (ret_kind != SLOT_I32 && ret_kind != SLOT_I64 && ret_kind != SLOT_PTR);
+    bool has_composite = (ret_kind != SLOT_I32 && ret_kind != SLOT_I64 && ret_kind != SLOT_PTR && ret_kind != SLOT_OPAQUE);
     for (int32_t pi = 0; !has_composite && pi < fn->arity; pi++) {
         if (fn->param_kind[pi] != SLOT_I32 && fn->param_kind[pi] != SLOT_I64 && fn->param_kind[pi] != SLOT_PTR) has_composite = true;
     }
@@ -8311,7 +8339,7 @@ static int32_t parse_call_from_args_span(Parser *owner, BodyIR *body, Locals *lo
     int32_t ret_kind = cold_return_kind_from_span(owner->symbols, fn->ret);
     int32_t slot = body_slot(body, ret_kind, cold_return_slot_size(owner->symbols, fn->ret, ret_kind));
     body_slot_set_type(body, slot, fn->ret);
-    bool has_composite = (ret_kind != SLOT_I32 && ret_kind != SLOT_I64 && ret_kind != SLOT_PTR);
+    bool has_composite = (ret_kind != SLOT_I32 && ret_kind != SLOT_I64 && ret_kind != SLOT_PTR && ret_kind != SLOT_OPAQUE);
     for (int32_t pi = 0; !has_composite && pi < fn->arity; pi++) {
         if (fn->param_kind[pi] != SLOT_I32 && fn->param_kind[pi] != SLOT_I64 && fn->param_kind[pi] != SLOT_PTR) has_composite = true;
     }
@@ -18298,7 +18326,7 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         function_patches_add(function_patches, call_pos, a);
         if (stack_bytes > 0) a64_emit_add_large(code, SP, SP, stack_bytes, true);
         int32_t ret_kind = cold_return_kind_from_span(symbols, fn->ret);
-        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], ret_kind == SLOT_I64 || ret_kind == SLOT_PTR);
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], ret_kind == SLOT_I64 || ret_kind == SLOT_PTR || ret_kind == SLOT_OPAQUE);
     } else if (kind == BODY_OP_COPY_I32) {
         int __cr2 = na_find(a);
         if (__cr2 >= 0) { if (__cr2 != 0) code_emit(code, a64_add_imm(R0, __cr2, 0, false)); }
@@ -18513,7 +18541,7 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         if (a < 0 || a >= symbols->function_count) die("invalid function call target");
         FnDef *fn = &symbols->functions[a];
         int32_t ret_kind = cold_return_kind_from_span(symbols, fn->ret);
-        if (ret_kind != SLOT_I32 && ret_kind != SLOT_I64 && ret_kind != SLOT_PTR) {
+        if (ret_kind != SLOT_I32 && ret_kind != SLOT_I64 && ret_kind != SLOT_PTR && ret_kind != SLOT_OPAQUE) {
             a64_emit_add_large(code, 8, SP, body->slot_offset[dst], true);
         }
         int32_t stack_bytes = codegen_load_call_args(code, body, fn, b);
@@ -18523,7 +18551,7 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         if (stack_bytes > 0) a64_emit_add_large(code, SP, SP, stack_bytes, true);
         if (ret_kind == SLOT_I32) {
             a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
-        } else if (ret_kind == SLOT_I64 || ret_kind == SLOT_PTR) {
+        } else if (ret_kind == SLOT_I64 || ret_kind == SLOT_PTR || ret_kind == SLOT_OPAQUE) {
             a64_emit_str_sp_off(code, R0, body->slot_offset[dst], true);
         }
     } else if (kind == BODY_OP_COPY_COMPOSITE) {
@@ -18891,7 +18919,8 @@ static void codegen_func(Code *code, BodyIR *body, Symbols *symbols,
             int32_t value_kind = body->slot_kind[value_slot];
             if (value_kind == SLOT_I32) {
                 a64_emit_ldr_sp_off(code, R0, body->slot_offset[value_slot], false);
-            } else if (value_kind == SLOT_I64 || value_kind == SLOT_PTR) {
+            } else if (value_kind == SLOT_I64 || value_kind == SLOT_PTR ||
+                       value_kind == SLOT_OPAQUE) {
                 a64_emit_ldr_sp_off(code, R0, body->slot_offset[value_slot], true);
             } else if (value_kind == SLOT_STR) {
                 if (body->sret_slot >= 0)
@@ -19097,10 +19126,32 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
         pthread_t *threads = arena_alloc(code->arena,
             (size_t)active_jobs * sizeof(pthread_t));
 
+        /* Per-worker arena cache: reuse mmap'd arenas across compilations.
+           Reset used=0 and keep pages; significantly reduces mmap/munmap churn. */
+        static Arena *worker_arena_cache[16] = {0};
+        static int32_t worker_arena_cache_count = 0;
+
         for (int32_t w = 0; w < active_jobs; w++) {
-            Arena *w_arena = mmap(0, sizeof(Arena), PROT_READ | PROT_WRITE,
-                                  MAP_PRIVATE | MAP_ANON, -1, 0);
-            if (w_arena == MAP_FAILED) die("worker arena mmap failed");
+            Arena *w_arena = NULL;
+            /* Try to reuse a cached arena */
+            if (w < worker_arena_cache_count && worker_arena_cache[w]) {
+                w_arena = worker_arena_cache[w];
+                /* Reset arena state: keep pages, just rewind allocation cursor.
+                   Page list stays intact; next alloc will reuse existing pages. */
+                w_arena->used = 0;
+                w_arena->phase_count = 0;
+            }
+            if (!w_arena) {
+                w_arena = mmap(0, sizeof(Arena), PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANON, -1, 0);
+                if (w_arena == MAP_FAILED) die("worker arena mmap failed");
+                /* Cache this arena for future compilations */
+                if (w < 16) {
+                    worker_arena_cache[w] = w_arena;
+                    if (w >= worker_arena_cache_count)
+                        worker_arena_cache_count = w + 1;
+                }
+            }
             Code *w_code = code_new(w_arena, 256);
             workers[w] = (CodegenWorker){
                 .next_fn = &next_fn,
@@ -19178,7 +19229,7 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
         }
 
         for (int32_t w = 0; w < active_jobs; w++) {
-            munmap(workers[w].local_code->arena, sizeof(Arena));
+            /* Arena retained in cache for next compilation; skip munmap */
         }
     } else {
         for (int32_t i = 0; i < function_count; i++) {
