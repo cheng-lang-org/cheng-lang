@@ -2170,6 +2170,68 @@ fn A64Check(): int32 =
 
     return 0
 
+fn StmtExprWriteFacts(sink: var FactSink, fnName: str, source: str): int32 =
+    var scan: StatementScan
+    scan.source = source
+    var exprId: int32 = 0
+    while scan.pos < len(source):
+        if StatementClassifyLine(scan) == false:
+            sink.error = 51
+            return sink.error
+        if scan.kindCode != 0 && scan.kindCode != 5:
+            let writeResult: int32 = FactWriteStatementRecord(sink, fnName, scan.kindCode, scan.indent, scan.payloadStart, scan.payloadLen)
+            if writeResult != 0:
+                return sink.error
+            if scan.payloadLen > 0:
+                var store: ExprTokenStore
+                let scanResult: int32 = ExprScanIntoStore(source, store)
+                if scanResult != 0:
+                    sink.error = scanResult
+                    return sink.error
+                for i in 0..<store.count:
+                    let tr: int32 = FactWriteExprTokenRecord(sink, fnName, exprId,
+                                                             ExprTokenKindAt(store, i),
+                                                             ExprTokenStartAt(store, i),
+                                                             ExprTokenLenAt(store, i),
+                                                             ExprTokenDepthAt(store, i))
+                    if tr != 0:
+                        return sink.error
+                exprId = exprId + 1
+        StatementAdvance(scan)
+    return 0
+
+fn StmtExprReadVerify(reader: var FactReader, source: str): int32 =
+    if FactExpectText(reader, "cold_csg_version=2\n") == false:
+        return 0 - reader.error
+    var stmtCount: int32 = 0
+    while reader.pos < reader.bytes.len:
+        var record: FactRecordView
+        if FactReadRecordView(reader, record) == false:
+            return 0 - reader.error
+        if record.kindCode == 3:
+            stmtCount = stmtCount + 1
+        elif record.kindCode != 4:
+            return 250 + record.kindCode
+    if stmtCount <= 0:
+        return 251
+    return stmtCount
+
+fn StmtExprRoundTripCheck(): int32 =
+    var sink: FactSink
+    if FactWriteVersion2(sink) != 0:
+        return 260 + sink.error
+    let testSource: str = "    let x = a + b\n    return x\n    if x > 7:\n        return 1\n"
+    if StmtExprWriteFacts(sink, "RoundTrip", testSource) != 0:
+        return 261 + sink.error
+    var reader: FactReader
+    reader.bytes = sink.bytes
+    let stmtCount: int32 = StmtExprReadVerify(reader, testSource)
+    if stmtCount <= 0:
+        return stmtCount
+    if stmtCount != 4:
+        return 262
+    return 0
+
 fn main(): int32 =
     let frontend = FrontendCheck()
     if frontend != 0:
@@ -2183,6 +2245,18 @@ fn main(): int32 =
     let expr = ExprCheck()
     if expr != 0:
         return expr
+    let facts = FactCheck()
+    if facts != 0:
+        return facts
+    let stmtFact = StatementFactCheck()
+    if stmtFact != 0:
+        return stmtFact
+    let exprFact = ExprFactCheck()
+    if exprFact != 0:
+        return exprFact
+    let rt = StmtExprRoundTripCheck()
+    if rt != 0:
+        return rt
     let a64 = A64Check()
     if a64 != 0:
         return a64
