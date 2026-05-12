@@ -5560,17 +5560,11 @@ static ObjectDef *symbols_resolve_object(Symbols *symbols, Span type_name) {
         if (field_type.len <= 0 && span_eq(src->name, "value") && arg_count > 0) {
             field_type = args[0];
         }
-        /* If source field type is a generic placeholder, use SLOT_OPAQUE
-           for uniform caller/callee layout with generic function bodies */
-        bool is_generic_field = false;
-        for (int32_t gi = 0; gi < base->generic_count; gi++)
-            if (span_same(src->type_name, base->generic_names[gi]))
-                { is_generic_field = true; break; }
         int32_t fk = cold_slot_kind_from_type_with_symbols(symbols, field_type);
         dst->name = src->name;
         dst->type_name = field_type;
-        dst->kind = is_generic_field ? SLOT_OPAQUE : fk;
-        dst->size = is_generic_field ? 8 : cold_slot_size_from_type_with_symbols(symbols, field_type, fk);
+        dst->kind = fk;
+        dst->size = cold_slot_size_from_type_with_symbols(symbols, field_type, fk);
         dst->array_len = 0;
         if (fk == SLOT_ARRAY_I32 && !cold_parse_i32_array_type(field_type, &dst->array_len) && !cold_span_starts_with(span_trim(field_type), "uint8[")) {
             dst->array_len = 4; /* default */
