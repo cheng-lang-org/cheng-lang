@@ -6575,6 +6575,8 @@ static int32_t cold_imported_param_specs(Symbols *symbols, Span alias, Span para
 static void parse_type(Parser *parser);
 
 static void cold_collect_import_module_types(Symbols *symbols, Span alias, Span source) {
+    ColdErrorRecoveryEnabled = true;
+    if (setjmp(ColdErrorJumpBuf) != 0) { ColdErrorRecoveryEnabled = false; return; }
     Symbols *local_symbols = symbols_new(symbols->arena);
     Parser parser = {source, 0, symbols->arena, local_symbols};
     while (parser.pos < source.len) {
@@ -6774,7 +6776,7 @@ static void cold_collect_import_module_signatures(Symbols *symbols, Span alias,
             if (trimmed.len > 3 && trimmed.ptr[3] == '`') continue;
             fprintf(stderr, "cheng_cold: cannot parse imported signature path=%s line=%d\n",
                     path, line_no);
-            die("cannot parse cold imported function signature");
+            continue;
         }
         Span names[COLD_MAX_I32_PARAMS];
         int32_t kinds[COLD_MAX_I32_PARAMS];

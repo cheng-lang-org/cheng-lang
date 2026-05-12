@@ -8814,6 +8814,119 @@ fn TypedExprIrAddCallStatement(ir: var TypedExprIr,
     add(ir.statements, stmt)
     return stmt.statementIndex
 
+fn TypedExprIrAddUnsupportedStatement(ir: var TypedExprIr,
+                                       ctx: var TypedExprSourceContext,
+                                       scope: TypedExprFunctionScope,
+                                       lineNumber: int32,
+                                       lineIndent: int32,
+                                       surfaceText: str): int32 =
+    var stmt: TypedExprIrStatement
+    stmt.sourcePath = ctx.sourcePath
+    stmt.functionName = scope.name
+    stmt.statementIndex = ir.statements.len
+    stmt.lineNumber = lineNumber
+    stmt.columnNumber = 1
+    stmt.lineIndent = lineIndent
+    stmt.enclosingIfLineNumber = -1
+    stmt.enclosingIfConditionText = ""
+    stmt.exprId = ""
+    stmt.kind = TypedExprIrStmtUnsupported
+    stmt.callKind = TypedExprCallNone
+    stmt.detailKind = parser.NormalizedExprDetailNone
+    stmt.surfaceText = surfaceText
+    stmt.bindingName = ""
+    stmt.resultType = ""
+    stmt.conditionKind = TypedExprIrCondNone
+    stmt.conditionLhsText = ""
+    stmt.conditionRhsText = ""
+    stmt.conditionLiteralText = ""
+    stmt.assignRootName = ""
+    stmt.assignRootType = ""
+    stmt.assignRootSourcePath = ""
+    stmt.assignRootGlobalFlag = false
+    stmt.assignPlaceKind = TypedExprPlaceTemporary
+    stmt.assignFieldName = ""
+    stmt.assignFieldType = ""
+    stmt.assignFieldOffsetBytes = 0
+    stmt.assignFieldSizeBytes = 0
+    stmt.assignFieldAlignBytes = 0
+    stmt.assignValueRootName = ""
+    stmt.assignValueRootType = ""
+    stmt.assignValueFieldName = ""
+    stmt.assignValueFieldType = ""
+    stmt.assignValueFieldOffsetBytes = 0
+    stmt.assignValueFieldSizeBytes = 0
+    stmt.assignValueFieldAlignBytes = 0
+    stmt.assignValueOpKind = TypedExprIrOpUnsupported
+    stmt.assignValueLhsText = ""
+    stmt.assignValueRhsText = ""
+    stmt.assignValueRhsConst = 0
+    stmt.assignValueRhsHasConst = false
+    stmt.callQualifier = ""
+    stmt.callCallee = ""
+    stmt.callTarget = ""
+    stmt.callTargetSourcePath = ""
+    stmt.callTargetImportc = false
+    stmt.callArgCount = 0
+    stmt.callArgsText = ""
+    stmt.callArgTypesText = ""
+    stmt.callArgNodeStart = -1
+    stmt.callArgNodeCount = 0
+    stmt.loweringMode = TypedExprLowerDeferred
+    stmt.returnKind = TypedExprReturnDeferred
+    stmt.returnRoot = false
+    add(ir.statements, stmt)
+    return stmt.statementIndex
+
+fn TypedExprIrStatementLineExists(ir: var TypedExprIr,
+                                   statementStart: int32,
+                                   statementEndRaw: int32,
+                                   lineNumber: int32): bool =
+    var statementEnd = statementEndRaw
+    if statementEnd > ir.statements.len:
+        statementEnd = ir.statements.len
+    if statementStart < 0 || statementStart >= statementEnd:
+        return false
+    for i in statementStart..<statementEnd:
+        if ir.statements[i].lineNumber == lineNumber:
+            return true
+    return false
+
+fn TypedExprIrAppendUnrepresentedTopLevelBodyStatements(ir: var TypedExprIr,
+                                                         ctx: var TypedExprSourceContext,
+                                                         scope: TypedExprFunctionScope,
+                                                         statementStart: int32,
+                                                         returnLineNumber: int32) =
+    if scope.startLine <= 0 || scope.startLine > ctx.lines.len:
+        return
+    var lineEnd = ctx.lines.len
+    if scope.endLine > 0 && scope.endLine < lineEnd:
+        lineEnd = scope.endLine
+    var bodyIndent: int32 = -1
+    for i in scope.startLine..<lineEnd:
+        let bodyRaw = ctx.lines[i]
+        let bodyTrim = chengpath.PathTrim(parser.ParserStripLineComment(bodyRaw))
+        if bodyTrim == "":
+            continue
+        if !parser.ParserHasLeadingIndent(bodyRaw):
+            break
+        let lineIndent = TypedExprLineIndentWidth(bodyRaw)
+        if bodyIndent < 0:
+            bodyIndent = lineIndent
+        if lineIndent != bodyIndent:
+            continue
+        let lineNumber = i + 1
+        if lineNumber == returnLineNumber:
+            continue
+        if TypedExprIrStatementLineExists(ir, statementStart, ir.statements.len, lineNumber):
+            continue
+        let _ = TypedExprIrAddUnsupportedStatement(ir,
+                                                   ctx,
+                                                   scope,
+                                                   lineNumber,
+                                                   lineIndent,
+                                                   bodyTrim)
+
 fn TypedExprIrAppendStatementsForScope(ir: var TypedExprIr,
                                         ctx: var TypedExprSourceContext,
                                         scope: TypedExprFunctionScope,
@@ -10535,6 +10648,11 @@ fn TypedExprBuildIrForScope(ctx: var TypedExprSourceContext,
     var emptySourceContexts: TypedExprSourceContext[]
     TypedExprIrAppendLocalDeclStatementsForScope(ir, ctx, emptySourceContexts, scope)
     TypedExprIrAppendStatementsForScope(ir, ctx, scope, facts, factStartIndex, factEndIndex)
+    TypedExprIrAppendUnrepresentedTopLevelBodyStatements(ir,
+                                                         ctx,
+                                                         scope,
+                                                         statementStart,
+                                                         returnLineNumber)
     let firstBindingCallFactIndex: int32 = TypedExprIrFirstBindingCallFactIndex(facts,
                                                                                 bodyLineNumber,
                                                                                 factStartIndex,
@@ -10638,6 +10756,11 @@ fn TypedExprBuildIrForScopeWithFactsAndExprLayer(ctx: var TypedExprSourceContext
                                                              exprStartIndex,
                                                              exprEndIndex,
                                                              includeStructuredStatements)
+    TypedExprIrAppendUnrepresentedTopLevelBodyStatements(ir,
+                                                         ctx,
+                                                         scope,
+                                                         statementStart,
+                                                         returnLineNumber)
     let firstBindingCallFactIndex: int32 = TypedExprIrFirstBindingCallFactIndex(facts,
                                                                                 bodyLineNumber,
                                                                                 factStartIndex,
@@ -10724,6 +10847,11 @@ fn TypedExprBuildIrForScopeFromExprLayer(ctx: var TypedExprSourceContext,
                                                      exprLayer,
                                                      exprStartIndex,
                                                      exprEndIndex)
+    TypedExprIrAppendUnrepresentedTopLevelBodyStatements(ir,
+                                                         ctx,
+                                                         scope,
+                                                         statementStart,
+                                                         returnLineNumber)
     let returnNodeIndex = TypedExprIrBuildReturnNode(ir,
                                                      ctx,
                                                      scope,
