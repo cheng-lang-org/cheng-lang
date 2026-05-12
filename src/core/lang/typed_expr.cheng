@@ -352,6 +352,7 @@ type
         rowKind: TypedExprColdCsgTypeRowKind
         typeName: str
         specs: str
+        typeParams: str
 
     TypedExprColdCsgStatementRow =
         sourcePath: str
@@ -1054,6 +1055,7 @@ fn TypedExprColdCsgTypeRowClone(row: TypedExprColdCsgTypeRow): TypedExprColdCsgT
     out.rowKind = row.rowKind
     out.typeName = row.typeName
     out.specs = row.specs
+    out.typeParams = row.typeParams
     return out
 
 fn TypedExprColdCsgStatementRowClone(row: TypedExprColdCsgStatementRow): TypedExprColdCsgStatementRow =
@@ -4939,6 +4941,23 @@ fn TypedExprColdCsgTupleSpecsFromText(fieldsRaw: str): str =
         out = Fmt"{out}{spec}"
     return out
 
+fn TypedExprColdCsgTypeParamsFromHead(headRaw: str): str =
+    let head = chengpath.PathTrim(headRaw)
+    let open = parser.ParserFindText(head, "[")
+    if open <= 0 || head.len <= open + 1 || head[head.len - 1] != ']':
+        return ""
+    let inner = chengpath.TextSlice(head, open + 1, head.len - open - 2)
+    let parts = strutil.Split(inner, ',')
+    var out: str
+    for i in 0..<parts.len:
+        let part = chengpath.PathTrim(parts[i])
+        if part == "":
+            continue
+        if out != "":
+            out = Fmt"{out},"
+        out = Fmt"{out}{part}"
+    return out
+
 fn TypedExprColdCsgTypeEntryParts(lineRaw: str,
                                    name: var str,
                                    rhs: var str): bool =
@@ -4949,7 +4968,7 @@ fn TypedExprColdCsgTypeEntryParts(lineRaw: str,
     if eq <= 0:
         return false
     let left = chengpath.PathTrim(chengpath.TextSlice(line, 0, eq))
-    name = TypedExprParseTypeDeclName(Fmt"{left} = x")
+    name = parser.ParserFirstToken(left)
     rhs = chengpath.PathTrim(chengpath.TextSlice(line, eq + 1, line.len - eq - 1))
     return name != ""
 
@@ -5036,6 +5055,8 @@ fn TypedExprColdCsgVariantSpecsFromText(text: str): str =
                     let fieldType = chengpath.PathTrim(chengpath.TextSlice(fields, fp, typeStop - fp))
                     if Len(fieldType) > 0:
                         fieldKinds = Fmt"{fieldKinds}{TypedExprColdCsgFieldKindCodeFromTypeName(fieldType)}"
+                        if TypedExprTypeIsGenericPlaceholder(fieldType):
+                            fieldKinds = Fmt"{fieldKinds}:{fieldType}"
                     fieldCount = fieldCount + 1
                     fp = typeStop
                     while fp < Len(fields) && fields[fp] == ',':
@@ -8190,19 +8211,23 @@ fn TypedExprColdCsgAddTypeRow(ctx: var TypedExprSourceContext,
                                rowKind: TypedExprColdCsgTypeRowKind,
                                typeNameRaw: str,
                                specsRaw: str) =
-    let typeName = parser.ParserIdentPrefix(chengpath.PathTrim(typeNameRaw))
+    let typeHead = chengpath.PathTrim(typeNameRaw)
+    let typeName = parser.ParserIdentPrefix(typeHead)
+    let typeParams = TypedExprColdCsgTypeParamsFromHead(typeHead)
     let specs = chengpath.PathTrim(specsRaw)
     if typeName == "" || specs == "":
         return
     for i in 0..<ctx.coldCsgTypeRows.len:
         if ctx.coldCsgTypeRows[i].rowKind == rowKind &&
-           ctx.coldCsgTypeRows[i].typeName == typeName:
+           ctx.coldCsgTypeRows[i].typeName == typeName &&
+           ctx.coldCsgTypeRows[i].typeParams == typeParams:
             return
     var row: TypedExprColdCsgTypeRow
     row.sourcePath = ctx.sourcePath
     row.rowKind = rowKind
     row.typeName = typeName
     row.specs = specs
+    row.typeParams = typeParams
     add(ctx.coldCsgTypeRows, row)
 
 fn TypedExprColdCsgAppendTypeEntryRowsToContext(ctx: var TypedExprSourceContext,
