@@ -13378,6 +13378,21 @@ static BodyIR *parse_fn(Parser *parser, int32_t *symbol_index_out) {
     if (body && body->block_count > 0 && body->block_term[0] < 0) {
         body->has_fallback = true;
     }
+    /* Generic function with generic return type: stub to avoid layout mismatch */
+    if (body && !body->has_fallback && symbol_index >= 0 &&
+        symbol_index < parser->symbols->function_count) {
+        FnDef *fn = &parser->symbols->functions[symbol_index];
+        if (fn->generic_count > 0) {
+            bool has_generic_ret = false;
+            for (int32_t ci = 0; ci < ret.len; ci++)
+                if (ret.ptr[ci] == '[') { has_generic_ret = true; break; }
+            if (!has_generic_ret && ret.len == 1 &&
+                ret.ptr[0] >= 'A' && ret.ptr[0] <= 'Z')
+                has_generic_ret = true;
+            if (has_generic_ret)
+                body->has_fallback = true;
+        }
+    }
     return body;
 }
 
