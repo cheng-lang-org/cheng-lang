@@ -6395,11 +6395,15 @@ static Span parser_scoped_bare_name(Parser *parser, Span name) {
 }
 
 static ObjectDef *parser_find_object(Parser *parser, Span name) {
-    if (parser_can_scope_bare_name(parser, name)) {
+    /* Try import-alias-scoped name first when in import mode */
+    if (parser && parser->import_alias.len > 0) {
         Span scoped = parser_scoped_bare_name(parser, name);
-        ObjectDef *object = symbols_find_object(parser->symbols, scoped);
-        if (object) return object;
+        if (scoped.len > 0) {
+            ObjectDef *object = symbols_find_object(parser->symbols, scoped);
+            if (object) return object;
+        }
     }
+    /* Fallback: unqualified name lookup */
     return symbols_find_object(parser->symbols, name);
 }
 
@@ -11488,6 +11492,45 @@ static int32_t parse_expr_from_span(Parser *owner, BodyIR *body, Locals *locals,
     return slot;
 }
 
+static bool parser_peek_empty_list_literal(Parser *parser) {
+    Parser probe = *parser;
+    if (!parser_take(&probe, "[")) return false;
+    return parser_take(&probe, "]");
+}
+
+static bool cold_slot_kind_is_sequence_target(int32_t kind) {
+    return kind == SLOT_SEQ_I32 || kind == SLOT_SEQ_I32_REF ||
+           kind == SLOT_SEQ_STR || kind == SLOT_SEQ_STR_REF ||
+           kind == SLOT_SEQ_OPAQUE || kind == SLOT_SEQ_OPAQUE_REF;
+}
+
+static int32_t cold_sequence_value_kind_for_target(int32_t kind) {
+    if (kind == SLOT_SEQ_I32 || kind == SLOT_SEQ_I32_REF) return SLOT_SEQ_I32;
+    if (kind == SLOT_SEQ_STR || kind == SLOT_SEQ_STR_REF) return SLOT_SEQ_STR;
+    if (kind == SLOT_SEQ_OPAQUE || kind == SLOT_SEQ_OPAQUE_REF) return SLOT_SEQ_OPAQUE;
+    die("target is not a sequence");
+    return SLOT_SEQ_I32;
+}
+
+static int32_t parse_empty_sequence_for_target(Parser *parser, BodyIR *body,
+                                               int32_t target_kind, Span target_type,
+                                               int32_t *kind_out) {
+    if (!parser_take(parser, "[")) die("expected [ for empty sequence");
+    if (!parser_take(parser, "]")) die("expected ] for empty sequence");
+    int32_t value_kind = cold_sequence_value_kind_for_target(target_kind);
+    int32_t slot = body_slot(body, value_kind, 16);
+    if (value_kind == SLOT_SEQ_I32) {
+        body_slot_set_type(body, slot, cold_cstr_span("int32[]"));
+    } else if (value_kind == SLOT_SEQ_STR) {
+        body_slot_set_type(body, slot, cold_cstr_span("str[]"));
+    } else {
+        body_slot_set_seq_opaque_type(body, parser->symbols, slot, target_type);
+    }
+    body_op3(body, BODY_OP_MAKE_COMPOSITE, slot, 0, -1, 0);
+    if (kind_out) *kind_out = value_kind;
+    return slot;
+}
+
 static bool cold_span_is_compare_token(Span op) {
     return span_eq(op, "==") || span_eq(op, "!=") ||
            span_eq(op, ">=") || span_eq(op, "<") ||
@@ -11745,7 +11788,14 @@ static void parse_assign(Parser *parser, BodyIR *body, Locals *locals, Span name
     }
     if (!parser_take(parser, "=")) die("expected = in assignment");
     int32_t kind = SLOT_I32;
-    int32_t slot = parse_expr(parser, body, locals, &kind);
+    int32_t slot = -1;
+    if (cold_slot_kind_is_sequence_target(local->kind) &&
+        parser_peek_empty_list_literal(parser)) {
+        slot = parse_empty_sequence_for_target(parser, body, local->kind,
+                                               body->slot_type[local->slot], &kind);
+    } else {
+        slot = parse_expr(parser, body, locals, &kind);
+    }
     if (local->kind == SLOT_I32) {
         slot = cold_materialize_i32_ref(body, slot, &kind);
         if (kind != SLOT_I32) {
@@ -11784,6 +11834,13 @@ static void parse_assign(Parser *parser, BodyIR *body, Locals *locals, Span name
             return;
         }
         body_op(body, BODY_OP_COPY_COMPOSITE, local->slot, slot, 0);
+        return;
+    }
+    if (local->kind == SLOT_SEQ_I32_REF || local->kind == SLOT_SEQ_STR_REF ||
+        local->kind == SLOT_SEQ_OPAQUE_REF) {
+        int32_t expected = cold_sequence_value_kind_for_target(local->kind);
+        if (kind != expected) die("sequence ref assignment value kind mismatch");
+        body_op3(body, BODY_OP_PAYLOAD_STORE, local->slot, slot, 0, body->slot_size[slot]);
         return;
     }
     if (local->kind == SLOT_VARIANT || local->kind == SLOT_OBJECT || local->kind == SLOT_OBJECT_REF ||
@@ -15508,8 +15565,9 @@ static void codegen_store_slot_to_payload(Code *code, BodyIR *body,
         codegen_store_slot_to_offset(code, body, dst_slot, dst_offset, src_slot);
         return;
     }
-    if (dst_kind != SLOT_OBJECT_REF && dst_kind != SLOT_SEQ_OPAQUE_REF &&
-        dst_kind != SLOT_PTR) {
+    if (dst_kind != SLOT_OBJECT_REF && dst_kind != SLOT_SEQ_I32_REF &&
+        dst_kind != SLOT_SEQ_STR_REF && dst_kind != SLOT_SEQ_OPAQUE_REF &&
+        dst_kind != SLOT_STR_REF && dst_kind != SLOT_PTR) {
         /* Non-object slot: write source directly to SP + base + field_offset */
         int32_t base_off = body->slot_offset[dst_slot];
         int32_t total_off = base_off + dst_offset;
@@ -16025,14 +16083,20 @@ static void codegen_shell_quote(Code *code, BodyIR *body, int32_t dst,
 }
 
 static void codegen_strlen_reg(Code *code, int ptr_reg, int len_reg) {
+    int addr_reg = 6;
+    if (addr_reg == ptr_reg || addr_reg == len_reg) addr_reg = 7;
+    if (addr_reg == ptr_reg || addr_reg == len_reg) addr_reg = 8;
+    int byte_reg = 7;
+    if (byte_reg == ptr_reg || byte_reg == len_reg || byte_reg == addr_reg) byte_reg = 8;
+    if (byte_reg == ptr_reg || byte_reg == len_reg || byte_reg == addr_reg) byte_reg = 9;
     code_emit(code, a64_movz_x(len_reg, 0, 0));
     code_emit(code, a64_cmp_imm(ptr_reg, 0));
     int32_t g2 = code->count;
     code_emit(code, a64_bcond(0, COND_EQ));
     int32_t loop = code->count;
-    code_emit(code, a64_add_reg_x(6, ptr_reg, len_reg));
-    code_emit(code, a64_ldrb_imm(7, 6, 0));
-    code_emit(code, a64_cmp_imm(7, 0));
+    code_emit(code, a64_add_reg_x(addr_reg, ptr_reg, len_reg));
+    code_emit(code, a64_ldrb_imm(byte_reg, addr_reg, 0));
+    code_emit(code, a64_cmp_imm(byte_reg, 0));
     int32_t done_pos = code->count;
     code_emit(code, a64_bcond(0, COND_EQ));
     code_emit(code, a64_add_imm(len_reg, len_reg, 1, true));
@@ -17132,11 +17196,11 @@ static void codegen_seq_str_add(Code *code, BodyIR *body, int32_t seq_slot, int3
     codegen_seq_str_header_addr(code, body, seq_slot, R2);
     code_emit(code, a64_ldr_imm(R0, R2, 0, false));
     code_emit(code, a64_ldr_imm(R3, R2, 8, true));
-    code_emit(code, a64_add_reg(R0, R0, R0));
-    code_emit(code, a64_add_reg(R0, R0, R0));
-    code_emit(code, a64_add_reg(R0, R0, R0));
-    code_emit(code, a64_add_reg(R0, R0, R0));
-    codegen_copy_bytes(code, R3, R0, 6);
+    code_emit(code, a64_add_reg(9, R0, R0));
+    code_emit(code, a64_add_reg(9, 9, 9));
+    code_emit(code, a64_add_reg(9, 9, 9));
+    code_emit(code, a64_add_reg(9, 9, 9));
+    codegen_copy_bytes(code, R3, 9, 6);
     code_emit(code, a64_str_imm(7, R2, 8, true));
     code_emit(code, a64_b(store_label - code->count));
 
