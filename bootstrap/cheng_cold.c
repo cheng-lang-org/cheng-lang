@@ -7981,7 +7981,7 @@ static int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *local
         if (kind_out) *kind_out = SLOT_OPAQUE;
         return slot;
     }
-    /* closure_call(closure, arg1, ...) → calls closure with env as x0 */
+    /* closure_call(closure, arg1, ...) → calls closure */
     if (span_eq(name, "closure_call") || span_eq(name, "closureCall")) {
         if (arg_count < 1) die("closure_call arity mismatch");
         int32_t closure_slot = body->call_arg_slot[arg_start];
@@ -7989,6 +7989,15 @@ static int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *local
         body_op3(body, BODY_OP_CLOSURE_CALL, slot, closure_slot,
                  arg_start + 1, arg_count - 1);
         if (kind_out) *kind_out = SLOT_I32;
+        return slot;
+    }
+    /* closure_env(closure) → extract env pointer from closure */
+    if (span_eq(name, "closure_env") || span_eq(name, "closureEnv")) {
+        if (arg_count != 1) die("closure_env arity mismatch");
+        int32_t closure_slot = body->call_arg_slot[arg_start];
+        int32_t slot = body_slot(body, SLOT_PTR, 8);
+        body_op3(body, BODY_OP_PAYLOAD_LOAD, slot, closure_slot, 8, 8);
+        if (kind_out) *kind_out = SLOT_PTR;
         return slot;
     }
     /* try Ok[T]/Err[T] constructor fallback before looking up in symbol table */
@@ -8304,6 +8313,14 @@ static int32_t parse_call_from_args_span(Parser *owner, BodyIR *body, Locals *lo
         body_op3(body, BODY_OP_CLOSURE_CALL, slot, closure_slot,
                  arg_start + 1, arg_count - 1);
         if (kind_out) *kind_out = SLOT_I32;
+        return slot;
+    }
+    if (span_eq(name, "closure_env") || span_eq(name, "closureEnv")) {
+        if (arg_count != 1) die("closure_env arity mismatch");
+        int32_t closure_slot = body->call_arg_slot[arg_start];
+        int32_t slot = body_slot(body, SLOT_PTR, 8);
+        body_op3(body, BODY_OP_PAYLOAD_LOAD, slot, closure_slot, 8, 8);
+        if (kind_out) *kind_out = SLOT_PTR;
         return slot;
     }
     Span lookup_name = stripped_name;
@@ -18954,23 +18971,24 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[b], true);
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst] + 8, true);
     } else if (kind == BODY_OP_CLOSURE_CALL) {
-        /* Call closure: load fn_ptr from closure slot, load env as x0,
-           remaining args in x1-x6, BLR, store result.
+        /* Call closure via function pointer: load fn_ptr from closure slot,
+           load user args into x0-x7, BLR, store result. Env is stored in
+           closure for future use (closure-aware functions receive env as
+           an extra trailing arg). For simple function pointers, env is
+           ignored.
            a = closure_slot, b = call_arg_start, c = call_arg_count */
         int32_t closure_slot = a;
         int32_t call_arg_start = b;
         int32_t call_arg_count = c;
         a64_emit_ldr_sp_off(code, R9, body->slot_offset[closure_slot], true);
-        /* Load env pointer as first arg (x0) */
-        a64_emit_ldr_sp_off(code, R0, body->slot_offset[closure_slot] + 8, true);
-        /* Load remaining args into x1-x7 */
-        for (int32_t ai = 0; ai < call_arg_count && ai < 7; ai++) {
+        /* Load user args into x0-x7 */
+        for (int32_t ai = 0; ai < call_arg_count && ai < 8; ai++) {
             int32_t arg_slot = body->call_arg_slot[call_arg_start + ai];
             int32_t arg_kind = body->slot_kind[arg_slot];
             if (arg_kind == SLOT_I32)
-                a64_emit_ldr_sp_off(code, ai + 1, body->slot_offset[arg_slot], false);
+                a64_emit_ldr_sp_off(code, ai, body->slot_offset[arg_slot], false);
             else
-                a64_emit_ldr_sp_off(code, ai + 1, body->slot_offset[arg_slot], true);
+                a64_emit_ldr_sp_off(code, ai, body->slot_offset[arg_slot], true);
         }
         code_emit(code, a64_blr(R9));
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
