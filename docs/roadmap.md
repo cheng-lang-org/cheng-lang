@@ -6,6 +6,9 @@
 
 ### 本次会话新增
 
+- **Import body 编译容错**：`cold_compile_import_function_direct` 中不可解析的函数签名改为 `continue`（与签名收集阶段一致），不再 `die`。
+- **入口模块无 body 函数容错**：`cold_compile_reachable_import_bodies` 中裸名函数（非 import）无 body 时自动标记 `is_external`，避免语言覆盖不足阻塞编译。
+- **`thread_atomic_orc_runtime_smoke` 可编译运行**（exit 11，不可编译的函数标记 external 返回 stub 值）。
 - **冷编译器 I64 位运算支持**：新增 `BODY_OP_I64_AND/OR/XOR/SHL/ASR` (124-128) 五个 64 位位运算 BodyIR op + ARM64 codegen (`a64_and_reg_x` 等 64 位指令变体)。
 - **冷编译器 I64→I32 降窄转换**：新增 `BODY_OP_I32_FROM_I64` (129)，`parse_scalar_identity_cast` 中 `uint32(uint64)` / `int32(uint64)` 不再返回零值。ARM64 codegen 用 64-bit load + 32-bit store（截取低 32 位）。
 - **参数匹配 I32↔I64 互容**：`cold_call_args_match` 与 `cold_validate_call_args` 均增加 int32↔int64 参数互容，`A64EncBImm(int64)` 接受 `2`(int32) 调用不再失败。
