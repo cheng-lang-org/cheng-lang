@@ -1331,13 +1331,40 @@ fn PrimaryBodyIrUInt8PtrDerefPointerText(textRaw: str): str =
     let inner = strutil.Strip(strings.SliceBytes(text, 2, len(text) - 3))
     return PrimaryBodyIrWholeCallInnerForHead(inner, "UInt8Ptr")
 
+fn PrimaryBodyIrCanonicalCallText(textRaw: str): str =
+    let text = strutil.Strip(textRaw)
+    var openPos: int32 = -1
+    for i in 0..<len(text):
+        if text[i] == '(':
+            openPos = i
+            break
+    if openPos <= 0 || len(text) <= openPos + 1 || text[len(text) - 1] != ')':
+        return text
+    let closePos = texpr.TypedExprFindMatchingParen(text, openPos)
+    if closePos != len(text) - 1:
+        return text
+    let head = strutil.Strip(strings.SliceBytes(text, 0, openPos))
+    let inner = strings.SliceBytes(text, openPos + 1, len(text) - openPos - 2)
+    let args = texpr.TypedExprSplitTopLevelCsv(inner)
+    var out = Fmt"{head}("
+    for i in 0..<args.len:
+        if i > 0:
+            out = Fmt"{out},"
+        out = Fmt"{out}{strutil.Strip(args[i])}"
+    out = Fmt"{out})"
+    return out
+
 fn PrimaryBodyIrPtrExpressionSlot(bodyIR: var coreir.BodyIR,
                                    slotNames: str[],
                                    textRaw: str): int32 =
     let text = strutil.Strip(textRaw)
     if text == "":
         return -1
-    let directSlot = PrimaryBodyIrFindArgSlot(slotNames, text)
+    var directSlot = PrimaryBodyIrFindArgSlot(slotNames, text)
+    if directSlot < 0:
+        let canonicalText = PrimaryBodyIrCanonicalCallText(text)
+        if canonicalText != text:
+            directSlot = PrimaryBodyIrFindArgSlot(slotNames, canonicalText)
     if directSlot >= 0 &&
        directSlot < bodyIR.localSlots.len &&
        PrimaryBodyIrSlotType(bodyIR, directSlot) == coreir.LocalPtrTag:
@@ -1391,12 +1418,16 @@ fn PrimaryBodyIrAppendUInt8PtrDerefStore(bodyIR: var coreir.BodyIR,
                                           typedIr: texpr.TypedExprIr,
                                           sourcePath: str,
                                           lhsTextRaw: str,
-                                          rhsTextRaw: str): bool =
+                                          rhsTextRaw: str,
+                                          failureDetail: var int32): bool =
+    failureDetail = 0
     let pointerText = PrimaryBodyIrUInt8PtrDerefPointerText(lhsTextRaw)
     if pointerText == "":
+        failureDetail = 711
         return false
     let pointerSlot = PrimaryBodyIrPtrExpressionSlot(bodyIR, slotNames, pointerText)
     if pointerSlot < 0:
+        failureDetail = 712
         return false
     let valueSlot = PrimaryBodyIrLocalInitValueSlot(bodyIR,
                                                    slotNames,
@@ -1407,6 +1438,7 @@ fn PrimaryBodyIrAppendUInt8PtrDerefStore(bodyIR: var coreir.BodyIR,
                                                    coreir.LocalI32Tag,
                                                    rhsTextRaw)
     if valueSlot < 0:
+        failureDetail = 713
         return false
     var op: coreir.BodyOp
     op.kind = coreir.BodyOpIndexedStoreTag
@@ -3064,13 +3096,21 @@ fn PrimaryBodyIrAppendI32Assign(bodyIR: var coreir.BodyIR,
     if len(lhsName) <= 0 || len(rhsText) <= 0:
         return false
     if PrimaryBodyIrUInt8PtrDerefPointerText(lhsName) != "":
-        return PrimaryBodyIrAppendUInt8PtrDerefStore(bodyIR,
-                                                     slotNames,
-                                                     varI32ParamNames,
-                                                     typedIr,
-                                                     stmt.sourcePath,
-                                                     lhsName,
-                                                     rhsText)
+        var storeFailureDetail: int32
+        if !PrimaryBodyIrAppendUInt8PtrDerefStore(bodyIR,
+                                                  slotNames,
+                                                  varI32ParamNames,
+                                                  typedIr,
+                                                  stmt.sourcePath,
+                                                  lhsName,
+                                                  rhsText,
+                                                  storeFailureDetail):
+            PrimaryBodyIrAppendInvalidOp(bodyIR,
+                                         stmt.lineNumber,
+                                         int32(stmt.kind),
+                                         storeFailureDetail,
+                                         0)
+        return true
     var lhsGlobalType = PrimaryBodyIrTypedGlobalType(typedIr, stmt.sourcePath, lhsName)
     if lhsGlobalType == "" &&
        stmt.assignRootGlobalFlag &&

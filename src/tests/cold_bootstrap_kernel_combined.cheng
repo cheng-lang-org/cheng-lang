@@ -2459,6 +2459,50 @@ fn A64EncStrbImm(rt: int32, rn: int32, offset12: int32): int32 =
                  a64RegField(rn, 5) |
                  a64RegField(rt, 0))
 
+fn A64EncLdrhImm(rt: int32, rn: int32, offset12: int32): int32 =
+    return int32(uint32(0x79400000) |
+                 a64ImmField(offset12 & 0xFFE, 0xFFF, 10) |
+                 a64RegField(rn, 5) |
+                 a64RegField(rt, 0))
+
+fn A64EncStrhImm(rt: int32, rn: int32, offset12: int32): int32 =
+    return int32(uint32(0x79000000) |
+                 a64ImmField(offset12 & 0xFFE, 0xFFF, 10) |
+                 a64RegField(rn, 5) |
+                 a64RegField(rt, 0))
+
+fn A64EncUdiv64(rd: int32, rn: int32, rm: int32): int32 =
+    return int32(uint32(0x9AC00800) |
+                 a64RegField(rm, 16) |
+                 a64RegField(rn, 5) |
+                 a64RegField(rd, 0))
+
+fn A64EncMsub64(rd: int32, rn: int32, rm: int32, ra: int32): int32 =
+    return int32(uint32(0x9B008000) |
+                 a64RegField(rm, 16) |
+                 a64RegField(ra, 10) |
+                 a64RegField(rn, 5) |
+                 a64RegField(rd, 0))
+
+fn A64EncMadd64(rd: int32, rn: int32, rm: int32, ra: int32): int32 =
+    return int32(uint32(0x9B000000) |
+                 a64RegField(rm, 16) |
+                 a64RegField(ra, 10) |
+                 a64RegField(rn, 5) |
+                 a64RegField(rd, 0))
+
+fn A64EncLslImm64(rd: int32, rn: int32, shift: int32): int32 =
+    return int32(uint32(0xD3400000) |
+                 a64ImmField(shift, 0x3F, 16) |
+                 a64RegField(rn, 5) |
+                 a64RegField(rd, 0))
+
+fn A64EncMovz64(rd: int32, imm16: int32, hw: int32): int32 =
+    return int32(uint32(0xD2800000) |
+                 a64ImmField(imm16, 0xFFFF, 5) |
+                 a64ImmField(hw, 0x3, 21) |
+                 a64RegField(rd, 0))
+
 fn A64EncBImm(deltaWords: int64): Result[int32] =
     if deltaWords < -33554432 || deltaWords > 33554431:
         return Err(" aarch64 encode: b offset out of range")
@@ -2520,6 +2564,14 @@ fn A64Check(): int32 =
         return 30
     if A64RelocPageRemainder(4101) != 5:
         return 31
+    if A64PageOffset(4101) != 5:
+        return 81
+    if A64PageNumber(8192) != 2:
+        return 82
+    if A64IsPageAligned(4096) != true:
+        return 83
+    if A64AlignToPage(4100) != 8192:
+        return 84
     if A64SignedDivModRoundTrip(-17, 4) != -17:
         return 32
 
@@ -2706,7 +2758,182 @@ fn FactsMixedReadCheck(): int32 =
         return 650
     return 0
 
+fn BootstrapPipelineCheck(): int32 =
+    let pipelineSource: str = "    let a = 1\n    let b = a + 7\n    return b\n"
+    var scan: StatementScan
+    scan.source = pipelineSource
+    var stmtCount: int32 = 0
+    var expectedKinds: int32[4]
+    expectedKinds[0] = 1
+    expectedKinds[1] = 1
+    expectedKinds[2] = 2
+    expectedKinds[3] = 0
+
+    while scan.pos < len(pipelineSource):
+        if StatementClassifyLine(scan) == false:
+            return 801
+        if scan.kindCode != 0 && scan.kindCode != 5:
+            if stmtCount >= 3:
+                return 802
+            if scan.kindCode != expectedKinds[stmtCount]:
+                return 810 + stmtCount
+            stmtCount = stmtCount + 1
+        StatementAdvance(scan)
+    if stmtCount != 3:
+        return 803
+
+    var sink: FactSink
+    if FactWriteVersion2(sink) != 0:
+        return 820
+    if StmtExprWriteFacts(sink, "Pipeline", pipelineSource) != 0:
+        return 821
+
+    var reader: FactReader
+    reader.bytes = sink.bytes
+    if FactExpectText(reader, "cold_csg_version=2\n") == false:
+        return 830
+    var readStmts: int32 = 0
+    while reader.pos < reader.bytes.len:
+        var record: FactRecordView
+        if FactReadRecordView(reader, record) == false:
+            return 840
+        if record.kindCode == 3:
+            readStmts = readStmts + 1
+    if readStmts != 3:
+        return 850
+    return 0
+
+fn FactsRecordCountCheck(): int32 =
+    var sink: FactSink
+    if FactWriteVersion2(sink) != 0:
+        return 701
+    var i: int32 = 0
+    while i < 5:
+        if FactWriteStatementRecord(sink, "Count", i + 1, i * 2, i * 10, i + 3) != 0:
+            return 710 + i
+        i = i + 1
+
+    var reader: FactReader
+    reader.bytes = sink.bytes
+    if FactExpectText(reader, "cold_csg_version=2\n") == false:
+        return 720
+
+    var count: int32 = 0
+    while reader.pos < reader.bytes.len:
+        var record: FactRecordView
+        if FactReadRecordView(reader, record) == false:
+            return 730 + count
+        if record.kindCode != 3:
+            return 740 + count
+        let expectedKind: int32 = count + 1
+        if FactRecordFieldInt(record, 2) != expectedKind:
+            return 750 + count
+        count = count + 1
+    if count != 5:
+        return 760
+    return 0
+
+fn StatementKindCheck(): int32 =
+    var scan: StatementScan
+    scan.source = "    let a = 1\n"
+    if StatementClassifyLine(scan) == false:
+        return 1001
+    if scan.kindCode != 1:
+        return 1002
+    var scan2: StatementScan
+    scan2.source = "    if x > 3:\n"
+    if StatementClassifyLine(scan2) == false:
+        return 1003
+    if scan2.kindCode != 3:
+        return 1004
+    var scan3: StatementScan
+    scan3.source = "        return val\n"
+    if StatementClassifyLine(scan3) == false:
+        return 1005
+    if scan3.kindCode != 2:
+        return 1006
+    var scan4: StatementScan
+    scan4.source = "    \n"
+    if StatementClassifyLine(scan4) == false:
+        return 1007
+    if scan4.kindCode != 0:
+        return 1008
+    return 0
+
+fn FrontendQuickCheck(): int32 =
+    if FrontendIsIdentStart('a') != true:
+        return 1051
+    if FrontendIsIdentCont('7') != true:
+        return 1052
+    if FrontendIsSpace(' ') != true:
+        return 1053
+    if FrontendLineIndentWidth("        x") != 8:
+        return 1054
+    if FrontendTextIsFactSafe("hello_world") != true:
+        return 1055
+    if FrontendIdentPrefixLen("abc_def", 0) != 7:
+        return 1056
+    return 0
+
+fn ScanStateCheck(): int32 =
+    var state: ScanState
+    state.pos = 0
+    state.limit = 10
+    state.ok = true
+    if state.ok != true:
+        return 1070
+    if state.pos != 0:
+        return 1071
+    if state.limit != 10:
+        return 1072
+    if state.values[0] != 0:
+        return 1073
+    state.values[0] = 42
+    if state.values[0] != 42:
+        return 1074
+    return 0
+
+fn FrontendFunctionNameLenCheck(): int32 =
+    if FrontendFunctionNameLenFromLine("fn myFunc(x: int32): int32 =") != 6:
+        return 1090
+    if FrontendFunctionNameLenFromLine("fn helper(): int32 =") != 6:
+        return 1091
+    return 0
+
+fn ExprTokenEdgeCheck(): int32 =
+    var store: ExprTokenStore
+    if ExprTokenAdd(store, 1, 0, 5, 0) != 0:
+        return 1110
+    if store.count != 1:
+        return 1111
+    if ExprTokenKindAt(store, 0) != 1:
+        return 1112
+    if ExprTokenStartAt(store, 0) != 0:
+        return 1113
+    if ExprTokenLenAt(store, 0) != 5:
+        return 1114
+    if ExprTokenDepthAt(store, 0) != 0:
+        return 1115
+    return 0
+
+fn A64InstructionCountCheck(): int32 =
+    var count: int32 = 0
+    count = count + 1
+    count = count + 1
+    count = count + 1
+    if A64EncAddReg(false, 0, 0, 0) != int32(uint32(0x0B000000)):
+        return 1130
+    if A64EncSubReg(false, 0, 0, 0) != int32(uint32(0x4B000000)):
+        return 1131
+    if A64EncOrrReg(false, 0, 0, 0) != int32(uint32(0x2A000000)):
+        return 1132
+    if A64EncEorReg(false, 0, 0, 0) != int32(uint32(0x4A000000)):
+        return 1133
+    return count + 38
+
 fn IntegrationCheck(): int32 =
+    if A64CodeWordCount(16) != 4:
+        return 1200
     return 42
 
 fn main(): int32 =
@@ -2743,6 +2970,30 @@ fn main(): int32 =
     let fm = FactsMixedReadCheck()
     if fm != 0:
         return fm
+    let fc = FactsRecordCountCheck()
+    if fc != 0:
+        return fc
+    let bp = BootstrapPipelineCheck()
+    if bp != 0:
+        return bp
+    let sk = StatementKindCheck()
+    if sk != 0:
+        return sk
+    let fq = FrontendQuickCheck()
+    if fq != 0:
+        return fq
+    let ss = ScanStateCheck()
+    if ss != 0:
+        return ss
+    let ffl = FrontendFunctionNameLenCheck()
+    if ffl != 0:
+        return ffl
+    let te = ExprTokenEdgeCheck()
+    if te != 0:
+        return te
+    let ac = A64InstructionCountCheck()
+    if ac != 0:
+        return ac
     let a64 = A64Check()
     if a64 != 0:
         return a64
