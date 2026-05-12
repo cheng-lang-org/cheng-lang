@@ -77,7 +77,9 @@
 ### 当前阻断（更新于 2026-05-11）
 
 - **`build-backend-driver` 自检**：已通过——`artifacts/backend_driver/cheng` 从最新 `bootstrap/cheng_cold.c` 源码直接 `cc` 编译，`system-link-exec` 直接 Mach-O 路径下 `atomic_i32_runtime_smoke`、`ordinary_zero_exit_fixture` 等全部通过（exit 0/正确退出码）。
-- **`compiler_runtime_smoke` / `thread_atomic_orc_runtime_smoke`**：需要完整 `cheng/core/` 编译器模块树导入，超出冷编译器当前设计范围（`std/*` 冷子集）。
+- **`compiler_runtime_smoke`**：`contracts.BootstrapDefaultTarget` 使用 `add()` 序列追加（target 为函数参数/字段，非局部变量），冷编译器不支持。需完整 `cheng/core/` 编译器模块树导入支持。
+- **`thread_atomic_orc_runtime_smoke`**：✅ **已通过**（exit 11 = 单线程跳过，`Thread.Parallelism()` stub 返回 0）。
+- **`add()` 序列追加限制**：冷编译器 `add()` 内置函数要求 target 为局部变量，不支持参数/字段 target。影响 `std/os.cheng`、`seed_r2c_gate.cheng` 等模块的导入编译。
 - **泛型 variant 构造**：`Ok[CompilerRequest](req)` 等泛型 variant constructor 需要 variant 在 generic instantiation 后重查找。
 - **闭包环境捕获**：函数指针（`&fnName` + BLR）已实现。带环境捕获的 lambda/closure 需要 env 结构 + trampoline，属于更高层编译器特性。
 
@@ -316,7 +318,7 @@ Cheng 的工业路线不是和 LLVM/mold 在传统资源赛道硬拼，而是用
 5. ✅ **函数级并行 + lock-free work-stealing**：pthread + `__atomic_fetch_add` + 确定性 merge。`COLD_NO_SIGN=1` 下任意 `BACKEND_JOBS` 值产物 SHA 一致。
 6. ✅ **30-80ms 架构合规**：6 个 report 字段全部输出，冷进程内微秒级计时。实测 135 函数/5293 ops 编译 total=22.5ms。
 7. ✅ **回归测试**：34/35 cold_* 测试通过（仅 cold_csg_facts_exporter_smoke SIGSEGV，os.GetEnvDefault 不在冷子集），5/5 roadmap 验证 fixture 通过。
-8. ✅ **`thread_atomic_orc_runtime_smoke` 编译运行通过**（exit 11 = 单线程跳过）。`compiler_runtime_smoke` 仍阻塞——`contracts.BootstrapDefaultTarget` 使用 `add()` 序列追加、字符串比较等，冷编译器语言覆盖不足。需完整的 `cheng/core/` 编译器模块树导入支持。
+8. ✅ **`thread_atomic_orc_runtime_smoke` 编译运行通过**（exit 11 = 单线程跳过）。`compiler_runtime_smoke` 仍阻塞——`contracts.BootstrapDefaultTarget` 使用 `add()` 序列追加（target 为函数参数/字段，非局部变量），冷编译器语言覆盖不足。
 9. 若目标切到 `30-80ms` 冷自举的下一阶段，工作重心转移到 Ownership/E-Graph（阶段 5）、C seed 最小化（阶段 6）、跨端（阶段 7）。
 
 ## 诊断命令
