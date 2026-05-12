@@ -31712,7 +31712,8 @@ static bool cheng_seed_emit_function_epilogue(char *out, size_t cap, int32_t fra
     if (save_offset < 0) {
         return false;
     }
-    if (!cheng_seed_emit_sp_load_pair(out, cap, 21, 22, save_offset - 32) ||
+    if (!cheng_seed_emit_sp_load_pair(out, cap, 23, 24, save_offset - 48) ||
+        !cheng_seed_emit_sp_load_pair(out, cap, 21, 22, save_offset - 32) ||
         !cheng_seed_emit_sp_load_pair(out, cap, 19, 20, save_offset - 16)) {
         return false;
     }
@@ -31738,8 +31739,17 @@ static bool cheng_seed_validate_scalar_function_frame_layout(const ChengSeedLowe
                                                      int32_t frame_size) {
     int32_t spill_layers = max_call_depth + 2;
     int32_t save_offset = frame_size - 16;
+    int32_t save_base_offset = save_offset - 48;
     int32_t call_arg_end;
     int32_t string_temp_end;
+    if (save_base_offset < 0) {
+        fprintf(stderr,
+                "[cheng_seed] invalid frame layout function=%s save_base_negative save_offset=%d frame_size=%d\n",
+                function->symbol_text,
+                save_offset,
+                frame_size);
+        return false;
+    }
     if (spill_layers < 2) {
         spill_layers = 2;
     }
@@ -31758,15 +31768,16 @@ static bool cheng_seed_validate_scalar_function_frame_layout(const ChengSeedLowe
                 frame_size);
         return false;
     }
-    if (string_temp_end + 16 > save_offset) {
+    if (string_temp_end > save_base_offset) {
         fprintf(stderr,
-                "[cheng_seed] invalid frame layout function=%s string_temps_overlap_save call_arg_base=%d string_temp_base=%d string_temp_stride=%d max_call_depth=%d string_temp_end=%d save_offset=%d frame_size=%d\n",
+                "[cheng_seed] invalid frame layout function=%s string_temps_overlap_save call_arg_base=%d string_temp_base=%d string_temp_stride=%d max_call_depth=%d string_temp_end=%d save_base_offset=%d save_offset=%d frame_size=%d\n",
                 function->symbol_text,
                 call_arg_base,
                 string_temp_base,
                 string_temp_stride,
                 max_call_depth,
                 string_temp_end,
+                save_base_offset,
                 save_offset,
                 frame_size);
         return false;
@@ -31799,7 +31810,7 @@ static void cheng_seed_maybe_debug_scalar_function_frame_layout(const ChengSeedL
         string_temp_end += string_temp_stride * spill_layers;
     }
     fprintf(stderr,
-            "[cheng_seed] frame-debug function=%s next_offset=%d max_call_depth=%d max_string_literals=%d call_arg_base=%d string_temp_base=%d string_temp_stride=%d string_temp_end=%d frame_size=%d save_offset=%d\n",
+            "[cheng_seed] frame-debug function=%s next_offset=%d max_call_depth=%d max_string_literals=%d call_arg_base=%d string_temp_base=%d string_temp_stride=%d string_temp_end=%d frame_size=%d save_base_offset=%d save_offset=%d\n",
             function->symbol_text,
             next_offset,
             max_call_depth,
@@ -31809,6 +31820,7 @@ static void cheng_seed_maybe_debug_scalar_function_frame_layout(const ChengSeedL
             string_temp_stride,
             string_temp_end,
             frame_size,
+            frame_size - 64,
             frame_size - 16);
 }
 
@@ -47006,8 +47018,8 @@ static bool cheng_seed_try_emit_scalar_function(const ChengSeedSystemLinkPlanStu
         }
         next_offset += string_temp_stride * spill_layers;
     }
-    /* Keep a 16-byte guard gap between scratch spill space and the saved FP/LR pair. */
-    frame_size = ((next_offset + 15 + 32) / 16) * 16;
+    /* Keep locals below the three callee-save pairs plus saved FP/LR. */
+    frame_size = ((next_offset + 15 + 64) / 16) * 16;
     if (cheng_seed_active_target_is_linux_x86_64()) {
         frame_size += 8;
     }
@@ -47077,7 +47089,8 @@ static bool cheng_seed_try_emit_scalar_function(const ChengSeedSystemLinkPlanStu
                 free(owned_lines);
                 return false;
             }
-            if (!cheng_seed_emit_sp_store_pair(out, cap, 19, 20, save_offset - 16) ||
+            if (!cheng_seed_emit_sp_store_pair(out, cap, 23, 24, save_offset - 48) ||
+                !cheng_seed_emit_sp_store_pair(out, cap, 19, 20, save_offset - 16) ||
                 !cheng_seed_emit_sp_store_pair(out, cap, 21, 22, save_offset - 32)) {
                 free(lines);
                 free(owned_lines);
@@ -48561,12 +48574,12 @@ static bool cheng_seed_append_module_global_init_function(const ChengSeedSystemL
         }
         string_temp_stride = string_temp_slots * cheng_seed_active_target_str_size_i32();
         next_offset += string_temp_stride * spill_layers;
-        frame_size = ((next_offset + 15 + 32) / 16) * 16;
+        frame_size = ((next_offset + 15 + 64) / 16) * 16;
         if (cheng_seed_active_target_is_linux_x86_64()) {
             frame_size += 8;
         }
-        if (frame_size < 24) {
-            frame_size = 24;
+        if (frame_size < 64) {
+            frame_size = 64;
         }
     }
     if (!cheng_seed_validate_scalar_function_frame_layout(&synthetic_function,
@@ -48614,7 +48627,8 @@ static bool cheng_seed_append_module_global_init_function(const ChengSeedSystemL
                 free(owned);
                 return false;
             }
-            if (!cheng_seed_emit_sp_store_pair(out, cap, 19, 20, save_offset - 16) ||
+            if (!cheng_seed_emit_sp_store_pair(out, cap, 23, 24, save_offset - 48) ||
+                !cheng_seed_emit_sp_store_pair(out, cap, 19, 20, save_offset - 16) ||
                 !cheng_seed_emit_sp_store_pair(out, cap, 21, 22, save_offset - 32)) {
                 free(lines);
                 free(owned);

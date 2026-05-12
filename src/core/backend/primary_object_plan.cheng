@@ -89,6 +89,8 @@ type
         reachableFunctionCount: int32
         typedIrTypeLayoutCount: int32
         typedIrTypeFieldCount: int32
+        typedIrTypeDefAliasCount: int32
+        typedIrChengMemHeaderPtrAliasCount: int32
         typedIrColdCsgTypeRowCount: int32
         typedIrLocalBindingCount: int32
         typedIrChengMemHeaderRcFieldCount: int32
@@ -547,9 +549,6 @@ fn PrimaryBodyIrTypeKindFromText(typeRaw: str): int32 =
         return coreir.LocalPtrTag
     if len(normType) > 0 && normType[len(normType) - 1] == '*':
         return coreir.LocalPtrTag
-    if len(normType) > 3 &&
-       strings.SliceBytes(normType, len(normType) - 3, 3) == "Ptr":
-        return coreir.LocalPtrTag
     if normType == "int64" || normType == "uint64" || normType == "u64" || normType == "i64":
         return coreir.LocalI64Tag
     if normType == "float64" || normType == "f64":
@@ -587,16 +586,19 @@ fn PrimaryBodyIrPointeeTypeText(typeRaw: str): str =
        typeText[3] >= 'A' &&
        typeText[3] <= 'Z':
         return strutil.Strip(strings.SliceBytes(typeText, 3, len(typeText) - 3))
-    var leafStart: int32
-    for i in 0..<len(typeText):
-        if typeText[i] == '.':
-            leafStart = i + 1
-        elif i + 1 < len(typeText) && typeText[i] == ':' && typeText[i + 1] == ':':
-            leafStart = i + 2
-    let leaf = strings.SliceBytes(typeText, leafStart, len(typeText) - leafStart)
-    if len(leaf) > 3 && strings.SliceBytes(leaf, len(leaf) - 3, 3) == "Ptr":
-        return strings.SliceBytes(leaf, 0, len(leaf) - 3)
     return ""
+
+fn PrimaryBodyIrPointeeTypeTextForSource(typedIr: texpr.TypedExprIr,
+                                          sourcePath: str,
+                                          typeRaw: str): str =
+    let aliasTarget = texpr.TypedExprIrLookupTypeDefAliasTargetType(typedIr,
+                                                                    sourcePath,
+                                                                    typeRaw)
+    if aliasTarget != "":
+        let aliasPointee = PrimaryBodyIrPointeeTypeText(aliasTarget)
+        if aliasPointee != "":
+            return aliasPointee
+    return PrimaryBodyIrPointeeTypeText(typeRaw)
 
 fn PrimaryBodyIrTypeTextIsGenericPointer(typeRaw: str): bool =
     let typeText = texpr.TypedExprNormalizeTypeText(typeRaw)
@@ -612,6 +614,14 @@ fn PrimaryBodyIrTypeShapeFromText(typedIr: texpr.TypedExprIr,
     sizeBytes = 0
     alignBytes = 0
     let normType = texpr.TypedExprNormalizeTypeText(typeRaw)
+    let aliasTarget = texpr.TypedExprIrLookupTypeDefAliasTargetType(typedIr,
+                                                                    sourcePath,
+                                                                    typeRaw)
+    if PrimaryBodyIrPointeeTypeText(aliasTarget) != "":
+        typeKind = coreir.LocalPtrTag
+        sizeBytes = 8
+        alignBytes = 8
+        return
     let isVarOrPtrType = PrimaryStartsWith(normType, "var") ||
                          (len(normType) > 0 && normType[len(normType) - 1] == '*')
     if !isVarOrPtrType && texpr.TypedExprIrTypeIsEnum(typedIr, sourcePath, typeRaw):
@@ -1252,8 +1262,7 @@ fn PrimaryBodyIrTypeCastInnerForTarget(textRaw: str,
        head == targetLeaf ||
        head == "int64" ||
        head == "uint64" ||
-       head == "ptr" ||
-       (len(head) > 3 && strings.SliceBytes(head, len(head) - 3, 3) == "Ptr"):
+       head == "ptr":
         return strutil.Strip(strings.SliceBytes(text, openPos + 1, len(text) - openPos - 2))
     return ""
 
@@ -1358,7 +1367,15 @@ fn PrimaryBodyIrConditionOperandSlot(bodyIR: var coreir.BodyIR,
         return existingSlot
     let globalType = PrimaryBodyIrTypedGlobalTypeExact(typedIr, sourcePath, text)
     if globalType != "":
-        let globalTypeKind = PrimaryBodyIrTypeKindFromText(globalType)
+        var globalTypeKind: int32
+        var globalSizeBytes: int32
+        var globalAlignBytes: int32
+        PrimaryBodyIrTypeShapeFromText(typedIr,
+                                       sourcePath,
+                                       globalType,
+                                       globalTypeKind,
+                                       globalSizeBytes,
+                                       globalAlignBytes)
         let globalSlotName = PrimaryBodyIrTypedGlobalSlotNameExact(typedIr, sourcePath, text)
         if globalSlotName == "":
             return -1
@@ -1739,7 +1756,15 @@ fn PrimaryBodyIrScalarValueSlotForText(bodyIR: var coreir.BodyIR,
     let globalType = PrimaryBodyIrTypedGlobalType(typedIr, sourcePath, text)
     if globalType == "":
         return -1
-    let globalTypeKind = PrimaryBodyIrTypeKindFromText(globalType)
+    var globalTypeKind: int32
+    var globalSizeBytes: int32
+    var globalAlignBytes: int32
+    PrimaryBodyIrTypeShapeFromText(typedIr,
+                                   sourcePath,
+                                   globalType,
+                                   globalTypeKind,
+                                   globalSizeBytes,
+                                   globalAlignBytes)
     if globalTypeKind != typeKind:
         return -1
     let globalSlotName = PrimaryBodyIrTypedGlobalSlotName(typedIr, sourcePath, text)
@@ -1800,7 +1825,9 @@ fn PrimaryBodyIrAddressSlotForName(bodyIR: var coreir.BodyIR,
             addressPassKind = -10
             return -1
         var ownerType = rootType
-        let pointeeType = PrimaryBodyIrPointeeTypeText(rootType)
+        let pointeeType = PrimaryBodyIrPointeeTypeTextForSource(typedIr,
+                                                                sourcePath,
+                                                                rootType)
         let passRootPointer = pointeeType != ""
         if passRootPointer:
             ownerType = pointeeType
@@ -2308,7 +2335,9 @@ fn PrimaryBodyIrAppendCallArgs(bodyIR: var coreir.BodyIR,
                         failureDetail0 = 241
                         failureDetail1 = argIndex
                         return false
-                    if PrimaryBodyIrPointeeTypeText(stmt.assignRootType) != "":
+                    if PrimaryBodyIrPointeeTypeTextForSource(typedIr,
+                                                             stmt.sourcePath,
+                                                             stmt.assignRootType) != "":
                         add(call.argSlots, rootSlot)
                         add(call.argPassKinds, coreir.BodyCallPassStackValueTag)
                     else:
@@ -6412,6 +6441,18 @@ fn PrimaryObjectTypedIrFieldCount(typedIr: texpr.TypedExprIr,
             count = count + 1
     return count
 
+fn PrimaryObjectTypedIrTypeDefAliasCount(typedIr: texpr.TypedExprIr,
+                                          aliasName: str,
+                                          targetType: str): int32 =
+    var count: int32
+    for i in 0..<typedIr.typeDefAliasNames.len:
+        if i >= typedIr.typeDefAliasTargetTypes.len:
+            continue
+        if typedIr.typeDefAliasNames[i] == aliasName &&
+           typedIr.typeDefAliasTargetTypes[i] == targetType:
+            count = count + 1
+    return count
+
 fn PrimaryObjectMissingLineNumber(lowering: lower.LoweringPlanStub,
                                    irIndex: int32): int32 =
     if irIndex < 0 || irIndex >= lowering.primaryObjectIr.functions.len:
@@ -7306,6 +7347,10 @@ fn PrimaryObjectPlanDiagnoseAndFinalizePhase(state: var PrimaryObjectPlanPhaseSt
     plan.error.callTargetSourcePath = state.error.callTargetSourcePath
     plan.typedIrTypeLayoutCount = lowering.typedIr.typeLayoutNames.len
     plan.typedIrTypeFieldCount = lowering.typedIr.typeFieldOwnerTypes.len
+    plan.typedIrTypeDefAliasCount = lowering.typedIr.typeDefAliasNames.len
+    plan.typedIrChengMemHeaderPtrAliasCount = PrimaryObjectTypedIrTypeDefAliasCount(lowering.typedIr,
+                                                                                    "ChengMemHeaderPtr",
+                                                                                    "ChengMemHeader*")
     plan.typedIrColdCsgTypeRowCount = lowering.typedIr.coldCsgTypeRows.len
     plan.typedIrLocalBindingCount = lowering.typedIr.localBindingNames.len
     plan.typedIrChengMemHeaderRcFieldCount = PrimaryObjectTypedIrFieldCount(lowering.typedIr,
@@ -7389,6 +7434,8 @@ fn PrimaryObjectPlanReport(plan: PrimaryObjectPlan): str =
     PrimaryObjectPlanAppendLine(out, "primary_object_entry_function_symbol", plan.entryFunctionSymbol)
     PrimaryObjectPlanAppendLine(out, "primary_object_typed_ir_type_layout_count", strings.IntToStr(plan.typedIrTypeLayoutCount))
     PrimaryObjectPlanAppendLine(out, "primary_object_typed_ir_type_field_count", strings.IntToStr(plan.typedIrTypeFieldCount))
+    PrimaryObjectPlanAppendLine(out, "primary_object_typed_ir_type_def_alias_count", strings.IntToStr(plan.typedIrTypeDefAliasCount))
+    PrimaryObjectPlanAppendLine(out, "primary_object_typed_ir_cheng_mem_header_ptr_alias_count", strings.IntToStr(plan.typedIrChengMemHeaderPtrAliasCount))
     PrimaryObjectPlanAppendLine(out, "primary_object_typed_ir_cold_csg_type_row_count", strings.IntToStr(plan.typedIrColdCsgTypeRowCount))
     PrimaryObjectPlanAppendLine(out, "primary_object_typed_ir_local_binding_count", strings.IntToStr(plan.typedIrLocalBindingCount))
     PrimaryObjectPlanAppendLine(out, "primary_object_typed_ir_cheng_mem_header_rc_field_count", strings.IntToStr(plan.typedIrChengMemHeaderRcFieldCount))

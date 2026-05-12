@@ -4662,6 +4662,42 @@ fn TypedExprParseTypeDeclName(lineRaw: str): str =
         head = chengpath.PathTrim(chengpath.TextSlice(headRaw, 0, genericPos))
     return parser.ParserIdentPrefix(parser.ParserFirstToken(head))
 
+fn TypedExprParseTypeDeclRhs(lineRaw: str): str =
+    let line = chengpath.PathTrim(lineRaw)
+    if line == "":
+        return ""
+    let eqPos = TypedExprFindTopLevelToken(line, "=")
+    if eqPos <= 0 || eqPos + 1 >= line.len:
+        return ""
+    return chengpath.PathTrim(chengpath.TextSlice(line,
+                                                  eqPos + 1,
+                                                  line.len - eqPos - 1))
+
+fn TypedExprPointerAliasPointeeType(typeRaw: str): str =
+    let typeText = TypedExprNormalizeTypeText(typeRaw)
+    if typeText == "":
+        return ""
+    if typeText.len > 0 && typeText[typeText.len - 1] == '*':
+        return chengpath.PathTrim(chengpath.TextSlice(typeText, 0, typeText.len - 1))
+    return ""
+
+fn TypedExprMaybeAddTypeDefAlias(ctx: var TypedExprSourceContext,
+                                  aliasNameRaw: str,
+                                  targetTypeRaw: str) =
+    let aliasName = parser.ParserIdentPrefix(chengpath.PathTrim(aliasNameRaw))
+    let targetType = TypedExprNormalizeTypeText(targetTypeRaw)
+    if aliasName == "" || targetType == "":
+        return
+    if TypedExprPointerAliasPointeeType(targetType) == "":
+        return
+    for i in 0..<ctx.typeDefAliasNames.len:
+        if i >= ctx.typeDefAliasTargetTypes.len:
+            continue
+        if ctx.typeDefAliasNames[i] == aliasName:
+            return
+    add(ctx.typeDefAliasNames, aliasName)
+    add(ctx.typeDefAliasTargetTypes, targetType)
+
 fn TypedExprSplitTopLevelCsv(itemsRaw: str): str[] =
     var out: str[]
     var start: int32
@@ -4723,14 +4759,30 @@ fn TypedExprPointerPointeeType(currentCtx: var TypedExprSourceContext,
         return ""
     if typeText.len > 0 && typeText[typeText.len - 1] == '*':
         return chengpath.PathTrim(chengpath.TextSlice(typeText, 0, typeText.len - 1))
-    let leaf = TypedExprTypeLeafName(typeText)
-    if leaf.len > 3 &&
-       chengpath.TextSlice(leaf, leaf.len - 3, 3) == "Ptr":
-        let pointeeLeaf = chengpath.TextSlice(leaf, 0, leaf.len - 3)
-        let ctxIndex = TypedExprFieldContextLookup(currentCtx, sourceContexts, pointeeLeaf)
-        if ctxIndex >= 0 || ctxIndex == -2:
-            return pointeeLeaf
-    return typeText
+    let aliasName = TypedExprTypeLeafName(typeText)
+    for i in 0..<currentCtx.typeDefAliasNames.len:
+        if i >= currentCtx.typeDefAliasTargetTypes.len:
+            continue
+        if currentCtx.typeDefAliasNames[i] != aliasName:
+            continue
+        let pointee = TypedExprPointerAliasPointeeType(currentCtx.typeDefAliasTargetTypes[i])
+        if pointee != "":
+            return pointee
+    var foundPointee = ""
+    for ci in 0..<sourceContexts.len:
+        for i in 0..<sourceContexts[ci].typeDefAliasNames.len:
+            if i >= sourceContexts[ci].typeDefAliasTargetTypes.len:
+                continue
+            if sourceContexts[ci].typeDefAliasNames[i] != aliasName:
+                continue
+            let pointee = TypedExprPointerAliasPointeeType(sourceContexts[ci].typeDefAliasTargetTypes[i])
+            if pointee == "":
+                continue
+            if foundPointee == "":
+                foundPointee = pointee
+            elif foundPointee != pointee:
+                return ""
+    return foundPointee
 
 fn TypedExprTypeFieldDeclMatches(field: TypedExprTypeFieldDecl,
                                   ownerTypeRaw: str,
@@ -6088,6 +6140,64 @@ fn TypedExprIrAppendTypeAlias(ir: var TypedExprIr,
     add(ir.typeAliasQualifiers, qualifier)
     add(ir.typeAliasTargetSourcePaths, targetSourcePath)
 
+fn TypedExprIrAppendTypeDefAliasesFromContext(ir: var TypedExprIr,
+                                               ctx: var TypedExprSourceContext) =
+    let sourcePath = parser.ParserNormalizePath(ctx.sourcePath)
+    if sourcePath == "":
+        return
+    for i in 0..<ctx.typeDefAliasNames.len:
+        if i >= ctx.typeDefAliasTargetTypes.len:
+            continue
+        let aliasName = parser.ParserIdentPrefix(chengpath.PathTrim(ctx.typeDefAliasNames[i]))
+        let targetType = TypedExprNormalizeTypeText(ctx.typeDefAliasTargetTypes[i])
+        if aliasName == "" || targetType == "":
+            continue
+        var seen = false
+        for existing in 0..<ir.typeDefAliasNames.len:
+            if existing >= ir.typeDefAliasSourcePaths.len ||
+               existing >= ir.typeDefAliasTargetTypes.len:
+                continue
+            if ir.typeDefAliasSourcePaths[existing] == sourcePath &&
+               ir.typeDefAliasNames[existing] == aliasName:
+                seen = true
+                break
+        if seen:
+            continue
+        add(ir.typeDefAliasSourcePaths, sourcePath)
+        add(ir.typeDefAliasNames, aliasName)
+        add(ir.typeDefAliasTargetTypes, targetType)
+
+fn TypedExprIrLookupTypeDefAliasTargetType(ir: TypedExprIr,
+                                            sourcePathRaw: str,
+                                            aliasNameRaw: str): str =
+    let sourcePath = parser.ParserNormalizePath(sourcePathRaw)
+    let aliasName = parser.ParserIdentPrefix(chengpath.PathTrim(aliasNameRaw))
+    if aliasName == "":
+        return ""
+    if sourcePath != "":
+        for i in 0..<ir.typeDefAliasNames.len:
+            if i >= ir.typeDefAliasSourcePaths.len ||
+               i >= ir.typeDefAliasTargetTypes.len:
+                continue
+            if ir.typeDefAliasNames[i] != aliasName:
+                continue
+            if ir.typeDefAliasSourcePaths[i] == sourcePath ||
+               TypedExprPathNormalizedEquals(ir.typeDefAliasSourcePaths[i], sourcePathRaw):
+                return ir.typeDefAliasTargetTypes[i]
+        return ""
+    var foundTarget = ""
+    for i in 0..<ir.typeDefAliasNames.len:
+        if i >= ir.typeDefAliasTargetTypes.len:
+            continue
+        if ir.typeDefAliasNames[i] != aliasName:
+            continue
+        if foundTarget == "":
+            foundTarget = ir.typeDefAliasTargetTypes[i]
+            continue
+        if foundTarget != ir.typeDefAliasTargetTypes[i]:
+            return ""
+    return foundTarget
+
 fn TypedExprIrAppendColdCsgRowsFromContext(ir: var TypedExprIr,
                                             ctx: var TypedExprSourceContext) =
     for i in 0..<ctx.coldCsgTypeRows.len:
@@ -6545,28 +6655,29 @@ fn TypedExprIrLookupSingleFieldMeta(ir: TypedExprIr,
     let sourcePath = parser.ParserNormalizePath(sourcePathRaw)
     let ownerType = TypedExprStripVarType(ownerTypeRaw)
     let fieldName = parser.ParserIdentPrefix(chengpath.PathTrim(fieldNameRaw))
-    if sourcePath == "" || ownerType == "" || fieldName == "":
+    if ownerType == "" || fieldName == "":
         return false
-    for i in 0..<ir.typeFieldOwnerTypes.len:
-        if i >= ir.typeFieldSourcePaths.len ||
-           i >= ir.typeFieldNames.len ||
-           i >= ir.typeFieldTypes.len ||
-           i >= ir.typeFieldOffsetBytes.len ||
-           i >= ir.typeFieldSizeBytes.len ||
-           i >= ir.typeFieldAlignBytes.len:
-            continue
-        if ir.typeFieldSourcePaths[i] != sourcePath &&
-           !TypedExprPathNormalizedEquals(ir.typeFieldSourcePaths[i], sourcePathRaw):
-            continue
-        if ir.typeFieldOwnerTypes[i] != ownerType:
-            continue
-        if ir.typeFieldNames[i] != fieldName:
-            continue
-        fieldType = ir.typeFieldTypes[i]
-        fieldOffsetBytes = ir.typeFieldOffsetBytes[i]
-        fieldSizeBytes = ir.typeFieldSizeBytes[i]
-        fieldAlignBytes = ir.typeFieldAlignBytes[i]
-        return fieldType != "" && fieldOffsetBytes >= 0 && fieldSizeBytes > 0 && fieldAlignBytes > 0
+    if sourcePath != "":
+        for i in 0..<ir.typeFieldOwnerTypes.len:
+            if i >= ir.typeFieldSourcePaths.len ||
+               i >= ir.typeFieldNames.len ||
+               i >= ir.typeFieldTypes.len ||
+               i >= ir.typeFieldOffsetBytes.len ||
+               i >= ir.typeFieldSizeBytes.len ||
+               i >= ir.typeFieldAlignBytes.len:
+                continue
+            if ir.typeFieldSourcePaths[i] != sourcePath &&
+               !TypedExprPathNormalizedEquals(ir.typeFieldSourcePaths[i], sourcePathRaw):
+                continue
+            if ir.typeFieldOwnerTypes[i] != ownerType:
+                continue
+            if ir.typeFieldNames[i] != fieldName:
+                continue
+            fieldType = ir.typeFieldTypes[i]
+            fieldOffsetBytes = ir.typeFieldOffsetBytes[i]
+            fieldSizeBytes = ir.typeFieldSizeBytes[i]
+            fieldAlignBytes = ir.typeFieldAlignBytes[i]
+            return fieldType != "" && fieldOffsetBytes >= 0 && fieldSizeBytes > 0 && fieldAlignBytes > 0
     let dotPos = TypedExprQualifiedTypeDot(ownerType)
     if dotPos > 0:
         let qualifier = chengpath.PathTrim(chengpath.TextSlice(ownerType, 0, dotPos))
@@ -8495,6 +8606,8 @@ fn TypedExprBuildSourceContext(source: TypedExprSourceText,
     ctx.importcFunctions = []
     ctx.importedModules = []
     ctx.declaredTypes = []
+    ctx.typeDefAliasNames = []
+    ctx.typeDefAliasTargetTypes = []
     ctx.typeFields = []
     ctx.coldCsgTypeRows = []
     ctx.coldCsgStatementRows = []
@@ -8604,6 +8717,8 @@ fn TypedExprBuildSourceContext(source: TypedExprSourceText,
         let lineIndent = TypedExprLineIndentWidth(rawLine)
         let declaredType = TypedExprParseTypeDeclName(trimmed)
         if declaredType != "":
+            let aliasTarget = TypedExprParseTypeDeclRhs(trimmed)
+            TypedExprMaybeAddTypeDefAlias(ctx, declaredType, aliasTarget)
             currentTypeName = declaredType
             currentTypeIndent = lineIndent
             currentTypeIsEnum = parser.ParserFindText(trimmed, "enum") >= 0
@@ -11015,6 +11130,7 @@ fn TypedExprBuildIrWithFactsAndExprLayer(sourceTexts: var TypedExprSourceText[],
         TypedExprBuildSourceContextIndex(ir, contexts)
         TypedExprIrAppendTypeAliasesFromFacts(ir, facts)
     for ci in 0..<contexts.len:
+        TypedExprIrAppendTypeDefAliasesFromContext(ir, contexts[ci])
         TypedExprIrAppendTypeLayoutsFromContext(ir, contexts[ci], contexts)
     for i in 0..<sourceTexts.len:
         os.ProcessResourceGuardCheck()
@@ -11030,6 +11146,7 @@ fn TypedExprBuildIrWithFactsAndExprLayer(sourceTexts: var TypedExprSourceText[],
                 return false
         TypedExprIrAppendImportcFunctionsFromContext(ir, ctx)
         TypedExprIrAppendEnumValuesFromContext(ir, ctx)
+        TypedExprIrAppendTypeDefAliasesFromContext(ir, ctx)
         TypedExprIrAppendTypeLayoutsFromContext(ir, ctx, contexts)
         TypedExprIrAppendColdCsgRowsFromContext(ir, ctx)
         let sourceFactRange = TypedExprSourceRangeIndexFind(factSourceRanges, ctx.sourcePath)
@@ -11152,6 +11269,7 @@ fn TypedExprBuildIrFromExprLayer(sourceTexts: var TypedExprSourceText[],
         var ctxForIr = contexts[i]
         TypedExprIrAppendImportcFunctionsFromContext(ir, ctxForIr)
         TypedExprIrAppendEnumValuesFromContext(ir, ctxForIr)
+        TypedExprIrAppendTypeDefAliasesFromContext(ir, ctxForIr)
         TypedExprIrAppendTypeLayoutsFromContext(ir, ctxForIr, contexts)
         TypedExprIrAppendColdCsgRowsFromContext(ir, ctxForIr)
         for bindingIndex in 0..<ctxForIr.bindings.len:
