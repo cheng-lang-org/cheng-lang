@@ -3343,49 +3343,6 @@ static bool cold_emit_csg_statement_rows(FILE *file, Span source) {
     return true;
 }
 
-static bool cold_emit_csg_facts_from_source_path(const char *source_path, const char *csg_out_path) {
-    Span source = source_open(source_path);
-    if (source.len <= 0) return false;
-    char parent[PATH_MAX];
-    if (cold_parent_dir(csg_out_path, parent, sizeof(parent)) && !cold_mkdir_p(parent)) {
-        munmap((void *)source.ptr, (size_t)source.len);
-        return false;
-    }
-    char tmp_path[PATH_MAX];
-    int tmp_len = snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%ld", csg_out_path, (long)getpid());
-    if (tmp_len < 0 || (size_t)tmp_len >= sizeof(tmp_path)) {
-        munmap((void *)source.ptr, (size_t)source.len);
-        return false;
-    }
-    FILE *file = fopen(tmp_path, "w");
-    if (!file) {
-        munmap((void *)source.ptr, (size_t)source.len);
-        return false;
-    }
-    fputs("cold_csg_version=1\n", file);
-    fputs("cold_csg_entry=main\n", file);
-    bool ok1 = cold_emit_csg_type_rows(file, source, true);
-    if (!ok1) fprintf(stderr, "[cheng_cold] csg emit: type_rows failed\n");
-    bool ok2 = ok1 && cold_emit_csg_function_rows(file, source);
-    if (ok1 && !ok2) fprintf(stderr, "[cheng_cold] csg emit: function_rows failed\n");
-    bool ok3 = ok2 && cold_emit_csg_statement_rows(file, source);
-    if (ok2 && !ok3) fprintf(stderr, "[cheng_cold] csg emit: statement_rows failed\n");
-    bool ok = ok3;
-    if (fclose(file) != 0) ok = false;
-    munmap((void *)source.ptr, (size_t)source.len);
-    if (!ok) {
-        fprintf(stderr, "[cheng_cold] csg emit: failed before rename, tmp=%s\n", tmp_path);
-        unlink(tmp_path);
-        return false;
-    }
-    if (rename(tmp_path, csg_out_path) != 0) {
-        fprintf(stderr, "[cheng_cold] csg emit: rename failed from %s to %s\n", tmp_path, csg_out_path);
-        unlink(tmp_path);
-        return false;
-    }
-    return ok;
-}
-
 static bool cold_files_equal(const char *left, const char *right) {
     Span a = source_open(left);
     Span b = source_open(right);
