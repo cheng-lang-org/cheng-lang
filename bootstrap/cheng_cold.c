@@ -19896,7 +19896,9 @@ static void cold_compile_csg_load_imported_types(const char *workspace_root,
         /* remember current object/type counts to detect newly added types */
         int32_t old_obj_count = symbols->object_count;
         int32_t old_type_count = symbols->type_count;
-        if (!cold_compile_csg_type_rows_from_source_into_symbols(imp_source, symbols, arena)) {
+        /* CSG type-row round-trip disabled: types are already collected
+           via cold_collect_import_module_types during signature collection. */
+        if (0 && !cold_compile_csg_type_rows_from_source_into_symbols(imp_source, symbols, arena)) {
             fprintf(stderr, "[cold_csg] failed to load types from %s\n", imp_path);
         }
         /* register aliased names for newly added types (DISABLED - crashes) */
@@ -21140,31 +21142,6 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
                                            target, emit, 0, "");
         return 0;
     }
-    /* --emit:csg = emit CSG facts as intermediate representation */
-    if (strcmp(emit, "csg") == 0) {
-        if (!source_path || source_path[0] == '\0') {
-            cold_write_system_link_exec_report(report_path, false, source_path, out_path, out_path,
-                                               target, emit, 0, "missing --in for emit:csg");
-            return 2;
-        }
-        if (!cold_emit_csg_facts_from_source_path(source_path, out_path)) {
-            cold_write_system_link_exec_report(report_path, false, source_path, out_path, out_path,
-                                               target, emit, 0, "cold csg emit failed");
-            return 2;
-        }
-        cold_write_system_link_exec_report(report_path, true, source_path, out_path, out_path,
-                                           target, emit, 0, "");
-        return 0;
-    }
-    if (csg_out_path && csg_out_path[0] != '\0') {
-        if (!cold_emit_csg_facts_from_source_path(source_path, csg_out_path)) {
-            cold_write_system_link_exec_report(report_path, false, source_path, csg_out_path, out_path,
-                                               target, emit, 0, "cold csg emit failed");
-            fprintf(stderr, "[cheng_cold] failed to emit cold csg facts: %s\n", csg_out_path);
-            return 2;
-        }
-    }
-
     /* derive workspace root from source path for import resolution */
     char workspace_root[PATH_MAX] = {0};
     if (source_path) {
