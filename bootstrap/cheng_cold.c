@@ -21323,7 +21323,10 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
         fprintf(stderr, "[cheng_cold] missing --out:<path>\n");
         return 2;
     }
-    if (strcmp(target, "arm64-apple-darwin") != 0) {
+    bool is_elf = (strcmp(target, "aarch64-unknown-linux-gnu") == 0 ||
+                    strcmp(target, "x86_64-unknown-linux-gnu") == 0);
+    bool is_macho = (strcmp(target, "arm64-apple-darwin") == 0);
+    if (!is_macho && !is_elf) {
         cold_write_system_link_exec_report(report_path, false, source_path, effective_csg_path, out_path,
                                            target, emit, 0, "unsupported target");
         fprintf(stderr, "[cheng_cold] unsupported target: %s\n", target);
