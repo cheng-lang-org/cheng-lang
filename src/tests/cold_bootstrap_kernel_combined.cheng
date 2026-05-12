@@ -465,11 +465,10 @@ fn StatementClassifyLine(scan: var StatementScan): bool =
 fn StatementScanExprTokens(source: str, start: int32, endPos: int32): int32 =
     if start >= endPos:
         return 0
-    var store: ExprTokenStore
-    let scanResult: int32 = ExprScanSpanIntoStore(source, start, endPos, store)
-    if scanResult != 0:
-        return 0 - scanResult
-    return store.count
+    let count: int32 = ExprScanSpanCountOnly(source, start, endPos)
+    if count < 0:
+        return count
+    return count
 
 fn StatementAdvance(scan: var StatementScan): int32 =
     scan.pos = scan.lineEnd
@@ -714,7 +713,9 @@ fn ExprScanSpanIntoStore(source: str, start: int32, endPos: int32,
     var depth: int32 = 0
     while pos < endPos:
         let ch: uint8 = source[pos]
-        if FrontendIsIdentStart(ch):
+        if ExprIsSpace(ch):
+            pos = pos + 1
+        elif FrontendIsIdentStart(ch):
             let idEnd: int32 = ExprSkipIdent(source, pos)
             if idEnd > endPos:
                 return 221
@@ -758,6 +759,48 @@ fn ExprScanSpanIntoStore(source: str, start: int32, endPos: int32,
     if depth != 0:
         return 203
     return 0
+
+fn ExprScanSpanCountOnly(source: str, start: int32, endPos: int32): int32 =
+    if start < 0 || endPos > len(source) || start >= endPos:
+        return 0
+    var pos: int32 = start
+    var depth: int32 = 0
+    var count: int32 = 0
+    while pos < endPos:
+        let ch: uint8 = source[pos]
+        if ExprIsSpace(ch):
+            pos = pos + 1
+        elif FrontendIsIdentStart(ch):
+            let idEnd: int32 = ExprSkipIdent(source, pos)
+            if idEnd > endPos:
+                return 0 - 221
+            count = count + 1
+            pos = idEnd
+        elif ExprIsDigit(ch):
+            let numEnd: int32 = ExprSkipNumber(source, pos)
+            if numEnd > endPos:
+                return 0 - 222
+            count = count + 1
+            pos = numEnd
+        elif ch == '(' || ch == '[':
+            depth = depth + 1
+            count = count + 1
+            pos = pos + 1
+        elif ch == ')' || ch == ']':
+            if depth <= 0:
+                return 0 - 202
+            count = count + 1
+            depth = depth - 1
+            pos = pos + 1
+        elif ExprIsTwoCharOp(source, pos):
+            count = count + 1
+            pos = pos + 2
+        else:
+            count = count + 1
+            pos = pos + 1
+    if depth != 0:
+        return 0 - 203
+    return count
 
 fn ExprStoreChecksum(store: var ExprTokenStore): int32 =
     var checksum: int32 = 0
