@@ -20376,7 +20376,14 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
         }
         ColdErrorRecoveryEnabled = false;
     }
-    if (symbols->function_cap > body_cap) body_cap = symbols->function_cap;
+    if (symbols->function_cap > body_cap) {
+        int32_t old_cap = body_cap;
+        body_cap = symbols->function_cap;
+        BodyIR **grown = arena_alloc(arena, (size_t)body_cap * sizeof(BodyIR *));
+        memset(grown, 0, (size_t)body_cap * sizeof(BodyIR *));
+        memcpy(grown, function_bodies, (size_t)old_cap * sizeof(BodyIR *));
+        function_bodies = grown;
+    }
     if (ColdImportSegvSaw) {
         ColdImportSegvSaw = 0;
         for (int32_t i = symbols->function_count; i < body_cap; i++) {
@@ -20408,6 +20415,16 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
     }
     (void)main_function;
 
+    /* Resize function_bodies if parsing added more functions */
+    if (symbols->function_cap > body_cap) {
+        int32_t old_cap = body_cap;
+        body_cap = symbols->function_cap;
+        BodyIR **grown = arena_alloc(arena, (size_t)body_cap * sizeof(BodyIR *));
+        memset(grown, 0, (size_t)body_cap * sizeof(BodyIR *));
+        memcpy(grown, function_bodies, (size_t)old_cap * sizeof(BodyIR *));
+        function_bodies = grown;
+    }
+
     if (first_function < 0) {
         /* No compilable functions: write minimal valid .o */
         bool ok = macho_write_object(out_path, 0, 0, 0, 0, 0, 0, 0, 0, 0);
@@ -20437,7 +20454,7 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
     code_emit(shared, a64_ret());
 
     /* First pass: compile each function body into the shared buffer */
-    for (int32_t i = 0; i < func_count; i++) {
+    for (int32_t i = 0; i < func_count && i < body_cap; i++) {
         if (!function_bodies[i]) continue;
         BodyIR *body = function_bodies[i];
         symbol_offset[i] = shared->count;
