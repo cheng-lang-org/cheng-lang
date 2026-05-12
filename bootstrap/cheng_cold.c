@@ -3988,7 +3988,7 @@ static bool cold_write_backend_driver_map(const char *path,
     fputs("cold_frontend_entry_system_link_report=1\n", file);
     fputs("cold_frontend_entry_system_link_report_verified=1\n", file);
     fprintf(file, "cold_frontend_declaration_hash=%016llx\n", (unsigned long long)stats->declaration_hash);
-    fputs("command_surface=print-contract,self-check,compile-bootstrap,bootstrap-bridge,build-backend-driver,system-link-exec\n", file);
+    fputs("command_surface=print-contract,self-check,compile-bootstrap,bootstrap-bridge,build-backend-driver\n", file);
     fputs("real_backend_codegen=1\n", file);
     fputs("system_link_exec=1\n", file);
     fputs("system_link_exec_scope=cold_subset_direct_macho\n", file);
@@ -4407,70 +4407,7 @@ static int cold_cmd_build_backend_driver(int argc, char **argv, const char *self
     return 0;
 }
 
-static bool cold_is_reserved_unimplemented_command(const char *cmd) {
-    return strcmp(cmd, "run-host-smokes") == 0 ||
-           strcmp(cmd, "run-production-regression") == 0 ||
-           strcmp(cmd, "verify-export-visibility") == 0 ||
-           strcmp(cmd, "verify-export-visibility-parallel") == 0 ||
-           strcmp(cmd, "release-compile") == 0;
-}
-
 static int32_t cold_jobs_from_env(void);
-
-static int cold_cmd_status(void) {
-    printf("cheng_cold status\n");
-    printf("  codegen_ops=38/38\n");
-    printf("  source_storage=mmap_span\n");
-    printf("  allocation=phase_arena\n");
-    printf("  ir_layout=soa_dense\n");
-    printf("  linkerless_image=1\n");
-    printf("  system_link=0\n");
-    printf("  hot_path_node_malloc=0\n");
-    printf("  parallel_codegen=%s\n", cold_jobs_from_env() > 1 ? "work_stealing" : "serial");
-    printf("  function_task_job_count=%d\n", cold_jobs_from_env());
-    printf("  regression_tests=28/28\n");
-    printf("  cold_tests=35/35\n");
-    printf("  target=arm64-apple-darwin\n");
-    return 0;
-}
-
-static int cold_cmd_print_build_plan(int argc, char **argv) {
-    const char *in_path = cold_flag_value(argc, argv, "--in");
-    if (!in_path || in_path[0] == '\0') {
-        fprintf(stderr, "[cheng_cold] print-build-plan requires --in:<path>\n");
-        return 1;
-    }
-    Span source = source_open(in_path);
-    if (source.len <= 0) {
-        fprintf(stderr, "[cheng_cold] cannot read source: %s\n", in_path);
-        return 1;
-    }
-    printf("build-plan for %s\n", in_path);
-    printf("  emit=exe\n");
-    printf("  target=arm64-apple-darwin\n");
-    printf("  pipeline=cold_subset_direct_macho\n");
-    int32_t fn_count = 0, type_count = 0;
-    const char *p = source.ptr, *e = source.ptr + source.len;
-    while (p < e) {
-        while (p < e && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
-        if (p >= e) break;
-        if (strncmp(p, "fn ", 3) == 0 || strncmp(p, "fn\t", 3) == 0) fn_count++;
-        else if (strncmp(p, "type ", 5) == 0 || strncmp(p, "type\t", 5) == 0) type_count++;
-        while (p < e && *p != '\n') p++;
-        if (p < e) p++;
-    }
-    printf("  function_count=%d\n", fn_count);
-    printf("  type_count=%d\n", type_count);
-    printf("  provider_count=0\n");
-    printf("  standalone=1\n");
-    munmap((void *)source.ptr, (size_t)source.len);
-    return 0;
-}
-
-static int cold_cmd_unimplemented(const char *cmd) {
-    fprintf(stderr, "[cheng_cold] command is not implemented in cold prototype: %s\n", cmd);
-    return 1;
-}
 
 static void cold_usage(void) {
     puts("cheng_cold");
@@ -4481,8 +4418,6 @@ static void cold_usage(void) {
     puts("  cheng_cold bootstrap-bridge [--in:<path>] [--out-dir:<path>]");
     puts("  cheng_cold build-backend-driver [--in:<contract>] [--out:<path>] [--out-dir:<dir>] [--report-out:<path>] [--map-out:<path>] [--index-out:<path>]");
     puts("  cheng_cold system-link-exec --in:<source> [--csg-in:<facts>|--csg-out:<facts>] --out:<path> [--emit:exe|obj|csg] [--target:arm64-apple-darwin] [--report-out:<path>]");
-    puts("  cheng_cold status");
-    puts("  cheng_cold print-build-plan --in:<path>");
     puts("    --emit:exe   produce standalone executable (default)");
     puts("    --emit:obj   emit CSG facts as intermediate object representation");
     puts("    --emit:csg   same as --emit:obj");
@@ -21105,15 +21040,6 @@ int main(int argc, char **argv) {
     }
     if (argc >= 2 && strcmp(argv[1], "system-link-exec") == 0) {
         return cold_cmd_system_link_exec(argc, argv);
-    }
-    if (argc >= 2 && strcmp(argv[1], "status") == 0) {
-        return cold_cmd_status();
-    }
-    if (argc >= 2 && strcmp(argv[1], "print-build-plan") == 0) {
-        return cold_cmd_print_build_plan(argc, argv);
-    }
-    if (argc >= 2 && cold_is_reserved_unimplemented_command(argv[1])) {
-        return cold_cmd_unimplemented(argv[1]);
     }
     const char *out_path = argc > 1 ? argv[1] : "/tmp/cheng_cold_out";
     const char *src_path = argc > 2 ? argv[2] : 0;
