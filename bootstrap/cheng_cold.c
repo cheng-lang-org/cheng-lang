@@ -5507,6 +5507,34 @@ static ObjectDef *symbols_resolve_object(Symbols *symbols, Span type_name) {
     type_name = span_trim(type_name);
     ObjectDef *existing = symbols_find_object(symbols, type_name);
     if (existing) return existing;
+    /* Cross-alias fallback: match last component after '.'.
+       e.g. "ir.BodyIR" matches "coreir.BodyIR" when the same module
+       was imported under different aliases via transitive imports. */
+    if (!existing) {
+        int32_t dot = -1;
+        for (int32_t i = type_name.len - 1; i >= 0; i--) {
+            if (type_name.ptr[i] == '.') { dot = i; break; }
+        }
+        if (dot >= 0) {
+            Span suffix = span_sub(type_name, dot + 1, type_name.len);
+            for (int32_t oi = 0; oi < symbols->object_count; oi++) {
+                Span oname = symbols->objects[oi].name;
+                int32_t odot = -1;
+                for (int32_t j = oname.len - 1; j >= 0; j--) {
+                    if (oname.ptr[j] == '.') { odot = j; break; }
+                }
+                if (odot >= 0 && span_same(span_sub(oname, odot + 1, oname.len), suffix)) {
+                    existing = &symbols->objects[oi];
+                    break;
+                }
+                if (odot < 0 && span_same(oname, suffix)) {
+                    existing = &symbols->objects[oi];
+                    break;
+                }
+            }
+        }
+    }
+    if (existing) return existing;
     if (span_eq(type_name, "ErrorInfo")) return symbols_ensure_std_error_info(symbols);
     if (span_eq(type_name, "Result")) return symbols_ensure_std_result_base(symbols);
     Span base_name = {0};
