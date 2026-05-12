@@ -5560,11 +5560,17 @@ static ObjectDef *symbols_resolve_object(Symbols *symbols, Span type_name) {
         if (field_type.len <= 0 && span_eq(src->name, "value") && arg_count > 0) {
             field_type = args[0];
         }
+        /* If source field type is a generic placeholder, use SLOT_OPAQUE
+           for uniform caller/callee layout with generic function bodies */
+        bool is_generic_field = false;
+        for (int32_t gi = 0; gi < base->generic_count; gi++)
+            if (span_same(src->type_name, base->generic_names[gi]))
+                { is_generic_field = true; break; }
         int32_t fk = cold_slot_kind_from_type_with_symbols(symbols, field_type);
         dst->name = src->name;
         dst->type_name = field_type;
-        dst->kind = fk;
-        dst->size = cold_slot_size_from_type_with_symbols(symbols, field_type, fk);
+        dst->kind = is_generic_field ? SLOT_OPAQUE : fk;
+        dst->size = is_generic_field ? 8 : cold_slot_size_from_type_with_symbols(symbols, field_type, fk);
         dst->array_len = 0;
         if (fk == SLOT_ARRAY_I32 && !cold_parse_i32_array_type(field_type, &dst->array_len) && !cold_span_starts_with(span_trim(field_type), "uint8[")) {
             dst->array_len = 4; /* default */
@@ -13703,22 +13709,6 @@ static BodyIR *parse_fn(Parser *parser, int32_t *symbol_index_out) {
     if (body && body->block_count > 0 && body->block_term[0] < 0) {
         body->has_fallback = true;
     }
-    /* Generic function with generic return type: stub to avoid layout mismatch */
-    if (body && !body->has_fallback && symbol_index >= 0 &&
-        symbol_index < parser->symbols->function_count) {
-        FnDef *fn = &parser->symbols->functions[symbol_index];
-        if (fn->generic_count > 0) {
-            bool has_generic_ret = false;
-            for (int32_t ci = 0; ci < ret.len; ci++)
-                if (ret.ptr[ci] == '[') { has_generic_ret = true; break; }
-            if (!has_generic_ret && ret.len == 1 &&
-                ret.ptr[0] >= 'A' && ret.ptr[0] <= 'Z')
-                has_generic_ret = true;
-            if (has_generic_ret)
-                body->has_fallback = true;
-        }
-    }
-    return body;
 }
 
 /* ================================================================
@@ -19965,7 +19955,8 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
     if (source_path && source_path[0] != '\0' && workspace_root && workspace_root[0] != '\0') {
         Span source = source_open(source_path);
         if (source.len > 0) {
-            cold_compile_csg_load_imported_types(workspace_root, source, symbols, arena);
+            /* cold_compile_csg_load_imported_types disabled: types already loaded via collect */
+            if (0) cold_compile_csg_load_imported_types(workspace_root, source, symbols, arena);
             munmap((void *)source.ptr, (size_t)source.len);
         }
     }
@@ -20650,7 +20641,7 @@ static bool cold_compile_source_path_to_macho(const char *out_path,
           if (!sm) sm = strstr(src_path, "src/");
           if (sm == src_path) { char rp[PATH_MAX]; if (realpath(src_path, rp)) { const char *s = strstr(rp, "/src/"); if (s) { size_t rl = (size_t)(s - rp); memcpy(ws_root, rp, rl); ws_root[rl] = 0; } } }
           else if (sm) { size_t rl = (size_t)(sm - src_path); if (rl < sizeof(ws_root)) { memcpy(ws_root, src_path, rl); ws_root[rl] = 0; } }
-          if (ws_root[0]) cold_compile_csg_load_imported_types(ws_root, mapped_source, symbols, arena);
+          if (ws_root[0]) { /* cold_compile_csg_load_imported_types disabled */ }
           else fprintf(stderr, "[WARN] ws_root empty, src_path=%s\n", src_path);
         }
         body_cap = symbols->function_cap;
@@ -20852,7 +20843,7 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
       if (!sm) sm = strstr(src_path, "src/");
       if (sm == src_path) { char rp[PATH_MAX]; if (realpath(src_path, rp)) { const char *s = strstr(rp, "/src/"); if (s) { size_t rl = (size_t)(s - rp); memcpy(ws_root, rp, rl); ws_root[rl] = 0; } } }
       else if (sm) { size_t rl = (size_t)(sm - src_path); if (rl < sizeof(ws_root)) { memcpy(ws_root, src_path, rl); ws_root[rl] = 0; } }
-      if (ws_root[0]) cold_compile_csg_load_imported_types(ws_root, mapped_source, symbols, arena);
+      if (ws_root[0]) { /* cold_compile_csg_load_imported_types disabled */ }
     }
     body_cap = symbols->function_cap;
     if (body_cap < 256) body_cap = 256;
