@@ -370,6 +370,11 @@ type
         globalSourcePaths: str[]
         globalNames: str[]
         globalTypes: str[]
+        localBindingSourcePaths: str[]
+        localBindingFunctionNames: str[]
+        localBindingLineNumbers: int32[]
+        localBindingNames: str[]
+        localBindingTypes: str[]
         importcSourcePaths: str[]
         importcNames: str[]
         importcReturnTypes: str[]
@@ -386,6 +391,9 @@ type
         typeFieldOffsetBytes: int32[]
         typeFieldSizeBytes: int32[]
         typeFieldAlignBytes: int32[]
+        typeDefAliasSourcePaths: str[]
+        typeDefAliasNames: str[]
+        typeDefAliasTargetTypes: str[]
         typeAliasSourcePaths: str[]
         typeAliasQualifiers: str[]
         typeAliasTargetSourcePaths: str[]
@@ -450,6 +458,8 @@ type
         importcFunctions: TypedExprImportcFunction[]
         importedModules: TypedExprImportedModule[]
         declaredTypes: str[]
+        typeDefAliasNames: str[]
+        typeDefAliasTargetTypes: str[]
         typeFields: TypedExprTypeFieldDecl[]
         coldCsgTypeRows: TypedExprColdCsgTypeRow[]
         coldCsgStatementRows: TypedExprColdCsgStatementRow[]
@@ -1074,6 +1084,16 @@ fn TypedExprIrClone(ir: var TypedExprIr): TypedExprIr =
         add(out.globalNames, ir.globalNames[i])
     for i in 0..<ir.globalTypes.len:
         add(out.globalTypes, ir.globalTypes[i])
+    for i in 0..<ir.localBindingSourcePaths.len:
+        add(out.localBindingSourcePaths, ir.localBindingSourcePaths[i])
+    for i in 0..<ir.localBindingFunctionNames.len:
+        add(out.localBindingFunctionNames, ir.localBindingFunctionNames[i])
+    for i in 0..<ir.localBindingLineNumbers.len:
+        add(out.localBindingLineNumbers, ir.localBindingLineNumbers[i])
+    for i in 0..<ir.localBindingNames.len:
+        add(out.localBindingNames, ir.localBindingNames[i])
+    for i in 0..<ir.localBindingTypes.len:
+        add(out.localBindingTypes, ir.localBindingTypes[i])
     for i in 0..<ir.importcSourcePaths.len:
         add(out.importcSourcePaths, ir.importcSourcePaths[i])
     for i in 0..<ir.importcNames.len:
@@ -1106,6 +1126,12 @@ fn TypedExprIrClone(ir: var TypedExprIr): TypedExprIr =
         add(out.typeFieldSizeBytes, ir.typeFieldSizeBytes[i])
     for i in 0..<ir.typeFieldAlignBytes.len:
         add(out.typeFieldAlignBytes, ir.typeFieldAlignBytes[i])
+    for i in 0..<ir.typeDefAliasSourcePaths.len:
+        add(out.typeDefAliasSourcePaths, ir.typeDefAliasSourcePaths[i])
+    for i in 0..<ir.typeDefAliasNames.len:
+        add(out.typeDefAliasNames, ir.typeDefAliasNames[i])
+    for i in 0..<ir.typeDefAliasTargetTypes.len:
+        add(out.typeDefAliasTargetTypes, ir.typeDefAliasTargetTypes[i])
     for i in 0..<ir.typeAliasSourcePaths.len:
         add(out.typeAliasSourcePaths, ir.typeAliasSourcePaths[i])
     for i in 0..<ir.typeAliasQualifiers.len:
@@ -2493,6 +2519,8 @@ fn TypedExprIrReportText(ir: var TypedExprIr): str =
     TypedExprReportAppendLine(out, "typed_ir_cold_csg_match_statement_count", IntToStr(TypedExprIrCountColdCsgStatementKind(ir, "match")))
     TypedExprReportAppendLine(out, "typed_ir_cold_csg_case_statement_count", IntToStr(TypedExprIrCountColdCsgStatementKind(ir, "case")))
     TypedExprReportAppendLine(out, "typed_ir_global_count", IntToStr(ir.globalNames.len))
+    TypedExprReportAppendLine(out, "typed_ir_local_binding_count", IntToStr(ir.localBindingNames.len))
+    TypedExprReportAppendLine(out, "typed_ir_type_def_alias_count", IntToStr(ir.typeDefAliasNames.len))
     TypedExprReportAppendLine(out, "typed_ir_local_decl_statement_count", IntToStr(TypedExprIrCountStatementKind(ir, TypedExprIrStmtLocalDecl)))
     TypedExprReportAppendLine(out, "typed_ir_let_call_statement_count", IntToStr(TypedExprIrCountStatementKind(ir, TypedExprIrStmtLetCall)))
     TypedExprReportAppendLine(out, "typed_ir_if_call_statement_count", IntToStr(TypedExprIrCountStatementKind(ir, TypedExprIrStmtIfCall)))
@@ -5093,6 +5121,63 @@ fn TypedExprMaybeAddInferredCallBinding(ctx: var TypedExprSourceContext,
                              bindingName,
                              typeText)
 
+fn TypedExprIrAppendLocalBinding(ir: var TypedExprIr,
+                                  sourcePathRaw: str,
+                                  functionNameRaw: str,
+                                  lineNumber: int32,
+                                  nameRaw: str,
+                                  typeRaw: str) =
+    let sourcePath = parser.ParserNormalizePath(sourcePathRaw)
+    let functionName = chengpath.PathTrim(functionNameRaw)
+    let name = parser.ParserIdentPrefix(chengpath.PathTrim(nameRaw))
+    let typeText = TypedExprNormalizeTypeText(typeRaw)
+    if sourcePath == "" || functionName == "" || lineNumber <= 0 || name == "" || typeText == "":
+        return
+    for i in 0..<ir.localBindingNames.len:
+        if i >= ir.localBindingSourcePaths.len ||
+           i >= ir.localBindingFunctionNames.len ||
+           i >= ir.localBindingLineNumbers.len:
+            continue
+        if ir.localBindingSourcePaths[i] == sourcePath &&
+           ir.localBindingFunctionNames[i] == functionName &&
+           ir.localBindingLineNumbers[i] == lineNumber &&
+           ir.localBindingNames[i] == name:
+            return
+    add(ir.localBindingSourcePaths, sourcePath)
+    add(ir.localBindingFunctionNames, functionName)
+    add(ir.localBindingLineNumbers, lineNumber)
+    add(ir.localBindingNames, name)
+    add(ir.localBindingTypes, typeText)
+
+fn TypedExprIrLookupLocalBindingType(ir: TypedExprIr,
+                                      sourcePathRaw: str,
+                                      functionNameRaw: str,
+                                      lineNumber: int32,
+                                      nameRaw: str): str =
+    let sourcePath = parser.ParserNormalizePath(sourcePathRaw)
+    let functionName = chengpath.PathTrim(functionNameRaw)
+    let name = parser.ParserIdentPrefix(chengpath.PathTrim(nameRaw))
+    if sourcePath == "" || functionName == "" || lineNumber <= 0 || name == "":
+        return ""
+    var foundType = ""
+    for i in 0..<ir.localBindingNames.len:
+        if i >= ir.localBindingSourcePaths.len ||
+           i >= ir.localBindingFunctionNames.len ||
+           i >= ir.localBindingLineNumbers.len ||
+           i >= ir.localBindingTypes.len:
+            continue
+        if ir.localBindingLineNumbers[i] >= lineNumber:
+            continue
+        if ir.localBindingNames[i] != name:
+            continue
+        if ir.localBindingFunctionNames[i] != functionName:
+            continue
+        if ir.localBindingSourcePaths[i] != sourcePath &&
+           !TypedExprPathNormalizedEquals(ir.localBindingSourcePaths[i], sourcePathRaw):
+            continue
+        foundType = ir.localBindingTypes[i]
+    return foundType
+
 fn TypedExprAppendInferredCallBindings(ctx: var TypedExprSourceContext,
                                         sourceContexts: var TypedExprSourceContext[],
                                         facts: var TypedExprFact[],
@@ -5700,16 +5785,6 @@ fn TypedExprSourceContextLookupWithIndex(ir: TypedExprIr,
 fn TypedExprSourceContextLookup(sourceContexts: var TypedExprSourceContext[],
                                   sourcePathRaw: str): int32 =
     let sourcePath = parser.ParserNormalizePath(sourcePathRaw)
-    if typedExprCachedIndexBucketHeads.len > 0:
-        let bucket = TypedExprSourceContextIndexHash(sourcePath,
-                                                      typedExprCachedIndexBucketHeads.len)
-        var entryIndex = typedExprCachedIndexBucketHeads[bucket]
-        while entryIndex >= 0:
-            if entryIndex >= typedExprCachedIndexEntryIndexes.len:
-                break
-            if typedExprCachedIndexSourcePaths[entryIndex] == sourcePath:
-                return typedExprCachedIndexEntryIndexes[entryIndex]
-            entryIndex = typedExprCachedIndexEntryNext[entryIndex]
     for i in 0..<sourceContexts.len:
         if sourceContexts[i].normalizedSourcePath == sourcePath:
             return i
@@ -10976,6 +11051,12 @@ fn TypedExprBuildIrWithFactsAndExprLayer(sourceTexts: var TypedExprSourceText[],
         for bindingIndex in 0..<ctx.bindings.len:
             let binding = ctx.bindings[bindingIndex]
             if !binding.globalFlag:
+                TypedExprIrAppendLocalBinding(ir,
+                                              binding.sourcePath,
+                                              binding.functionName,
+                                              binding.lineNumber,
+                                              binding.name,
+                                              binding.typeText)
                 continue
             var seenGlobal = false
             for globalIndex in 0..<ir.globalNames.len:
@@ -11076,6 +11157,12 @@ fn TypedExprBuildIrFromExprLayer(sourceTexts: var TypedExprSourceText[],
         for bindingIndex in 0..<ctxForIr.bindings.len:
             let binding = ctxForIr.bindings[bindingIndex]
             if !binding.globalFlag:
+                TypedExprIrAppendLocalBinding(ir,
+                                              binding.sourcePath,
+                                              binding.functionName,
+                                              binding.lineNumber,
+                                              binding.name,
+                                              binding.typeText)
                 continue
             var seenGlobal = false
             for globalIndex in 0..<ir.globalNames.len:

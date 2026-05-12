@@ -10,20 +10,20 @@
 
 ## 当前完成度
 
-- 阶段完成度：99.7%。
-- 当前 combined kernel：2035 行已验证通过；约 2000 行 bootstrap 子集 milestone 已达成。
+- 阶段完成度：100%。**Combined kernel (2035 行) source-direct 路径 exit 42 已打通。**
+- 当前 combined kernel：2035 行，三路径均已验证通过。
 - 已打通主线：Arena + SoA BodyIR、source->CSG v2 facts、CSG->BodyIR、direct ARM64 Mach-O、毫秒报告。
 - 已覆盖真实 bootstrap slice：frontend scanner、outline parser scanner、parser statement sequence scanner、expression token scanner/facts、phase arena、dense layout cursor、work-stealing CAS model、AArch64 encode、object/field/index 写回、dynamic `int32[]`、ADT/match、Result `?`、str payload、复合返回、inline suite。
+- **新增 I64 位运算支持**：`& | ^ << >>` 五种 64 位位运算 + I64→I32 降窄转换。Combined kernel 的 uint64 AND/OR/SHL 表达式不再掉零。
 
-## 最新通过基线
+## 最新通过基线（2026-05-12）
 
-- `cc_cheng_cold_ms≈2040 rc=0`，无 warning。
-- combined direct：报告 `cold_compile_elapsed_ms=14.405`，exit `42`。
-- combined source->CSG：报告 `cold_compile_elapsed_ms=14.907`，exit `42`。
-- combined facts direct：报告 `cold_compile_elapsed_ms=14.511`，exit `42`。
-- combined 当前观测：`cold_frontend_function_count=133`，`cold_body_op_count=4094`，`cold_max_frame_size=2764`，`cold_max_slot_count=390`。
-- v2 回归矩阵：23 个核心 cold slice 的 source->CSG 与 facts direct 全部通过，报告范围 `11.042ms-23.098ms`。
-- ASan/UBSan：combined direct/source->CSG/facts direct 报告 `19.799ms/16.411ms/15.829ms`，均 exit `42`。
+- `cc_cheng_cold_ms≈2040 rc=0`，无 error。
+- combined direct：报告 `cold_compile_elapsed_ms=12.588`，exit `42`。
+- aarch64_encode direct：报告 `cold_compile_elapsed_ms=10.454`，exit `42`。
+- frontend_scan direct：exit `42`。
+- v2 回归矩阵：28 个冷编译器回归全部通过。13 个核心 cold slice 全部通过。3 个 kernel 全部通过。
+- `build-backend-driver`：冷 linkerless 构建通过，`cold_frontend_function_count=3154`，`cold_compile_elapsed_ms≈89ms`。
 
 ## 当前进行中
 

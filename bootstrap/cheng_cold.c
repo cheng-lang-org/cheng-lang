@@ -6054,6 +6054,8 @@ static int32_t cold_lower_question_result(Symbols *symbols, BodyIR *body, Locals
 /* ================================================================
  * Parser
  * ================================================================ */
+/* Forward declare import source struct (defined later at ~line 19939) */
+struct ColdImportSource;
 typedef struct {
     Span source;
     int32_t pos;
@@ -6061,7 +6063,16 @@ typedef struct {
     Symbols *symbols;
     bool import_mode;  /* when true, parse_fn skips symbols_add_fn */
     Span import_alias;
+    struct ColdImportSource *import_sources;  /* for import alias resolution in bare names */
+    int32_t import_source_count;
 } Parser;
+
+/* Import source record: alias + resolved path */
+struct ColdImportSource {
+    Span alias;
+    char path[PATH_MAX];
+};
+typedef struct ColdImportSource ColdImportSource;
 
 static void parser_ws(Parser *parser) {
     for (;;) {
@@ -7937,6 +7948,17 @@ static int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *local
               return sl;
           }
         }
+        /* Try bare-name resolution via import aliases */
+        if (parser->import_source_count > 0 && parser->import_sources) {
+            for (int32_t isi = 0; isi < parser->import_source_count; isi++) {
+                Span qualified = cold_arena_join3(parser->arena, parser->import_sources[isi].alias, ".", stripped_name);
+                int32_t resolved = symbols_find_fn_for_call(parser->symbols, qualified, body, arg_start, arg_count);
+                if (resolved >= 0) {
+                    fn_index = resolved;
+                    break;
+                }
+            }
+        }
         { int32_t param_kinds[COLD_MAX_I32_PARAMS];
           int32_t param_sizes[COLD_MAX_I32_PARAMS];
           for (int32_t ai = 0; ai < arg_count && ai < COLD_MAX_I32_PARAMS; ai++) {
@@ -8086,6 +8108,17 @@ static int32_t parse_call_from_args_span(Parser *owner, BodyIR *body, Locals *lo
             body_op3(body, BODY_OP_CALL_PTR, slot, indirect_local->slot, arg_start, arg_count);
             if (kind_out) *kind_out = SLOT_I32;
             return slot;
+        }
+        /* Try bare-name resolution via import aliases */
+        if (owner->import_source_count > 0 && owner->import_sources) {
+            for (int32_t isi = 0; isi < owner->import_source_count; isi++) {
+                Span qualified = cold_arena_join3(owner->arena, owner->import_sources[isi].alias, ".", stripped_name);
+                int32_t resolved = symbols_find_fn_for_call(owner->symbols, qualified, body, arg_start, arg_count);
+                if (resolved >= 0) {
+                    fn_index = resolved;
+                    break;
+                }
+            }
         }
         /* External function, will be registered below */
         { int32_t param_kinds[COLD_MAX_I32_PARAMS];
@@ -19820,6 +19853,10 @@ static int32_t cold_compile_one_import_direct(Symbols *symbols, const char *path
     #define COLD_IMPORT_FN_MAP_CAP 128
     int32_t qual_indices[COLD_IMPORT_FN_MAP_CAP];
     for (int32_t i = 0; i < COLD_IMPORT_FN_MAP_CAP; i++) qual_indices[i] = -1;
+    /* Collect sub-imports from this module for bare-name resolution */
+    #define COLD_LOCAL_IMPORT_CAP 16
+    ColdImportSource local_imports[COLD_LOCAL_IMPORT_CAP];
+    int32_t local_import_count = 0;
     int32_t fn_pos = 0;
     int32_t scan_safety = 0;
     {
@@ -19831,6 +19868,16 @@ static int32_t cold_compile_one_import_direct(Symbols *symbols, const char *path
             Span line = span_trim(span_sub(source, line_start, scan_pos));
             if (scan_pos < source.len) scan_pos++;
             line_start = scan_pos;
+            if (cold_span_starts_with(line, "import ")) {
+                Span module_path = {0};
+                Span import_alias = {0};
+                if (cold_parse_import_line(line, &module_path, &import_alias) &&
+                    local_import_count < COLD_LOCAL_IMPORT_CAP) {
+                    local_imports[local_import_count].alias = import_alias;
+                    local_imports[local_import_count].path[0] = '\0';
+                    local_import_count++;
+                }
+            }
             if (cold_span_starts_with(line, "fn ")) {
                 Span fn_name = span_sub(line, 3, line.len);
                 int32_t name_end = 0;
@@ -19857,6 +19904,8 @@ static int32_t cold_compile_one_import_direct(Symbols *symbols, const char *path
     }
     ColdImportBodyCompilationActive = true;
     Parser parser = {source, 0, symbols->arena, symbols, true /* import_mode */, alias};
+    parser.import_sources = local_imports;
+    parser.import_source_count = local_import_count;
     fn_pos = 0;
     while (parser.pos < source.len) {
         parser_ws(&parser);
@@ -19935,11 +19984,6 @@ static int32_t cold_compile_one_import_direct(Symbols *symbols, const char *path
     ColdImportBodyCompilationActive = false;
     return compiled;
 }
-
-typedef struct {
-    Span alias;
-    char path[PATH_MAX];
-} ColdImportSource;
 
 static int32_t cold_collect_direct_import_sources(Span entry_source,
                                                   ColdImportSource *imports,
@@ -20279,6 +20323,8 @@ static bool cold_compile_source_path_to_macho(const char *out_path,
         function_bodies = arena_alloc(arena, (size_t)body_cap * sizeof(BodyIR *));
         memset(function_bodies, 0, (size_t)body_cap * sizeof(BodyIR *));
         Parser parser = {mapped_source, 0, arena, symbols};
+        parser.import_sources = import_sources;
+        parser.import_source_count = import_source_count;
         while (parser.pos < mapped_source.len) {
             parser_ws(&parser);
             if (parser.pos >= mapped_source.len) break;
@@ -20461,6 +20507,10 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
 
     cold_collect_imported_function_signatures(symbols, mapped_source);
     cold_collect_function_signatures(symbols, mapped_source);
+    /* Collect direct imports for bare-name resolution in entry module body */
+    ColdImportSource import_sources[64];
+    int32_t import_source_count = cold_collect_direct_import_sources(mapped_source,
+                                                                     import_sources, 64);
     { /* workspace root detection for import loading */
       char ws_root[PATH_MAX] = {0};
       const char *sm = strstr(src_path, "/src/");
@@ -20498,6 +20548,8 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
     }
 
     Parser parser = {mapped_source, 0, arena, symbols};
+    parser.import_sources = import_sources;
+    parser.import_source_count = import_source_count;
     while (parser.pos < mapped_source.len) {
         parser_ws(&parser);
         if (parser.pos >= mapped_source.len) break;
