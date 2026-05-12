@@ -38,6 +38,7 @@ static bool cold_diag_dump_per_fn = false;
 static bool cold_diag_dump_slots = false;
 
 #include "macho_direct.h"
+#include "elf64_direct.h"
 
 #ifndef MAP_ANON
 #define MAP_ANON MAP_ANONYMOUS
@@ -7797,7 +7798,7 @@ static int32_t cold_materialize_self_exec(Parser *parser, BodyIR *body);
 static int32_t parse_constructor(Parser *parser, BodyIR *body, Locals *locals,
                                  Variant *variant);
 
-static bool cold_compile_source_to_object(const char *out_path, const char *src_path);
+static bool cold_compile_source_to_object(const char *out_path, const char *src_path, const char *target);
 
 static int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *locals,
                                      Span name, int32_t *kind_out) {
@@ -10420,7 +10421,7 @@ static bool cold_try_backend_intrinsic(Parser *parser, BodyIR *body, Span name,
         const char *out_path = body_strdup_from_slot(parser->arena, body, out_slot);
         int32_t result = 1;
         if (src_path && out_path) {
-            result = cold_compile_source_to_object(out_path, src_path) ? 0 : 1;
+            result = cold_compile_source_to_object(out_path, src_path, 0) ? 0 : 1;
         }
         int32_t slot = cold_make_i32_const_slot(body, result);
         if (kind_out) *kind_out = SLOT_I32;
@@ -20993,7 +20994,13 @@ static bool cold_write_system_link_exec_report(const char *path,
 }
 
 /* Compile source to Mach-O object file (.o) with symbol table */
-static bool cold_compile_source_to_object(const char *out_path, const char *src_path) {
+static bool cold_compile_source_to_object(const char *out_path, const char *src_path, const char *target) {
+    bool is_elf = target && strstr(target, "linux") != 0;
+    uint16_t elf_machine = 0;
+    if (is_elf) {
+        if (strstr(target, "aarch64")) elf_machine = EM_AARCH64;
+        else if (strstr(target, "x86_64")) elf_machine = EM_X86_64;
+    }
     Arena *arena = mmap(0, sizeof(Arena), PROT_READ | PROT_WRITE,
                         MAP_PRIVATE | MAP_ANON, -1, 0);
     if (arena == MAP_FAILED) return false;
@@ -21087,7 +21094,7 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
 
     if (first_function < 0) {
         /* No compilable functions: write minimal valid .o */
-        bool ok = macho_write_object(out_path, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        bool ok = is_elf ? elf64_write_object(out_path, 0, 0, 0, 0, 0, 0, 0, 0, 0, elf_machine) : macho_write_object(out_path, 0, 0, 0, 0, 0, 0, 0, 0, 0);
         munmap((void *)mapped_source.ptr, (size_t)mapped_source.len);
         return ok;
     }
@@ -21213,15 +21220,11 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
         name_count++;
     }
 
-    bool ok = macho_write_object(out_path, shared->words, shared->count,
-                                 func_names, func_offsets, name_count,
-                                 local_count, reloc_offsets, reloc_symbols,
-                                 reloc_count);
-    munmap((void *)mapped_source.ptr, (size_t)mapped_source.len);
+    bool ok = is_elf ? elf64_write_object(out_path, shared->words, shared->count, func_names, func_offsets, name_count, local_count, reloc_offsets, reloc_symbols, reloc_count, elf_machine) : macho_write_object(out_path, shared->words, shared->count, func_names, func_offsets, name_count, local_count, reloc_offsets, reloc_symbols, reloc_count);
     return ok;
 }
 
-static bool cold_compile_source_to_object(const char *out_path, const char *src_path);
+static bool cold_compile_source_to_object(const char *out_path, const char *src_path, const char *target);
 
 static int cold_cmd_system_link_exec(int argc, char **argv) {
     const char *source_path = cold_flag_value(argc, argv, "--in");
@@ -21302,7 +21305,7 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
                                                target, emit, 0, "missing --in for emit:obj");
             return 2;
         }
-        if (!cold_compile_source_to_object(out_path, source_path)) {
+        if (!cold_compile_source_to_object(out_path, source_path, target)) {
             cold_write_system_link_exec_report(report_path, false, source_path, out_path, out_path,
                                                target, emit, 0, "cold object emit failed");
             return 2;
@@ -21353,7 +21356,7 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
         snprintf(host_stubs_o, sizeof(host_stubs_o), "%s.host_stubs.o", out_path);
 
         setenv("CHENG_NO_IMPORT_BODIES", "1", 1);
-        if (!cold_compile_source_to_object(primary_o, source_path)) {
+        if (!cold_compile_source_to_object(primary_o, source_path, target)) {
             fprintf(stderr, "[cheng_cold] --link-providers: primary compile failed\n");
             return 2;
         }
@@ -21400,7 +21403,7 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
         for (int i = 0; i < import_count; i++) {
             snprintf(provider_o[provider_count], PATH_MAX,
               "%s.provider.%d.o", out_path, i);
-            if (!cold_compile_source_to_object(provider_o[provider_count], import_paths[i])) {
+            if (!cold_compile_source_to_object(provider_o[provider_count], import_paths[i], target)) {
                 fprintf(stderr, "[cheng_cold] --link-providers: import compile failed: %s\n",
                   import_paths[i]);
                 cold_write_system_link_exec_report(report_path, false, source_path, 0, out_path,
