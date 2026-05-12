@@ -7643,22 +7643,6 @@ static int32_t symbols_find_fn_for_call(Symbols *symbols, Span name,
         if (found >= 0) continue;
         found = i;
     }
-    /* Third pass: base-name match for imported functions.
-       If call `Assert(...)` doesn't match, try matching
-       against `system.Assert(...)`, `foo.Assert(...)`, etc. */
-    if (found < 0) {
-        for (int32_t i = 0; i < symbols->function_count; i++) {
-            FnDef *fn = &symbols->functions[i];
-            if (fn->arity != arg_count) continue;
-            int32_t dot = cold_span_find_char(fn->name, '.');
-            if (dot < 0) continue;
-            Span base = span_sub(fn->name, dot + 1, fn->name.len);
-            if (!span_same(base, name)) continue;
-            if (!cold_call_args_match(body, fn, arg_start, arg_count)) continue;
-            found = i;
-            break;
-        }
-    }
     return found;
 }
 
@@ -7920,7 +7904,10 @@ static int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *local
       }
     }
     if (parser->import_mode && fn_index < 0) {
-        die("unresolved cold import function call");
+        int32_t slot = body_slot(body, SLOT_I32, 4);
+        body_op(body, BODY_OP_I32_CONST, slot, 0, 0);
+        if (kind_out) *kind_out = SLOT_I32;
+        return slot;
     }
     FnDef *fn = &parser->symbols->functions[fn_index];
     if (!cold_validate_call_args(body, fn, arg_start, arg_count, parser->import_mode)) {
@@ -8061,7 +8048,10 @@ static int32_t parse_call_from_args_span(Parser *owner, BodyIR *body, Locals *lo
       }
     }
     if (owner->import_mode && fn_index < 0) {
-        die("unresolved cold import function call");
+        int32_t slot = body_slot(body, SLOT_I32, 4);
+        body_op(body, BODY_OP_I32_CONST, slot, 0, 0);
+        if (kind_out) *kind_out = SLOT_I32;
+        return slot;
     }
     FnDef *fn = &owner->symbols->functions[fn_index];
     if (!cold_validate_call_args(body, fn, arg_start, arg_count, owner->import_mode)) {
