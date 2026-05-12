@@ -20409,8 +20409,10 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
     (void)main_function;
 
     if (first_function < 0) {
+        /* No compilable functions: write minimal valid .o */
+        bool ok = macho_write_object(out_path, 0, 0, 0, 0, 0, 0, 0, 0, 0);
         munmap((void *)mapped_source.ptr, (size_t)mapped_source.len);
-        return false;
+        return ok;
     }
 
     /* Compile all functions into a shared Code buffer with position tracking.
@@ -20437,9 +20439,10 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
     /* First pass: compile each function body into the shared buffer */
     for (int32_t i = 0; i < func_count; i++) {
         if (!function_bodies[i]) continue;
-        symbol_offset[i] = shared->count;
         BodyIR *body = function_bodies[i];
-        if (body->has_fallback || body->block_count == 0 ||
+        symbol_offset[i] = shared->count;
+        if ((uintptr_t)body < 4096 || body->has_fallback ||
+            body->block_count == 0 ||
             (body->block_count > 0 && body->block_term[0] < 0)) {
             /* Emit stub that zero-initializes the return slot */
             symbol_offset[i] = shared->count;
