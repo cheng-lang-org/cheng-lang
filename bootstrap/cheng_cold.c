@@ -20996,11 +20996,18 @@ static bool cold_write_system_link_exec_report(const char *path,
 
 /* Compile source to Mach-O object file (.o) with symbol table */
 static bool cold_compile_source_to_object(const char *out_path, const char *src_path, const char *target) {
-    bool is_elf = target && strstr(target, "linux") != 0;
-    uint16_t elf_machine = 0;
+    bool is_elf  = target && strstr(target, "linux") != 0;
+    bool is_coff = target && strstr(target, "windows") != 0;
+    uint16_t elf_machine  = 0;
+    uint16_t coff_machine = 0;
     if (is_elf) {
         if (strstr(target, "aarch64")) elf_machine = EM_AARCH64;
-        else if (strstr(target, "x86_64")) elf_machine = EM_X86_64;
+        else if (strstr(target, "riscv64")) elf_machine = EM_RISCV;
+        else if (strstr(target, "x86_64"))  elf_machine = EM_X86_64;
+    }
+    if (is_coff) {
+        if (strstr(target, "aarch64")) coff_machine = IMAGE_FILE_MACHINE_ARM64;
+        else if (strstr(target, "x86_64"))  coff_machine = IMAGE_FILE_MACHINE_AMD64;
     }
     Arena *arena = mmap(0, sizeof(Arena), PROT_READ | PROT_WRITE,
                         MAP_PRIVATE | MAP_ANON, -1, 0);
@@ -21095,7 +21102,7 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
 
     if (first_function < 0) {
         /* No compilable functions: write minimal valid .o */
-        bool ok = is_elf ? elf64_write_object(out_path, 0, 0, 0, 0, 0, 0, 0, 0, 0, elf_machine) : macho_write_object(out_path, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        bool ok = is_elf ? elf64_write_object(out_path, 0, 0, 0, 0, 0, 0, 0, 0, 0, elf_machine) : is_coff ? coff_write_object(out_path, 0, 0, 0, 0, 0, 0, 0, 0, 0, coff_machine) : macho_write_object(out_path, 0, 0, 0, 0, 0, 0, 0, 0, 0);
         munmap((void *)mapped_source.ptr, (size_t)mapped_source.len);
         return ok;
     }
@@ -21221,7 +21228,7 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
         name_count++;
     }
 
-    bool ok = is_elf ? elf64_write_object(out_path, shared->words, shared->count, func_names, func_offsets, name_count, local_count, reloc_offsets, reloc_symbols, reloc_count, elf_machine) : macho_write_object(out_path, shared->words, shared->count, func_names, func_offsets, name_count, local_count, reloc_offsets, reloc_symbols, reloc_count);
+    bool ok = is_elf ? elf64_write_object(out_path, shared->words, shared->count, func_names, func_offsets, name_count, local_count, reloc_offsets, reloc_symbols, reloc_count, elf_machine) : is_coff ? coff_write_object(out_path, shared->words, shared->count, func_names, func_offsets, name_count, local_count, reloc_offsets, reloc_symbols, reloc_count, coff_machine) : macho_write_object(out_path, shared->words, shared->count, func_names, func_offsets, name_count, local_count, reloc_offsets, reloc_symbols, reloc_count);
     return ok;
 }
 
@@ -21285,9 +21292,12 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
         return 2;
     }
     bool is_elf = (strcmp(target, "aarch64-unknown-linux-gnu") == 0 ||
-                    strcmp(target, "x86_64-unknown-linux-gnu") == 0);
+                    strcmp(target, "x86_64-unknown-linux-gnu") == 0 ||
+                    strcmp(target, "riscv64-unknown-linux-gnu") == 0);
+    bool is_coff = (strcmp(target, "x86_64-pc-windows-msvc") == 0 ||
+                     strcmp(target, "aarch64-pc-windows-msvc") == 0);
     bool is_macho = (strcmp(target, "arm64-apple-darwin") == 0);
-    if (!is_macho && !is_elf) {
+    if (!is_macho && !is_elf && !is_coff) {
         cold_write_system_link_exec_report(report_path, false, source_path, effective_csg_path, out_path,
                                            target, emit, 0, "unsupported target");
         fprintf(stderr, "[cheng_cold] unsupported target: %s\n", target);
