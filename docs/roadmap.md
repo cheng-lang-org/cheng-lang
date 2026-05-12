@@ -77,7 +77,7 @@
 ### 当前阻断（更新于 2026-05-11）
 
 - **`build-backend-driver` 自检**：已通过——`artifacts/backend_driver/cheng` 从最新 `bootstrap/cheng_cold.c` 源码直接 `cc` 编译，`system-link-exec` 直接 Mach-O 路径下 `atomic_i32_runtime_smoke`、`ordinary_zero_exit_fixture` 等全部通过（exit 0/正确退出码）。
-- **`compiler_runtime_smoke`**：`contracts.BootstrapDefaultTarget` 使用 `add()` 序列追加（target 为函数参数/字段，非局部变量），冷编译器不支持。需完整 `cheng/core/` 编译器模块树导入支持。
+- **`compiler_runtime_smoke`**：`add()` target 解析已修复（可变形参/借用槽支持 ✅）。下一卡点：`BackendBuildPlanSharedCompilerSourceUnits` 中 opaque sequence add 元素大小不匹配（88 > 32），需完整 struct 布局计算或变长序列存储。需完整 `cheng/core/` 编译器模块树导入支持。
 - **`thread_atomic_orc_runtime_smoke`**：✅ **已通过**（exit 11 = 单线程跳过，`Thread.Parallelism()` stub 返回 0）。
 - **`add()` 序列追加限制**：冷编译器 `add()` 内置函数要求 target 为局部变量，不支持参数/字段 target。影响 `std/os.cheng`、`seed_r2c_gate.cheng` 等模块的导入编译。
 - **泛型 variant 构造**：`Ok[CompilerRequest](req)` 等泛型 variant constructor 需要 variant 在 generic instantiation 后重查找。
