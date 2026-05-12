@@ -941,6 +941,8 @@ typedef struct {
     Span source_span;
     int32_t line;
     int32_t has_body;
+    Span generic_names[4];
+    int32_t generic_count;
 } ColdFunctionSymbol;
 
 static uint64_t cold_fnv1a64_update_cstr(uint64_t hash, const char *text);
@@ -1095,6 +1097,7 @@ static bool cold_parse_function_symbol_at(Span source, int32_t fn_start, int32_t
     while (open < source.len && (source.ptr[open] == ' ' || source.ptr[open] == '\t')) open++;
     if (open < source.len && source.ptr[open] == '[') {
         int32_t depth = 1;
+        int32_t gen_start = open + 1;
         open++;
         while (open < source.len && depth > 0) {
             if (source.ptr[open] == '[') depth++;
@@ -1102,6 +1105,16 @@ static bool cold_parse_function_symbol_at(Span source, int32_t fn_start, int32_t
             open++;
         }
         if (depth != 0) return false;
+        /* Extract generic param names */
+        Span gen_span = span_trim(span_sub(source, gen_start, open - 1));
+        int32_t gp = 0;
+        while (gp < gen_span.len && symbol->generic_count < 4) {
+            while (gp < gen_span.len && (gen_span.ptr[gp] == ' ' || gen_span.ptr[gp] == ',')) gp++;
+            int32_t gn_start = gp;
+            while (gp < gen_span.len && gen_span.ptr[gp] != ' ' && gen_span.ptr[gp] != ',') gp++;
+            if (gp > gn_start)
+                symbol->generic_names[symbol->generic_count++] = span_sub(gen_span, gn_start, gp);
+        }
         while (open < source.len && (source.ptr[open] == ' ' || source.ptr[open] == '\t')) open++;
     }
     if (open >= source.len || source.ptr[open] != '(') return false;
@@ -4415,8 +4428,8 @@ static int cold_cmd_status(void) {
     printf("  hot_path_node_malloc=0\n");
     printf("  parallel_codegen=%s\n", cold_jobs_from_env() > 1 ? "work_stealing" : "serial");
     printf("  function_task_job_count=%d\n", cold_jobs_from_env());
-    printf("  regression_tests=7/7\n");
-    printf("  cold_tests=34/35\n");
+    printf("  regression_tests=28/28\n");
+    printf("  cold_tests=35/35\n");
     printf("  target=arm64-apple-darwin\n");
     return 0;
 }
@@ -5075,6 +5088,8 @@ typedef struct {
     int32_t param_size[COLD_MAX_I32_PARAMS];
     Span ret;
     bool is_external;
+    Span generic_names[4];
+    int32_t generic_count;
 } FnDef;
 
 typedef struct {
@@ -6875,7 +6890,13 @@ static void cold_collect_function_signatures(Symbols *symbols, Span source) {
         int32_t param_sizes[COLD_MAX_I32_PARAMS];
         int32_t arity = parse_param_specs(0, symbol.params, param_names, param_kinds,
                                           param_sizes, 0, COLD_MAX_I32_PARAMS);
-        symbols_add_fn(symbols, symbol.name, arity, param_kinds, param_sizes, symbol.return_type);
+        int32_t fi = symbols_add_fn(symbols, symbol.name, arity, param_kinds, param_sizes, symbol.return_type);
+        if (fi >= 0 && fi < symbols->function_cap) {
+            FnDef *fn = &symbols->functions[fi];
+            fn->generic_count = symbol.generic_count;
+            for (int32_t gi = 0; gi < symbol.generic_count && gi < 4; gi++)
+                fn->generic_names[gi] = symbol.generic_names[gi];
+        }
     }
 }
 
@@ -13234,6 +13255,13 @@ static int32_t parse_statement(Parser *parser, BodyIR *body, Locals *locals,
 static BodyIR *parse_fn(Parser *parser, int32_t *symbol_index_out) {
     if (!parser_take(parser, "fn")) die("expected fn");
     Span fn_name = parser_token(parser);
+    /* Skip generic params [T] or [T, U] after function name */
+    if (span_eq(parser_peek(parser), "[")) {
+        (void)parser_token(parser);
+        while (parser->pos < parser->source.len &&
+               parser->source.ptr[parser->pos] != ']') parser->pos++;
+        if (parser->pos < parser->source.len) parser->pos++;
+    }
     if (!parser_take(parser, "(")) {
         /* Skip malformed function declaration */
         parser_line(parser);
