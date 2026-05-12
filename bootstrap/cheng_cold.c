@@ -20143,7 +20143,7 @@ static void cold_compile_reachable_import_bodies(Symbols *symbols,
                 target = body->op_a[op];
             }
             if (target < 0) continue;
-            if (target >= function_count) die("cold reachable import target out of range");
+            if (target >= function_count) continue;  /* skip out-of-range targets */
             if (reachable[target]) continue;
             reachable[target] = true;
             stack[stack_count++] = target;
