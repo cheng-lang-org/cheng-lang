@@ -4707,6 +4707,7 @@ typedef struct {
 
     int32_t param_count;
     int32_t param_slot[COLD_MAX_I32_PARAMS];
+    Span param_name[COLD_MAX_I32_PARAMS];
     int32_t return_kind;
     int32_t return_size;
     Span return_type;
@@ -5400,36 +5401,6 @@ static ObjectDef *symbols_find_object(Symbols *symbols, Span name) {
     for (int32_t i = 0; i < symbols->object_count; i++) {
         if (span_same(symbols->objects[i].name, name)) return &symbols->objects[i];
     }
-    /* if qualified name not found, try stripping module prefix (skip generic types) TEST */
-    bool has_bracket = false;
-    for (int32_t i = 0; i < name.len; i++) {
-        if (name.ptr[i] == '[') { has_bracket = true; break; }
-    }
-    if (!has_bracket) {
-        int32_t dot = -1;
-        for (int32_t i = name.len - 1; i >= 0; i--) {
-            if (name.ptr[i] == '.') { dot = i; break; }
-        }
-        if (dot > 0) {
-        Span short_name = span_sub(name, dot + 1, name.len);
-        for (int32_t i = 0; i < symbols->object_count; i++) {
-            if (span_same(symbols->objects[i].name, short_name)) return &symbols->objects[i];
-        }
-    }
-    } /* close has_bracket check */
-    /* Fallback for unqualified names: search for *.name suffix (imported objects).
-       Only match names starting with uppercase (type names), to avoid false
-       positives on local variables / field names. */
-    if (name.len > 0 && name.ptr[0] >= 'A' && name.ptr[0] <= 'Z') {
-        for (int32_t i = 0; i < symbols->object_count; i++) {
-            ObjectDef *co = &symbols->objects[i];
-            if (co->name.len > name.len + 1 &&
-                co->name.ptr[co->name.len - name.len - 1] == '.' &&
-                memcmp(co->name.ptr + co->name.len - name.len, name.ptr, (size_t)name.len) == 0) {
-                return co;
-            }
-        }
-    }
     return 0;
 }
 
@@ -5562,18 +5533,6 @@ static ObjectDef *symbols_resolve_object(Symbols *symbols, Span type_name) {
     type_name = span_trim(type_name);
     ObjectDef *existing = symbols_find_object(symbols, type_name);
     if (existing) return existing;
-    /* Fallback: search for qualified name *.type_name (imported objects).
-       Only for names starting with uppercase (type names). */
-    if (type_name.len > 0 && type_name.ptr[0] >= 'A' && type_name.ptr[0] <= 'Z') {
-        for (int32_t qi = 0; qi < symbols->object_count; qi++) {
-            ObjectDef *co = &symbols->objects[qi];
-            if (co->name.len > type_name.len + 1 &&
-                co->name.ptr[co->name.len - type_name.len - 1] == '.' &&
-                memcmp(co->name.ptr + co->name.len - type_name.len, type_name.ptr, (size_t)type_name.len) == 0) {
-                return co;
-            }
-        }
-    }
     if (span_eq(type_name, "ErrorInfo")) return symbols_ensure_std_error_info(symbols);
     if (span_eq(type_name, "Result")) return symbols_ensure_std_result_base(symbols);
     Span base_name = {0};
@@ -6418,6 +6377,59 @@ static Span cold_qualify_import_type(Arena *arena, Span alias, Span type) {
     return cold_arena_join3(arena, cold_cstr_span("var "), "", qualified);
 }
 
+static Span parser_scope_type(Parser *parser, Span type) {
+    type = span_trim(type);
+    if (parser && parser->import_mode && parser->import_alias.len > 0) {
+        return cold_qualify_import_type(parser->arena, parser->import_alias, type);
+    }
+    return type;
+}
+
+static bool parser_can_scope_bare_name(Parser *parser, Span name) {
+    return parser && parser->import_mode && parser->import_alias.len > 0 &&
+           name.len > 0 && cold_span_find_char(name, '.') < 0;
+}
+
+static Span parser_scoped_bare_name(Parser *parser, Span name) {
+    return cold_arena_join3(parser->arena, parser->import_alias, ".", name);
+}
+
+static ObjectDef *parser_find_object(Parser *parser, Span name) {
+    if (parser_can_scope_bare_name(parser, name)) {
+        Span scoped = parser_scoped_bare_name(parser, name);
+        ObjectDef *object = symbols_find_object(parser->symbols, scoped);
+        if (object) return object;
+    }
+    return symbols_find_object(parser->symbols, name);
+}
+
+static ObjectDef *parser_resolve_object(Parser *parser, Span name) {
+    if (parser_can_scope_bare_name(parser, name)) {
+        Span scoped = parser_scoped_bare_name(parser, name);
+        ObjectDef *object = symbols_resolve_object(parser->symbols, scoped);
+        if (object) return object;
+    }
+    return symbols_resolve_object(parser->symbols, name);
+}
+
+static Variant *parser_find_variant(Parser *parser, Span name) {
+    if (parser_can_scope_bare_name(parser, name)) {
+        Span scoped = parser_scoped_bare_name(parser, name);
+        Variant *variant = symbols_find_variant(parser->symbols, scoped);
+        if (variant) return variant;
+    }
+    return symbols_find_variant(parser->symbols, name);
+}
+
+static ConstDef *parser_find_const(Parser *parser, Span name) {
+    if (parser_can_scope_bare_name(parser, name)) {
+        Span scoped = parser_scoped_bare_name(parser, name);
+        ConstDef *constant = symbols_find_const(parser->symbols, scoped);
+        if (constant) return constant;
+    }
+    return symbols_find_const(parser->symbols, name);
+}
+
 static Span cold_import_default_alias(Span module_path) {
     int32_t start = 0;
     for (int32_t i = 0; i < module_path.len; i++) {
@@ -6755,7 +6767,10 @@ static void cold_collect_import_module_signatures(Symbols *symbols, Span alias,
         Span qualified_name = cold_arena_join3(symbols->arena, alias, ".", symbol.name);
         Span qualified_ret = cold_qualify_import_type(symbols->arena, alias,
                                                       symbol.return_type);
-        symbols_add_fn(symbols, qualified_name, arity, kinds, sizes, qualified_ret);
+        int32_t fi = symbols_add_fn(symbols, qualified_name, arity, kinds, sizes, qualified_ret);
+        if (fi >= 0 && fi < symbols->function_cap && !symbol.has_body) {
+            symbols->functions[fi].is_external = true;
+        }
     }
     munmap((void *)source.ptr, (size_t)source.len);
 }
@@ -7806,6 +7821,16 @@ static int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *local
             if (kind_out) *kind_out = SLOT_I32;
             return slot;
         }
+        if (parser->import_mode && parser->import_alias.len > 0 &&
+            cold_span_find_char(stripped_name, '.') < 0) {
+            Span qualified = cold_arena_join3(parser->arena, parser->import_alias,
+                                              ".", stripped_name);
+            fn_index = symbols_find_fn_for_call(parser->symbols, qualified,
+                                                body, arg_start, arg_count);
+            if (fn_index >= 0) lookup_name = qualified;
+        }
+    }
+    if (fn_index < 0) {
         /* External function, will be registered below */
         /* try variant constructor: Err[int32] -> Err, or bare Err */
         { Span base_name = name;
@@ -7913,8 +7938,8 @@ static int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *local
                       span_same(parser->symbols->functions[si].name, stripped_name)) {
                       fn_index = si;
                       break;
-                  }
-              }
+	      }
+    }
               if (fn_index < 0) {
                   fn_index = symbols_add_fn(parser->symbols, stripped_name, arg_count, param_kinds, param_sizes, cold_cstr_span("i"));
                   parser->symbols->functions[fn_index].is_external = true;
@@ -8057,6 +8082,16 @@ static int32_t parse_call_from_args_span(Parser *owner, BodyIR *body, Locals *lo
             if (kind_out) *kind_out = SLOT_I32;
             return slot;
         }
+        if (owner->import_mode && owner->import_alias.len > 0 &&
+            cold_span_find_char(stripped_name, '.') < 0) {
+            Span qualified = cold_arena_join3(owner->arena, owner->import_alias,
+                                              ".", stripped_name);
+            fn_index = symbols_find_fn_for_call(owner->symbols, qualified,
+                                                body, arg_start, arg_count);
+            if (fn_index >= 0) lookup_name = qualified;
+        }
+    }
+    if (fn_index < 0) {
         /* Try bare-name resolution via import aliases */
         if (owner->import_source_count > 0 && owner->import_sources) {
             for (int32_t isi = 0; isi < owner->import_source_count; isi++) {
@@ -8182,6 +8217,20 @@ static int32_t body_slot_for_object_field(BodyIR *body, ObjectField *field) {
     body_slot_set_type(body, slot, field->type_name);
     if (field->kind == SLOT_ARRAY_I32) body_slot_set_array_len(body, slot, field->array_len);
     return slot;
+}
+
+static bool parser_next_is_object_constructor(Parser *parser) {
+    Span open_tok = parser_peek(parser);
+    if (span_eq(open_tok, "{")) return true;
+    if (!span_eq(open_tok, "(")) return false;
+
+    Parser probe = *parser;
+    (void)parser_token(&probe);
+    Span first = parser_peek(&probe);
+    if (span_eq(first, ")")) return true;
+    if (first.len <= 0) return false;
+    (void)parser_token(&probe);
+    return span_eq(parser_peek(&probe), ":");
 }
 
 static int32_t parse_object_constructor(Parser *parser, BodyIR *body, Locals *locals,
@@ -9063,6 +9112,7 @@ static bool cold_try_os_intrinsic(Parser *parser, BodyIR *body, Span name,
         return true;
     }
     if (span_eq(name, "os.GetEnv") || span_eq(name, "GetEnv") ||
+        span_eq(name, "os.getEnv") || span_eq(name, "getEnv") ||
         span_eq(name, "os.getenv")) {
         if (arg_count != 1) die("GetEnv intrinsic arity mismatch");
         int32_t key = body->call_arg_slot[arg_start];
@@ -10722,20 +10772,7 @@ static int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32
         (void)parser_token(parser);
         Span tn = parser_token(parser);
         if (span_eq(parser_peek(parser), "[")) { (void)parser_token(parser); while (parser->pos < parser->source.len && parser->source.ptr[parser->pos] != ']') parser->pos++; if (parser->pos < parser->source.len) parser->pos++; } if (span_eq(parser_peek(parser), "[")) { (void)parser_token(parser); while (parser->pos < parser->source.len && parser->source.ptr[parser->pos] != ']') parser->pos++; if (parser->pos < parser->source.len) parser->pos++; } if (!parser_take(parser, ")")) die("new(Type): missing )");
-        ObjectDef *nobj = symbols_find_object(parser->symbols, tn);
-        /* Try qualified name lookup if unqualified fails */
-        if (!nobj) {
-            int32_t qlen = 0;
-            for (int32_t qi = 0; qi < parser->symbols->object_count && qlen < 64; qi++) {
-                ObjectDef *co = &parser->symbols->objects[qi];
-                /* Check if name ends with ".tn" */
-                if (co->name.len > tn.len + 1 && co->name.ptr[co->name.len - tn.len - 1] == '.' &&
-                    memcmp(co->name.ptr + co->name.len - tn.len, tn.ptr, (size_t)tn.len) == 0) {
-                    nobj = co;
-                    break;
-                }
-            }
-        }
+        ObjectDef *nobj = parser_find_object(parser, tn);
         if (nobj && nobj->slot_size > 0) {
             int32_t len = body_slot(body, SLOT_I32, 4);
             body_op(body, BODY_OP_I32_CONST, len, nobj->slot_size, 0);
@@ -10746,14 +10783,14 @@ static int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32
         }
         die("new(Type): type missing or invalid");
     }
-    Variant *variant = symbols_find_variant(parser->symbols, token);
+    Variant *variant = parser_find_variant(parser, token);
     if (variant) {
         *kind = SLOT_VARIANT;
         return parse_constructor(parser, body, locals, variant);
     }
-    ObjectDef *object = symbols_find_object(parser->symbols, token);
+    ObjectDef *object = parser_find_object(parser, token);
     if (object && !object->is_ref && (token.ptr[0] >= 'A' && token.ptr[0] <= 'Z') &&
-        span_eq(parser_peek(parser), "(")) {
+        parser_next_is_object_constructor(parser)) {
         *kind = SLOT_OBJECT;
         return parse_object_constructor(parser, body, locals, object);
     }
@@ -10796,7 +10833,7 @@ static int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32
     if (span_eq(parser_peek(parser), "{") &&
         token.len > 0 && token.ptr[0] >= 'A' && token.ptr[0] <= 'Z') {
         /* object constructor with curly braces */
-        ObjectDef *obj = symbols_resolve_object(parser->symbols, token);
+        ObjectDef *obj = parser_resolve_object(parser, token);
         if (!obj || obj->is_ref) die("object type missing for constructor");
         *kind = SLOT_OBJECT;
         return parse_object_constructor(parser, body, locals, obj);
@@ -10927,7 +10964,7 @@ static int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32
         *kind = SLOT_I32;
         return slot;
     }
-    ConstDef *constant = symbols_find_const(parser->symbols, token);
+    ConstDef *constant = parser_find_const(parser, token);
     if (constant) {
         if (constant->is_str) {
             int32_t literal_index = body_string_literal(body, constant->str_val);
@@ -11597,7 +11634,7 @@ static int32_t parse_let_binding(Parser *parser, BodyIR *body, Locals *locals,
     Span type = {0};
     if (span_eq(parser_peek(parser), ":")) {
         (void)parser_token(parser);
-        type = parser_take_type_span(parser);
+        type = parser_scope_type(parser, parser_take_type_span(parser));
     }
     if (!span_eq(parser_peek(parser), "=")) {
         if (type.len <= 0) die("expected = after let binding");
@@ -11881,18 +11918,7 @@ static int32_t parse_seq_lvalue_from_span(Parser *owner, BodyIR *body, Locals *l
     Span name = parser_token(&parser);
     if (name.len <= 0) die("add target must name an int32[]");
     Local *local = locals_find(locals, name);
-    if (!local) {
-        fprintf(stderr, "[add_debug] target=%.*s locals_count=%d\n",
-                (int)name.len, name.ptr, locals->count);
-        fprintf(stderr, "[add_debug] body->debug_name=%.*s param_count=%d\n",
-                (int)body->debug_name.len, body->debug_name.ptr, body->param_count);
-        for (int32_t li = 0; li < locals->count && li < 20; li++) {
-            fprintf(stderr, "  local[%d]=%.*s kind=%d slot=%d\n",
-                    li, (int)locals->items[li].name.len, locals->items[li].name.ptr,
-                    locals->items[li].kind, locals->items[li].slot);
-        }
-        die("add target must be a local sequence");
-    }
+    if (!local) die("add target must be a local sequence");
     int32_t slot = local->slot;
     int32_t kind = local->kind;
     if (span_eq(parser_peek(&parser), ".")) {
@@ -13283,7 +13309,7 @@ static BodyIR *parse_fn(Parser *parser, int32_t *symbol_index_out) {
         param_sizes[arity] = 4;
         if (span_eq(parser_peek(parser), ":")) {
             (void)parser_token(parser);
-            Span param_type = parser_take_type_span(parser);
+            Span param_type = parser_scope_type(parser, parser_take_type_span(parser));
             param_types[arity] = param_type;
             param_kinds[arity] = cold_slot_kind_from_type_with_symbols(parser->symbols, param_type);
             param_sizes[arity] = cold_param_size_from_type(parser->symbols, param_type, param_kinds[arity]);
@@ -13297,7 +13323,7 @@ static BodyIR *parse_fn(Parser *parser, int32_t *symbol_index_out) {
     Span ret = {0};
     if (span_eq(parser_peek(parser), ":")) {
         (void)parser_token(parser);
-        ret = parser_take_type_span(parser);
+        ret = parser_scope_type(parser, parser_take_type_span(parser));
     }
     if (!span_eq(parser_peek(parser), "=")) {
         int32_t symbol_index;
@@ -13352,6 +13378,15 @@ static BodyIR *parse_fn(Parser *parser, int32_t *symbol_index_out) {
         }
         body_slot_set_type(body, slot, st);
         body->param_slot[i] = slot;
+        /* arena-copy parameter name for later lookup */
+        if (param_names[i].len > 0) {
+            uint8_t *cn = arena_alloc(parser->arena, (size_t)(param_names[i].len + 1));
+            memcpy(cn, param_names[i].ptr, (size_t)param_names[i].len);
+            cn[param_names[i].len] = 0;
+            body->param_name[i] = (Span){cn, param_names[i].len};
+        } else {
+            body->param_name[i] = (Span){0};
+        }
         locals_add(&locals, param_names[i], slot, param_kinds[i]);
     }
     int32_t block = body_block(body);
@@ -20091,7 +20126,12 @@ static void cold_compile_import_function_direct(Symbols *symbols,
                                                 target_fn)) {
             continue;
         }
-        if (!symbol.has_body) die("reachable cold import function has no body");
+        if (!symbol.has_body) {
+            fprintf(stderr, "cheng_cold: function %.*s has no body (path=%s line=%d)\n",
+                    (int)symbol.name.len, symbol.name.ptr,
+                    import_source->path, symbol.line);
+            die("reachable cold import function has no body");
+        }
         Parser parser = {symbol.source_span, 0, symbols->arena, symbols,
                          true /* import_mode */, import_source->alias};
         int32_t parsed_index = -1;
