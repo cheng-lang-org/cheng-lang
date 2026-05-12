@@ -316,7 +316,7 @@ Cheng 的工业路线不是和 LLVM/mold 在传统资源赛道硬拼，而是用
 5. ✅ **函数级并行 + lock-free work-stealing**：pthread + `__atomic_fetch_add` + 确定性 merge。`COLD_NO_SIGN=1` 下任意 `BACKEND_JOBS` 值产物 SHA 一致。
 6. ✅ **30-80ms 架构合规**：6 个 report 字段全部输出，冷进程内微秒级计时。实测 135 函数/5293 ops 编译 total=22.5ms。
 7. ✅ **回归测试**：34/35 cold_* 测试通过（仅 cold_csg_facts_exporter_smoke SIGSEGV，os.GetEnvDefault 不在冷子集），5/5 roadmap 验证 fixture 通过。
-8. ✅ **`thread_atomic_orc_runtime_smoke` 编译运行通过**（exit 11 = 单线程跳过，测试逻辑正确。`@importc` stub 返回 0 导致 `Parallelism()<=1` 触发 skip 分支）。剩余：`compiler_runtime_smoke` — 需要完整 `cheng/core/` 编译器模块树导入。
+8. ✅ **`thread_atomic_orc_runtime_smoke` 编译运行通过**（exit 11 = 单线程跳过）。`compiler_runtime_smoke` 仍阻塞——`contracts.BootstrapDefaultTarget` 使用 `add()` 序列追加、字符串比较等，冷编译器语言覆盖不足。需完整的 `cheng/core/` 编译器模块树导入支持。
 9. 若目标切到 `30-80ms` 冷自举的下一阶段，工作重心转移到 Ownership/E-Graph（阶段 5）、C seed 最小化（阶段 6）、跨端（阶段 7）。
 
 ## 诊断命令
