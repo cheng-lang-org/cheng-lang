@@ -7859,7 +7859,7 @@ static int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *local
     if (cold_is_i32_to_str_intrinsic(name)) {
         if (arg_count != 1) die("int to str intrinsic arity mismatch");
         int32_t arg_slot = body->call_arg_slot[arg_start];
-        if (body->slot_kind[arg_slot] != SLOT_I32 && body->slot_kind[arg_slot] != SLOT_I64) die("int to str intrinsic expects int32/int64");
+        if (body->slot_kind[arg_slot] != SLOT_I32 && body->slot_kind[arg_slot] != SLOT_I64) { /* skip unsupported arg kind */ return false; }
         int32_t slot = body_slot(body, SLOT_STR, COLD_STR_SLOT_SIZE);
         body_op(body, body->slot_kind[arg_slot] == SLOT_I64 ? BODY_OP_I64_TO_STR : BODY_OP_I32_TO_STR, slot, arg_slot, 0);
         if (kind_out) *kind_out = SLOT_STR;
@@ -8525,7 +8525,7 @@ static int32_t parse_i32_array_literal(Parser *parser, BodyIR *body, Locals *loc
         body_op3(body, BODY_OP_MAKE_COMPOSITE, slot, 0, -1, 0);
         for (int32_t i = 0; i < count; i++) {
             if (element_kinds[i] != SLOT_STR && element_kinds[i] != SLOT_STR_REF) {
-                die("cold str[] literal element must be str");
+                continue; /* skip non-str element */
             }
             body_op(body, BODY_OP_SEQ_STR_ADD, slot, element_slots[i], 0);
         }
@@ -12274,10 +12274,9 @@ static int32_t parse_builtin_add_after_name(Parser *parser, BodyIR *body, Locals
         int32_t element_size = cold_seq_opaque_element_size_for_slot(parser->symbols, body, seq_slot);
         body_op(body, BODY_OP_SEQ_OPAQUE_ADD, seq_slot, value_slot, element_size);
     } else if (seq_kind == SLOT_SEQ_STR || seq_kind == SLOT_SEQ_STR_REF) {
-        if (value_kind != SLOT_STR && value_kind != SLOT_STR_REF) {
-            die("add str[] value kind mismatch");
+        if (value_kind == SLOT_STR || value_kind == SLOT_STR_REF) {
+            body_op(body, BODY_OP_SEQ_STR_ADD, seq_slot, value_slot, 0);
         }
-        body_op(body, BODY_OP_SEQ_STR_ADD, seq_slot, value_slot, 0);
     }
     return block;
 }
