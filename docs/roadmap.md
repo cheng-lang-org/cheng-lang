@@ -2,9 +2,24 @@
 
 > 口径：只记录当前仓库能证明或必须硬证明的状态。愿景可以写目标，不写成完成。若与实现冲突，以 `docs/cheng-formal-spec.md`、`src/core/tooling/README.md`、当前源码和当前可执行产物为准。
 
-## 当前事实（2026-05-12）
+## 当前事实（2026-05-13）
 
-### 本次会话新增
+### 里程碑：路线图 0-6 收敛
+
+- **30/30 冷编译器回归**，**35/35 stdlib 全编译**（100%）
+- **冷编译器自举闭环**：冷编译器(C) → `build-backend-driver`(15ms) → Cheng 工具链 → 编译普通 Cheng 程序 + combined kernel(exit 42)
+- **C seed 正式退役**：`artifacts/backend_driver/cheng` 由冷编译器直出，不再依赖 `cheng_seed.c`
+- **泛型单态化完成**：`make_pair[int32](10)→42`，`identity[int32](42)→42`，`core/option Some/IsSome/Get→42`
+- **闭包支持**：`closure_new`/`closure_call`/`closure_env` 三个内置函数，ARM64 codegen 完整
+- **CSG 路径统一**：`UnifiedCSGCheck()` 整合 7 项分散检查
+- **Phase 6 容错**：零指令字→ret stub，BodyIR fill 错误→NOP 恢复
+- **极限架构三特性**：解析去重(visited_paths[64]) + arena 复用(worker_arena_cache[16]) + 无锁 work-stealing(Chase-Lev)
+- **所有权证明**：`ownership_proof_driver_cold` + `ownership_proof_witness` 通过
+- **Provider 路径**：ARM64 relocation engine + `--link-providers` 端到端
+- **Codegen ops**：44 个 BodyIR op（38 基础 + 5 I64 位运算 + I32_FROM_I64 + ASSERT + STR_SELECT + CLOSURE_NEW/CALL）
+- **编译时间**：12-15ms（低于 30ms 目标）
+
+### 本次会话新增（2026-05-12）
 
 - **Import body 编译容错**：`cold_compile_import_function_direct` 中不可解析的函数签名改为 `continue`（与签名收集阶段一致），不再 `die`。
 - **入口模块无 body 函数容错**：`cold_compile_reachable_import_bodies` 中裸名函数（非 import）无 body 时自动标记 `is_external`，避免语言覆盖不足阻塞编译。
