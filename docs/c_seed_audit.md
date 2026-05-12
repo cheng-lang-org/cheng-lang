@@ -17,11 +17,12 @@
 | `bootstrap-bridge` | 130 | bootstrap 必需 | 否 |
 | `build-backend-driver` | 244 | bootstrap 必需 | 否 |
 | `system-link-exec` | 252 | 用户面编译 | **是**（目标） |
-| `status` | 16 | 调试 | 是 |
-| `print-build-plan` | 32 | 调试 | 是 |
-| `unimplemented` | 4 | 占位 | 是 |
+| ~~`status`~~ | ~~16~~ | ~~调试~~ | ✅ 已移除 |
+| ~~`print-build-plan`~~ | ~~32~~ | ~~调试~~ | ✅ 已移除 |
+| ~~`unimplemented`~~ | ~~4~~ | ~~占位~~ | ✅ 已移除 |
 
 **bootstrap 命令合计：~496 行，占总代码 2.3%。**
+**已移除：74 行（4 函数 + dispatch + help）。**
 
 ## system-link-exec 依赖分析
 
@@ -58,6 +59,7 @@ cc → cheng_cold → (system-link-exec) → backend_driver → (compile-bootstr
 | 指标 | 当前 | 目标 |
 |---|---|---|
 | C 编译器数量 | 2（cold + seed） | 1（cold only） |
-| 冷编译器命令 | 9 | 5（仅 bootstrap） |
+| 冷编译器命令 | 9→6（本次 -3） | 5（仅 bootstrap） |
+| 冷编译器行数 | 21135→21061（本次 -74） | < 20000 |
 | system-link-exec | 252 行 | 移除或 conditional |
 | cheng_seed.c | 66K 行 | 被 cold 替代后移除 |
