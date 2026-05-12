@@ -39,6 +39,7 @@ static bool cold_diag_dump_slots = false;
 
 #include "macho_direct.h"
 #include "elf64_direct.h"
+#include "coff_direct.h"
 
 #ifndef MAP_ANON
 #define MAP_ANON MAP_ANONYMOUS

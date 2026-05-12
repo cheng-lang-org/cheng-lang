@@ -28,6 +28,7 @@
 #define ET_REL           1
 #define EM_AARCH64       183
 #define EM_X86_64        62
+#define EM_RISCV         243
 
 #define SHT_PROGBITS     1
 #define SHT_SYMTAB       2
@@ -53,6 +54,10 @@
 /* x86_64 relocations */
 #define R_X86_64_PLT32       4
 #define R_X86_64_PC32        2
+
+/* RISC-V relocations */
+#define R_RISCV_CALL         18
+#define R_RISCV_CALL_PLT     19
 
 typedef struct {
     uint32_t sh_name;
@@ -151,7 +156,9 @@ static bool elf64_write_object(const char *path,
     for (int32_t i = 0; i < nreloc; i++) {
         relas[i].r_offset = (uint64_t)reloc_offsets[i];
         uint32_t sym = (uint32_t)(reloc_symbols[i] + 1); /* +1 for NULL sym[0] */
-        uint32_t type = (machine == EM_AARCH64) ? R_AARCH64_CALL26 : R_X86_64_PLT32;
+        uint32_t type = (machine == EM_AARCH64) ? R_AARCH64_CALL26 :
+                        (machine == EM_RISCV)   ? R_RISCV_CALL :
+                        R_X86_64_PLT32;
         relas[i].r_info = ((uint64_t)type << 32) | (uint64_t)sym;
         relas[i].r_addend = 0;
     }
