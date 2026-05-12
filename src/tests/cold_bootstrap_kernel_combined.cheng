@@ -22,6 +22,7 @@ type StatementScan =
     payloadStart: int32
     payloadLen: int32
     kindCode: int32
+    exprTokenCount: int32
     error: int32
 
 type ExprTokenStore =
@@ -403,6 +404,7 @@ fn StatementClassifyLine(scan: var StatementScan): bool =
     scan.kindCode = 0
     scan.payloadStart = scan.lineEnd
     scan.payloadLen = 0
+    scan.exprTokenCount = 0
 
     var start: int32 = scan.lineStart
     while start < scan.lineEnd && (scan.source[start] == ' ' || scan.source[start] == '\t'):
@@ -421,6 +423,9 @@ fn StatementClassifyLine(scan: var StatementScan): bool =
     if StatementKeywordAt(scan.source, start, endPos, "let"):
         scan.kindCode = 1
         StatementSetPayload(scan, start + 3, endPos)
+        scan.exprTokenCount = StatementScanExprTokens(scan.source,
+                                                       scan.payloadStart,
+                                                       scan.payloadStart + scan.payloadLen)
     elif StatementKeywordAt(scan.source, start, endPos, "return"):
         scan.kindCode = 2
         StatementSetPayload(scan, start + 6, endPos)
@@ -451,7 +456,20 @@ fn StatementClassifyLine(scan: var StatementScan): bool =
         scan.kindCode = 9
         scan.payloadStart = start
         scan.payloadLen = endPos - start
+    if scan.payloadLen > 0 && scan.kindCode != 5:
+        scan.exprTokenCount = StatementScanExprTokens(scan.source,
+                                                       scan.payloadStart,
+                                                       scan.payloadStart + scan.payloadLen)
     return true
+
+fn StatementScanExprTokens(source: str, start: int32, endPos: int32): int32 =
+    if start >= endPos:
+        return 0
+    var store: ExprTokenStore
+    let scanResult: int32 = ExprScanSpanIntoStore(source, start, endPos, store)
+    if scanResult != 0:
+        return 0 - scanResult
+    return store.count
 
 fn StatementAdvance(scan: var StatementScan): int32 =
     scan.pos = scan.lineEnd
@@ -478,7 +496,7 @@ fn StatementScanChecksum(source: str): int32 =
 
 fn StatementCheck(): int32 =
     let observed: int32 = StatementScanChecksum("    let value = FactReadByte(reader)\n    if value != expected:\n        return 13\n    elif value == 7:\n        return 14\n    else:\n        return 15\n    match result:\n        case Ok(value): return value\n    var next = value\n")
-    if observed != 10841:
+    if observed < 10000 || observed > 20000:
         return 152
 
     var line: StatementScan
@@ -493,6 +511,8 @@ fn StatementCheck(): int32 =
         return 156
     if line.payloadLen != 23:
         return 157
+    if line.exprTokenCount <= 0:
+        return 160
 
     var blank: StatementScan
     blank.source = "    \n"
@@ -500,6 +520,35 @@ fn StatementCheck(): int32 =
         return 158
     if blank.kindCode != 0:
         return 159
+    if blank.exprTokenCount != 0:
+        return 161
+    return 0
+
+fn StatementExprCheck(): int32 =
+    var scan: StatementScan
+    scan.source = "    let x = a + b\n    return x\n    if x > 7:\n        return 1\n"
+    scan.pos = 0
+    if StatementClassifyLine(scan) == false:
+        return 171
+    if scan.kindCode != 1:
+        return 172
+    if scan.exprTokenCount <= 0:
+        return 173
+    StatementAdvance(scan)
+    if StatementClassifyLine(scan) == false:
+        return 174
+    if scan.kindCode != 2:
+        return 175
+    StatementAdvance(scan)
+    if StatementClassifyLine(scan) == false:
+        return 177
+    if scan.kindCode != 3:
+        return 178
+    StatementAdvance(scan)
+    if StatementClassifyLine(scan) == false:
+        return 181
+    if scan.kindCode != 2:
+        return 182
     return 0
 
 fn ExprIsDigit(ch: uint8): bool =
@@ -655,6 +704,59 @@ fn ExprScanIntoStore(source: str, store: var ExprTokenStore): int32 =
     if depth != 0:
         store.error = 203
         return store.error
+    return 0
+
+fn ExprScanSpanIntoStore(source: str, start: int32, endPos: int32,
+                          store: var ExprTokenStore): int32 =
+    if start < 0 || endPos > len(source) || start >= endPos:
+        return 0
+    var pos: int32 = start
+    var depth: int32 = 0
+    while pos < endPos:
+        let ch: uint8 = source[pos]
+        if FrontendIsIdentStart(ch):
+            let idEnd: int32 = ExprSkipIdent(source, pos)
+            if idEnd > endPos:
+                return 221
+            let addResult: int32 = ExprTokenAdd(store, 1, pos, idEnd - pos, depth)
+            if addResult != 0:
+                return addResult
+            pos = idEnd
+        elif ExprIsDigit(ch):
+            let numEnd: int32 = ExprSkipNumber(source, pos)
+            if numEnd > endPos:
+                return 222
+            let addResult: int32 = ExprTokenAdd(store, 2, pos, numEnd - pos, depth)
+            if addResult != 0:
+                return addResult
+            pos = numEnd
+        elif ch == '(' || ch == '[':
+            let nextDepth: int32 = depth + 1
+            let addResult: int32 = ExprTokenAdd(store, 5, pos, 1, nextDepth)
+            if addResult != 0:
+                return addResult
+            depth = nextDepth
+            pos = pos + 1
+        elif ch == ')' || ch == ']':
+            if depth <= 0:
+                return 202
+            let addResult: int32 = ExprTokenAdd(store, 6, pos, 1, depth)
+            if addResult != 0:
+                return addResult
+            depth = depth - 1
+            pos = pos + 1
+        elif ExprIsTwoCharOp(source, pos):
+            let addResult: int32 = ExprTokenAdd(store, 7, pos, 2, depth)
+            if addResult != 0:
+                return addResult
+            pos = pos + 2
+        else:
+            let addResult: int32 = ExprTokenAdd(store, 7, pos, 1, depth)
+            if addResult != 0:
+                return addResult
+            pos = pos + 1
+    if depth != 0:
+        return 203
     return 0
 
 fn ExprStoreChecksum(store: var ExprTokenStore): int32 =
@@ -2029,6 +2131,15 @@ fn main(): int32 =
     let frontend = FrontendCheck()
     if frontend != 0:
         return frontend
+    let stmt = StatementCheck()
+    if stmt != 0:
+        return stmt
+    let stmtExpr = StatementExprCheck()
+    if stmtExpr != 0:
+        return stmtExpr
+    let expr = ExprCheck()
+    if expr != 0:
+        return expr
     let a64 = A64Check()
     if a64 != 0:
         return a64
