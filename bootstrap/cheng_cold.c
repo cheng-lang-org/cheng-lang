@@ -11112,6 +11112,13 @@ static int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32
     }
     Variant *variant = parser_find_variant(parser, token);
     if (variant) {
+        /* Consume generic parameters [T, ...] before constructor args */
+        while (span_eq(parser_peek(parser), "[")) {
+            (void)parser_token(parser);
+            while (parser->pos < parser->source.len &&
+                   parser->source.ptr[parser->pos] != ']') parser->pos++;
+            if (parser->pos < parser->source.len) parser->pos++;
+        }
         *kind = SLOT_VARIANT;
         return parse_constructor(parser, body, locals, variant);
     }
