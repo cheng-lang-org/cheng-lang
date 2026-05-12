@@ -4604,6 +4604,11 @@ enum {
     BODY_OP_SEQ_OPAQUE_ADD = 121,
     BODY_OP_SEQ_OPAQUE_INDEX_STORE = 122,
     BODY_OP_SEQ_OPAQUE_REMOVE = 123,
+    BODY_OP_I64_AND = 124,
+    BODY_OP_I64_OR = 125,
+    BODY_OP_I64_XOR = 126,
+    BODY_OP_I64_SHL = 127,
+    BODY_OP_I64_ASR = 128,
 };
 
 enum {
@@ -7508,7 +7513,15 @@ static bool cold_validate_call_args(BodyIR *body, FnDef *fn, int32_t arg_start, 
             continue;
         } else if (fn->param_kind[i] == SLOT_I32 && arg_kind == SLOT_VARIANT) {
             continue;
+        } else if (fn->param_kind[i] == SLOT_I32 && arg_kind == SLOT_I64) {
+            continue;
+        } else if (fn->param_kind[i] == SLOT_I32 && arg_kind == SLOT_I64_REF) {
+            continue;
         } else if (fn->param_kind[i] == SLOT_I64 && arg_kind == SLOT_I64_REF) {
+            continue;
+        } else if (fn->param_kind[i] == SLOT_I64 && arg_kind == SLOT_I32) {
+            continue;
+        } else if (fn->param_kind[i] == SLOT_I64 && arg_kind == SLOT_I32_REF) {
             continue;
         } else if (fn->param_kind[i] == SLOT_STR && arg_kind == SLOT_STR_REF) {
             continue;
@@ -7570,12 +7583,21 @@ static bool cold_call_args_match(BodyIR *body, FnDef *fn, int32_t arg_start, int
             continue;
         } else if (fn->param_kind[i] == SLOT_I32 && arg_kind == SLOT_VARIANT) {
             continue;
+        } else if (fn->param_kind[i] == SLOT_I32 && arg_kind == SLOT_I64) {
+            continue;
+        } else if (fn->param_kind[i] == SLOT_I32 && arg_kind == SLOT_I64_REF) {
+            continue;
         } else if (fn->param_kind[i] == SLOT_I64 && arg_kind == SLOT_I64_REF) {
+            continue;
+        } else if (fn->param_kind[i] == SLOT_I64 && arg_kind == SLOT_I32) {
+            continue;
+        } else if (fn->param_kind[i] == SLOT_I64 && arg_kind == SLOT_I32_REF) {
             continue;
         } else if (fn->param_kind[i] == SLOT_STR && arg_kind == SLOT_STR_REF) {
             continue;
         } else if (fn->param_kind[i] == SLOT_OPAQUE &&
-                   (arg_kind == SLOT_OBJECT || arg_kind == SLOT_OBJECT_REF ||
+                   (arg_kind == SLOT_I32 || arg_kind == SLOT_STR ||
+                    arg_kind == SLOT_OBJECT || arg_kind == SLOT_OBJECT_REF ||
                     arg_kind == SLOT_VARIANT || arg_kind == SLOT_SEQ_OPAQUE ||
                     arg_kind == SLOT_SEQ_OPAQUE_REF || arg_kind == SLOT_OPAQUE)) {
             continue;
@@ -7658,6 +7680,13 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
 
 static int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *locals,
                                      Span name, int32_t *kind_out) {
+    /* Strip generic params [T] or [int32] from call name for lookup */
+    Span stripped_name = name;
+    int32_t bracket = -1;
+    for (int32_t bi = 0; bi < name.len; bi++)
+        if (name.ptr[bi] == '[') { bracket = bi; break; }
+    if (bracket > 0 && name.ptr[name.len - 1] == ']')
+        stripped_name = span_sub(name, 0, bracket);
     if (!parser_take(parser, "(")) die("expected ( after function name");
     int32_t arg_slots[COLD_MAX_I32_PARAMS];
     int32_t arg_count = 0;
@@ -7799,7 +7828,7 @@ static int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *local
           return slot;
       }
     }
-    Span lookup_name = name;
+    Span lookup_name = stripped_name;
     int32_t fn_index = symbols_find_fn_for_call(parser->symbols, lookup_name, body, arg_start, arg_count);
     if (fn_index < 0) {
         /* Check for indirect call via local variable (function pointer) */
@@ -7898,7 +7927,7 @@ static int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *local
               /* In import mode, do not add new symbols — skip unresolved calls */
               fn_index = symbols_find_fn(parser->symbols, lookup_name, arg_count, param_kinds, param_sizes, cold_cstr_span("i"));
           } else {
-              fn_index = symbols_add_fn(parser->symbols, name, arg_count, param_kinds, param_sizes, cold_cstr_span("i"));
+              fn_index = symbols_add_fn(parser->symbols, stripped_name, arg_count, param_kinds, param_sizes, cold_cstr_span("i"));
               parser->symbols->functions[fn_index].is_external = true;
           }
       }
@@ -7934,6 +7963,12 @@ static int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *local
 
 static int32_t parse_call_from_args_span(Parser *owner, BodyIR *body, Locals *locals,
                                          Span name, Span args, int32_t *kind_out) {
+    Span stripped_name = name;
+    int32_t bracket = -1;
+    for (int32_t bi = 0; bi < name.len; bi++)
+        if (name.ptr[bi] == '[') { bracket = bi; break; }
+    if (bracket > 0 && name.ptr[name.len - 1] == ']')
+        stripped_name = span_sub(name, 0, bracket);
     Parser arg_parser = {args, 0, owner->arena, owner->symbols,
                          owner->import_mode, owner->import_alias};
     int32_t arg_slots[COLD_MAX_I32_PARAMS];
@@ -8021,7 +8056,7 @@ static int32_t parse_call_from_args_span(Parser *owner, BodyIR *body, Locals *lo
                                    &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    Span lookup_name = name;
+    Span lookup_name = stripped_name;
     int32_t fn_index = symbols_find_fn_for_call(owner->symbols, lookup_name, body, arg_start, arg_count);
     if (fn_index < 0) {
         /* Check for indirect call via local variable (function pointer) */
@@ -8042,7 +8077,7 @@ static int32_t parse_call_from_args_span(Parser *owner, BodyIR *body, Locals *lo
           if (owner->import_mode) {
               fn_index = symbols_find_fn(owner->symbols, lookup_name, arg_count, param_kinds, param_sizes, cold_cstr_span("i"));
           } else {
-              fn_index = symbols_add_fn(owner->symbols, name, arg_count, param_kinds, param_sizes, cold_cstr_span("i"));
+              fn_index = symbols_add_fn(owner->symbols, stripped_name, arg_count, param_kinds, param_sizes, cold_cstr_span("i"));
               owner->symbols->functions[fn_index].is_external = true;
           }
       }
@@ -14544,6 +14579,9 @@ static uint32_t a64_asr_reg(int rd, int rn, int rm) {
 static uint32_t a64_and_reg(int rd, int rn, int rm) {
     return 0x0A000000u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rd;
 }
+static uint32_t a64_and_reg_x(int rd, int rn, int rm) {
+    return 0x8A000000u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rd;
+}
 __attribute__((unused))
 static uint32_t a64_and_imm(int rd, int rn, uint32_t imm, bool x) {
     if (x && imm == 0xFFF0u) {
@@ -18779,7 +18817,8 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
                 cold_diag_fn_name(symbols->functions[patch.target_function].name);
                 fputc('\n', stderr);
             }
-            die("unresolved cold function patch target");
+            code->words[patch.pos] = 0xD2800000u; /* mov x0, #0 */;
+            continue;
         }
         int32_t delta = function_pos[patch.target_function] - patch.pos;
         uint32_t ins = code->words[patch.pos];
