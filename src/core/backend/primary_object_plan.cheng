@@ -1675,6 +1675,70 @@ fn PrimaryBodyIrAppendConditionTerm(bodyIR: var coreir.BodyIR,
     currentBlockStart = bodyIR.ops.len
     pendingFalseTerm = termIndex
 
+fn PrimaryBodyIrAppendBoolConditionAssign(bodyIR: var coreir.BodyIR,
+                                           slotNames: var str[],
+                                           typedIr: texpr.TypedExprIr,
+                                           sourcePath: str,
+                                           rhsTextRaw: str,
+                                           targetSlot: int32): bool =
+    if targetSlot < 0 ||
+       targetSlot >= bodyIR.localSlots.len ||
+       PrimaryBodyIrSlotType(bodyIR, targetSlot) != coreir.LocalI32Tag:
+        return false
+    let rhsText = strutil.Strip(rhsTextRaw)
+    if rhsText == "":
+        return false
+    var parts: str[]
+    if PrimaryBodyIrConditionHasAnd(rhsText):
+        parts = PrimaryBodyIrSplitAndConditions(rhsText)
+    else:
+        add(parts, rhsText)
+    if parts.len <= 0:
+        return false
+    var dummyNextOpIndex: int32
+    for partIndex in 0..<parts.len:
+        let partText = strutil.Strip(parts[partIndex])
+        if partText == "":
+            return false
+        var lhsSlot: int32
+        var rhsSlot: int32
+        var cmpTag: int32
+        if !PrimaryBodyIrEmitConditionOps(bodyIR,
+                                          slotNames,
+                                          typedIr,
+                                          sourcePath,
+                                          partText,
+                                          lhsSlot,
+                                          rhsSlot,
+                                          cmpTag,
+                                          dummyNextOpIndex):
+            return false
+        var cmpTargetSlot = targetSlot
+        if partIndex > 0:
+            cmpTargetSlot = PrimaryBodyIrFindOrCreateSlot(bodyIR,
+                                                          slotNames,
+                                                          Fmt"{bodyIR.localSlots[targetSlot].name}#and_part#{partIndex}",
+                                                          coreir.LocalI32Tag)
+            if cmpTargetSlot < 0:
+                return false
+        var cmpOp: coreir.BodyOp
+        cmpOp.kind = coreir.BodyOpCmpTag
+        cmpOp.target = cmpTargetSlot
+        add(cmpOp.operands, cmpTag)
+        add(cmpOp.operands, lhsSlot)
+        add(cmpOp.operands, rhsSlot)
+        add(bodyIR.ops, cmpOp)
+        if partIndex > 0:
+            var andOp: coreir.BodyOp
+            andOp.kind = coreir.BodyOpBinOpTag
+            andOp.target = targetSlot
+            add(andOp.operands, coreir.LocalI32Tag)
+            add(andOp.operands, int32(texpr.TypedExprIrOpI32Mul))
+            add(andOp.operands, targetSlot)
+            add(andOp.operands, cmpTargetSlot)
+            add(bodyIR.ops, andOp)
+    return true
+
 fn PrimaryBodyIrAppendTypedStrLiteralCondition(bodyIR: var coreir.BodyIR,
                                                 slotNames: var str[],
                                                 stmt: texpr.TypedExprIrStatement,
@@ -2393,6 +2457,14 @@ fn PrimaryBodyIrAppendLocalDeclInitializer(bodyIR: var coreir.BodyIR,
                                                     slotNames,
                                                     rhsText,
                                                     targetSlot)
+    if targetTypeKind == coreir.LocalI32Tag &&
+       PrimaryBodyIrConditionHasAnd(rhsText):
+        return PrimaryBodyIrAppendBoolConditionAssign(bodyIR,
+                                                      slotNames,
+                                                      typedIr,
+                                                      stmt.sourcePath,
+                                                      rhsText,
+                                                      targetSlot)
     if stmt.assignValueFieldName != "":
         return PrimaryBodyIrAppendFieldLoadToSlot(bodyIR,
                                                   slotNames,
@@ -3230,6 +3302,14 @@ fn PrimaryBodyIrAppendI32Assign(bodyIR: var coreir.BodyIR,
     let lhsSlot = PrimaryBodyIrFindSlotIndex(slotNames, lhsName)
     if lhsSlot < 0:
         return false
+    if PrimaryBodyIrSlotType(bodyIR, lhsSlot) == coreir.LocalI32Tag &&
+       PrimaryBodyIrConditionHasAnd(rhsText):
+        return PrimaryBodyIrAppendBoolConditionAssign(bodyIR,
+                                                      slotNames,
+                                                      typedIr,
+                                                      stmt.sourcePath,
+                                                      rhsText,
+                                                      lhsSlot)
     let lhsIsVarI32 = PrimaryBodyIrNameInList(varI32ParamNames, lhsName)
     if !lhsIsVarI32 && PrimaryBodyIrSlotType(bodyIR, lhsSlot) != coreir.LocalI32Tag:
         let rhsSlot = PrimaryBodyIrFindArgSlot(slotNames, rhsText)
