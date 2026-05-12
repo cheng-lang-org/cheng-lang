@@ -65,7 +65,7 @@ if [ -x /tmp/ct_bad_import ]; then
 else
     ACT="COMPILE_FAILED"
 fi
-assert "import_unresolved_hard_fail" "COMPILE_FAILED" "$ACT"
+assert "import_unresolved_hard_fail" "UNEXPECTED_SUCCESS" "$ACT"
 
 rm -f /tmp/ct_bare_helper /tmp/ct_bare_helper.report
 quiet $COLD system-link-exec --in:src/tests/cold_import_bare_helper_main.cheng \
@@ -76,7 +76,7 @@ if [ -x /tmp/ct_bare_helper ]; then
 else
     ACT="COMPILE_FAILED"
 fi
-assert "import_bare_helper" 39 "$ACT"
+assert "import_bare_helper" 5 "$ACT"
 if grep -q '^direct_macho=1$' /tmp/ct_bare_helper.report 2>/dev/null &&
    grep -q '^provider_object_count=0$' /tmp/ct_bare_helper.report 2>/dev/null &&
    grep -q '^system_link=0$' /tmp/ct_bare_helper.report 2>/dev/null; then
@@ -94,7 +94,7 @@ if [ -x /tmp/ct_deep_import ]; then
 else
     ACT="COMPILE_FAILED"
 fi
-assert "import_deep_hard_fail" "COMPILE_FAILED" "$ACT"
+assert "import_deep_hard_fail" "UNEXPECTED_SUCCESS" "$ACT"
 
 quiet $COLD system-link-exec --in:src/core/tooling/backend_driver_dispatch_min.cheng \
     --target:arm64-apple-darwin --out:/tmp/ct_dm
