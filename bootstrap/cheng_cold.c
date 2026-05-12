@@ -4558,6 +4558,7 @@ enum {
     BODY_OP_I64_SHL = 127,
     BODY_OP_I64_ASR = 128,
     BODY_OP_I32_FROM_I64 = 129,
+    BODY_OP_ASSERT = 130,
 };
 
 enum {
@@ -7477,6 +7478,12 @@ static bool cold_try_slplan_intrinsic(Parser *parser, BodyIR *body, Span name,
 static bool cold_try_backend_intrinsic(Parser *parser, BodyIR *body, Span name,
                                        int32_t arg_start, int32_t arg_count,
                                        int32_t *slot_out, int32_t *kind_out);
+static bool cold_try_assert_intrinsic(BodyIR *body, Span name,
+                                      int32_t arg_start, int32_t arg_count,
+                                      int32_t *slot_out, int32_t *kind_out);
+static bool cold_try_bootstrap_intrinsic(BodyIR *body, Span name,
+                                         int32_t arg_start, int32_t arg_count,
+                                         int32_t *slot_out, int32_t *kind_out);
 
 static bool cold_validate_call_args(BodyIR *body, FnDef *fn, int32_t arg_start, int32_t arg_count, bool import_mode) {
     if (arg_count != fn->arity) { return false; }
@@ -7786,6 +7793,14 @@ static int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *local
                                    &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
+    if (cold_try_assert_intrinsic(body, name, arg_start, arg_count,
+                                  &intrinsic_slot, kind_out)) {
+        return intrinsic_slot;
+    }
+    if (cold_try_bootstrap_intrinsic(body, name, arg_start, arg_count,
+                                     &intrinsic_slot, kind_out)) {
+        return intrinsic_slot;
+    }
     /* try Ok[T]/Err[T] constructor fallback before looking up in symbol table */
     { Span base_name = name;
       int32_t br2 = cold_span_find_char(name, '[');
@@ -8073,6 +8088,14 @@ static int32_t parse_call_from_args_span(Parser *owner, BodyIR *body, Locals *lo
     }
     if (cold_try_backend_intrinsic(owner, body, name, arg_start, arg_count,
                                    &intrinsic_slot, kind_out)) {
+        return intrinsic_slot;
+    }
+    if (cold_try_assert_intrinsic(body, name, arg_start, arg_count,
+                                  &intrinsic_slot, kind_out)) {
+        return intrinsic_slot;
+    }
+    if (cold_try_bootstrap_intrinsic(body, name, arg_start, arg_count,
+                                     &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
     Span lookup_name = stripped_name;
@@ -9691,6 +9714,59 @@ static int32_t cold_make_str_literal_cstr_slot(BodyIR *body, const char *text) {
     int32_t slot = cold_make_str_result_slot(body);
     body_op(body, BODY_OP_STR_LITERAL, slot, literal_index, 0);
     return slot;
+}
+
+static bool cold_try_assert_intrinsic(BodyIR *body, Span name,
+                                      int32_t arg_start, int32_t arg_count,
+                                      int32_t *slot_out, int32_t *kind_out) {
+    if (!span_eq(name, "assert") && !span_eq(name, "Assert") &&
+        !span_eq(name, "system.assert") && !span_eq(name, "system.Assert")) {
+        return false;
+    }
+    if (arg_count != 2) die("assert intrinsic arity mismatch");
+    int32_t cond = body->call_arg_slot[arg_start];
+    int32_t msg = body->call_arg_slot[arg_start + 1];
+    int32_t cond_kind = body->slot_kind[cond];
+    int32_t msg_kind = body->slot_kind[msg];
+    if (cond_kind != SLOT_I32 && cond_kind != SLOT_I32_REF)
+        die("assert condition must be bool/i32");
+    if (msg_kind != SLOT_STR && msg_kind != SLOT_STR_REF)
+        die("assert message must be str");
+    int32_t slot = body_slot(body, SLOT_I32, 4);
+    body_op(body, BODY_OP_ASSERT, slot, cond, msg);
+    if (kind_out) *kind_out = SLOT_I32;
+    *slot_out = slot;
+    return true;
+}
+
+static const char *cold_host_target_text(void) {
+#if defined(__APPLE__) && defined(__aarch64__)
+    return "arm64-apple-darwin";
+#elif defined(__APPLE__) && defined(__x86_64__)
+    return "x86_64-apple-darwin";
+#elif defined(__linux__) && defined(__aarch64__)
+    return "aarch64-unknown-linux-gnu";
+#elif defined(__linux__) && defined(__x86_64__)
+    return "x86_64-unknown-linux-gnu";
+#else
+    return "";
+#endif
+}
+
+static bool cold_try_bootstrap_intrinsic(BodyIR *body, Span name,
+                                         int32_t arg_start, int32_t arg_count,
+                                         int32_t *slot_out, int32_t *kind_out) {
+    (void)arg_start;
+    if (!span_eq(name, "BootstrapDetectHostTarget") &&
+        !span_eq(name, "contracts.BootstrapDetectHostTarget") &&
+        !span_eq(name, "bootstrap_contracts.BootstrapDetectHostTarget")) {
+        return false;
+    }
+    if (arg_count != 0) die("BootstrapDetectHostTarget arity mismatch");
+    int32_t slot = cold_make_str_literal_cstr_slot(body, cold_host_target_text());
+    if (kind_out) *kind_out = SLOT_STR;
+    *slot_out = slot;
+    return true;
 }
 
 static void cold_store_str_out_slot(BodyIR *body, int32_t dst, int32_t src, const char *context) {
