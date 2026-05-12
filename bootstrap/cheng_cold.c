@@ -4604,6 +4604,12 @@ enum {
     BODY_OP_SEQ_OPAQUE_ADD = 121,
     BODY_OP_SEQ_OPAQUE_INDEX_STORE = 122,
     BODY_OP_SEQ_OPAQUE_REMOVE = 123,
+    BODY_OP_I64_AND = 124,
+    BODY_OP_I64_OR = 125,
+    BODY_OP_I64_XOR = 126,
+    BODY_OP_I64_SHL = 127,
+    BODY_OP_I64_ASR = 128,
+    BODY_OP_I32_FROM_I64 = 129,
 };
 
 enum {
@@ -7510,6 +7516,14 @@ static bool cold_validate_call_args(BodyIR *body, FnDef *fn, int32_t arg_start, 
             continue;
         } else if (fn->param_kind[i] == SLOT_I64 && arg_kind == SLOT_I64_REF) {
             continue;
+        } else if (fn->param_kind[i] == SLOT_I32 && arg_kind == SLOT_I64) {
+            continue;
+        } else if (fn->param_kind[i] == SLOT_I32 && arg_kind == SLOT_I64_REF) {
+            continue;
+        } else if (fn->param_kind[i] == SLOT_I64 && arg_kind == SLOT_I32) {
+            continue;
+        } else if (fn->param_kind[i] == SLOT_I64 && arg_kind == SLOT_I32_REF) {
+            continue;
         } else if (fn->param_kind[i] == SLOT_STR && arg_kind == SLOT_STR_REF) {
             continue;
         } else if (fn->param_kind[i] == SLOT_OPAQUE &&
@@ -7571,6 +7585,14 @@ static bool cold_call_args_match(BodyIR *body, FnDef *fn, int32_t arg_start, int
         } else if (fn->param_kind[i] == SLOT_I32 && arg_kind == SLOT_VARIANT) {
             continue;
         } else if (fn->param_kind[i] == SLOT_I64 && arg_kind == SLOT_I64_REF) {
+            continue;
+        } else if (fn->param_kind[i] == SLOT_I32 && arg_kind == SLOT_I64) {
+            continue;
+        } else if (fn->param_kind[i] == SLOT_I32 && arg_kind == SLOT_I64_REF) {
+            continue;
+        } else if (fn->param_kind[i] == SLOT_I64 && arg_kind == SLOT_I32) {
+            continue;
+        } else if (fn->param_kind[i] == SLOT_I64 && arg_kind == SLOT_I32_REF) {
             continue;
         } else if (fn->param_kind[i] == SLOT_STR && arg_kind == SLOT_STR_REF) {
             continue;
@@ -10492,6 +10514,13 @@ static int32_t parse_scalar_identity_cast(Parser *parser, BodyIR *body,
     int32_t value_kind = SLOT_I32;
     int32_t value_slot = parse_expr(parser, body, locals, &value_kind);
     if (value_kind != SLOT_I32) {
+        if (value_kind == SLOT_I64) {
+            int32_t dst = body_slot(body, SLOT_I32, 4);
+            body_op(body, BODY_OP_I32_FROM_I64, dst, value_slot, 0);
+            *kind = SLOT_I32;
+            if (!parser_take(parser, ")")) return 0;
+            return dst;
+        }
         /* Non-int32 scalar cast: return 0 */
         int32_t zero = body_slot(body, SLOT_I32, 4);
         body_op(body, BODY_OP_I32_CONST, zero, 0, 0);
@@ -11189,7 +11218,8 @@ static int32_t parse_term(Parser *parser, BodyIR *body, Locals *locals, int32_t 
         int32_t right = parse_primary(parser, body, locals, &right_kind);
         right = parse_postfix(parser, body, locals, right, &right_kind);
         right = cold_materialize_i32_ref(body, right, &right_kind);
-        if (left_kind == SLOT_I64 || right_kind == SLOT_I64) {
+        if (left_kind == SLOT_I64 || left_kind == SLOT_I64_REF ||
+            right_kind == SLOT_I64 || right_kind == SLOT_I64_REF) {
             if (span_eq(op, "%")) {
                 /* int64 modulo: fall back to i32 */
                 int32_t zero = body_slot(body, SLOT_I32, 4);
@@ -11243,19 +11273,20 @@ static int32_t parse_arith_expr(Parser *parser, BodyIR *body, Locals *locals, in
         int32_t right_kind = SLOT_I32;
         int32_t right = parse_term(parser, body, locals, &right_kind);
         right = cold_materialize_i32_ref(body, right, &right_kind);
-        if (left_kind == SLOT_I64 || right_kind == SLOT_I64) {
-            if (!span_eq(op, "+") && !span_eq(op, "-")) {
-                /* Unsupported int64 bit op: fall through as i32 */
-                int32_t zero = body_slot(body, SLOT_I32, 4);
-                body_op(body, BODY_OP_I32_CONST, zero, 0, 0);
-                left = zero;
-                left_kind = SLOT_I32;
-                continue;
-            }
+        if (left_kind == SLOT_I64 || left_kind == SLOT_I64_REF ||
+            right_kind == SLOT_I64 || right_kind == SLOT_I64_REF) {
             left = cold_materialize_i64_value(body, left, &left_kind);
             right = cold_materialize_i64_value(body, right, &right_kind);
             int32_t dst = body_slot(body, SLOT_I64, 8);
-            body_op(body, span_eq(op, "+") ? BODY_OP_I64_ADD : BODY_OP_I64_SUB, dst, left, right);
+            int32_t op_code;
+            if (span_eq(op, "+")) op_code = BODY_OP_I64_ADD;
+            else if (span_eq(op, "-")) op_code = BODY_OP_I64_SUB;
+            else if (span_eq(op, "&")) op_code = BODY_OP_I64_AND;
+            else if (span_eq(op, "|")) op_code = BODY_OP_I64_OR;
+            else if (span_eq(op, "^")) op_code = BODY_OP_I64_XOR;
+            else if (span_eq(op, "<<")) op_code = BODY_OP_I64_SHL;
+            else op_code = BODY_OP_I64_ASR;
+            body_op(body, op_code, dst, left, right);
             left = dst;
             left_kind = SLOT_I64;
             continue;
@@ -14556,6 +14587,21 @@ static uint32_t a64_asr_reg(int rd, int rn, int rm) {
 static uint32_t a64_and_reg(int rd, int rn, int rm) {
     return 0x0A000000u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rd;
 }
+static uint32_t a64_and_reg_x(int rd, int rn, int rm) {
+    return 0x8A000000u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rd;
+}
+static uint32_t a64_orr_reg_x(int rd, int rn, int rm) {
+    return 0xAA000000u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rd;
+}
+static uint32_t a64_eor_reg_x(int rd, int rn, int rm) {
+    return 0xCA000000u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rd;
+}
+static uint32_t a64_lsl_reg_x(int rd, int rn, int rm) {
+    return 0x9AC02000u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rd;
+}
+static uint32_t a64_asr_reg_x(int rd, int rn, int rm) {
+    return 0x9AC02800u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rd;
+}
 __attribute__((unused))
 static uint32_t a64_and_imm(int rd, int rn, uint32_t imm, bool x) {
     if (x && imm == 0xFFF0u) {
@@ -17208,6 +17254,9 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
         code_emit(code, a64_sxtw(R0, R0));
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], true);
+    } else if (kind == BODY_OP_I32_FROM_I64) {
+        a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], true);
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
     } else if (kind == BODY_OP_I64_ADD || kind == BODY_OP_I64_SUB ||
                kind == BODY_OP_I64_MUL || kind == BODY_OP_I64_DIV) {
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], true);
@@ -17216,6 +17265,17 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         else if (kind == BODY_OP_I64_SUB) code_emit(code, a64_sub_reg_x(R0, R0, R1));
         else if (kind == BODY_OP_I64_MUL) code_emit(code, a64_mul_reg_x(R0, R0, R1));
         else code_emit(code, a64_sdiv_reg_x(R0, R0, R1));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], true);
+    } else if (kind == BODY_OP_I64_AND || kind == BODY_OP_I64_OR ||
+               kind == BODY_OP_I64_XOR || kind == BODY_OP_I64_SHL ||
+               kind == BODY_OP_I64_ASR) {
+        a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], true);
+        a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], true);
+        if (kind == BODY_OP_I64_AND) code_emit(code, a64_and_reg_x(R0, R0, R1));
+        else if (kind == BODY_OP_I64_OR) code_emit(code, a64_orr_reg_x(R0, R0, R1));
+        else if (kind == BODY_OP_I64_XOR) code_emit(code, a64_eor_reg_x(R0, R0, R1));
+        else if (kind == BODY_OP_I64_SHL) code_emit(code, a64_lsl_reg_x(R0, R0, R1));
+        else code_emit(code, a64_asr_reg_x(R0, R0, R1));
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], true);
     } else if (kind == BODY_OP_I64_CMP) {
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], true);
