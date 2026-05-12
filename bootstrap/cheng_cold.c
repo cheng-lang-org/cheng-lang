@@ -20113,7 +20113,10 @@ static void cold_compile_import_function_direct(Symbols *symbols,
         if (!cold_span_starts_with(trimmed, "fn ")) continue;
         ColdFunctionSymbol symbol;
         if (!cold_parse_function_symbol_at(source, start, line_no, &symbol)) {
-            die("cannot parse cold imported function symbol");
+            if (trimmed.len > 3 && trimmed.ptr[3] == '`') continue;
+            fprintf(stderr, "cheng_cold: cannot parse imported body fn path=%s line=%d\n",
+                    import_source->path, line_no);
+            continue;
         }
         if (!span_same(symbol.name, local_name)) continue;
         if (!cold_import_function_symbol_matches(symbols, import_source, &symbol,
@@ -20153,8 +20156,20 @@ static void cold_compile_reachable_import_bodies(Symbols *symbols,
         int32_t fn_index = stack[--stack_count];
         if (fn_index < 0 || fn_index >= function_count) die("cold reachable import index out of range");
         if (!function_bodies[fn_index]) {
-            cold_compile_import_function_direct(symbols, imports, import_count,
-                                                function_bodies, body_cap, fn_index);
+            /* Only try import compilation for qualified names (alias.fn).
+               Entry-module functions with bare names that failed body
+               compilation get marked external to avoid hard-fail. */
+            Span fn_name = symbols->functions[fn_index].name;
+            bool is_imported = false;
+            for (int32_t ci = 0; ci < fn_name.len; ci++) {
+                if (fn_name.ptr[ci] == '.') { is_imported = true; break; }
+            }
+            if (is_imported) {
+                cold_compile_import_function_direct(symbols, imports, import_count,
+                                                    function_bodies, body_cap, fn_index);
+            } else {
+                symbols->functions[fn_index].is_external = true;
+            }
         }
         BodyIR *body = function_bodies[fn_index];
         if (!cold_body_codegen_ready(body)) {

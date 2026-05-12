@@ -928,6 +928,59 @@ fn PrimaryBodyIrBindingTypeForName(typedIr: texpr.TypedExprIr,
             foundType = stmt.resultType
     return foundType
 
+fn PrimaryBodyIrLookupSingleFieldMeta(typedIr: texpr.TypedExprIr,
+                                       ownerTypeRaw: str,
+                                       fieldNameRaw: str,
+                                       fieldType: var str,
+                                       fieldOffsetBytes: var int32,
+                                       fieldSizeBytes: var int32,
+                                       fieldAlignBytes: var int32): bool =
+    fieldType = ""
+    fieldOffsetBytes = 0
+    fieldSizeBytes = 0
+    fieldAlignBytes = 0
+    let ownerType = texpr.TypedExprStripVarType(ownerTypeRaw)
+    let fieldName = strutil.Strip(fieldNameRaw)
+    if ownerType == "" || fieldName == "":
+        return false
+    var fieldLimit = typedIr.typeFieldOwnerTypes.len
+    if typedIr.typeFieldNames.len < fieldLimit:
+        fieldLimit = typedIr.typeFieldNames.len
+    if typedIr.typeFieldTypes.len < fieldLimit:
+        fieldLimit = typedIr.typeFieldTypes.len
+    if typedIr.typeFieldOffsetBytes.len < fieldLimit:
+        fieldLimit = typedIr.typeFieldOffsetBytes.len
+    if typedIr.typeFieldSizeBytes.len < fieldLimit:
+        fieldLimit = typedIr.typeFieldSizeBytes.len
+    if typedIr.typeFieldAlignBytes.len < fieldLimit:
+        fieldLimit = typedIr.typeFieldAlignBytes.len
+    var foundIndex: int32 = -1
+    var foundCount: int32
+    for i in 0..<fieldLimit:
+        if typedIr.typeFieldOwnerTypes[i] != ownerType:
+            continue
+        if typedIr.typeFieldNames[i] != fieldName:
+            continue
+        foundIndex = i
+        foundCount = foundCount + 1
+    if foundCount != 1:
+        return false
+    if foundIndex < 0:
+        return false
+    fieldType = typedIr.typeFieldTypes[foundIndex]
+    fieldOffsetBytes = typedIr.typeFieldOffsetBytes[foundIndex]
+    fieldSizeBytes = typedIr.typeFieldSizeBytes[foundIndex]
+    fieldAlignBytes = typedIr.typeFieldAlignBytes[foundIndex]
+    if fieldType == "":
+        return false
+    if fieldOffsetBytes < 0:
+        return false
+    if fieldSizeBytes <= 0:
+        return false
+    if fieldAlignBytes <= 0:
+        return false
+    return true
+
 fn PrimaryBodyIrMaterializeFieldArgSlot(bodyIR: var coreir.BodyIR,
                                          slotNames: var str[],
                                          typedIr: texpr.TypedExprIr,
@@ -959,14 +1012,25 @@ fn PrimaryBodyIrMaterializeFieldArgSlot(bodyIR: var coreir.BodyIR,
     var fieldOffsetBytes: int32
     var fieldSizeBytes: int32
     var fieldAlignBytes: int32
-    if !texpr.TypedExprIrLookupFieldPathMeta(typedIr,
-                                             sourcePath,
-                                             rootType,
-                                             fieldPath,
-                                             fieldType,
-                                             fieldOffsetBytes,
-                                             fieldSizeBytes,
-                                             fieldAlignBytes):
+    var fieldMetaOk = false
+    if !strutil.Contains(fieldPath, "."):
+        fieldMetaOk = PrimaryBodyIrLookupSingleFieldMeta(typedIr,
+                                                         rootType,
+                                                         fieldPath,
+                                                         fieldType,
+                                                         fieldOffsetBytes,
+                                                         fieldSizeBytes,
+                                                         fieldAlignBytes)
+    else:
+        fieldMetaOk = texpr.TypedExprIrLookupFieldPathMeta(typedIr,
+                                                           sourcePath,
+                                                           rootType,
+                                                           fieldPath,
+                                                           fieldType,
+                                                           fieldOffsetBytes,
+                                                           fieldSizeBytes,
+                                                           fieldAlignBytes)
+    if !fieldMetaOk:
         failureDetail0 = 434
         return -1
     let baseSlot = PrimaryBodyIrFindOrCreateFieldBaseSlot(bodyIR,
@@ -1848,14 +1912,25 @@ fn PrimaryBodyIrAddressSlotForName(bodyIR: var coreir.BodyIR,
         var fieldOffsetBytes: int32
         var fieldSizeBytes: int32
         var fieldAlignBytes: int32
-        if !texpr.TypedExprIrLookupFieldPathMeta(typedIr,
-                                                 sourcePath,
-                                                 ownerType,
-                                                 fieldPath,
-                                                 fieldType,
-                                                 fieldOffsetBytes,
-                                                 fieldSizeBytes,
-                                                 fieldAlignBytes):
+        var fieldMetaOk = false
+        if !strutil.Contains(fieldPath, "."):
+            fieldMetaOk = PrimaryBodyIrLookupSingleFieldMeta(typedIr,
+                                                             ownerType,
+                                                             fieldPath,
+                                                             fieldType,
+                                                             fieldOffsetBytes,
+                                                             fieldSizeBytes,
+                                                             fieldAlignBytes)
+        else:
+            fieldMetaOk = texpr.TypedExprIrLookupFieldPathMeta(typedIr,
+                                                               sourcePath,
+                                                               ownerType,
+                                                               fieldPath,
+                                                               fieldType,
+                                                               fieldOffsetBytes,
+                                                               fieldSizeBytes,
+                                                               fieldAlignBytes)
+        if !fieldMetaOk:
             if pointeeType == "":
                 addressPassKind = -12
             elif ownerType == "ChengMemHeader" && fieldPath == "rc":
