@@ -15091,10 +15091,57 @@ static void code_emit(Code *code, uint32_t word);
 static void codegen_func(Code *code, BodyIR *body, Symbols *symbols,
                          FunctionPatchList *function_patches);
 
+#define COLD_WSDEQUE_CAP 256
+typedef struct {
+    int32_t tasks[COLD_WSDEQUE_CAP];
+    int32_t top;
+    int32_t bottom;
+} ColdWSDeque;
+
+static bool cold_wsdeque_push(ColdWSDeque *q, int32_t task) {
+    int32_t t = q->top;
+    if (t >= COLD_WSDEQUE_CAP) return false;
+    q->tasks[t] = task;
+    __atomic_store_n(&q->top, t + 1, __ATOMIC_RELEASE);
+    return true;
+}
+
+static bool cold_wsdeque_pop(ColdWSDeque *q, int32_t *task) {
+    int32_t t = __atomic_load_n(&q->top, __ATOMIC_ACQUIRE);
+    if (t <= 0) return false;
+    int32_t new_t = t - 1;
+    __atomic_store_n(&q->top, new_t, __ATOMIC_RELEASE);
+    int32_t b = __atomic_load_n(&q->bottom, __ATOMIC_ACQUIRE);
+    if (new_t >= b) {
+        *task = q->tasks[new_t];
+        return true;
+    }
+    __atomic_store_n(&q->top, b, __ATOMIC_RELEASE);
+    return false;
+}
+
+static bool cold_wsdeque_steal(ColdWSDeque *q, int32_t *task) {
+    int32_t b = __atomic_load_n(&q->bottom, __ATOMIC_ACQUIRE);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    int32_t t = __atomic_load_n(&q->top, __ATOMIC_ACQUIRE);
+    if (b >= t) return false;
+    *task = q->tasks[b];
+    int32_t expected = b;
+    if (!__atomic_compare_exchange_n(&q->bottom, &expected, b + 1,
+                                     0, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
+        return false;
+    }
+    return true;
+}
+
+
 /* ---- parallel codegen worker (lock-free work-stealing) ---- */
 
 typedef struct {
-    int32_t *next_fn;             /* shared atomic counter (accessed via __atomic builtins) */
+    ColdWSDeque *deque;          /* per-worker work-stealing deque */
+    ColdWSDeque *all_deques;     /* base of all workers' deques (array) */
+    int32_t worker_index;        /* index of this worker (0..active-1) */
+    int32_t active_workers;      /* total active workers */
     int32_t entry_function;
     int32_t function_count;
     BodyIR **function_bodies;
@@ -15103,14 +15150,30 @@ typedef struct {
     Code *local_code;
     FunctionPatchList local_patches;
     int32_t *local_function_pos;
-    int32_t *local_function_end;  /* end position in local_code for each function */
+    int32_t *local_function_end;
 } CodegenWorker;
 
+/* Lock-free Work-Stealing Deque (Chase-Lev style).
+   Owner pushes/pops from top; thieves steal from bottom.
+   All synchronisation via __atomic builtins. */
 static void *codegen_worker_run(void *arg) {
     CodegenWorker *w = (CodegenWorker *)arg;
     for (;;) {
-        int32_t i = __atomic_fetch_add(w->next_fn, 1, __ATOMIC_RELAXED);
-        if (i >= w->function_count) break;
+        int32_t i = -1;
+        /* 1. Try to pop from own deque */
+        if (!cold_wsdeque_pop(w->deque, &i)) {
+            /* 2. Steal from a random victim */
+            bool stolen = false;
+            for (int32_t attempt = 0; attempt < w->active_workers * 2; attempt++) {
+                int32_t victim = (w->worker_index + 1 + attempt) % w->active_workers;
+                if (cold_wsdeque_steal(&w->all_deques[victim], &i)) {
+                    stolen = true;
+                    break;
+                }
+            }
+            if (!stolen) break;  /* all queues empty */
+        }
+        if (i < 0 || i >= w->function_count) continue;
         if (i == w->entry_function || !w->reachable_functions[i] ||
             !w->function_bodies[i] ||
             w->function_bodies[i]->has_fallback) continue;
@@ -19126,6 +19189,20 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
         pthread_t *threads = arena_alloc(code->arena,
             (size_t)active_jobs * sizeof(pthread_t));
 
+        /* Per-worker work-stealing deques */
+        ColdWSDeque *deques = arena_alloc(code->arena,
+            (size_t)active_jobs * sizeof(ColdWSDeque));
+        memset(deques, 0, (size_t)active_jobs * sizeof(ColdWSDeque));
+
+        /* Distribute function indices across workers (interleaved for load balance) */
+        int32_t dist_idx = 0;
+        for (int32_t i = 0; i < function_count; i++) {
+            if (i == entry_function || !reachable_functions[i] ||
+                !function_bodies[i] || function_bodies[i]->has_fallback) continue;
+            cold_wsdeque_push(&deques[dist_idx % active_jobs], i);
+            dist_idx++;
+        }
+
         /* Per-worker arena cache: reuse mmap'd arenas across compilations.
            Reset used=0 and keep pages; significantly reduces mmap/munmap churn. */
         static Arena *worker_arena_cache[16] = {0};
@@ -19154,7 +19231,10 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
             }
             Code *w_code = code_new(w_arena, 256);
             workers[w] = (CodegenWorker){
-                .next_fn = &next_fn,
+                .deque = &deques[w],
+                .all_deques = deques,
+                .worker_index = w,
+                .active_workers = active_jobs,
                 .entry_function = entry_function,
                 .function_count = function_count,
                 .function_bodies = function_bodies,
