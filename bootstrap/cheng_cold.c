@@ -5133,7 +5133,7 @@ static Span cold_arena_span_copy(Arena *arena, Span text);
 static Symbols *symbols_new(Arena *arena) {
     Symbols *symbols = arena_alloc(arena, sizeof(Symbols));
     symbols->arena = arena;
-    symbols->function_cap = 32;
+    symbols->function_cap = 512;
     symbols->type_cap = 16;
     symbols->object_cap = 16;
     symbols->const_cap = 16;
@@ -18936,6 +18936,12 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
             code->words[patch.pos] = a64_adr(ins & 0x1Fu, delta * 4);
         } else {
             code->words[patch.pos] = (ins & 0xFC000000u) | ((uint32_t)delta & 0x03FFFFFFu);
+        }
+        if (cold_diag_dump_per_fn) {
+            fprintf(stderr, "[patch] pos=%d target=", patch.pos);
+            cold_diag_fn_name(symbols->functions[patch.target_function].name);
+            fprintf(stderr, " fn_pos=%d delta=%d ins=%08x\n",
+                    function_pos[patch.target_function], delta, code->words[patch.pos]);
         }
     }
     code->words[entry_call_pos] = (code->words[entry_call_pos] & 0xFC000000u) |
