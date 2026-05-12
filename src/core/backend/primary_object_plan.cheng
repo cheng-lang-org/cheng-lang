@@ -571,6 +571,23 @@ fn PrimaryBodyIrTypeKindFromText(typeRaw: str): int32 =
             return coreir.LocalPtrTag
     return coreir.LocalI32Tag
 
+fn PrimaryBodyIrPointeeTypeText(typeRaw: str): str =
+    let typeText = texpr.TypedExprStripVarType(typeRaw)
+    if typeText == "":
+        return ""
+    if len(typeText) > 0 && typeText[len(typeText) - 1] == '*':
+        return strutil.Strip(strings.SliceBytes(typeText, 0, len(typeText) - 1))
+    var leafStart: int32
+    for i in 0..<len(typeText):
+        if typeText[i] == '.':
+            leafStart = i + 1
+        elif i + 1 < len(typeText) && typeText[i] == ':' && typeText[i + 1] == ':':
+            leafStart = i + 2
+    let leaf = strings.SliceBytes(typeText, leafStart, len(typeText) - leafStart)
+    if len(leaf) > 3 && strings.SliceBytes(leaf, len(leaf) - 3, 3) == "Ptr":
+        return strings.SliceBytes(leaf, 0, len(leaf) - 3)
+    return ""
+
 fn PrimaryBodyIrTypeShapeFromText(typedIr: texpr.TypedExprIr,
                                    sourcePath: str,
                                    typeRaw: str,
@@ -734,6 +751,30 @@ fn PrimaryBodyIrTypedGlobalSlotName(typedIr: texpr.TypedExprIr,
         else:
             found = ""
     return found
+
+fn PrimaryBodyIrTypedGlobalTypeExact(typedIr: texpr.TypedExprIr,
+                                      sourcePath: str,
+                                      name: str): str =
+    for i in 0..<typedIr.globalNames.len:
+        if i >= typedIr.globalSourcePaths.len || i >= typedIr.globalTypes.len:
+            continue
+        if typedIr.globalNames[i] != name:
+            continue
+        if PrimaryPathNormalizedEquals(typedIr.globalSourcePaths[i], sourcePath):
+            return typedIr.globalTypes[i]
+    return ""
+
+fn PrimaryBodyIrTypedGlobalSlotNameExact(typedIr: texpr.TypedExprIr,
+                                          sourcePath: str,
+                                          name: str): str =
+    for i in 0..<typedIr.globalNames.len:
+        if i >= typedIr.globalSourcePaths.len:
+            continue
+        if typedIr.globalNames[i] != name:
+            continue
+        if PrimaryPathNormalizedEquals(typedIr.globalSourcePaths[i], sourcePath):
+            return Fmt"{typedIr.globalSourcePaths[i]}::{name}"
+    return ""
 
 fn PrimaryBodyIrCanonicalArgName(argRaw: str): str =
     let arg = strutil.Strip(argRaw)
@@ -1115,7 +1156,7 @@ fn PrimaryBodyIrPtrAddressArgName(textRaw: str): str =
         let rawName = strutil.Strip(strings.SliceBytes(text, 1, len(text) - 1))
         if rawName == "" ||
            PrimaryBodyIrTextHasCallSurface(rawName) ||
-           PrimaryBodyIrTextHasFieldOrIndex(rawName):
+           (PrimaryBodyIrTextHasFieldOrIndex(rawName) && !texpr.TypedExprTextIsSimpleFieldPath(rawName)):
             return ""
         return rawName
     if len(text) <= 6:
@@ -1130,7 +1171,7 @@ fn PrimaryBodyIrPtrAddressArgName(textRaw: str): str =
     let name = strutil.Strip(strings.SliceBytes(inner, 1, len(inner) - 1))
     if name == "" ||
        PrimaryBodyIrTextHasCallSurface(name) ||
-       PrimaryBodyIrTextHasFieldOrIndex(name):
+       (PrimaryBodyIrTextHasFieldOrIndex(name) && !texpr.TypedExprTextIsSimpleFieldPath(name)):
         return ""
     return name
 
@@ -1253,6 +1294,8 @@ fn PrimaryBodyIrSplitAndConditions(condText: str): str[] =
 
 fn PrimaryBodyIrConditionOperandSlot(bodyIR: var coreir.BodyIR,
                                       slotNames: var str[],
+                                      typedIr: texpr.TypedExprIr,
+                                      sourcePath: str,
                                       textRaw: str,
                                       nextOpIndex: var int32): int32 =
     let text = strutil.Strip(textRaw)
@@ -1288,10 +1331,34 @@ fn PrimaryBodyIrConditionOperandSlot(bodyIR: var coreir.BodyIR,
     let existingSlot = PrimaryBodyIrFindArgSlot(slotNames, text)
     if existingSlot >= 0:
         return existingSlot
+    let globalType = PrimaryBodyIrTypedGlobalTypeExact(typedIr, sourcePath, text)
+    if globalType != "":
+        let globalTypeKind = PrimaryBodyIrTypeKindFromText(globalType)
+        let globalSlotName = PrimaryBodyIrTypedGlobalSlotNameExact(typedIr, sourcePath, text)
+        if globalSlotName == "":
+            return -1
+        let globalSlot = PrimaryBodyIrFindOrCreateSlot(bodyIR,
+                                                       slotNames,
+                                                       globalSlotName,
+                                                       globalTypeKind)
+        bodyIR.localSlots[globalSlot].placeKind = coreir.BodyPlaceGlobalAddressTag
+        let valueSlot = PrimaryBodyIrFindOrCreateSlot(bodyIR,
+                                                      slotNames,
+                                                      Fmt"{globalSlotName}#global_value",
+                                                      globalTypeKind)
+        var op: coreir.BodyOp
+        op.kind = coreir.BodyOpGlobalLoadTag
+        op.target = valueSlot
+        add(op.operands, globalSlot)
+        add(bodyIR.ops, op)
+        nextOpIndex = nextOpIndex + 1
+        return valueSlot
     return PrimaryBodyIrFindOrCreateSlot(bodyIR, slotNames, text, coreir.LocalI32Tag)
 
 fn PrimaryBodyIrEmitConditionOps(bodyIR: var coreir.BodyIR,
                                    slotNames: var str[],
+                                   typedIr: texpr.TypedExprIr,
+                                   sourcePath: str,
                                    condText: str,
                                    lhsSlot: var int32,
                                    rhsSlot: var int32,
@@ -1360,8 +1427,8 @@ fn PrimaryBodyIrEmitConditionOps(bodyIR: var coreir.BodyIR,
     var condRhs = condRhsRaw
     if rhsStartPos > 0:
         condRhs = strings.SliceBytes(condRhsRaw, rhsStartPos, len(condRhsRaw) - rhsStartPos)
-    lhsSlot = PrimaryBodyIrConditionOperandSlot(bodyIR, slotNames, condLhs, nextOpIndex)
-    rhsSlot = PrimaryBodyIrConditionOperandSlot(bodyIR, slotNames, condRhs, nextOpIndex)
+    lhsSlot = PrimaryBodyIrConditionOperandSlot(bodyIR, slotNames, typedIr, sourcePath, condLhs, nextOpIndex)
+    rhsSlot = PrimaryBodyIrConditionOperandSlot(bodyIR, slotNames, typedIr, sourcePath, condRhs, nextOpIndex)
     if lhsSlot < 0 || rhsSlot < 0:
         return false
     return true
@@ -1677,10 +1744,57 @@ fn PrimaryBodyIrAddressSlotForName(bodyIR: var coreir.BodyIR,
                                     irFunction: lower.PrimaryObjectIrFunction,
                                     sourcePath: str,
                                     lineNumber: int32,
-                                    nameRaw: str): int32 =
+                                    nameRaw: str,
+                                    addressPassKind: var int32): int32 =
     let name = strutil.Strip(nameRaw)
+    addressPassKind = coreir.BodyCallPassParamAddressTag
     if name == "":
         return -1
+    if texpr.TypedExprTextIsSimpleFieldPath(name):
+        let rootName = texpr.TypedExprAssignLhsRootName(name)
+        let fieldPath = texpr.TypedExprAssignFieldPath(name)
+        if rootName == "" || fieldPath == "":
+            return -1
+        let rootType = PrimaryBodyIrBindingTypeForName(typedIr,
+                                                       typedFn,
+                                                       irFunction,
+                                                       lineNumber,
+                                                       rootName)
+        if rootType == "":
+            return -1
+        var ownerType = rootType
+        let pointeeType = PrimaryBodyIrPointeeTypeText(rootType)
+        let passRootPointer = pointeeType != ""
+        if passRootPointer:
+            ownerType = pointeeType
+        var fieldType = ""
+        var fieldOffsetBytes: int32
+        var fieldSizeBytes: int32
+        var fieldAlignBytes: int32
+        if !texpr.TypedExprIrLookupFieldPathMeta(typedIr,
+                                                 sourcePath,
+                                                 ownerType,
+                                                 fieldPath,
+                                                 fieldType,
+                                                 fieldOffsetBytes,
+                                                 fieldSizeBytes,
+                                                 fieldAlignBytes):
+            return -1
+        if fieldOffsetBytes != 0:
+            return -1
+        let rootSlot = PrimaryBodyIrFindOrCreateFieldBaseSlot(bodyIR,
+                                                              slotNames,
+                                                              typedIr,
+                                                              sourcePath,
+                                                              rootName,
+                                                              rootType)
+        if rootSlot < 0 || rootSlot >= bodyIR.localSlots.len:
+            return -1
+        if passRootPointer:
+            if PrimaryBodyIrSlotType(bodyIR, rootSlot) != coreir.LocalPtrTag:
+                return -1
+            addressPassKind = coreir.BodyCallPassStackValueTag
+        return rootSlot
     let localSlot = PrimaryBodyIrFindArgSlot(slotNames, name)
     if localSlot >= 0:
         return localSlot
@@ -3385,7 +3499,7 @@ fn PrimaryBuildBodyIrFromTypedStatements(
                     var lhsSlot: int32
                     var rhsSlot: int32
                     var cmpTag: int32
-                    if !PrimaryBodyIrEmitConditionOps(bodyIR, slotNames, subCondText, lhsSlot, rhsSlot, cmpTag, nextOpIndex):
+                    if !PrimaryBodyIrEmitConditionOps(bodyIR, slotNames, typedIr, stmt.sourcePath, subCondText, lhsSlot, rhsSlot, cmpTag, nextOpIndex):
                         continue
                     var cbrTerm: coreir.BodyTerm
                     cbrTerm.kind = coreir.BodyTermCbrTag
@@ -3409,7 +3523,7 @@ fn PrimaryBuildBodyIrFromTypedStatements(
                 var lhsSlot: int32
                 var rhsSlot: int32
                 var cmpTag: int32
-                if PrimaryBodyIrEmitConditionOps(bodyIR, slotNames, condText, lhsSlot, rhsSlot, cmpTag, nextOpIndex):
+                if PrimaryBodyIrEmitConditionOps(bodyIR, slotNames, typedIr, stmt.sourcePath, condText, lhsSlot, rhsSlot, cmpTag, nextOpIndex):
                     var cbrTerm: coreir.BodyTerm
                     cbrTerm.kind = coreir.BodyTermCbrTag
                     cbrTerm.conditionKind = cmpTag
@@ -3441,7 +3555,7 @@ fn PrimaryBuildBodyIrFromTypedStatements(
                 var lhsSlot: int32
                 var rhsSlot: int32
                 var cmpTag: int32
-                if PrimaryBodyIrEmitConditionOps(bodyIR, slotNames, condText, lhsSlot, rhsSlot, cmpTag, nextOpIndex):
+                if PrimaryBodyIrEmitConditionOps(bodyIR, slotNames, typedIr, stmt.sourcePath, condText, lhsSlot, rhsSlot, cmpTag, nextOpIndex):
                     var elifCbrTerm: coreir.BodyTerm
                     elifCbrTerm.kind = coreir.BodyTermCbrTag
                     elifCbrTerm.conditionKind = cmpTag
