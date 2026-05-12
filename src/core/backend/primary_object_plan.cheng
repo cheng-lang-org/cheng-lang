@@ -403,31 +403,60 @@ fn PrimaryBodyIrGeneralCfgWordCount(bodyIR: coreir.BodyIR): int32 =
         count = count + termSize
     return count
 
-fn PrimaryBodyIrExtractIntFromText(text: str): int32 =
+fn PrimaryBodyIrCharLiteralValue(textRaw: str): int32 =
+    let text = strutil.Strip(textRaw)
+    if len(text) < 3 || text[0] != '\'' || text[len(text) - 1] != '\'':
+        return -1
+    let payloadLen = len(text) - 2
+    if payloadLen == 1:
+        return int32(text[1])
+    if payloadLen == 2 && text[1] == '\\':
+        let esc = text[2]
+        if esc == 'n':
+            return 10
+        if esc == 'r':
+            return 13
+        if esc == 't':
+            return 9
+        if esc == '0':
+            return 0
+        return int32(esc)
+    return -1
+
+fn PrimaryBodyIrExtractIntFromText(textRaw: str): int32 =
+    let text = strutil.Strip(textRaw)
+    let charValue = PrimaryBodyIrCharLiteralValue(text)
+    if charValue >= 0:
+        return charValue
+    let int32Inner = PrimaryBodyIrWholeCallInnerForHead(text, "int32")
+    if int32Inner != "":
+        return PrimaryBodyIrExtractIntFromText(int32Inner)
+    let int64Inner = PrimaryBodyIrWholeCallInnerForHead(text, "int64")
+    if int64Inner != "":
+        return PrimaryBodyIrExtractIntFromText(int64Inner)
+    let uint8Inner = PrimaryBodyIrWholeCallInnerForHead(text, "uint8")
+    if uint8Inner != "":
+        return PrimaryBodyIrExtractIntFromText(uint8Inner)
+    let uint64Inner = PrimaryBodyIrWholeCallInnerForHead(text, "uint64")
+    if uint64Inner != "":
+        return PrimaryBodyIrExtractIntFromText(uint64Inner)
+    if text == "":
+        return 0
+    var sign: int32 = 1
+    var start: int32
+    if text[0] == '-':
+        sign = -1
+        start = 1
+    if start >= len(text):
+        return 0
     var out: int32
-    var parenPos: int32
-    parenPos = -1
-    for i in 0..<len(text):
-        if text[i] == '(':
-            parenPos = i
-    if parenPos >= 0:
-        var j = parenPos + 1
-        while j < len(text):
-            let ch = text[j]
-            if ch >= '0' && ch <= '9':
-                out = out * 10 + int32(ch) - int32('0')
-            elif out > 0:
-                break
-            j = j + 1
-    if out == 0:
-        var capturing = false
-        for i in 0..<len(text):
-            let ch = text[i]
-            if ch >= '0' && ch <= '9':
-                capturing = true
-                out = out * 10 + int32(ch) - int32('0')
-            elif capturing:
-                break
+    for i in start..<len(text):
+        let ch = text[i]
+        if ch < '0' || ch > '9':
+            return 0
+        out = out * 10 + int32(ch) - int32('0')
+    if sign < 0:
+        return 0 - out
     return out
 
 fn PrimaryBodyIrParseCondition(
@@ -1292,6 +1321,91 @@ fn PrimaryBodyIrWholeCallInnerForHead(textRaw: str,
         return ""
     return strutil.Strip(strings.SliceBytes(text, openPos + 1, len(text) - openPos - 2))
 
+fn PrimaryBodyIrUInt8PtrDerefPointerText(textRaw: str): str =
+    let text = strutil.Strip(textRaw)
+    if len(text) <= 4 || text[0] != '*' || text[1] != '(' || text[len(text) - 1] != ')':
+        return ""
+    let closePos = texpr.TypedExprFindMatchingParen(text, 1)
+    if closePos != len(text) - 1:
+        return ""
+    let inner = strutil.Strip(strings.SliceBytes(text, 2, len(text) - 3))
+    return PrimaryBodyIrWholeCallInnerForHead(inner, "UInt8Ptr")
+
+fn PrimaryBodyIrPtrExpressionSlot(bodyIR: coreir.BodyIR,
+                                   slotNames: str[],
+                                   textRaw: str): int32 =
+    let text = strutil.Strip(textRaw)
+    if text == "":
+        return -1
+    let directSlot = PrimaryBodyIrFindArgSlot(slotNames, text)
+    if directSlot >= 0 &&
+       directSlot < bodyIR.localSlots.len &&
+       PrimaryBodyIrSlotType(bodyIR, directSlot) == coreir.LocalPtrTag:
+        return directSlot
+    let ptrInner = PrimaryBodyIrWholeCallInnerForHead(text, "ptr")
+    if ptrInner != "":
+        let innerSlot = PrimaryBodyIrFindArgSlot(slotNames, ptrInner)
+        if innerSlot >= 0 &&
+           innerSlot < bodyIR.localSlots.len &&
+           PrimaryBodyIrSlotType(bodyIR, innerSlot) == coreir.LocalPtrTag:
+            return innerSlot
+    return -1
+
+fn PrimaryBodyIrAppendUInt8PtrDerefLoad(bodyIR: var coreir.BodyIR,
+                                         slotNames: var str[],
+                                         textRaw: str,
+                                         targetSlot: int32): bool =
+    let pointerText = PrimaryBodyIrUInt8PtrDerefPointerText(textRaw)
+    if pointerText == "":
+        return false
+    if targetSlot < 0 ||
+       targetSlot >= bodyIR.localSlots.len ||
+       PrimaryBodyIrSlotType(bodyIR, targetSlot) != coreir.LocalI32Tag:
+        return false
+    let pointerSlot = PrimaryBodyIrPtrExpressionSlot(bodyIR, slotNames, pointerText)
+    if pointerSlot < 0:
+        return false
+    var op: coreir.BodyOp
+    op.kind = coreir.BodyOpLoadLocalTag
+    op.target = targetSlot
+    add(op.operands, coreir.BodyLoadLocalPtrDerefU8Tag)
+    add(op.operands, pointerSlot)
+    add(op.operands, 1)
+    add(bodyIR.ops, op)
+    return true
+
+fn PrimaryBodyIrAppendUInt8PtrDerefStore(bodyIR: var coreir.BodyIR,
+                                          slotNames: var str[],
+                                          varI32ParamNames: str[],
+                                          typedIr: texpr.TypedExprIr,
+                                          sourcePath: str,
+                                          lhsTextRaw: str,
+                                          rhsTextRaw: str): bool =
+    let pointerText = PrimaryBodyIrUInt8PtrDerefPointerText(lhsTextRaw)
+    if pointerText == "":
+        return false
+    let pointerSlot = PrimaryBodyIrPtrExpressionSlot(bodyIR, slotNames, pointerText)
+    if pointerSlot < 0:
+        return false
+    let valueSlot = PrimaryBodyIrLocalInitValueSlot(bodyIR,
+                                                   slotNames,
+                                                   varI32ParamNames,
+                                                   typedIr,
+                                                   sourcePath,
+                                                   "uint8",
+                                                   coreir.LocalI32Tag,
+                                                   rhsTextRaw)
+    if valueSlot < 0:
+        return false
+    var op: coreir.BodyOp
+    op.kind = coreir.BodyOpIndexedStoreTag
+    op.target = pointerSlot
+    add(op.operands, pointerSlot)
+    add(op.operands, valueSlot)
+    add(op.operands, coreir.BodyStoreLocalPtrDerefU8Tag)
+    add(bodyIR.ops, op)
+    return true
+
 fn PrimaryBodyIrTypeCastInnerForTarget(textRaw: str,
                                         targetTypeRaw: str): str =
     let text = strutil.Strip(textRaw)
@@ -1802,6 +1916,56 @@ fn PrimaryBodyIrScalarValueSlotForText(bodyIR: var coreir.BodyIR,
             add(constOp.operands, enumValue)
             add(bodyIR.ops, constOp)
             return slotId
+        let ptrDerefText = PrimaryBodyIrUInt8PtrDerefPointerText(text)
+        if ptrDerefText != "":
+            let slotId = PrimaryBodyIrFindOrCreateSlot(bodyIR, slotNames, text, coreir.LocalI32Tag)
+            if !PrimaryBodyIrAppendUInt8PtrDerefLoad(bodyIR, slotNames, text, slotId):
+                return -1
+            return slotId
+    if typeKind == coreir.LocalI32Tag || typeKind == coreir.LocalI64Tag:
+        var binPos: int32 = -1
+        var binKind: int32
+        let addPos = texpr.TypedExprFindTopLevelTextToken(text, "+")
+        let subPos = texpr.TypedExprFindTopLevelTextToken(text, "-")
+        if addPos > 0:
+            binPos = addPos
+            binKind = int32(texpr.TypedExprIrOpI32Add)
+        elif subPos > 0:
+            binPos = subPos
+            binKind = int32(texpr.TypedExprIrOpI32Sub)
+        if binPos > 0 && binPos + 1 < len(text):
+            let lhsText = strutil.Strip(strings.SliceBytes(text, 0, binPos))
+            let rhsText = strutil.Strip(strings.SliceBytes(text,
+                                                           binPos + 1,
+                                                           len(text) - binPos - 1))
+            if lhsText == "" || rhsText == "":
+                return -1
+            let lhsSlot = PrimaryBodyIrScalarValueSlotForText(bodyIR,
+                                                              slotNames,
+                                                              varI32ParamNames,
+                                                              typedIr,
+                                                              sourcePath,
+                                                              lhsText,
+                                                              typeKind)
+            let rhsSlot = PrimaryBodyIrScalarValueSlotForText(bodyIR,
+                                                              slotNames,
+                                                              varI32ParamNames,
+                                                              typedIr,
+                                                              sourcePath,
+                                                              rhsText,
+                                                              typeKind)
+            if lhsSlot < 0 || rhsSlot < 0:
+                return -1
+            let slotId = PrimaryBodyIrFindOrCreateSlot(bodyIR, slotNames, text, typeKind)
+            var binOp: coreir.BodyOp
+            binOp.kind = coreir.BodyOpBinOpTag
+            binOp.target = slotId
+            add(binOp.operands, typeKind)
+            add(binOp.operands, binKind)
+            add(binOp.operands, lhsSlot)
+            add(binOp.operands, rhsSlot)
+            add(bodyIR.ops, binOp)
+            return slotId
     let slotId = PrimaryBodyIrFindArgSlot(slotNames, text)
     if slotId >= 0:
         if PrimaryBodyIrNameInList(varI32ParamNames, text):
@@ -2194,6 +2358,12 @@ fn PrimaryBodyIrAppendLocalDeclInitializer(bodyIR: var coreir.BodyIR,
                                                      rhsText,
                                                      targetSlot,
                                                      callOrdinal)
+    if targetTypeKind == coreir.LocalI32Tag &&
+       PrimaryBodyIrUInt8PtrDerefPointerText(rhsText) != "":
+        return PrimaryBodyIrAppendUInt8PtrDerefLoad(bodyIR,
+                                                    slotNames,
+                                                    rhsText,
+                                                    targetSlot)
     if stmt.assignValueFieldName != "":
         return PrimaryBodyIrAppendFieldLoadToSlot(bodyIR,
                                                   slotNames,
@@ -2792,6 +2962,14 @@ fn PrimaryBodyIrAppendI32Assign(bodyIR: var coreir.BodyIR,
     let rhsText = strutil.Strip(stmt.surfaceText)
     if len(lhsName) <= 0 || len(rhsText) <= 0:
         return false
+    if PrimaryBodyIrUInt8PtrDerefPointerText(lhsName) != "":
+        return PrimaryBodyIrAppendUInt8PtrDerefStore(bodyIR,
+                                                     slotNames,
+                                                     varI32ParamNames,
+                                                     typedIr,
+                                                     stmt.sourcePath,
+                                                     lhsName,
+                                                     rhsText)
     var lhsGlobalType = PrimaryBodyIrTypedGlobalType(typedIr, stmt.sourcePath, lhsName)
     if lhsGlobalType == "" &&
        stmt.assignRootGlobalFlag &&
@@ -3420,12 +3598,13 @@ fn PrimaryBuildBodyIrFromTypedStatements(
                         feedsSameLineCall = true
                         break
                 if feedsSameLineCall:
+                    let callResultType = PrimaryBodyIrResolvedCallResultType(typedIr, stmt)
                     resultSlot = PrimaryBodyIrFindOrCreateTypedSlot(bodyIR,
                                                                     slotNames,
                                                                     typedIr,
-                                                                    stmt.sourcePath,
+                                                                    PrimaryBodyIrCallResultLayoutSourcePath(stmt),
                                                                     fullCallText,
-                                                                    stmt.resultType)
+                                                                    callResultType)
                 let _ = PrimaryBodyIrAppendCallOp(bodyIR,
                                                   slotNames,
                                                   lowering,
@@ -5212,20 +5391,28 @@ fn PrimaryBodyIRFillBlockOp(words: var int32[],
         pos = PrimaryBodyIRLoadSlotToReg(words, pos, bodyIR, op.operands[1], a64.A64X10, frameBytes, paramSaveOffset, paramSaveCount)
         if pos < 0 || pos >= words.len:
             return -1
+        if op.operands.len >= 3 &&
+           op.operands[2] == coreir.BodyStoreLocalPtrDerefU8Tag:
+            words[pos] = Value(a64.A64EncStrbImm(a64.A64X10, a64.A64X9, 0))
+            return pos + 1
         let valueType = PrimaryBodyIrSlotType(bodyIR, op.operands[1])
         let is64 = valueType == coreir.LocalI64Tag || valueType == coreir.LocalPtrTag
         words[pos] = Value(a64.A64EncStrImm(is64, a64.A64X10, a64.A64X9, int64(0)))
         return pos + 1
     if op.kind == coreir.BodyOpLoadLocalTag:
         if op.operands.len >= 3 &&
-           op.operands[0] == coreir.BodyLoadLocalPtrDerefI32Tag:
+           (op.operands[0] == coreir.BodyLoadLocalPtrDerefI32Tag ||
+            op.operands[0] == coreir.BodyLoadLocalPtrDerefU8Tag):
             if op.operands[1] < 0 || op.operands[1] >= bodyIR.localSlots.len ||
                op.target < 0 || op.target >= bodyIR.localSlots.len:
                 return -1
             var pos = PrimaryBodyIRLoadSlotToReg(words, offset, bodyIR, op.operands[1], a64.A64X9, frameBytes, paramSaveOffset, paramSaveCount)
             if pos < 0 || pos >= words.len:
                 return -1
-            words[pos] = Value(a64.A64EncLdrImm(false, a64.A64X10, a64.A64X9, int64(0)))
+            if op.operands[0] == coreir.BodyLoadLocalPtrDerefU8Tag:
+                words[pos] = Value(a64.A64EncLdrbImm(a64.A64X10, a64.A64X9, 0))
+            else:
+                words[pos] = Value(a64.A64EncLdrImm(false, a64.A64X10, a64.A64X9, int64(0)))
             return PrimaryBodyIRStoreRegToSlot(words, pos + 1, bodyIR, op.target, a64.A64X10, frameBytes, paramSaveOffset, paramSaveCount)
         if op.operands.len >= 1:
             if op.operands[0] < 0 || op.operands[0] >= bodyIR.localSlots.len ||
@@ -6280,7 +6467,8 @@ fn PrimaryBodyIROpSizeAt(bodyIR: coreir.BodyIR,
         return count + extra * 2
     if op.kind == coreir.BodyOpLoadLocalTag:
         if op.operands.len >= 3 &&
-           op.operands[0] == coreir.BodyLoadLocalPtrDerefI32Tag:
+           (op.operands[0] == coreir.BodyLoadLocalPtrDerefI32Tag ||
+            op.operands[0] == coreir.BodyLoadLocalPtrDerefU8Tag):
             if op.operands.len < 2 || op.target < 0 || op.target >= bodyIR.localSlots.len:
                 return 0
             return 3

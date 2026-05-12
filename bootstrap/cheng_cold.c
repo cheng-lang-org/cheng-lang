@@ -5188,7 +5188,8 @@ static bool cold_fn_param_kind_can_refine(int32_t existing, int32_t fresh) {
     if (existing == SLOT_VARIANT &&
         (fresh == SLOT_I32 || fresh == SLOT_OBJECT || fresh == SLOT_SEQ_OPAQUE)) return true;
     if (existing == SLOT_OPAQUE &&
-        (fresh == SLOT_OBJECT || fresh == SLOT_VARIANT || fresh == SLOT_SEQ_OPAQUE)) return true;
+        (fresh == SLOT_OBJECT || fresh == SLOT_VARIANT || fresh == SLOT_SEQ_OPAQUE ||
+         fresh == SLOT_PTR)) return true;
     if (existing == SLOT_OPAQUE_REF &&
         (fresh == SLOT_OBJECT_REF || fresh == SLOT_SEQ_I32_REF ||
          fresh == SLOT_SEQ_STR_REF || fresh == SLOT_I32_REF || fresh == SLOT_STR_REF)) return true;
@@ -5223,7 +5224,7 @@ static int32_t symbols_add_fn(Symbols *symbols, Span name, int32_t arity,
         FnDef *fn = &symbols->functions[existing];
         if (fn->arity != arity || !span_same(fn->name, name)) continue;
         bool same_signature = span_same(fn->ret, ret);
-        bool refinable_signature = same_signature;
+        bool refinable_signature = true;
         for (int32_t i = 0; same_signature && i < arity; i++) {
             int32_t new_kind = param_kinds ? param_kinds[i] : SLOT_I32;
             int32_t new_size = param_sizes ? param_sizes[i] : cold_slot_size_for_kind(new_kind);
@@ -7524,24 +7525,24 @@ static bool cold_try_backend_intrinsic(Parser *parser, BodyIR *body, Span name,
                                        int32_t *slot_out, int32_t *kind_out);
 
 static bool cold_validate_call_args(BodyIR *body, FnDef *fn, int32_t arg_start, int32_t arg_count, bool import_mode) {
-    if (arg_count != fn->arity) { if (import_mode) return false; die("cold function arity mismatch"); }
+    if (arg_count != fn->arity) { return false; }
     for (int32_t i = 0; i < arg_count; i++) {
         int32_t arg_slot = body->call_arg_slot[arg_start + i];
         int32_t arg_kind = body->slot_kind[arg_slot];
         if (fn->param_kind[i] == SLOT_I32_REF) {
-            if (arg_kind != SLOT_I32 && arg_kind != SLOT_I32_REF && arg_kind != SLOT_VARIANT) { if (import_mode) return false; die("cold var int32 arg kind mismatch"); }
+            if (arg_kind != SLOT_I32 && arg_kind != SLOT_I32_REF && arg_kind != SLOT_VARIANT) { return false; }
         } else if (fn->param_kind[i] == SLOT_I64_REF) {
-            if (arg_kind != SLOT_I64 && arg_kind != SLOT_I64_REF) { if (import_mode) return false; die("cold var int64 arg kind mismatch"); }
+            if (arg_kind != SLOT_I64 && arg_kind != SLOT_I64_REF) { return false; }
         } else if (fn->param_kind[i] == SLOT_SEQ_I32_REF) {
-            if (arg_kind != SLOT_SEQ_I32 && arg_kind != SLOT_SEQ_I32_REF) { if (import_mode) return false; die("cold var int32[] arg kind mismatch"); }
+            if (arg_kind != SLOT_SEQ_I32 && arg_kind != SLOT_SEQ_I32_REF) { return false; }
         } else if (fn->param_kind[i] == SLOT_SEQ_STR_REF) {
-            if (arg_kind != SLOT_SEQ_STR && arg_kind != SLOT_SEQ_STR_REF) { if (import_mode) return false; die("cold var str[] arg kind mismatch"); }
+            if (arg_kind != SLOT_SEQ_STR && arg_kind != SLOT_SEQ_STR_REF) { return false; }
         } else if (fn->param_kind[i] == SLOT_SEQ_OPAQUE_REF) {
-            if (arg_kind != SLOT_SEQ_OPAQUE && arg_kind != SLOT_SEQ_OPAQUE_REF) { if (import_mode) return false; die("cold var opaque[] arg kind mismatch"); }
+            if (arg_kind != SLOT_SEQ_OPAQUE && arg_kind != SLOT_SEQ_OPAQUE_REF) { return false; }
         } else if (fn->param_kind[i] == SLOT_STR_REF) {
-            if (arg_kind != SLOT_STR && arg_kind != SLOT_STR_REF) { if (import_mode) return false; die("cold var str arg kind mismatch"); }
+            if (arg_kind != SLOT_STR && arg_kind != SLOT_STR_REF) { return false; }
         } else if (fn->param_kind[i] == SLOT_OBJECT_REF) {
-            if (arg_kind != SLOT_OBJECT && arg_kind != SLOT_OBJECT_REF) { if (import_mode) return false; die("cold var object arg kind mismatch"); }
+            if (arg_kind != SLOT_OBJECT && arg_kind != SLOT_OBJECT_REF) { return false; }
         } else if (fn->param_kind[i] == SLOT_I32 && arg_kind == SLOT_I32_REF) {
             continue;
         } else if (fn->param_kind[i] == SLOT_I32 && arg_kind == SLOT_VARIANT) {
@@ -7576,7 +7577,7 @@ static bool cold_validate_call_args(BodyIR *body, FnDef *fn, int32_t arg_start, 
         } else if (fn->param_kind[i] == SLOT_OBJECT && arg_kind == SLOT_OBJECT_REF) {
             continue;
         } else if (arg_kind != fn->param_kind[i]) {
-            { if (import_mode) return false; die("cold function arg kind mismatch"); }
+            { return false; }
         }
         int32_t arg_size = body->slot_size[arg_slot];
         int32_t param_size = fn->param_size[i] > 0 ? fn->param_size[i] : arg_size;
@@ -7969,8 +7970,20 @@ static int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *local
               /* In import mode, do not add new symbols — skip unresolved calls */
               fn_index = symbols_find_fn(parser->symbols, lookup_name, arg_count, param_kinds, param_sizes, cold_cstr_span("i"));
           } else {
-              fn_index = symbols_add_fn(parser->symbols, stripped_name, arg_count, param_kinds, param_sizes, cold_cstr_span("i"));
-              parser->symbols->functions[fn_index].is_external = true;
+              /* Try name-only lookup first to avoid duplicates when call args
+                 have less-precise types than the already-registered signature. */
+              fn_index = -1;
+              for (int32_t si = 0; si < parser->symbols->function_count; si++) {
+                  if (parser->symbols->functions[si].arity == arg_count &&
+                      span_same(parser->symbols->functions[si].name, stripped_name)) {
+                      fn_index = si;
+                      break;
+                  }
+              }
+              if (fn_index < 0) {
+                  fn_index = symbols_add_fn(parser->symbols, stripped_name, arg_count, param_kinds, param_sizes, cold_cstr_span("i"));
+                  parser->symbols->functions[fn_index].is_external = true;
+              }
           }
       }
     }
@@ -8130,8 +8143,19 @@ static int32_t parse_call_from_args_span(Parser *owner, BodyIR *body, Locals *lo
           if (owner->import_mode) {
               fn_index = symbols_find_fn(owner->symbols, lookup_name, arg_count, param_kinds, param_sizes, cold_cstr_span("i"));
           } else {
-              fn_index = symbols_add_fn(owner->symbols, stripped_name, arg_count, param_kinds, param_sizes, cold_cstr_span("i"));
-              owner->symbols->functions[fn_index].is_external = true;
+              /* Try name-only lookup first to avoid duplicates */
+              fn_index = -1;
+              for (int32_t si = 0; si < owner->symbols->function_count; si++) {
+                  if (owner->symbols->functions[si].arity == arg_count &&
+                      span_same(owner->symbols->functions[si].name, stripped_name)) {
+                      fn_index = si;
+                      break;
+                  }
+              }
+              if (fn_index < 0) {
+                  fn_index = symbols_add_fn(owner->symbols, stripped_name, arg_count, param_kinds, param_sizes, cold_cstr_span("i"));
+                  owner->symbols->functions[fn_index].is_external = true;
+              }
           }
       }
     }
