@@ -14906,7 +14906,7 @@ static void codegen_store_params(Code *code, BodyIR *body) {
         int32_t stack_offset = -1;
         bool in_regs = cold_abi_place_arg(&reg, &stack, kind, size,
                                           &base_reg, &stack_offset);
-        int32_t incoming_stack_offset = 16 + stack_offset;
+        int32_t incoming_stack_offset = 32 + stack_offset;
         if (kind == SLOT_I32) {
             if (in_regs) {
                 a64_emit_str_sp_off(code, base_reg, body->slot_offset[slot], false);
