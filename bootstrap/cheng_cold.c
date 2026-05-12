@@ -78,58 +78,7 @@ typedef struct {
     int32_t phase_page_count[8];   /* pages at phase start */
 } Arena;
 
-static void arena_phase_begin(Arena *a, const char *name) {
-    if (!a || a->phase_count >= 8) return;
-    /* Count current pages */
-    int32_t np = 0;
-    for (ArenaPage *p = a->head; p; p = p->next) np++;
-    a->phase_page_count[a->phase_count] = np;
-    a->phase_start_used[a->phase_count] = a->used;
-    a->phase_start_us[a->phase_count] = cold_now_us();
-    a->phase_name[a->phase_count] = name;
-    a->phase_count++;
-}
 
-static void arena_phase_end(Arena *a) {
-    /* Release pages allocated during this phase by resetting ptr.
-       We keep the page list intact but rewind the current page's
-       allocation pointer, effectively freeing phase-local allocations. */
-    if (!a || a->phase_count < 1) return;
-    int32_t last = a->phase_count - 1;
-    int32_t start_np = a->phase_page_count[last];
-    int32_t cur_np = 0;
-    ArenaPage *p = a->head;
-    for (; p; p = p->next) cur_np++;
-    /* Release pages that were added during this phase */
-    if (cur_np > start_np) {
-        /* Walk to the page at start_np (0-indexed) */
-        ArenaPage *prev = NULL;
-        ArenaPage *walk = a->head;
-        for (int32_t i = 0; i < start_np && walk; i++) {
-            prev = walk;
-            walk = walk->next;
-        }
-        if (prev && walk) {
-            /* walk is the first page of this phase. Release it and all after. */
-            ArenaPage *to_free = walk;
-            prev->next = NULL;
-            a->current = prev;
-            while (to_free) {
-                ArenaPage *next = to_free->next;
-                size_t payload = (size_t)(to_free->end - to_free->base);
-                munmap(to_free, sizeof(ArenaPage) + payload);
-                to_free = next;
-            }
-            a->used = a->phase_start_used[last];
-            prev->ptr = prev->base; /* reset ptr for reuse */
-        }
-    } else if (a->current) {
-        /* No new pages, just rewind ptr */
-        a->used = a->phase_start_used[last];
-        a->current->ptr = a->current->base;
-    }
-    a->phase_count--; /* pop phase */
-}
 
 static char ColdDieError[512] = {0};
 static char ColdDieReportPath[PATH_MAX] = {0};
@@ -5557,34 +5506,6 @@ static ObjectDef *symbols_ensure_std_result_base(Symbols *symbols) {
 static ObjectDef *symbols_resolve_object(Symbols *symbols, Span type_name) {
     type_name = span_trim(type_name);
     ObjectDef *existing = symbols_find_object(symbols, type_name);
-    if (existing) return existing;
-    /* Cross-alias fallback: match last component after '.'.
-       e.g. "ir.BodyIR" matches "coreir.BodyIR" when the same module
-       was imported under different aliases via transitive imports. */
-    if (!existing) {
-        int32_t dot = -1;
-        for (int32_t i = type_name.len - 1; i >= 0; i--) {
-            if (type_name.ptr[i] == '.') { dot = i; break; }
-        }
-        if (dot >= 0) {
-            Span suffix = span_sub(type_name, dot + 1, type_name.len);
-            for (int32_t oi = 0; oi < symbols->object_count; oi++) {
-                Span oname = symbols->objects[oi].name;
-                int32_t odot = -1;
-                for (int32_t j = oname.len - 1; j >= 0; j--) {
-                    if (oname.ptr[j] == '.') { odot = j; break; }
-                }
-                if (odot >= 0 && span_same(span_sub(oname, odot + 1, oname.len), suffix)) {
-                    existing = &symbols->objects[oi];
-                    break;
-                }
-                if (odot < 0 && span_same(oname, suffix)) {
-                    existing = &symbols->objects[oi];
-                    break;
-                }
-            }
-        }
-    }
     if (existing) return existing;
     if (span_eq(type_name, "ErrorInfo")) return symbols_ensure_std_error_info(symbols);
     if (span_eq(type_name, "Result")) return symbols_ensure_std_result_base(symbols);
@@ -15752,25 +15673,14 @@ static uint32_t a64_cbnz(int rt, int32_t offset_words) {
 }
 
 static uint32_t a64_fadd_s(int rd, int rn, int rm) { return 0x1E202800u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rd; }
-static uint32_t a64_fadd_d(int rd, int rn, int rm) { return 0x1E602800u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rd; }
 static uint32_t a64_fsub_s(int rd, int rn, int rm) { return 0x1E203800u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rd; }
-static uint32_t a64_fsub_d(int rd, int rn, int rm) { return 0x1E603800u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rd; }
 static uint32_t a64_fmul_s(int rd, int rn, int rm) { return 0x1E200800u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rd; }
-static uint32_t a64_fmul_d(int rd, int rn, int rm) { return 0x1E600800u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rd; }
 static uint32_t a64_fdiv_s(int rd, int rn, int rm) { return 0x1E201800u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rd; }
-static uint32_t a64_fdiv_d(int rd, int rn, int rm) { return 0x1E601800u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rd; }
 static uint32_t a64_scvtf_s(int rd, int rn) { return 0x1E220000u | ((uint32_t)rn << 5) | (uint32_t)rd; }
-static uint32_t a64_scvtf_d(int rd, int rn) { return 0x1E620000u | ((uint32_t)rn << 5) | (uint32_t)rd; }
 static uint32_t a64_fcvtzs_w(int rd, int rn) { return 0x1E380000u | ((uint32_t)rn << 5) | (uint32_t)rd; }
-static uint32_t a64_fcvtzs_x(int rd, int rn) { return 0x9E380000u | ((uint32_t)rn << 5) | (uint32_t)rd; }
 static uint32_t a64_fneg_s(int rd, int rn) { return 0x1E214000u | ((uint32_t)rn << 5) | (uint32_t)rd; }
-static uint32_t a64_fneg_d(int rd, int rn) { return 0x1E614000u | ((uint32_t)rn << 5) | (uint32_t)rd; }
-static uint32_t a64_fcmp_s(int rn, int rm) { return 0x1E202000u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5); }
-static uint32_t a64_fcmp_d(int rn, int rm) { return 0x1E602000u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5); }
 static uint32_t a64_fmov_s(int rd, int rn) { return 0x1E270000u | ((uint32_t)rn << 5) | (uint32_t)rd; }
 static uint32_t a64_fmov_sr(int rd, int rn) { return 0x1E260000u | ((uint32_t)rn << 5) | (uint32_t)rd; }
-static uint32_t a64_fmov_d(int rd, int rn) { return 0x1E670000u | ((uint32_t)rn << 5) | (uint32_t)rd; }
-static uint32_t a64_fmov_dr(int rd, int rn) { return 0x1E660000u | ((uint32_t)rn << 5) | (uint32_t)rd; }
 
 static void codegen_copy_slot_from_offset(Code *code, BodyIR *body,
                                           int32_t dst_slot, int32_t src_slot,
@@ -15980,43 +15890,7 @@ static void codegen_store_empty_str(Code *code, BodyIR *body, int32_t slot) {
     codegen_store_str_pair(code, body, slot, R0, R0);
 }
 
-static bool cold_codegen_kind_is_64bit_scalar(int32_t kind) {
-    return kind == SLOT_I64 || kind == SLOT_PTR || kind == SLOT_OPAQUE ||
-           kind == SLOT_OPAQUE_REF || kind == SLOT_OBJECT_REF ||
-           kind == SLOT_STR_REF || kind == SLOT_SEQ_I32_REF ||
-           kind == SLOT_SEQ_STR_REF || kind == SLOT_SEQ_OPAQUE_REF ||
-           kind == SLOT_I64_REF;
-}
 
-static void codegen_copy_slot_to_slot(Code *code, BodyIR *body, int32_t dst, int32_t src) {
-    int32_t dst_kind = body->slot_kind[dst];
-    int32_t src_kind = body->slot_kind[src];
-    if (dst_kind == SLOT_I32) {
-        if (src_kind != SLOT_I32) die("select i32 source kind mismatch");
-        a64_emit_ldr_sp_off(code, R1, body->slot_offset[src], false);
-        a64_emit_str_sp_off(code, R1, body->slot_offset[dst], false);
-        return;
-    }
-    if (dst_kind == SLOT_STR) {
-        codegen_load_str_pair(code, body, src, R1, R2);
-        codegen_store_str_pair(code, body, dst, R1, R2);
-        return;
-    }
-    if (dst_kind == SLOT_I64 || dst_kind == SLOT_PTR || cold_codegen_kind_is_64bit_scalar(dst_kind)) {
-        if (!(src_kind == SLOT_I64 || src_kind == SLOT_PTR || cold_codegen_kind_is_64bit_scalar(src_kind))) {
-            die("select 64-bit source kind mismatch");
-        }
-        a64_emit_ldr_sp_off(code, R1, body->slot_offset[src], true);
-        a64_emit_str_sp_off(code, R1, body->slot_offset[dst], true);
-        return;
-    }
-    int32_t total = body->slot_size[dst];
-    if (body->slot_size[src] < total) die("select composite source too small");
-    for (int32_t off = 0; off < total; off += 8) {
-        a64_emit_ldr_sp_off(code, R1, body->slot_offset[src] + off, true);
-        a64_emit_str_sp_off(code, R1, body->slot_offset[dst] + off, true);
-    }
-}
 
 static void codegen_mmap_len_reg(Code *code, int len_reg, int dst_reg, int brk_imm) {
     if (len_reg != R1) code_emit(code, a64_add_imm(R1, len_reg, 0, true));

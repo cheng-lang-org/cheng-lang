@@ -77,6 +77,7 @@
 - cold `build-backend-driver` 不能接受 compile 非零退出，也不能在失败后扫描 `.o` 再用 `cc` 链接；冷 linkerless 编译失败必须直接失败。
 - 替换 `artifacts/backend_driver/cheng` 前必须先跑候选门禁，再覆盖后跑正式入口同一组门禁；只验证候选旁路文件不算完成。
 - cold bootstrap seed 只承诺浅导入；深层导入闭包走 Cheng 工具链。import body 内调用必须严格裸名精确查找，禁止自动加 `import_alias.` 前缀，也禁止 bare-name fallback。
+- provider 编译器选择必须先尊重 `CHENG_NO_BACKEND_DRIVER_HANDOFF`，runtime provider 必须显式走 stage3/stage0；不能先取 argv0，否则生成候选会递归调用自身编译 runtime provider 并 hang。
 
 ## Resolved
 
