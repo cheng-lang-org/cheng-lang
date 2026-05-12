@@ -604,6 +604,9 @@ fn PrimaryBodyIrTypeKindFromText(typeRaw: str): int32 =
         return coreir.LocalAggregateTag
     if PrimaryStartsWith(normType, "Result["):
         return coreir.LocalAggregateTag
+    if PrimaryStartsWith(normType, "seq[") ||
+       (len(normType) >= 2 && strings.SliceBytes(normType, len(normType) - 2, 2) == "[]"):
+        return coreir.LocalAggregateTag
     if len(normType) > 0:
         var leafStart = 0
         for ci in 0..<len(normType):
@@ -653,6 +656,12 @@ fn PrimaryBodyIrTypeShapeFromText(typedIr: texpr.TypedExprIr,
     sizeBytes = 0
     alignBytes = 0
     let normType = texpr.TypedExprNormalizeTypeText(typeRaw)
+    if PrimaryStartsWith(normType, "seq[") ||
+       (len(normType) >= 2 && strings.SliceBytes(normType, len(normType) - 2, 2) == "[]"):
+        typeKind = coreir.LocalAggregateTag
+        sizeBytes = 16
+        alignBytes = 8
+        return
     let aliasTarget = texpr.TypedExprIrLookupTypeDefAliasTargetType(typedIr,
                                                                     sourcePath,
                                                                     typeRaw)
@@ -703,6 +712,10 @@ fn PrimaryBodyIrNameInList(names: str[], name: str): bool =
 fn PrimaryBodyIrReturnTypeIsVoid(typeRaw: str): bool =
     let normType = texpr.TypedExprNormalizeTypeText(typeRaw)
     return normType == "" || normType == "void"
+
+fn PrimaryBodyIrTypeTextIsSeqStr(typeRaw: str): bool =
+    let normType = texpr.TypedExprNormalizeTypeText(typeRaw)
+    return normType == "str[]" || normType == "seq[str]"
 
 fn PrimaryBodyIrCallFullText(stmt: texpr.TypedExprIrStatement): str =
     if stmt.callArgCount > 0:
@@ -2382,7 +2395,8 @@ fn PrimaryBodyIrLocalInitValueSlot(bodyIR: var coreir.BodyIR,
 fn PrimaryBodyIrDirectExternalCallTarget(symbolRaw: str): bool =
     return symbolRaw == "driver_c_str_from_utf8_copy_bridge" ||
            symbolRaw == "cheng_malloc" ||
-           symbolRaw == "setMem"
+           symbolRaw == "setMem" ||
+           symbolRaw == "cheng_seq_str_add"
 
 fn PrimaryBodyIrAppendNewObjectValue(bodyIR: var coreir.BodyIR,
                                       slotNames: var str[],
@@ -2489,6 +2503,113 @@ fn PrimaryBodyIrAppendStringLiteralValue(bodyIR: var coreir.BodyIR,
     var op: coreir.BodyOp
     op.kind = coreir.BodyOpCallTag
     op.target = targetSlot
+    add(op.operands, callOrdinal)
+    add(bodyIR.ops, op)
+    callOrdinal = callOrdinal + 1
+    return true
+
+fn PrimaryBodyIrAppendZeroLocalSlot(bodyIR: var coreir.BodyIR,
+                                     slotNames: var str[],
+                                     targetSlot: int32,
+                                     callOrdinal: var int32): bool =
+    if targetSlot < 0 || targetSlot >= bodyIR.localSlots.len:
+        return false
+    let byteCount = PrimaryLocalSlotSizeOf(bodyIR.localSlots[targetSlot])
+    if byteCount <= 0:
+        return false
+    let zeroSlot = PrimaryBodyIrLocalInitConstSlot(bodyIR,
+                                                   slotNames,
+                                                   Fmt"{bodyIR.localSlots[targetSlot].name}#zero",
+                                                   coreir.LocalI32Tag,
+                                                   0)
+    let sizeSlot = PrimaryBodyIrLocalInitConstSlot(bodyIR,
+                                                   slotNames,
+                                                   Fmt"{bodyIR.localSlots[targetSlot].name}#size",
+                                                   coreir.LocalI32Tag,
+                                                   byteCount)
+    if zeroSlot < 0 || sizeSlot < 0:
+        return false
+    var call: coreir.CallOp
+    call.targetSymbol = "setMem"
+    call.resultSlot = -1
+    call.resultPassKind = coreir.BodyCallPassStackValueTag
+    add(call.argSlots, coreir.CallArgSlotAddress(targetSlot))
+    add(call.argPassKinds, coreir.BodyCallPassParamAddressTag)
+    add(call.argSlots, zeroSlot)
+    add(call.argPassKinds, coreir.BodyCallPassStackValueTag)
+    add(call.argSlots, sizeSlot)
+    add(call.argPassKinds, coreir.BodyCallPassStackValueTag)
+    add(bodyIR.callSequence, call)
+    var op: coreir.BodyOp
+    op.kind = coreir.BodyOpCallTag
+    op.target = -1
+    add(op.operands, callOrdinal)
+    add(bodyIR.ops, op)
+    callOrdinal = callOrdinal + 1
+    return true
+
+fn PrimaryBodyIrAppendSeqStrAddBuiltin(bodyIR: var coreir.BodyIR,
+                                        slotNames: var str[],
+                                        typedIr: texpr.TypedExprIr,
+                                        typedFn: texpr.TypedExprIrFunction,
+                                        irFunction: lower.PrimaryObjectIrFunction,
+                                        stmt: texpr.TypedExprIrStatement,
+                                        callOrdinal: var int32): bool =
+    if stmt.callKind != texpr.TypedExprCallBuiltin ||
+       stmt.callCallee != "add" ||
+       stmt.callArgCount != 2:
+        return false
+    let argNames = PrimaryBodyIrCallArgNames(stmt.callArgsText)
+    if argNames.len != 2:
+        return false
+    let seqName = strutil.Strip(argNames[0])
+    let valueText = strutil.Strip(argNames[1])
+    if seqName == "" || valueText == "":
+        return false
+    let seqType = PrimaryBodyIrBindingTypeForName(typedIr,
+                                                  typedFn,
+                                                  irFunction,
+                                                  stmt.lineNumber,
+                                                  seqName)
+    if !PrimaryBodyIrTypeTextIsSeqStr(seqType):
+        return false
+    let seqSlot = PrimaryBodyIrFindOrCreateTypedSlot(bodyIR,
+                                                     slotNames,
+                                                     typedIr,
+                                                     stmt.sourcePath,
+                                                     seqName,
+                                                     seqType)
+    if seqSlot < 0 || seqSlot >= bodyIR.localSlots.len:
+        return false
+    var valueSlot = PrimaryBodyIrFindArgSlot(slotNames, valueText)
+    if valueSlot < 0 && PrimaryBodyIrTextIsStringLiteral(valueText):
+        valueSlot = PrimaryBodyIrFindOrCreateSlot(bodyIR,
+                                                  slotNames,
+                                                  Fmt"{seqName}#add_value#{bodyIR.cstringLiterals.len}",
+                                                  coreir.LocalStrTag)
+        if valueSlot < 0 ||
+           !PrimaryBodyIrAppendStringLiteralValue(bodyIR,
+                                                  slotNames,
+                                                  valueText,
+                                                  valueSlot,
+                                                  callOrdinal):
+            return false
+    if valueSlot < 0 ||
+       valueSlot >= bodyIR.localSlots.len ||
+       PrimaryBodyIrSlotType(bodyIR, valueSlot) != coreir.LocalStrTag:
+        return false
+    var call: coreir.CallOp
+    call.targetSymbol = "cheng_seq_str_add"
+    call.resultSlot = -1
+    call.resultPassKind = coreir.BodyCallPassStackValueTag
+    add(call.argSlots, coreir.CallArgSlotAddress(seqSlot))
+    add(call.argPassKinds, coreir.BodyCallPassParamAddressTag)
+    add(call.argSlots, valueSlot)
+    add(call.argPassKinds, coreir.BodyCallPassStackValueTag)
+    add(bodyIR.callSequence, call)
+    var op: coreir.BodyOp
+    op.kind = coreir.BodyOpCallTag
+    op.target = -1
     add(op.operands, callOrdinal)
     add(bodyIR.ops, op)
     callOrdinal = callOrdinal + 1
@@ -3613,13 +3734,18 @@ fn PrimaryBuildBodyIrFromTypedStatements(
                                                                stmt.sourcePath,
                                                                stmt.bindingName,
                                                                stmt.resultType)
-            let _ = PrimaryBodyIrAppendLocalDeclInitializer(bodyIR,
-                                                            slotNames,
-                                                            varI32ParamNames,
-                                                            typedIr,
-                                                            stmt,
-                                                            localSlot,
-                                                            callOrdinal)
+            let localInitialized = PrimaryBodyIrAppendLocalDeclInitializer(bodyIR,
+                                                                          slotNames,
+                                                                          varI32ParamNames,
+                                                                          typedIr,
+                                                                          stmt,
+                                                                          localSlot,
+                                                                          callOrdinal)
+            if !localInitialized && PrimaryBodyIrTypeTextIsSeqStr(stmt.resultType):
+                let _ = PrimaryBodyIrAppendZeroLocalSlot(bodyIR,
+                                                         slotNames,
+                                                         localSlot,
+                                                         callOrdinal)
         elif stmt.kind == texpr.TypedExprIrStmtResultIntrinsic:
             let argNames = PrimaryBodyIrCallArgNames(stmt.callArgsText)
             var sourceSlot: int32 = -1
@@ -3722,6 +3848,21 @@ fn PrimaryBuildBodyIrFromTypedStatements(
                                              0)
                 nextOpIndex = nextOpIndex + 1
         elif stmt.kind == texpr.TypedExprIrStmtCall:
+            if stmt.callKind == texpr.TypedExprCallBuiltin && stmt.callCallee == "add":
+                if !PrimaryBodyIrAppendSeqStrAddBuiltin(bodyIR,
+                                                        slotNames,
+                                                        typedIr,
+                                                        typedFn,
+                                                        irFunction,
+                                                        stmt,
+                                                        callOrdinal):
+                    PrimaryBodyIrAppendInvalidOp(bodyIR,
+                                                 stmt.lineNumber,
+                                                 int32(stmt.kind),
+                                                 631,
+                                                 0)
+                nextOpIndex = nextOpIndex + 1
+                continue
             let targetStr = stmt.callTarget
             if len(targetStr) > 0:
                 var callLineHasReturn = false
