@@ -4412,6 +4412,7 @@ static int32_t cold_jobs_from_env(void);
 static void cold_usage(void) {
     puts("cheng_cold");
     puts("usage:");
+    puts("  cheng_cold status [--root:<dir>] [--in:<path>]");
     puts("  cheng_cold print-contract --in:<path>");
     puts("  cheng_cold self-check --in:<path>");
     puts("  cheng_cold compile-bootstrap --in:<path> --out:<path> [--report-out:<path>]");
@@ -4423,6 +4424,28 @@ static void cold_usage(void) {
     puts("    --emit:csg   same as --emit:obj");
     puts("  reserved backend commands hard-fail until their real paths exist");
     puts("  cheng_cold <out> [source]");
+}
+
+static int cold_cmd_status(int argc, char **argv) {
+    const char *root = cold_flag_value(argc, argv, "--root");
+    const char *source = cold_flag_value(argc, argv, "--in");
+    if (!root || root[0] == '\0') root = ".";
+    if (!source) source = "";
+    puts("cheng");
+    puts("version=cheng.compiler_runtime.v1");
+    puts("execution=argv_control_plane");
+    puts("bootstrap_mode=selfhost");
+    puts("compiler_entry=src/core/tooling/backend_driver_dispatch_min.cheng");
+    puts("ordinary_command=system-link-exec");
+    puts("ordinary_pipeline=canonical_csg_verified_primary_object_codegen_ready");
+    puts("stage3=artifacts/bootstrap/cheng.stage3");
+    printf("flag_root=%s\n", root);
+    printf("flag_in=%s\n", source);
+    puts("flag_exec_edges=0");
+    puts("flag_exec_unresolved=0");
+    puts("linkerless_image=1");
+    puts("system_link=0");
+    return 0;
 }
 
 /* ================================================================
@@ -4559,6 +4582,7 @@ enum {
     BODY_OP_I64_ASR = 128,
     BODY_OP_I32_FROM_I64 = 129,
     BODY_OP_ASSERT = 130,
+    BODY_OP_STR_SELECT_NONEMPTY = 131,
 };
 
 enum {
@@ -5963,6 +5987,14 @@ typedef struct {
     int32_t import_source_count;
 } Parser;
 
+static Parser parser_child(Parser *owner, Span source) {
+    Parser child = {source, 0, owner->arena, owner->symbols,
+                    owner->import_mode, owner->import_alias};
+    child.import_sources = owner->import_sources;
+    child.import_source_count = owner->import_source_count;
+    return child;
+}
+
 /* Import source record: alias + resolved path */
 struct ColdImportSource {
     Span alias;
@@ -6396,15 +6428,11 @@ static Span parser_scoped_bare_name(Parser *parser, Span name) {
 }
 
 static ObjectDef *parser_find_object(Parser *parser, Span name) {
-    /* Try import-alias-scoped name first when in import mode */
-    if (parser && parser->import_alias.len > 0) {
+    if (parser_can_scope_bare_name(parser, name)) {
         Span scoped = parser_scoped_bare_name(parser, name);
-        if (scoped.len > 0) {
-            ObjectDef *object = symbols_find_object(parser->symbols, scoped);
-            if (object) return object;
-        }
+        ObjectDef *object = symbols_find_object(parser->symbols, scoped);
+        if (object) return object;
     }
-    /* Fallback: unqualified name lookup */
     return symbols_find_object(parser->symbols, name);
 }
 
@@ -6647,6 +6675,140 @@ static void cold_collect_import_module_types(Symbols *symbols, Span alias, Span 
     }
 }
 
+static void cold_register_import_enum(Symbols *symbols, Span alias, Span type_name,
+                                      Span *variant_names, int32_t variant_count) {
+    if (variant_count <= 0) return;
+    Span qualified_type = cold_arena_join3(symbols->arena, alias, ".", type_name);
+    TypeDef *type = symbols_find_type(symbols, qualified_type);
+    if (!type) {
+        type = symbols_add_type(symbols, qualified_type, variant_count);
+    }
+    if (type->variant_count != variant_count) die("import enum variant count drift");
+    type->is_enum = true;
+    for (int32_t vi = 0; vi < variant_count; vi++) {
+        Span qualified_variant = cold_arena_join3(symbols->arena, alias, ".",
+                                                  variant_names[vi]);
+        Variant *variant = &type->variants[vi];
+        variant->name = qualified_variant;
+        variant->tag = vi;
+        variant->field_count = 0;
+        variant_finalize_layout(type, variant);
+        if (!symbols_find_const(symbols, qualified_variant)) {
+            symbols_add_const(symbols, qualified_variant, vi);
+        }
+        Span qualified_type_variant = cold_arena_join3(symbols->arena,
+                                                       qualified_type, ".",
+                                                       variant_names[vi]);
+        if (!symbols_find_const(symbols, qualified_type_variant)) {
+            symbols_add_const(symbols, qualified_type_variant, vi);
+        }
+    }
+}
+
+static bool cold_parse_enum_member_line(Span trimmed, Span *type_name,
+                                        Span *inline_variants) {
+    int32_t eq = cold_span_find_char(trimmed, '=');
+    if (eq <= 0) return false;
+    Span left = span_trim(span_sub(trimmed, 0, eq));
+    Span right = span_trim(span_sub(trimmed, eq + 1, trimmed.len));
+    if (!cold_span_starts_with(right, "enum")) return false;
+    if (cold_span_starts_with(left, "type ")) {
+        left = span_trim(span_sub(left, 5, left.len));
+    }
+    if (!cold_span_is_simple_ident(left)) return false;
+    *type_name = left;
+    *inline_variants = span_trim(span_sub(right, 4, right.len));
+    return true;
+}
+
+static int32_t cold_collect_enum_variants_from_span(Span text, Span *variants,
+                                                    int32_t cap) {
+    Parser parser = {text, 0, 0, 0};
+    int32_t count = 0;
+    while (parser.pos < parser.source.len) {
+        Span name = parser_token(&parser);
+        if (name.len <= 0) break;
+        if (span_eq(name, ",") || !cold_span_is_simple_ident(name)) continue;
+        if (count >= cap) die("too many cold enum variants");
+        variants[count++] = name;
+    }
+    return count;
+}
+
+static void cold_collect_import_module_enum_blocks(Symbols *symbols, Span alias,
+                                                   Span source) {
+    int32_t line_cap = 1;
+    for (int32_t i = 0; i < source.len; i++) {
+        if (source.ptr[i] == '\n') line_cap++;
+    }
+    int32_t *line_starts = arena_alloc(symbols->arena, (size_t)line_cap * sizeof(int32_t));
+    int32_t *line_ends = arena_alloc(symbols->arena, (size_t)line_cap * sizeof(int32_t));
+    int32_t line_count = 0;
+    int32_t pos = 0;
+    while (pos < source.len) {
+        if (line_count >= line_cap) die("cold enum line accounting drift");
+        int32_t start = pos;
+        while (pos < source.len && source.ptr[pos] != '\n') pos++;
+        line_starts[line_count] = start;
+        line_ends[line_count] = pos;
+        line_count++;
+        if (pos < source.len) pos++;
+    }
+    bool in_type_group = false;
+    int32_t group_indent = -1;
+    for (int32_t li = 0; li < line_count; li++) {
+        Span line = span_sub(source, line_starts[li], line_ends[li]);
+        Span trimmed = span_trim(line);
+        if (trimmed.len <= 0) continue;
+        int32_t indent = cold_line_indent_width(line);
+        if (indent == 0) {
+            in_type_group = span_eq(trimmed, "type");
+            group_indent = -1;
+            if (!in_type_group && !cold_span_starts_with(trimmed, "type ")) {
+                continue;
+            }
+        } else if (!in_type_group) {
+            continue;
+        }
+        if (in_type_group) {
+            if (indent <= 0) continue;
+            if (group_indent < 0) group_indent = indent;
+            if (indent < group_indent) {
+                in_type_group = false;
+                group_indent = -1;
+                continue;
+            }
+            if (indent != group_indent) continue;
+        }
+        Span type_name = {0};
+        Span inline_variants = {0};
+        if (!cold_parse_enum_member_line(trimmed, &type_name, &inline_variants)) {
+            continue;
+        }
+        Span variants[COLD_MAX_OBJECT_FIELDS];
+        int32_t variant_count = cold_collect_enum_variants_from_span(inline_variants,
+                                                                     variants,
+                                                                     COLD_MAX_OBJECT_FIELDS);
+        if (variant_count == 0) {
+            int32_t body_indent = -1;
+            for (int32_t vi_line = li + 1; vi_line < line_count; vi_line++) {
+                Span vline = span_sub(source, line_starts[vi_line], line_ends[vi_line]);
+                Span vt = span_trim(vline);
+                if (vt.len <= 0) continue;
+                int32_t vindent = cold_line_indent_width(vline);
+                if (vindent <= indent) break;
+                if (body_indent < 0) body_indent = vindent;
+                if (vindent < body_indent) break;
+                if (vindent != body_indent) continue;
+                if (!cold_span_is_simple_ident(vt)) break;
+                if (variant_count >= COLD_MAX_OBJECT_FIELDS) die("too many cold enum variants");
+                variants[variant_count++] = vt;
+            }
+        }
+        cold_register_import_enum(symbols, alias, type_name, variants, variant_count);
+    }
+}
+
 static void cold_collect_import_module_consts(Symbols *symbols, Span alias, Span source) {
     /* scan source for top-level "const" blocks and add constants with alias */
     int32_t pos = 0;
@@ -6695,6 +6857,7 @@ static void cold_collect_import_module_types_from_path(Symbols *symbols, Span al
     Span source = source_open(path);
     if (source.len <= 0) return; /* skip empty import */
     cold_collect_import_module_types(symbols, alias, source);
+    cold_collect_import_module_enum_blocks(symbols, alias, source);
     cold_collect_import_module_consts(symbols, alias, source);
     munmap((void *)source.ptr, (size_t)source.len);
 }
@@ -6941,7 +7104,7 @@ static void parse_grouped_type_block(Parser *parser, int32_t block_start, int32_
         uint8_t *synthetic = arena_alloc(parser->arena, (size_t)normalized.len + 6);
         memcpy(synthetic, "type ", 5);
         memcpy(synthetic + 5, normalized.ptr, (size_t)normalized.len);
-        Parser member_parser = {{synthetic, normalized.len + 5}, 0, parser->arena, parser->symbols};
+        Parser member_parser = parser_child(parser, (Span){synthetic, normalized.len + 5});
         parse_type(&member_parser);
     }
     parser->pos = block_end;
@@ -6990,7 +7153,7 @@ static void parse_type(Parser *parser) {
         if (line_end < parser->source.len) line_end++;
     }
 
-    Parser line = {span_sub(parser->source, line_start, line_end), 0, parser->arena, parser->symbols};
+    Parser line = parser_child(parser, span_sub(parser->source, line_start, line_end));
     if (!parser_take(&line, "type")) die("expected type");
     Span type_name = parser_token(&line);
     Span generic_names[COLD_MAX_VARIANT_FIELDS];
@@ -7018,7 +7181,7 @@ static void parse_type(Parser *parser) {
     Span rhs_check = span_trim(span_sub(line.source, line.pos, line.source.len));
     if (cold_span_starts_with(rhs_check, "enum")) {
         if (generic_count > 0) die("cold enum cannot be generic");
-        Parser enum_parser = {rhs_check, 0, parser->arena, parser->symbols};
+        Parser enum_parser = parser_child(parser, rhs_check);
         if (!parser_take(&enum_parser, "enum")) die("expected enum");
         Span variant_names[COLD_MAX_OBJECT_FIELDS];
         int32_t enum_variant_count = 0;
@@ -7946,7 +8109,6 @@ static int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *local
               param_sizes[ai] = body->slot_size[body->call_arg_slot[arg_start + ai]];
           }
           if (parser->import_mode) {
-              /* In import mode, do not add new symbols — skip unresolved calls */
               fn_index = symbols_find_fn(parser->symbols, lookup_name, arg_count, param_kinds, param_sizes, cold_cstr_span("i"));
           } else {
               /* Try name-only lookup first to avoid duplicates when call args
@@ -8384,8 +8546,12 @@ static int32_t parse_i32_array_literal(Parser *parser, BodyIR *body, Locals *loc
         int32_t slot = body_slot(body, SLOT_SEQ_STR, 16);
         body_slot_set_type(body, slot, cold_cstr_span("str[]"));
         body_op3(body, BODY_OP_MAKE_COMPOSITE, slot, 0, -1, 0);
-        for (int32_t i = 0; i < count; i++)
+        for (int32_t i = 0; i < count; i++) {
+            if (element_kinds[i] != SLOT_STR && element_kinds[i] != SLOT_STR_REF) {
+                die("cold str[] literal element must be str");
+            }
             body_op(body, BODY_OP_SEQ_STR_ADD, slot, element_slots[i], 0);
+        }
         *kind = SLOT_SEQ_STR;
         return slot;
     }
@@ -8670,7 +8836,7 @@ static int32_t parse_fmt_literal(Parser *parser, BodyIR *body, Locals *locals, i
             if (i >= content.len) die("unterminated Fmt interpolation");
             Span expr = span_trim(span_sub(content, expr_start, i));
             if (expr.len <= 0) die("empty Fmt interpolation");
-            Parser expr_parser = {expr, 0, parser->arena, parser->symbols};
+            Parser expr_parser = parser_child(parser, expr);
             int32_t expr_kind = SLOT_I32;
             int32_t expr_slot = parse_expr(&expr_parser, body, locals, &expr_kind);
             parser_ws(&expr_parser);
@@ -8816,7 +8982,9 @@ static bool cold_try_str_len_intrinsic(BodyIR *body, Span name,
                                        int32_t arg_start, int32_t arg_count,
                                        int32_t *slot_out, int32_t *kind_out) {
     if (!(span_eq(name, "strings.Len") || span_eq(name, "strutil.Len") ||
-          span_eq(name, "strutils.Len") || span_eq(name, "Len"))) {
+          span_eq(name, "strutils.Len") || span_eq(name, "Len") ||
+          span_eq(name, "StrLenFast") || span_eq(name, "strLenFast") ||
+          span_eq(name, "system.StrLenFast") || span_eq(name, "system.strLenFast"))) {
         return false;
     }
     if (arg_count != 1) die("Len intrinsic arity mismatch");
@@ -9529,17 +9697,33 @@ static bool cold_try_path_intrinsic(Parser *parser, BodyIR *body, Span name,
         *slot_out = slot;
         return true;
     }
+    if (span_eq(name, "provroot.RuntimeProviderPath") ||
+        span_eq(name, "RuntimeProviderPath")) {
+        if (arg_count != 2) die("RuntimeProviderPath arity mismatch");
+        int32_t root = body->call_arg_slot[arg_start];
+        int32_t raw = body->call_arg_slot[arg_start + 1];
+        root = cold_require_str_value(body, root, "RuntimeProviderPath root");
+        raw = cold_require_str_value(body, raw, "RuntimeProviderPath rel");
+        int32_t key = cold_make_str_literal_cstr_slot(body, "CHENG_ROOT");
+        int32_t env_root = cold_make_str_result_slot(body);
+        body_op(body, BODY_OP_GETENV_STR, env_root, key, 0);
+        int32_t selected_root = cold_make_str_result_slot(body);
+        body_op(body, BODY_OP_STR_SELECT_NONEMPTY, selected_root, env_root, root);
+        int32_t slot = cold_make_str_result_slot(body);
+        body_op(body, BODY_OP_PATH_ABSOLUTE, slot, selected_root, raw);
+        if (kind_out) *kind_out = SLOT_STR;
+        *slot_out = slot;
+        return true;
+    }
     if (span_eq(name, "chengpath.PathAbsolute") ||
         span_eq(name, "PathAbsolute")) {
         if (arg_count != 2) die("PathAbsolute arity mismatch");
         int32_t root = body->call_arg_slot[arg_start];
         int32_t raw = body->call_arg_slot[arg_start + 1];
-        (void)cold_require_str_value(body, root, "PathAbsolute root");
+        root = cold_require_str_value(body, root, "PathAbsolute root");
         raw = cold_require_str_value(body, raw, "PathAbsolute raw");
-        int32_t cwd_slot = cold_make_str_result_slot(body);
-        body_op(body, BODY_OP_CWD_STR, cwd_slot, 0, 0);
         int32_t slot = cold_make_str_result_slot(body);
-        body_op(body, BODY_OP_PATH_ABSOLUTE, slot, cwd_slot, raw);
+        body_op(body, BODY_OP_PATH_ABSOLUTE, slot, root, raw);
         if (kind_out) *kind_out = SLOT_STR;
         *slot_out = slot;
         return true;
@@ -10634,7 +10818,7 @@ static int32_t parse_scalar_identity_cast(Parser *parser, BodyIR *body,
             *kind = SLOT_I64;
             return slot;
         }
-        Parser arg_parser = {arg_span, 0, parser->arena, parser->symbols};
+        Parser arg_parser = parser_child(parser, arg_span);
         int32_t value_kind = SLOT_I32;
         int32_t value_slot = parse_expr(&arg_parser, body, locals, &value_kind);
         parser_ws(&arg_parser);
@@ -11037,12 +11221,7 @@ static int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32
                 }
             }
         }
-        /* fallback: create synthetic const for unknown qualified enum-like identifiers */
-        symbols_add_const(parser->symbols, qualified, 0);
-        int32_t slot = body_slot(body, SLOT_I32, 4);
-        body_op(body, BODY_OP_I32_CONST, slot, 0, 0);
-        *kind = SLOT_I32;
-        return slot;
+        die("unknown qualified identifier");
     }
     ConstDef *constant = parser_find_const(parser, token);
     if (constant) {
@@ -11258,7 +11437,7 @@ static int32_t parse_postfix(Parser *parser, BodyIR *body, Locals *locals,
                     body_op3(body, BODY_OP_SEQ_I32_INDEX_DYNAMIC, dst, slot, index_slot, 0);
                 }
             } else {
-                Parser index_parser = {index, 0, parser->arena, parser->symbols};
+                Parser index_parser = parser_child(parser, index);
                 int32_t index_kind = SLOT_I32;
                 int32_t index_slot = parse_expr(&index_parser, body, locals, &index_kind);
                 parser_ws(&index_parser);
@@ -11554,7 +11733,7 @@ static int32_t parse_compare_expr(Parser *parser, BodyIR *body, Locals *locals, 
 static int32_t parse_expr_from_span(Parser *owner, BodyIR *body, Locals *locals,
                                     Span expr, int32_t *kind,
                                     const char *trailing_message) {
-    Parser expr_parser = {expr, 0, owner->arena, owner->symbols};
+    Parser expr_parser = parser_child(owner, expr);
     int32_t slot = parse_expr(&expr_parser, body, locals, kind);
     parser_ws(&expr_parser);
     if (expr_parser.pos != expr_parser.source.len) {
@@ -12047,7 +12226,7 @@ static int32_t parse_field_assign(Parser *parser, BodyIR *body, Locals *locals,
 
 static int32_t parse_seq_lvalue_from_span(Parser *owner, BodyIR *body, Locals *locals,
                                           Span target, int32_t *kind_out) {
-    Parser parser = {target, 0, owner->arena, owner->symbols};
+    Parser parser = parser_child(owner, target);
     Span name = parser_token(&parser);
     if (name.len <= 0) die("add target must name an int32[]");
     Local *local = locals_find(locals, name);
@@ -12117,10 +12296,11 @@ static int32_t parse_builtin_add_after_name(Parser *parser, BodyIR *body, Locals
     } else if (seq_kind == SLOT_SEQ_OPAQUE || seq_kind == SLOT_SEQ_OPAQUE_REF) {
         int32_t element_size = cold_seq_opaque_element_size_for_slot(parser->symbols, body, seq_slot);
         body_op(body, BODY_OP_SEQ_OPAQUE_ADD, seq_slot, value_slot, element_size);
-    } else {
-        if (value_kind == SLOT_STR || value_kind == SLOT_I32) {
-            body_op(body, BODY_OP_SEQ_STR_ADD, seq_slot, value_slot, 0);
+    } else if (seq_kind == SLOT_SEQ_STR || seq_kind == SLOT_SEQ_STR_REF) {
+        if (value_kind != SLOT_STR && value_kind != SLOT_STR_REF) {
+            die("add str[] value kind mismatch");
         }
+        body_op(body, BODY_OP_SEQ_STR_ADD, seq_slot, value_slot, 0);
     }
     return block;
 }
@@ -12159,7 +12339,7 @@ static Span condition_strip_outer(Span condition);
 
 static int32_t cold_match_eval_target(Parser *parser, BodyIR *body, Locals *locals,
                                       Span expr_span, int32_t *variant_slot) {
-    Parser expr_parser = {expr_span, 0, parser->arena, parser->symbols};
+    Parser expr_parser = parser_child(parser, expr_span);
     int32_t kind = SLOT_I32;
     int32_t slot = parse_expr(&expr_parser, body, locals, &kind);
     parser_ws(&expr_parser);
@@ -12216,7 +12396,7 @@ static int32_t parse_match_arm(Parser *parser, BodyIR *body, Locals *locals,
             end++;
         }
         Span arm_body = span_trim(span_sub(parser->source, start, end));
-        Parser arm_parser = {arm_body, 0, parser->arena, parser->symbols};
+        Parser arm_parser = parser_child(parser, arm_body);
         int32_t arm_end = arm_block;
         while (arm_parser.pos < arm_parser.source.len &&
                body->block_term[arm_end] < 0) {
@@ -12329,7 +12509,7 @@ static int32_t parse_match(Parser *parser, BodyIR *body, Locals *locals,
             int32_t nl = 0;
             while (nl < rest.len && rest.ptr[nl] != '\n') nl++;
             Span arm_body = span_trim(span_sub(rest, 0, nl));
-            Parser arm_parser = {arm_body, 0, parser->arena, parser->symbols};
+            Parser arm_parser = parser_child(parser, arm_body);
             int32_t end_block = arm_block;
             while (arm_parser.pos < arm_parser.source.len &&
                    body->block_term[end_block] < 0) {
@@ -12381,7 +12561,7 @@ static int32_t parse_match(Parser *parser, BodyIR *body, Locals *locals,
                            parser->source.ptr[end] != '\n' &&
                            parser->source.ptr[end] != '\r') end++;
                     Span arm_body = span_trim(span_sub(parser->source, start, end));
-                    Parser arm_parser = {arm_body, 0, parser->arena, parser->symbols};
+                    Parser arm_parser = parser_child(parser, arm_body);
                     while (arm_parser.pos < arm_parser.source.len &&
                            body->block_term[arm_end] < 0) {
                         arm_end = parse_statement(&arm_parser, body, locals, arm_end, loop);
@@ -12743,7 +12923,7 @@ static void parse_condition_span(Parser *owner, BodyIR *body, Locals *locals,
         return;
     }
 
-    Parser leaf = {condition, 0, owner->arena, owner->symbols};
+    Parser leaf = parser_child(owner, condition);
     int32_t left_kind = SLOT_I32;
     int32_t left = parse_expr(&leaf, body, locals, &left_kind);
     int32_t left_end = leaf.pos;
@@ -13299,7 +13479,7 @@ static int32_t parse_statement(Parser *parser, BodyIR *body, Locals *locals,
                     is = body_slot(body, SLOT_I32, 4);
                     body_op(body, BODY_OP_I32_CONST, is, span_i32(idx_span), 0);
                 } else {
-                    Parser ip = {idx_span, 0, parser->arena, parser->symbols};
+                    Parser ip = parser_child(parser, idx_span);
                     is = parse_expr(&ip, body, locals, &ik);
                 }
                 int32_t ref_kind = fld->kind == SLOT_SEQ_OPAQUE ? SLOT_SEQ_OPAQUE_REF : SLOT_OBJECT_REF;
@@ -13349,7 +13529,7 @@ static int32_t parse_statement(Parser *parser, BodyIR *body, Locals *locals,
                 is = body_slot(body, SLOT_I32, 4);
                 body_op(body, BODY_OP_I32_CONST, is, span_i32(idx_span), 0);
             } else {
-                Parser ip = {idx_span, 0, parser->arena, parser->symbols};
+                Parser ip = parser_child(parser, idx_span);
                 is = parse_expr(&ip, body, locals, &ik);
             }
             if (base->kind == SLOT_ARRAY_I32)
@@ -16224,6 +16404,21 @@ static void codegen_getenv_str(Code *code, BodyIR *body, int32_t dst, int32_t ke
     a64_patch_b(code, done_jump, code->count);
 }
 
+static void codegen_str_select_nonempty(Code *code, BodyIR *body, int32_t dst,
+                                        int32_t preferred, int32_t alternate) {
+    codegen_load_str_pair(code, body, preferred, R2, R3);
+    code_emit(code, a64_cmp_imm(R3, 0));
+    int32_t use_alternate = code->count;
+    code_emit(code, a64_bcond(0, COND_EQ));
+    codegen_store_str_pair(code, body, dst, R2, R3);
+    int32_t done = code->count;
+    code_emit(code, a64_b(0));
+    a64_patch_bcond(code, use_alternate, code->count);
+    codegen_load_str_pair(code, body, alternate, R2, R3);
+    codegen_store_str_pair(code, body, dst, R2, R3);
+    a64_patch_b(code, done, code->count);
+}
+
 static void codegen_read_flag(Code *code, BodyIR *body, int32_t dst,
                               int32_t key_slot, int32_t default_slot) {
     codegen_load_str_pair(code, body, key_slot, R1, R2);
@@ -17209,8 +17404,8 @@ static void codegen_seq_i32_add(Code *code, BodyIR *body, int32_t seq_slot, int3
 }
 
 static void codegen_seq_str_add(Code *code, BodyIR *body, int32_t seq_slot, int32_t value_slot) {
-    if (body->slot_kind[value_slot] != SLOT_STR && body->slot_kind[value_slot] != SLOT_I32)
-        return; /* skip non-str add */
+    if (body->slot_kind[value_slot] != SLOT_STR && body->slot_kind[value_slot] != SLOT_STR_REF)
+        die("str[] add value kind mismatch");
     codegen_seq_str_header_addr(code, body, seq_slot, R2);
     code_emit(code, a64_ldr_imm(R0, R2, 0, false));
     code_emit(code, a64_ldr_imm(R1, R2, 4, false));
@@ -17225,10 +17420,9 @@ static void codegen_seq_str_add(Code *code, BodyIR *body, int32_t seq_slot, int3
     code_emit(code, a64_add_reg_x(6, 6, 6));
     code_emit(code, a64_add_reg_x(6, 6, 6));
     code_emit(code, a64_add_reg_x(R3, R3, 6));
-    a64_emit_ldr_sp_off(code, 4, body->slot_offset[value_slot], true);
+    codegen_load_str_pair(code, body, value_slot, 4, 5);
     code_emit(code, a64_str_imm(4, R3, 0, true));
-    a64_emit_ldr_sp_off(code, 4, body->slot_offset[value_slot] + 8, true);
-    code_emit(code, a64_str_imm(4, R3, 8, true));
+    code_emit(code, a64_str_imm(5, R3, 8, true));
     code_emit(code, a64_add_imm(R0, R0, 1, false));
     code_emit(code, a64_str_imm(R0, R2, 0, false));
     int32_t done_jump = code->count;
@@ -17555,6 +17749,45 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         code_emit(code, a64_movz_x(16, 1, 0));
         code_emit(code, a64_svc(0x80));
         code_emit(code, a64_brk(0x4517));
+    } else if (kind == BODY_OP_ASSERT) {
+        if (body->slot_kind[a] == SLOT_I32_REF) {
+            a64_emit_ldr_sp_off(code, R1, body->slot_offset[a], true);
+            code_emit(code, a64_ldr_imm(R0, R1, 0, false));
+        } else if (body->slot_kind[a] == SLOT_I32) {
+            a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
+        } else {
+            die("assert condition slot kind mismatch");
+        }
+        code_emit(code, a64_cmp_imm(R0, 0));
+        int32_t ok_pos = code->count;
+        code_emit(code, a64_bcond(0, COND_NE));
+        code_emit(code, a64_movz_x(R0, 2, 0));
+        if (body->slot_kind[b] == SLOT_STR_REF) {
+            a64_emit_ldr_sp_off(code, R3, body->slot_offset[b], true);
+            code_emit(code, a64_ldr_imm(R1, R3, 0, true));
+            code_emit(code, a64_ldr_imm(R2, R3, 8, true));
+        } else if (body->slot_kind[b] == SLOT_STR) {
+            a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], true);
+            a64_emit_ldr_sp_off(code, R2, body->slot_offset[b] + 8, true);
+        } else {
+            die("assert message slot kind mismatch");
+        }
+        code_emit(code, a64_movz_x(16, 4, 0));
+        code_emit(code, a64_svc(0x80));
+        code_emit(code, a64_movz_x(R0, 2, 0));
+        code_emit(code, a64_movz(R1, '\n', 0));
+        code_emit(code, a64_strb_imm(R1, SP, body->slot_offset[dst]));
+        a64_emit_add_large(code, R1, SP, body->slot_offset[dst], true);
+        code_emit(code, a64_movz_x(R2, 1, 0));
+        code_emit(code, a64_movz_x(16, 4, 0));
+        code_emit(code, a64_svc(0x80));
+        code_emit(code, a64_movz(R0, 1, 0));
+        code_emit(code, a64_movz_x(16, 1, 0));
+        code_emit(code, a64_svc(0x80));
+        code_emit(code, a64_brk(0xA55E));
+        a64_patch_bcond(code, ok_pos, code->count);
+        code_emit(code, a64_movz(R0, 0, 0));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
     } else if (kind == BODY_OP_WRITE_LINE) {
         if (body->slot_kind[a] == SLOT_OPAQUE) {
             a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], true);
@@ -17635,6 +17868,8 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         a64_patch_b(code, done_jump, code->count);
     } else if (kind == BODY_OP_GETENV_STR) {
         codegen_getenv_str(code, body, dst, a);
+    } else if (kind == BODY_OP_STR_SELECT_NONEMPTY) {
+        codegen_str_select_nonempty(code, body, dst, a, b);
     } else if (kind == BODY_OP_READ_FLAG) {
         codegen_read_flag(code, body, dst, a, b);
     } else if (kind == BODY_OP_PARSE_INT) {
@@ -21226,6 +21461,9 @@ int main(int argc, char **argv) {
     }
     if (argc >= 2 && strcmp(argv[1], "build-backend-driver") == 0) {
         return cold_cmd_build_backend_driver(argc, argv, argv[0]);
+    }
+    if (argc >= 2 && strcmp(argv[1], "status") == 0) {
+        return cold_cmd_status(argc, argv);
     }
     if (argc >= 2 && strcmp(argv[1], "system-link-exec") == 0) {
         return cold_cmd_system_link_exec(argc, argv);

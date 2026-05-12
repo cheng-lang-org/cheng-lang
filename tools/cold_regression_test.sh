@@ -76,7 +76,7 @@ if [ -x /tmp/ct_bare_helper ]; then
 else
     ACT="COMPILE_FAILED"
 fi
-assert "import_bare_helper" 5 "$ACT"
+assert "import_bare_helper" 39 "$ACT"
 if grep -q '^direct_macho=1$' /tmp/ct_bare_helper.report 2>/dev/null &&
    grep -q '^provider_object_count=0$' /tmp/ct_bare_helper.report 2>/dev/null &&
    grep -q '^system_link=0$' /tmp/ct_bare_helper.report 2>/dev/null; then
@@ -257,6 +257,29 @@ else
     ACT=0
 fi
 assert "build_backend_driver_status_marker" 1 "$ACT"
+
+rm -f /tmp/ct_compiler_runtime_smoke /tmp/ct_compiler_runtime_smoke.report \
+    /tmp/ct_compiler_runtime_smoke.stdout /tmp/ct_compiler_runtime_smoke.stderr
+quiet $COLD system-link-exec --root:"$PWD" --in:src/tests/compiler_runtime_smoke.cheng \
+    --emit:exe --target:arm64-apple-darwin --out:/tmp/ct_compiler_runtime_smoke \
+    --report-out:/tmp/ct_compiler_runtime_smoke.report
+if [ -x /tmp/ct_compiler_runtime_smoke ]; then
+    /tmp/ct_compiler_runtime_smoke >/tmp/ct_compiler_runtime_smoke.stdout \
+        2>/tmp/ct_compiler_runtime_smoke.stderr
+    ACT=$?
+else
+    ACT="COMPILE_FAILED"
+fi
+assert "compiler_runtime_smoke" 0 "$ACT"
+if grep -q 'compiler_runtime_smoke ok' /tmp/ct_compiler_runtime_smoke.stdout 2>/dev/null &&
+   grep -q '^direct_macho=1$' /tmp/ct_compiler_runtime_smoke.report 2>/dev/null &&
+   grep -q '^provider_object_count=0$' /tmp/ct_compiler_runtime_smoke.report 2>/dev/null &&
+   grep -q '^system_link=0$' /tmp/ct_compiler_runtime_smoke.report 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "compiler_runtime_smoke_linkerless_marker" 1 "$ACT"
 
 # 4: for_range
 cat > /tmp/ct_for.cheng << 'EOF'
