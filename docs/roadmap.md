@@ -287,13 +287,15 @@ Cheng 的工业路线不是和 LLVM/mold 在传统资源赛道硬拼，而是用
 
 目标：C seed 只做冷启动外根，不承载生产编译能力。
 
-| 区域 | 策略 |
-|---|---|
-| 命令分发 | 只保留 bootstrap 必需命令 |
-| `system-link-exec` | 迁入 Cheng 主链，seed 不再实现生产编译 |
-| runtime/provider | 新能力只进 `src/core/runtime` 或 Cheng provider，不扩展旧 C surface |
-| Wasm/对象写入 | 已迁出的实现不得回潮 |
-| 验证 | C seed forced build 只用于恢复破损 artifact，不计入完成证明 |
+详细审计见 `docs/c_seed_audit.md`。
+
+| 区域 | 策略 | 当前状态 |
+|---|---|---|
+| 命令分发 | 只保留 bootstrap 必需命令 | 9 命令中 5 个必需，4 个可移除 |
+| `system-link-exec` | 迁入 Cheng 主链 | 252 行，阻塞于回归测试依赖 |
+| `cheng_seed.c` | 被 cold 替代后移除 | 66K 行，bootstrap 链仍需要 |
+| runtime/provider | 新能力只进 `src/core/runtime` | ✅ |
+| 验证 | C seed forced build 只用于恢复 | 已就位 |
 
 ## 阶段 7：跨端与应用层
 

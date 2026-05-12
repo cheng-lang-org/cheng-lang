@@ -1380,6 +1380,32 @@ fn PrimaryBodyIrPtrExpressionSlot(bodyIR: var coreir.BodyIR,
                PrimaryCallTargetTailName(bodyIR.callSequence[ci].targetSymbol) == "cheng_ptr_plus":
                 bodyIR.callSequence[ci].resultPassKind = coreir.BodyCallPassStackValueTag
         return directSlot
+    let ptrPlusArgsText = PrimaryBodyIrWholeCallInnerForHead(text, "cheng_ptr_plus")
+    if ptrPlusArgsText != "":
+        let argNames = PrimaryBodyIrCallArgNames(ptrPlusArgsText)
+        var callIndex = bodyIR.callSequence.len
+        while callIndex > 0:
+            callIndex = callIndex - 1
+            if PrimaryCallTargetTailName(bodyIR.callSequence[callIndex].targetSymbol) != "cheng_ptr_plus":
+                continue
+            if bodyIR.callSequence[callIndex].argSlots.len != argNames.len:
+                continue
+            var argsMatch = true
+            for ai in 0..<argNames.len:
+                let argSlot = PrimaryBodyIrFindArgSlot(slotNames, PrimaryBodyIrCanonicalCallText(argNames[ai]))
+                if argSlot < 0 || argSlot != bodyIR.callSequence[callIndex].argSlots[ai]:
+                    argsMatch = false
+                    break
+            if !argsMatch:
+                continue
+            let resultSlot = bodyIR.callSequence[callIndex].resultSlot
+            if resultSlot < 0 || resultSlot >= bodyIR.localSlots.len:
+                return -1
+            bodyIR.localSlots[resultSlot].typeKind = coreir.LocalPtrTag
+            bodyIR.localSlots[resultSlot].sizeBytes = 8
+            bodyIR.localSlots[resultSlot].alignBytes = 8
+            bodyIR.callSequence[callIndex].resultPassKind = coreir.BodyCallPassStackValueTag
+            return resultSlot
     let ptrInner = PrimaryBodyIrWholeCallInnerForHead(text, "ptr")
     if ptrInner != "":
         let innerSlot = PrimaryBodyIrFindArgSlot(slotNames, ptrInner)
@@ -1389,9 +1415,68 @@ fn PrimaryBodyIrPtrExpressionSlot(bodyIR: var coreir.BodyIR,
             return innerSlot
     return -1
 
+fn PrimaryBodyIrAppendPtrPlusCallSlot(bodyIR: var coreir.BodyIR,
+                                       slotNames: var str[],
+                                       varI32ParamNames: str[],
+                                       typedIr: texpr.TypedExprIr,
+                                       sourcePath: str,
+                                       textRaw: str): int32 =
+    let text = strutil.Strip(textRaw)
+    let ptrPlusArgsText = PrimaryBodyIrWholeCallInnerForHead(text, "cheng_ptr_plus")
+    if ptrPlusArgsText == "":
+        return -1
+    let argNames = PrimaryBodyIrCallArgNames(ptrPlusArgsText)
+    if argNames.len != 2:
+        return -1
+    let baseSlot = PrimaryBodyIrPtrExpressionSlot(bodyIR, slotNames, argNames[0])
+    if baseSlot < 0 ||
+       baseSlot >= bodyIR.localSlots.len ||
+       PrimaryBodyIrSlotType(bodyIR, baseSlot) != coreir.LocalPtrTag:
+        return -1
+    let offsetSlot = PrimaryBodyIrScalarValueSlotForText(bodyIR,
+                                                         slotNames,
+                                                         varI32ParamNames,
+                                                         typedIr,
+                                                         sourcePath,
+                                                         argNames[1],
+                                                         coreir.LocalI32Tag)
+    if offsetSlot < 0 ||
+       offsetSlot >= bodyIR.localSlots.len ||
+       PrimaryBodyIrSlotType(bodyIR, offsetSlot) != coreir.LocalI32Tag:
+        return -1
+    let resultName = PrimaryBodyIrCanonicalCallText(text)
+    let resultSlot = PrimaryBodyIrFindOrCreateSlot(bodyIR,
+                                                   slotNames,
+                                                   resultName,
+                                                   coreir.LocalPtrTag)
+    if resultSlot < 0:
+        return -1
+    bodyIR.localSlots[resultSlot].typeKind = coreir.LocalPtrTag
+    bodyIR.localSlots[resultSlot].sizeBytes = 8
+    bodyIR.localSlots[resultSlot].alignBytes = 8
+    let callOrdinal = bodyIR.callSequence.len
+    var call: coreir.CallOp
+    call.targetSymbol = "cheng_ptr_plus"
+    call.resultSlot = resultSlot
+    call.resultPassKind = coreir.BodyCallPassStackValueTag
+    add(call.argSlots, baseSlot)
+    add(call.argPassKinds, coreir.BodyCallPassStackValueTag)
+    add(call.argSlots, offsetSlot)
+    add(call.argPassKinds, coreir.BodyCallPassStackValueTag)
+    add(bodyIR.callSequence, call)
+    var op: coreir.BodyOp
+    op.kind = coreir.BodyOpCallTag
+    op.target = resultSlot
+    add(op.operands, callOrdinal)
+    add(bodyIR.ops, op)
+    return resultSlot
+
 fn PrimaryBodyIrAppendUInt8PtrDerefLoad(bodyIR: var coreir.BodyIR,
                                          slotNames: var str[],
                                          textRaw: str,
+                                         varI32ParamNames: str[],
+                                         typedIr: texpr.TypedExprIr,
+                                         sourcePath: str,
                                          targetSlot: int32): bool =
     let pointerText = PrimaryBodyIrUInt8PtrDerefPointerText(textRaw)
     if pointerText == "":
@@ -1400,7 +1485,14 @@ fn PrimaryBodyIrAppendUInt8PtrDerefLoad(bodyIR: var coreir.BodyIR,
        targetSlot >= bodyIR.localSlots.len ||
        PrimaryBodyIrSlotType(bodyIR, targetSlot) != coreir.LocalI32Tag:
         return false
-    let pointerSlot = PrimaryBodyIrPtrExpressionSlot(bodyIR, slotNames, pointerText)
+    var pointerSlot = PrimaryBodyIrPtrExpressionSlot(bodyIR, slotNames, pointerText)
+    if pointerSlot < 0:
+        pointerSlot = PrimaryBodyIrAppendPtrPlusCallSlot(bodyIR,
+                                                         slotNames,
+                                                         varI32ParamNames,
+                                                         typedIr,
+                                                         sourcePath,
+                                                         pointerText)
     if pointerSlot < 0:
         return false
     var op: coreir.BodyOp
@@ -1425,7 +1517,14 @@ fn PrimaryBodyIrAppendUInt8PtrDerefStore(bodyIR: var coreir.BodyIR,
     if pointerText == "":
         failureDetail = 711
         return false
-    let pointerSlot = PrimaryBodyIrPtrExpressionSlot(bodyIR, slotNames, pointerText)
+    var pointerSlot = PrimaryBodyIrPtrExpressionSlot(bodyIR, slotNames, pointerText)
+    if pointerSlot < 0:
+        pointerSlot = PrimaryBodyIrAppendPtrPlusCallSlot(bodyIR,
+                                                         slotNames,
+                                                         varI32ParamNames,
+                                                         typedIr,
+                                                         sourcePath,
+                                                         pointerText)
     if pointerSlot < 0:
         failureDetail = 712
         return false
@@ -2044,7 +2143,13 @@ fn PrimaryBodyIrScalarValueSlotForText(bodyIR: var coreir.BodyIR,
         let ptrDerefText = PrimaryBodyIrUInt8PtrDerefPointerText(text)
         if ptrDerefText != "":
             let slotId = PrimaryBodyIrFindOrCreateSlot(bodyIR, slotNames, text, coreir.LocalI32Tag)
-            if !PrimaryBodyIrAppendUInt8PtrDerefLoad(bodyIR, slotNames, text, slotId):
+            if !PrimaryBodyIrAppendUInt8PtrDerefLoad(bodyIR,
+                                                     slotNames,
+                                                     text,
+                                                     varI32ParamNames,
+                                                     typedIr,
+                                                     sourcePath,
+                                                     slotId):
                 return -1
             return slotId
     if typeKind == coreir.LocalI32Tag || typeKind == coreir.LocalI64Tag:
@@ -2488,6 +2593,9 @@ fn PrimaryBodyIrAppendLocalDeclInitializer(bodyIR: var coreir.BodyIR,
         return PrimaryBodyIrAppendUInt8PtrDerefLoad(bodyIR,
                                                     slotNames,
                                                     rhsText,
+                                                    varI32ParamNames,
+                                                    typedIr,
+                                                    stmt.sourcePath,
                                                     targetSlot)
     if targetTypeKind == coreir.LocalI32Tag &&
        PrimaryBodyIrConditionHasAnd(rhsText):
