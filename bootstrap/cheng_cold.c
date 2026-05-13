@@ -3655,6 +3655,28 @@ static int32_t body_string_literal(BodyIR *body, Span literal) {
     return idx;
 }
 
+/* Compute a simple structural hash of a BodyIR function.
+   Two functions with the same ops, slots, blocks, and terms
+   in the same order will produce the same hash. */
+static uint64_t cold_body_ir_canonical_hash(BodyIR *body) {
+    if (!body) return 0;
+    uint64_t h = 0x9ae16a3b2f90405full;
+    /* Hash op kinds (not dst/a/b/c values — just the structure) */
+    for (int32_t i = 0; i < body->op_count; i++) {
+        h ^= ((uint64_t)body->op_kind[i] * 0xc6a4a7935bd1e995ull);
+        h = (h << 7) | (h >> 57);
+    }
+    /* Hash term kinds */
+    for (int32_t i = 0; i < body->term_count; i++) {
+        h ^= ((uint64_t)body->term_kind[i] * 0xc6a4a7935bd1e995ull);
+        h = (h << 7) | (h >> 57);
+    }
+    /* Hash block structure */
+    h ^= ((uint64_t)body->block_count * 0xc6a4a7935bd1e995ull);
+    h ^= ((uint64_t)body->slot_count * 0xc6a4a7935bd1e995ull);
+    return h;
+}
+
 /* ================================================================
  * Symbol table and local table
  * ================================================================ */
@@ -8684,7 +8706,10 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
     } else if (kind == BODY_OP_LOAD_I32) {
         int __cr = na_find(dst);
         if (__cr >= 0) { if (__cr != 0) code_emit(code, a64_add_imm(R0, __cr, 0, false)); }
-        else { a64_emit_ldr_sp_off(code, R0, body->slot_offset[dst], false); }
+        else {
+            a64_emit_ldr_sp_off(code, R0, body->slot_offset[dst], false);
+            if (body->slot_no_alias && body->slot_no_alias[dst]) na_set(0, dst);
+        }
     } else if (kind == BODY_OP_I32_REF_LOAD) {
         a64_emit_ldr_sp_off(code, R1, body->slot_offset[a], true);
         code_emit(code, a64_ldr_imm(R0, R1, 0, false));
@@ -9428,8 +9453,12 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
             code_emit(code, a64_bl(0));
             function_patches_add(function_patches, call_pos, a);
             if (stack_bytes > 0) a64_emit_add_large(code, SP, SP, stack_bytes, true);
+            /* Clobber caller-saved registers (R0-R7 per AAPCS64) */
+            na_clobber(0); na_clobber(1); na_clobber(2); na_clobber(3);
+            na_clobber(4); na_clobber(5); na_clobber(6); na_clobber(7);
             int32_t ret_kind = cold_return_kind_from_span(symbols, fn->ret);
             a64_emit_str_sp_off(code, R0, body->slot_offset[dst], ret_kind == SLOT_I64 || ret_kind == SLOT_PTR || ret_kind == SLOT_OPAQUE);
+            if (ret_kind == SLOT_I32 && body->slot_no_alias && body->slot_no_alias[dst]) na_set(0, dst);
         }
     } else if (kind == BODY_OP_COPY_I32) {
         int __cr2 = na_find(a);
@@ -9660,8 +9689,12 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
             code_emit(code, a64_bl(0));
             function_patches_add(function_patches, call_pos, a);
             if (stack_bytes > 0) a64_emit_add_large(code, SP, SP, stack_bytes, true);
+            /* Clobber caller-saved registers (R0-R7 per AAPCS64) */
+            na_clobber(0); na_clobber(1); na_clobber(2); na_clobber(3);
+            na_clobber(4); na_clobber(5); na_clobber(6); na_clobber(7);
             if (ret_kind == SLOT_I32) {
                 a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
+                if (body->slot_no_alias && body->slot_no_alias[dst]) na_set(0, dst);
             } else if (ret_kind == SLOT_I64 || ret_kind == SLOT_PTR || ret_kind == SLOT_OPAQUE) {
                 a64_emit_str_sp_off(code, R0, body->slot_offset[dst], true);
             }
@@ -9744,26 +9777,32 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         code_emit(code, a64_movz(R2, 1, 0));
         a64_patch_b(code, done_pos, code->count);
         a64_emit_str_sp_off(code, R2, body->slot_offset[dst], false);
-        na_clobber(2);
+        if (body->slot_no_alias && body->slot_no_alias[dst]) na_set(2, dst);
     } else if (kind == BODY_OP_I32_SHL) {
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
         a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], false);
+        na_clobber(1);
         code_emit(code, a64_lsl_reg(R0, R0, R1));
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
+        if (body->slot_no_alias && body->slot_no_alias[dst]) na_set(0, dst);
     } else if (kind == BODY_OP_I32_ASR) {
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
         a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], false);
+        na_clobber(1);
         code_emit(code, a64_asr_reg(R0, R0, R1));
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
+        if (body->slot_no_alias && body->slot_no_alias[dst]) na_set(0, dst);
     } else if (kind == BODY_OP_I32_AND || kind == BODY_OP_I32_OR || kind == BODY_OP_I32_XOR) {
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
         a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], false);
+        na_clobber(1);
         uint32_t op_word;
         if (kind == BODY_OP_I32_AND) op_word = a64_and_reg(R0, R0, R1);
         else if (kind == BODY_OP_I32_OR) op_word = a64_orr_reg(R0, R0, R1);
         else op_word = a64_eor_reg(R0, R0, R1);
         code_emit(code, op_word);
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
+        if (body->slot_no_alias && body->slot_no_alias[dst]) na_set(0, dst);
     } else if (kind == BODY_OP_OPEN) {
         /* open(path_str, flags) → fd (dst)
            a: path slot (SLOT_STR), b: flags slot (SLOT_I32) */
@@ -9953,7 +9992,11 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         }
         a64_emit_ldr_sp_off(code, R9, body->slot_offset[fn_ptr_slot], true);
         code_emit(code, a64_blr(R9));
+        /* Clobber caller-saved registers (R0-R7 per AAPCS64) */
+        na_clobber(0); na_clobber(1); na_clobber(2); na_clobber(3);
+        na_clobber(4); na_clobber(5); na_clobber(6); na_clobber(7);
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
+        if (body->slot_no_alias && body->slot_no_alias[dst]) na_set(0, dst);
     } else if (kind == BODY_OP_CLOSURE_NEW) {
         /* Create closure: dst = { fn_ptr, env_ptr } (16 bytes)
            a = fn_addr_slot, b = env_slot */
@@ -9982,7 +10025,11 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
                 a64_emit_ldr_sp_off(code, ai, body->slot_offset[arg_slot], true);
         }
         code_emit(code, a64_blr(R9));
+        /* Clobber caller-saved registers (R0-R7 per AAPCS64) */
+        na_clobber(0); na_clobber(1); na_clobber(2); na_clobber(3);
+        na_clobber(4); na_clobber(5); na_clobber(6); na_clobber(7);
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
+        if (body->slot_no_alias && body->slot_no_alias[dst]) na_set(0, dst);
     } else {
         ; /* unknown op: skip silently */
     }
@@ -11830,6 +11877,8 @@ typedef struct ColdCompileStats {
     int32_t facts_function_count;
     int32_t facts_word_count;
     int32_t facts_reloc_count;
+    int32_t canonical_hash_count;
+    int32_t total_function_count;
 } ColdCompileStats;
 
 static void cold_print_exec_phase_report(FILE *file, ColdCompileStats *stats) {
@@ -11866,6 +11915,33 @@ static void cold_print_resource_report(FILE *file) {
 
 static void cold_collect_body_stats(Symbols *symbols, BodyIR **function_bodies, int32_t function_count,
                                     ColdCompileStats *stats) {
+    /* Count total non-fallback functions and compute canonical hashes */
+    uint64_t *canonical_hashes = 0;
+    int32_t canonical_cap = 0;
+    int32_t canonical_count = 0;
+    for (int32_t i = 0; i < function_count; i++) {
+        BodyIR *body = function_bodies[i];
+        if (!body || body->has_fallback) continue;
+        stats->total_function_count++;
+        uint64_t h = cold_body_ir_canonical_hash(body);
+        bool seen = false;
+        for (int32_t j = 0; j < canonical_count; j++) {
+            if (canonical_hashes[j] == h) { seen = true; break; }
+        }
+        if (!seen) {
+            if (canonical_count >= canonical_cap) {
+                int32_t new_cap = canonical_cap == 0 ? 64 : canonical_cap * 2;
+                uint64_t *new_h = realloc(canonical_hashes, (size_t)new_cap * sizeof(uint64_t));
+                if (!new_h) { free(canonical_hashes); return; }
+                canonical_hashes = new_h;
+                canonical_cap = new_cap;
+            }
+            canonical_hashes[canonical_count++] = h;
+        }
+    }
+    stats->canonical_hash_count = canonical_count;
+    free(canonical_hashes);
+
     for (int32_t i = 0; i < function_count; i++) {
         BodyIR *body = function_bodies[i];
         if (!body || body->has_fallback) continue;
@@ -14411,6 +14487,8 @@ static bool cold_write_system_link_exec_report(const char *path,
         fprintf(file, "facts_function_count=%d\n", stats->facts_function_count);
         fprintf(file, "facts_word_count=%d\n", stats->facts_word_count);
         fprintf(file, "facts_reloc_count=%d\n", stats->facts_reloc_count);
+        fprintf(file, "canonical_hash_count=%d\n", stats->canonical_hash_count);
+        fprintf(file, "total_function_count=%d\n", stats->total_function_count);
         cold_print_elapsed_ms(file, "cold_compile_elapsed_ms", stats->elapsed_us);
     }
     /* 30-80ms cold self-hosting architecture compliance */
