@@ -123,8 +123,6 @@ static int ColdImportSegvSaw = 0;
 static bool ColdImportBodyCompilationActive = false; /* set during import body compilation */
 static void cold_sigsegv_die_handler(int sig) {
     (void)sig;
-    /* Try per-function recovery first (inner setjmp in body parsing loop).
-       Then per-import recovery (outer setjmp in cold_compile_imported_bodies_no_recurse). */
     if (ColdErrorRecoveryEnabled) {
         longjmp(ColdErrorJumpBuf, 1);
     }
@@ -132,7 +130,9 @@ static void cold_sigsegv_die_handler(int sig) {
         ColdImportSegvActive = false;
         longjmp(ColdImportSegvJumpBuf, 1);
     }
-    die("SEGV in cold compiler");
+    const char msg[] = "cheng_cold: SEGV in cold compiler\n";
+    write(2, msg, sizeof(msg) - 1);
+    _exit(2);
 }
 
 static int32_t align_i32(int32_t v, int32_t a) {
@@ -20873,6 +20873,14 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
         if (entry_function < 0) return false;
 
         if (obj_mode) {
+            /* Install SIGSEGV/SIGBUS handlers for codegen error recovery */
+            struct sigaction sa_segv_old, sa_bus_old, sa_crash;
+            memset(&sa_crash, 0, sizeof(sa_crash));
+            sa_crash.sa_handler = cold_sigsegv_die_handler;
+            sa_crash.sa_flags = SA_NODEFER;
+            sigaction(SIGSEGV, &sa_crash, &sa_segv_old);
+            sigaction(SIGBUS,  &sa_crash, &sa_bus_old);
+
             /* Per-function codegen + object file writer */
             int32_t func_count = symbols->function_count;
             Code *shared = code_new(arena, 1024);
@@ -20887,12 +20895,21 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
                 symbol_offset[i] = shared->count;
                 if ((uintptr_t)body < 4096 || body->has_fallback ||
                     body->block_count == 0) {
-                    /* Emit stub */
                     code_emit(shared, a64_movz(R0, 0, 0));
                     code_emit(shared, a64_ret());
                     continue;
                 }
-                codegen_func(shared, body, symbols, &function_patches);
+                int32_t saved_count = shared->count;
+                symbol_offset[i] = saved_count;
+                ColdErrorRecoveryEnabled = true;
+                if (setjmp(ColdErrorJumpBuf) == 0) {
+                    codegen_func(shared, body, symbols, &function_patches);
+                } else {
+                    shared->count = saved_count;
+                    code_emit(shared, a64_movz(R0, 0, 0));
+                    code_emit(shared, a64_ret());
+                }
+                ColdErrorRecoveryEnabled = false;
             }
 
             /* Resolve patches and collect relocations */
@@ -20965,6 +20982,8 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
                 stats->code_words = shared->count;
                 stats->arena_kb = arena->used / 1024;
             }
+            sigaction(SIGSEGV, &sa_segv_old, 0);
+            sigaction(SIGBUS,  &sa_bus_old, 0);
             munmap((void *)csg_text.ptr, (size_t)csg_text.len);
             return ok;
         }
