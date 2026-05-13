@@ -2071,63 +2071,6 @@ static bool cold_parse_i32_seq_type(Span type);
 static bool cold_parse_str_seq_type(Span type);
 static bool cold_parse_opaque_seq_type(Span type);
 static bool cold_type_has_qualified_name(Span type);
-static void cold_write_param_specs(FILE *file, Span params) {
-    int32_t pos = 0;
-    int32_t count = 0;
-    while (pos < params.len) {
-        while (pos < params.len && (params.ptr[pos] == ' ' || params.ptr[pos] == '\t' ||
-                                     params.ptr[pos] == ',' || params.ptr[pos] == '\n' ||
-                                     params.ptr[pos] == '\r')) pos++;
-        int32_t start = pos;
-        while (pos < params.len) {
-            uint8_t c = params.ptr[pos];
-            if (!(isalnum(c) || c == '_')) break;
-            pos++;
-        }
-        if (pos > start) {
-            Span name = span_sub(params, start, pos);
-            char kind_code = 'i';
-            Span param_type = {0};
-            while (pos < params.len && (params.ptr[pos] == ' ' || params.ptr[pos] == '\t')) pos++;
-            if (pos < params.len && params.ptr[pos] == ':') {
-                pos++;
-                while (pos < params.len && (params.ptr[pos] == ' ' || params.ptr[pos] == '\t')) pos++;
-                int32_t type_start = pos;
-                int32_t square_depth = 0;
-                while (pos < params.len) {
-                    uint8_t c = params.ptr[pos];
-                    if (c == '[') square_depth++;
-                    else if (c == ']') {
-                        if (square_depth <= 0) break;
-                        square_depth--;
-                    } else if (c == ',' && square_depth == 0) {
-                        break;
-                    }
-                    pos++;
-                }
-                if (pos > type_start) {
-                    param_type = span_trim(span_sub(params, type_start, pos));
-                    kind_code = cold_param_kind_code_from_type(param_type);
-                }
-            }
-            if (count > 0) fputc(',', file);
-            cold_write_span(file, name);
-            bool is_var_param = false;
-            (void)cold_type_strip_var(param_type, &is_var_param);
-            if ((is_var_param || kind_code == 'v' || kind_code == 'q' ||
-                 kind_code == 't' || kind_code == 'u' || kind_code == 'U' ||
-                 kind_code == 'o') &&
-                param_type.len > 0 && !span_eq(param_type, "v")) {
-                fputc(':', file);
-                cold_write_span(file, param_type);
-            } else {
-                fprintf(file, ":%c", kind_code);
-            }
-            count++;
-        }
-        while (pos < params.len && params.ptr[pos] != ',') pos++;
-    }
-}
 
 static Span cold_binding_name_from_head(Span head) {
     head = span_trim(head);
@@ -2149,30 +2092,6 @@ static char cold_field_kind_code_from_type(Span type) {
     return 'i';
 }
 
-static char cold_param_kind_code_from_type(Span type) {
-    bool is_var = false;
-    type = cold_type_strip_var(type, &is_var);
-    if (is_var && (span_eq(type, "str") || span_eq(type, "cstring"))) return 'S';
-    if (is_var && cold_parse_str_seq_type(type)) return 'T';
-    if (is_var && cold_parse_opaque_seq_type(type)) return 'U';
-    if (is_var && cold_type_has_qualified_name(type)) return 'O';
-    if (span_eq(type, "str") || span_eq(type, "cstring")) return 's';
-    if (span_eq(type, "int64") || span_eq(type, "uint64")) return 'l';
-    if (span_eq(type, "int32") || span_eq(type, "int") || span_eq(type, "i") ||
-        span_eq(type, "bool") ||
-        span_eq(type, "uint8") || span_eq(type, "char") ||
-        span_eq(type, "uint32") ||
-        span_eq(type, "void") || type.len == 0) return 'i';
-    if (cold_parse_i32_seq_type(type)) return 'q';
-    if (cold_parse_str_seq_type(type)) return 't';
-    if (cold_parse_opaque_seq_type(type)) return 'u';
-    if (span_eq(type, "ptr")) return 'o';
-    if (cold_type_has_qualified_name(type)) return 'o';
-    if (cold_span_starts_with(type, "uint8[")) return 'i';
-    if (type.len > 1 && type.ptr[0] >= 'A' && type.ptr[0] <= 'Z') return 'v';
-    return 'i'; /* default to int32 */
-    return 'i';
-}
 
 static bool cold_skip_balanced_span(Span span, int32_t *pos, char open, char close) {
     if (*pos >= span.len || span.ptr[*pos] != (uint8_t)open) return false;
@@ -2195,88 +2114,6 @@ static void cold_skip_type_ws(Span span, int32_t *pos) {
     }
 }
 
-static bool cold_emit_csg_variant_specs(FILE *file, Span variants) {
-    int32_t pos = 0;
-    int32_t emitted = 0;
-    while (pos < variants.len) {
-        cold_skip_type_ws(variants, &pos);
-        if (pos < variants.len && variants.ptr[pos] == '|') {
-            pos++;
-            continue;
-        }
-        Span variant_name = {0};
-        if (!cold_parse_ident_at(variants, &pos, &variant_name)) return false;
-        int32_t field_count = 0;
-        char field_kinds[COLD_MAX_VARIANT_FIELDS];
-        Span field_types[COLD_MAX_VARIANT_FIELDS];
-        cold_skip_type_ws(variants, &pos);
-        if (pos < variants.len && variants.ptr[pos] == '(') {
-            pos++;
-            cold_skip_type_ws(variants, &pos);
-            while (pos < variants.len && variants.ptr[pos] != ')') {
-                if (field_count >= COLD_MAX_VARIANT_FIELDS) return false;
-                Span field_name = {0};
-                if (!cold_parse_ident_at(variants, &pos, &field_name)) return false;
-                cold_skip_type_ws(variants, &pos);
-                if (pos >= variants.len || variants.ptr[pos] != ':') return false;
-                pos++;
-                int32_t type_start = pos;
-                int32_t depth_square = 0;
-                int32_t depth_paren = 0;
-                while (pos < variants.len) {
-                    uint8_t c = variants.ptr[pos];
-                    if (c == '[') depth_square++;
-                    else if (c == ']') {
-                        if (depth_square <= 0) return false;
-                        depth_square--;
-                    } else if (c == '(') {
-                        depth_paren++;
-                    } else if (c == ')') {
-                        if (depth_paren == 0 && depth_square == 0) break;
-                        if (depth_paren <= 0) return false;
-                        depth_paren--;
-                    } else if (c == ',' && depth_square == 0 && depth_paren == 0) {
-                        break;
-                    }
-                    pos++;
-                }
-                Span field_type = span_trim(span_sub(variants, type_start, pos));
-                if (field_type.len <= 0) return false;
-                field_kinds[field_count] = cold_field_kind_code_from_type(field_type);
-                field_types[field_count] = field_type;
-                field_count++;
-                cold_skip_type_ws(variants, &pos);
-                if (pos < variants.len && variants.ptr[pos] == ',') {
-                    pos++;
-                    cold_skip_type_ws(variants, &pos);
-                    continue;
-                }
-                if (pos >= variants.len || variants.ptr[pos] != ')') return false;
-            }
-            if (pos >= variants.len || variants.ptr[pos] != ')') return false;
-            pos++;
-        }
-        if (emitted > 0) fputc(',', file);
-        cold_write_span(file, variant_name);
-        fprintf(file, ":%d", field_count);
-        if (field_count > 0) {
-            fputc(':', file);
-            for (int32_t i = 0; i < field_count; i++) fputc(field_kinds[i], file);
-            fputc(':', file);
-            for (int32_t i = 0; i < field_count; i++) {
-                if (i > 0) fputc(';', file);
-                cold_write_span(file, field_types[i]);
-            }
-        }
-        emitted++;
-        cold_skip_type_ws(variants, &pos);
-        if (pos < variants.len) {
-            if (variants.ptr[pos] != '|') return false;
-            pos++;
-        }
-    }
-    return emitted > 0;
-}
 
 static bool cold_write_object_field_spec(FILE *file, Span type) {
     type = span_trim(type);
@@ -2361,45 +2198,8 @@ static bool cold_type_block_looks_like_object(Span fields) {
     return count > 0;
 }
 
-static bool cold_emit_csg_object_specs(FILE *file, Span fields) {
-    int32_t pos = 0;
-    int32_t emitted = 0;
-    while (pos < fields.len) {
-        int32_t start = pos;
-        while (pos < fields.len && fields.ptr[pos] != '\n') pos++;
-        int32_t end = pos;
-        if (pos < fields.len) pos++;
-        Span line = span_trim(span_sub(fields, start, end));
-        if (line.len <= 0) continue;
-        if (!cold_emit_csg_field_decl_spec(file, line, &emitted)) return false;
-    }
-    return emitted > 0;
-}
 
-static bool cold_parse_type_entry_parts(Span trimmed, Span *type_name, Span *rhs) {
-    int32_t p = 0;
-    if (!cold_parse_ident_at(trimmed, &p, type_name)) return false;
-    cold_skip_inline_ws(trimmed, &p);
-    if (p < trimmed.len && trimmed.ptr[p] == '[') {
-        if (!cold_skip_balanced_span(trimmed, &p, '[', ']')) return false;
-        cold_skip_inline_ws(trimmed, &p);
-    }
-    if (p >= trimmed.len || trimmed.ptr[p] != '=') return false;
-    p++;
-    *rhs = span_trim(span_sub(trimmed, p, trimmed.len));
-    return true;
-}
 
-static Span cold_type_entry_generic_params(Span trimmed) {
-    int32_t p = 0;
-    Span ignored = {0};
-    if (!cold_parse_ident_at(trimmed, &p, &ignored)) return (Span){0};
-    cold_skip_inline_ws(trimmed, &p);
-    if (p >= trimmed.len || trimmed.ptr[p] != '[') return (Span){0};
-    int32_t open = p;
-    if (!cold_skip_balanced_span(trimmed, &p, '[', ']')) return (Span){0};
-    return span_trim(span_sub(trimmed, open + 1, p - 1));
-}
 
 /* ---- scanner helpers for cold_emit_csg_type_rows ---- */
 
@@ -2417,346 +2217,13 @@ static int32_t scan_next_line(Span source, int32_t pos, Span *line) {
 /* Collect indented body lines starting at pos. Stops when a line is top-level or has indent
    <= base_indent. Returns the body text (subspan of source, may be empty). *next_pos is set to
    the start of the line that terminated collection (rollback position). */
-static Span scan_collect_body(Span source, int32_t pos, int32_t base_indent, int32_t *next_pos) {
-    int32_t body_start = pos;
-    int32_t body_end = pos;
-    int32_t cursor = pos;
-    int32_t safety = 0;
-    while (cursor < source.len) {
-        if (++safety > 10000) die("scan_collect_body: safety limit exceeded");
-        int32_t old_cursor = cursor;
-        Span line;
-        cursor = scan_next_line(source, cursor, &line);
-        Span lt = span_trim(line);
-        if (lt.len <= 0) continue;
-        if (cold_line_top_level(line)) { cursor = old_cursor; break; }
-        if (cold_line_indent_width(line) <= base_indent) { cursor = old_cursor; break; }
-        body_end = cursor < source.len ? cursor - 1 : source.len;
-        if (cursor <= old_cursor) die("scan_collect_body: cursor did not advance");
-    }
-    *next_pos = cursor;
-    return span_trim(span_sub(source, body_start, body_end));
-}
 
 /* Emit enum body as 0-field variant list. enum_body is the raw text between entry_indent
    lines. Returns whether emission succeeded. */
-static bool emit_enum_variants(FILE *file, Span enum_body) {
-    if (enum_body.len <= 0) return false;
-    /* walk lines of enum_body, extract identifiers as variant names */
-    int32_t pos = 0;
-    int32_t first = 1;
-    int32_t safety = 0;
-    while (pos < enum_body.len) {
-        if (++safety > 5000) die("emit_enum_variants: safety limit exceeded");
-        /* skip whitespace */
-        while (pos < enum_body.len && (enum_body.ptr[pos] == ' ' ||
-               enum_body.ptr[pos] == '\t' || enum_body.ptr[pos] == '\n' ||
-               enum_body.ptr[pos] == '\r')) pos++;
-        if (pos >= enum_body.len) break;
-        int32_t start = pos;
-        while (pos < enum_body.len && cold_ident_char(enum_body.ptr[pos])) pos++;
-        if (pos > start) {
-            if (!first) fputc(',', file);
-            first = 0;
-            cold_write_span(file, span_sub(enum_body, start, pos));
-            fputs(":0", file);
-        } else {
-            /* non-identifier character: skip it to avoid infinite loop */
-            pos++;
-        }
-    }
-    return true;
-}
 
 /* ---- cold_emit_csg_type_rows (rewritten: single-pass, cursor-only-at-top) ---- */
 
-static bool cold_emit_csg_type_rows(FILE *file, Span source, bool warn_on_error) {
-    int32_t pos = 0;
-    bool in_triple = false;
-    int32_t safety = 0;
-    int32_t line_limit = warn_on_error ? 10000 : 200000;
-    while (pos < source.len) {
-        if (++safety > line_limit) {
-            if (warn_on_error) return true;
-            return false;
-        }
-        int32_t old_pos = pos;
-        Span line;
-        pos = scan_next_line(source, pos, &line);
-        if (in_triple) {
-            if (cold_line_has_triple_quote(line)) in_triple = false;
-            goto check_progress;
-        }
-        if (!cold_line_top_level(line)) {
-            if (cold_line_has_triple_quote(line)) in_triple = true;
-            goto check_progress;
-        }
-        Span trimmed = span_trim(line);
-        if (!cold_span_is_exact_or_prefix_space(trimmed, "type")) goto check_progress;
 
-        /* --- block type: "type" on its own line --- */
-        if (span_eq(trimmed, "type")) {
-            int32_t cursor = pos;
-            int32_t block_indent = -1;
-            int32_t block_safety = 0;
-            while (cursor < source.len) {
-                if (++block_safety > 10000) {
-                    if (warn_on_error) { pos = cursor; goto block_done; }
-                    return false;
-                }
-                int32_t entry_old = cursor;
-                Span entry_line;
-                cursor = scan_next_line(source, cursor, &entry_line);
-                Span entry_trimmed = span_trim(entry_line);
-                if (entry_trimmed.len <= 0) continue;
-
-                if (cold_line_top_level(entry_line)) { cursor = entry_old; break; }
-                int32_t entry_indent = cold_line_indent_width(entry_line);
-                if (block_indent < 0) block_indent = entry_indent;
-                if (entry_indent < block_indent) { cursor = entry_old; break; }
-                if (entry_indent > block_indent) continue; /* enum/object body field */
-
-                Span entry_name = {0};
-                Span rhs = {0};
-                if (!cold_parse_type_entry_parts(entry_trimmed, &entry_name, &rhs)) {
-                    if (warn_on_error) { pos = cursor; goto block_done; }
-                    return false;
-                }
-                Span generics = cold_type_entry_generic_params(entry_trimmed);
-
-                /* --- rhs empty: block body on following lines --- */
-                if (rhs.len <= 0) {
-                    int32_t body_next;
-                    Span body = scan_collect_body(source, cursor, entry_indent, &body_next);
-                    cursor = body_next;
-                    if (body.len <= 0) continue;
-                    if (cold_type_block_looks_like_object(body)) {
-                        fprintf(file, "cold_csg_object\t");
-                        cold_write_span(file, entry_name);
-                        fputs("\t", file);
-                        if (!cold_emit_csg_object_specs(file, body)) { /* skip */ }
-                        fputc('\n', file);
-                    } else {
-                        fprintf(file, "cold_csg_type\t");
-                        cold_write_span(file, entry_name);
-                        fputs("\t", file);
-                        if (!cold_emit_csg_variant_specs(file, body)) { /* skip */ }
-                        if (generics.len > 0) { fputc('\t', file); cold_write_span(file, generics); }
-                        fputc('\n', file);
-                    }
-                    continue;
-                }
-
-                /* --- rhs = enum --- */
-                if (span_eq(rhs, "enum")) {
-                    int32_t enum_next;
-                    Span enum_body = scan_collect_body(source, cursor, entry_indent, &enum_next);
-                    cursor = enum_next;
-                    fprintf(file, "cold_csg_type\t");
-                    cold_write_span(file, entry_name);
-                    fputc('\t', file);
-                    if (enum_body.len > 0) emit_enum_variants(file, enum_body);
-                    fputc('\n', file);
-                    continue;
-                }
-
-                /* --- skip simple aliases --- */
-                if (span_eq(rhs, "ptr") || span_eq(rhs, "int32") || span_eq(rhs, "int64") ||
-                    span_eq(rhs, "str") || span_eq(rhs, "cstring") ||
-                    span_eq(rhs, "bool") || span_eq(rhs, "void") ||
-                    cold_span_starts_with(rhs, "fn ") || cold_span_starts_with(rhs, "fn("))
-                    continue;
-
-                /* --- rhs = object ... --- */
-                if (cold_span_starts_with(rhs, "object")) {
-                    int32_t field_next;
-                    Span field_body = scan_collect_body(source, cursor, entry_indent, &field_next);
-                    cursor = field_next;
-                    fprintf(file, "cold_csg_object\t");
-                    cold_write_span(file, entry_name);
-                    fputs("\t", file);
-                    if (!cold_emit_csg_object_specs(file, field_body)) { /* skip */ }
-                    fputc('\n', file);
-                    continue;
-                }
-
-                /* --- rhs = ref --- */
-                if (span_eq(rhs, "ref")) continue;
-
-                /* --- rhs = tuple[...] --- */
-                if (cold_span_starts_with(rhs, "tuple[")) {
-                    /* emit tuple as object */
-                    int32_t tb = cold_span_find_char(rhs, '[');
-                    int32_t te = rhs.len - 1;
-                    if (te >= 0 && rhs.ptr[te] == ']' && tb >= 0 && tb + 1 < te) {
-                        Span fields = span_trim(span_sub(rhs, tb + 1, te));
-                        fprintf(file, "cold_csg_object\t");
-                        cold_write_span(file, entry_name);
-                        fputs("\t", file);
-                        cold_emit_csg_object_specs(file, fields);
-                        fputc('\n', file);
-                    }
-                    continue;
-                }
-
-                /* --- rhs is variant spec on same line --- */
-                fprintf(file, "cold_csg_type\t");
-                cold_write_span(file, entry_name);
-                fputs("\t", file);
-                if (!cold_emit_csg_variant_specs(file, rhs)) { /* skip */ }
-                if (generics.len > 0) { fputc('\t', file); cold_write_span(file, generics); }
-                fputc('\n', file);
-
-                if (cursor <= entry_old) die("type block entry: cursor did not advance");
-            }
-        block_done:
-            pos = cursor;
-            continue;
-        }
-
-        /* --- single-line: type Name = ... --- */
-        {
-            int32_t p = 0;
-            Span keyword = {0}, type_name = {0};
-            if (!cold_parse_ident_at(trimmed, &p, &keyword) || !span_eq(keyword, "type")) {
-                if (warn_on_error) continue;
-                return false;
-            }
-            cold_skip_inline_ws(trimmed, &p);
-            if (!cold_parse_ident_at(trimmed, &p, &type_name)) {
-                if (warn_on_error) continue;
-                return false;
-            }
-            cold_skip_inline_ws(trimmed, &p);
-            Span generics = {0};
-            if (p < trimmed.len && trimmed.ptr[p] == '[') {
-                int32_t gopen = p;
-                if (!cold_skip_balanced_span(trimmed, &p, '[', ']')) {
-                    if (warn_on_error) continue;
-                    return false;
-                }
-                generics = span_trim(span_sub(trimmed, gopen + 1, p - 1));
-                cold_skip_inline_ws(trimmed, &p);
-            }
-            if (p >= trimmed.len || trimmed.ptr[p] != '=') {
-                if (warn_on_error) continue;
-                return false;
-            }
-            p++;
-            Span rhs = span_trim(span_sub(trimmed, p, trimmed.len));
-
-            /* --- skip simple aliases (enum handled separately) --- */
-            if (span_eq(rhs, "ptr") || span_eq(rhs, "int32") || span_eq(rhs, "int64") ||
-                span_eq(rhs, "str") || span_eq(rhs, "cstring") ||
-                span_eq(rhs, "bool") || span_eq(rhs, "void") ||
-                cold_span_starts_with(rhs, "fn ") || cold_span_starts_with(rhs, "fn("))
-                goto check_progress;
-
-            if (span_eq(rhs, "enum")) {
-                fprintf(file, "cold_csg_type\t");
-                cold_write_span(file, type_name);
-                fputs("\t\n", file);
-                goto check_progress;
-            }
-
-            /* --- rhs starts with "object" --- */
-            if (cold_span_starts_with(rhs, "object")) {
-                int32_t body_next;
-                Span body = scan_collect_body(source, pos, 0, &body_next);
-                pos = body_next;
-                fprintf(file, "cold_csg_object\t");
-                cold_write_span(file, type_name);
-                fputs("\t", file);
-                if (!cold_emit_csg_object_specs(file, body)) { /* skip */ }
-                fputc('\n', file);
-                continue;
-            }
-
-            if (span_eq(rhs, "ref")) goto check_progress;
-
-            if (cold_span_starts_with(rhs, "tuple[")) {
-                /* single-line tuple: emit as object */
-                int32_t tb = cold_span_find_char(rhs, '[');
-                int32_t te = rhs.len - 1;
-                if (te >= 0 && rhs.ptr[te] == ']' && tb >= 0 && tb + 1 < te) {
-                    Span fields = span_trim(span_sub(rhs, tb + 1, te));
-                    fprintf(file, "cold_csg_object\t");
-                    cold_write_span(file, type_name);
-                    fputs("\t", file);
-                    cold_emit_csg_object_specs(file, fields);
-                    fputc('\n', file);
-                }
-                goto check_progress;
-            }
-
-            /* rhs empty: variant block on following lines */
-            if (rhs.len <= 0) {
-                int32_t body_next;
-                Span body = scan_collect_body(source, pos, 0, &body_next);
-                pos = body_next;
-                if (body.len > 0) {
-                    if (cold_type_block_looks_like_object(body)) {
-                        fprintf(file, "cold_csg_object\t");
-                        cold_write_span(file, type_name);
-                        fputs("\t", file);
-                        if (!cold_emit_csg_object_specs(file, body)) { /* skip */ }
-                        fputc('\n', file);
-                    } else {
-                        rhs = body;
-                    }
-                }
-                if (body.len <= 0) goto check_progress;
-                if (rhs.len <= 0) goto check_progress; /* was emitted as object */
-            }
-
-            fprintf(file, "cold_csg_type\t");
-            cold_write_span(file, type_name);
-            fputs("\t", file);
-            if (!cold_emit_csg_variant_specs(file, rhs)) { /* skip */ }
-            if (generics.len > 0) { fputc('\t', file); cold_write_span(file, generics); }
-            fputc('\n', file);
-        }
-
-    check_progress:
-        if (pos <= old_pos && pos < source.len) die("cold_emit_csg_type_rows: cursor did not advance");
-    }
-    return true;
-}
-
-static bool cold_emit_csg_function_rows(FILE *file, Span source) {
-    int32_t pos = 0;
-    int32_t line_no = 0;
-    int32_t fn_index = 0;
-    bool in_triple = false;
-    while (pos < source.len) {
-        int32_t start = pos;
-        while (pos < source.len && source.ptr[pos] != '\n') pos++;
-        int32_t end = pos;
-        if (pos < source.len) pos++;
-        line_no++;
-        Span line = span_sub(source, start, end);
-        if (in_triple) {
-            if (cold_line_has_triple_quote(line)) in_triple = false;
-            continue;
-        }
-        if (!cold_line_top_level(line)) {
-            if (cold_line_has_triple_quote(line)) in_triple = true;
-            continue;
-        }
-        Span trimmed = span_trim(line);
-        if (!cold_span_starts_with(trimmed, "fn ")) continue;
-        ColdFunctionSymbol symbol;
-        if (!cold_parse_function_symbol_at(source, start, line_no, &symbol)) return false;
-        fprintf(file, "cold_csg_function\t%d\t", fn_index++);
-        cold_write_span(file, symbol.name);
-        fputc('\t', file);
-        cold_write_param_specs(file, symbol.params);
-        fputc('\t', file);
-        cold_write_span(file, symbol.return_type);
-        fputc('\n', file);
-    }
-    return fn_index > 0;
-}
 
 static bool cold_emit_csg_statement_row(FILE *file, int32_t fn_index, int32_t indent, Span trimmed) {
     if (span_eq(trimmed, "}") || span_eq(trimmed, "{")) {
@@ -3020,332 +2487,6 @@ static bool cold_emit_csg_statement_row(FILE *file, int32_t fn_index, int32_t in
     return true;
 }
 
-static bool cold_emit_csg_statement_rows(FILE *file, Span source) {
-    int32_t pos = 0;
-    int32_t fn_index = -1;
-    bool in_triple = false;
-    bool in_type_or_const = false;
-    int32_t line_no = 0;
-    while (pos < source.len) {
-        int32_t start = pos;
-        while (pos < source.len && source.ptr[pos] != '\n') pos++;
-        int32_t end = pos;
-        if (pos < source.len) pos++;
-        line_no++;
-        Span line = span_sub(source, start, end);
-        if (in_triple) {
-            if (cold_line_has_triple_quote(line)) in_triple = false;
-            continue;
-        }
-        if (cold_line_top_level(line)) {
-            Span trimmed_top = span_trim(line);
-            if (cold_span_starts_with(trimmed_top, "fn ")) {
-                fn_index++;
-                ColdFunctionSymbol symbol;
-                if (cold_parse_function_symbol_at(source, start, line_no, &symbol)) {
-                    if (symbol.has_body) {
-                        /* jump to body line start (preserve indentation for cold_line_top_level) */
-                        int32_t body_text = cold_span_offset(source, symbol.body);
-                        if (body_text > pos && body_text <= pos + 2 + (int32_t)trimmed_top.len) {
-                            /* body starts on same line: pos is already correct */
-                        } else if (body_text > pos) {
-                            while (body_text > 0 && source.ptr[body_text - 1] != '\n') body_text--;
-                            pos = body_text;
-                        }
-                    } else {
-                        int32_t sig_end = cold_span_offset(source, symbol.source_span) + symbol.source_span.len;
-                        if (sig_end > pos) pos = sig_end;
-                    }
-                }
-                in_type_or_const = false;
-                continue;
-            }
-            if (cold_span_is_exact_or_prefix_space(trimmed_top, "const")) {
-                /* emit const declarations as cold_csg_const rows, then skip block */
-                in_type_or_const = true;
-                int32_t cpos = pos;
-                while (cpos < source.len) {
-                    int32_t cs = cpos;
-                    while (cpos < source.len && source.ptr[cpos] != '\n') cpos++;
-                    int32_t ce = cpos;
-                    if (cpos < source.len) cpos++;
-                    Span cline = span_sub(source, cs, ce);
-                    Span ct = span_trim(cline);
-                    if (ct.len <= 0 || cold_line_top_level(cline)) { cpos = cs; break; }
-                    int32_t ceq = cold_span_find_char(ct, '=');
-                    if (ceq <= 0) continue;
-                    Span cname = span_trim(span_sub(ct, 0, ceq));
-                    Span cval = span_trim(span_sub(ct, ceq + 1, ct.len));
-                    if (cname.len <= 0) continue;
-                    if (span_is_i32(cval)) {
-                        fprintf(file, "cold_csg_const\t%d\t", span_i32(cval));
-                        cold_write_span_csg(file, cname);
-                        fputc('\n', file);
-                    } else if (cval.len >= 2 && cval.ptr[0] == '"' && cval.ptr[cval.len - 1] == '"') {
-                        Span inner = span_sub(cval, 1, cval.len - 1);
-                        fprintf(file, "cold_csg_const_str\t");
-                        cold_write_span_csg(file, inner);
-                        fprintf(file, "\t");
-                        cold_write_span_csg(file, cname);
-                        fputc('\n', file);
-                    }
-                }
-            } else if (cold_span_is_exact_or_prefix_space(trimmed_top, "type") ||
-                       cold_span_is_exact_or_prefix_space(trimmed_top, "import") ||
-                       cold_span_is_exact_or_prefix_space(trimmed_top, "module")) {
-                in_type_or_const = true;
-            }
-            if (cold_line_has_triple_quote(line)) in_triple = true;
-            continue;
-        }
-        if (fn_index < 0) continue;
-        if (in_type_or_const) continue;
-        Span trimmed = span_trim(line);
-        if (trimmed.len <= 0 || cold_span_starts_with(trimmed, "#") || cold_span_starts_with(trimmed, "//")) continue;
-        int32_t indent = cold_line_indent_width(line);
-        /* note: mbuf/cond_buf/call_buf must live in this scope because trimmed may point into them */
-        char mbuf[4096];
-        char cond_buf[2048];
-        char call_buf[4096];
-
-        /* generic multi-line merge: unbalanced parens or line ends with && || , */
-        {
-            int32_t pdepth = 0;
-            for (int32_t i = 0; i < trimmed.len; i++) {
-                if (trimmed.ptr[i] == '(') pdepth++;
-                else if (trimmed.ptr[i] == ')') pdepth--;
-            }
-            bool line_ends_cont = false;
-            if (trimmed.len > 0) {
-                int32_t last = trimmed.len - 1;
-                if (trimmed.ptr[last] == ',') line_ends_cont = true;
-                if (last >= 1) {
-                    if (trimmed.ptr[last] == '&' && trimmed.ptr[last - 1] == '&') line_ends_cont = true;
-                    if (trimmed.ptr[last] == '|' && trimmed.ptr[last - 1] == '|') line_ends_cont = true;
-                }
-            }
-            /* if/elif/while/for headers: only merge if explicit continuation (&&/||) not unbalanced parens */
-            bool _header_no_merge = false;
-            if (pdepth > 0 && !line_ends_cont &&
-                (cold_span_starts_with(trimmed, "if ") ||
-                 cold_span_starts_with(trimmed, "elif ") ||
-                 cold_span_starts_with(trimmed, "while ") ||
-                 cold_span_starts_with(trimmed, "for "))) {
-                _header_no_merge = true;
-            }
-            if (!_header_no_merge && (pdepth > 0 || line_ends_cont)) {
-                int32_t mlen = trimmed.len < (int32_t)sizeof(mbuf) - 1 ? trimmed.len : (int32_t)sizeof(mbuf) - 1;
-                memcpy(mbuf, trimmed.ptr, (size_t)mlen);
-                mbuf[mlen] = '\0';
-                int32_t scan = pos;
-                bool prev_ended_cont = line_ends_cont;
-                while (scan < source.len) {
-                    int32_t cs = scan;
-                    while (scan < source.len && source.ptr[scan] != '\n') scan++;
-                    int32_t ce = scan;
-                    if (scan < source.len) scan++;
-                    Span cline = span_sub(source, cs, ce);
-                    Span ctrim = span_trim(cline);
-                    if (ctrim.len <= 0 || cold_line_top_level(cline)) break;
-                    int32_t cindent = cold_line_indent_width(cline);
-                    if (cindent < indent) break; /* must be at least as indented */
-                    for (int32_t i = 0; i < ctrim.len; i++) {
-                        if (ctrim.ptr[i] == '(') pdepth++;
-                        else if (ctrim.ptr[i] == ')') pdepth--;
-                    }
-                    /* if line starts with a statement keyword, never treat as continuation */
-                    if (cold_span_starts_with(ctrim, "if ") ||
-                        cold_span_starts_with(ctrim, "elif ") ||
-                        cold_span_starts_with(ctrim, "else") ||
-                        cold_span_starts_with(ctrim, "while ") ||
-                        cold_span_starts_with(ctrim, "for ") ||
-                        cold_span_starts_with(ctrim, "return ") ||
-                        span_eq(ctrim, "return") ||
-                        cold_span_starts_with(ctrim, "let ") ||
-                        cold_span_starts_with(ctrim, "var ") ||
-                        cold_span_starts_with(ctrim, "match ") ||
-                        cold_span_starts_with(ctrim, "break") ||
-                        cold_span_starts_with(ctrim, "continue") ||
-                        span_eq(ctrim, "}") || span_eq(ctrim, "{")) {
-                        scan = cs; break;
-                    }
-                    bool c_cont = false;
-                    if (ctrim.len > 0) {
-                        int32_t clast = ctrim.len - 1;
-                        if (ctrim.ptr[clast] == ',') c_cont = true;
-                        /* ':' is NOT a continuation marker -- it terminates if/while/for headers */
-                        if (clast >= 1) {
-                            if (ctrim.ptr[clast] == '&' && ctrim.ptr[clast - 1] == '&') c_cont = true;
-                            if (ctrim.ptr[clast] == '|' && ctrim.ptr[clast - 1] == '|') c_cont = true;
-                        }
-                        int32_t cf = 0;
-                        while (cf < ctrim.len && ctrim.ptr[cf] == ' ') cf++;
-                        if (cf + 1 < ctrim.len) {
-                            if (ctrim.ptr[cf] == '&' && ctrim.ptr[cf + 1] == '&') c_cont = true;
-                            if (ctrim.ptr[cf] == '|' && ctrim.ptr[cf + 1] == '|') c_cont = true;
-                        }
-                    }
-                    /* if prev ended with && || , consume one more line as final continuation */
-                    if (!c_cont && prev_ended_cont && pdepth <= 0) {
-                        c_cont = true;
-                        prev_ended_cont = false;
-                    } else {
-                        prev_ended_cont = c_cont;
-                    }
-                    if (!c_cont && pdepth <= 0) { scan = cs; break; }
-                    if (mlen + 1 + ctrim.len < (int32_t)sizeof(mbuf)) {
-                        mbuf[mlen++] = ' ';
-                        memcpy(mbuf + mlen, ctrim.ptr, (size_t)ctrim.len);
-                        mlen += ctrim.len;
-                        mbuf[mlen] = '\0';
-                    }
-                    pos = scan;
-                    if (pdepth == 0 && !c_cont) break;
-                }
-                trimmed = (Span){(const uint8_t *)mbuf, mlen};
-            }
-        }
-
-        /* for if/elif/while conditions, merge continuation lines into single condition */
-        if (cold_span_starts_with(trimmed, "if ") ||
-            cold_span_starts_with(trimmed, "elif ") ||
-            cold_span_starts_with(trimmed, "while ")) {
-            int32_t kw_len = cold_span_starts_with(trimmed, "if ") ? 3 :
-                             cold_span_starts_with(trimmed, "elif ") ? 5 : 6;
-            Span condition = cold_span_cut_at_block_colon(span_sub(trimmed, kw_len, trimmed.len));
-            /* always scan ahead for continuation lines */
-            int32_t cond_len = condition.len < (int32_t)sizeof(cond_buf) - 1 ? condition.len : (int32_t)sizeof(cond_buf) - 1;
-            memcpy(cond_buf, condition.ptr, (size_t)cond_len);
-            cond_buf[cond_len] = '\0';
-            int32_t scan = pos;
-            while (scan < source.len) {
-                int32_t cs = scan;
-                while (scan < source.len && source.ptr[scan] != '\n') scan++;
-                int32_t ce = scan;
-                if (scan < source.len) scan++;
-                Span cline = span_sub(source, cs, ce);
-                Span ctrim = span_trim(cline);
-                if (ctrim.len <= 0 || cold_line_top_level(cline)) break;
-                int32_t cindent = cold_line_indent_width(cline);
-                if (cindent < indent + 2) break;
-                /* check if continuation line -- must NOT start with a statement keyword */
-                if (cold_span_starts_with(ctrim, "if ") ||
-                    cold_span_starts_with(ctrim, "elif ") ||
-                    cold_span_starts_with(ctrim, "else:") ||
-                    cold_span_starts_with(ctrim, "while ") ||
-                    cold_span_starts_with(ctrim, "for ") ||
-                    cold_span_starts_with(ctrim, "return ") ||
-                    cold_span_starts_with(ctrim, "let ") ||
-                    cold_span_starts_with(ctrim, "var ") ||
-                    cold_span_starts_with(ctrim, "fn ") ||
-                    span_eq(ctrim, "return") || span_eq(ctrim, "break") || span_eq(ctrim, "continue")) {
-                    scan = cs;
-                    break;
-                }
-                bool is_cont = false;
-                if (ctrim.len > 0) {
-                    int32_t clast = ctrim.len - 1;
-                    /* ':' is block header, NOT a condition continuation */
-                    if (clast >= 1) {
-                        if (ctrim.ptr[clast] == '&' && ctrim.ptr[clast - 1] == '&') is_cont = true;
-                        if (ctrim.ptr[clast] == '|' && ctrim.ptr[clast - 1] == '|') is_cont = true;
-                    }
-                    int32_t cfirst = 0;
-                    while (cfirst < ctrim.len && ctrim.ptr[cfirst] == ' ') cfirst++;
-                    if (cfirst + 1 < ctrim.len) {
-                        if (ctrim.ptr[cfirst] == '&' && ctrim.ptr[cfirst + 1] == '&') is_cont = true;
-                        if (ctrim.ptr[cfirst] == '|' && ctrim.ptr[cfirst + 1] == '|') is_cont = true;
-                    }
-                }
-                if (!is_cont) { scan = cs; break; }
-                if (cond_len + 1 + ctrim.len < (int32_t)sizeof(cond_buf)) {
-                    cond_buf[cond_len++] = ' ';
-                    memcpy(cond_buf + cond_len, ctrim.ptr, (size_t)ctrim.len);
-                    cond_len += ctrim.len;
-                    cond_buf[cond_len] = '\0';
-                }
-                pos = scan;
-            }
-            fprintf(file, "cold_csg_stmt\t%d\t%d\t%s\t", fn_index, indent,
-                    cold_span_starts_with(trimmed, "if ") ? "if" :
-                    cold_span_starts_with(trimmed, "elif ") ? "elif" : "while");
-            cold_write_span_csg(file, (Span){(const uint8_t *)cond_buf, cond_len});
-            fputc('\n', file);
-            /* emit inline suite if present (e.g. `if cond: stmt`) */
-            {
-                int32_t _kw = cold_span_starts_with(trimmed, "if ") ? 3 :
-                              cold_span_starts_with(trimmed, "elif ") ? 5 : 6;
-                Span _head = span_sub(trimmed, _kw, trimmed.len);
-                int32_t _colon = cold_span_find_char(_head, ':');
-                if (_colon >= 0 && _colon + 1 < _head.len) {
-                    Span _suite = span_trim(span_sub(_head, _colon + 1, _head.len));
-                    if (_suite.len > 0) {
-                        int32_t _sp = 0;
-                        while (_sp < _suite.len) {
-                            int32_t _sc = cold_span_find_char(span_sub(_suite, _sp, _suite.len), ';');
-                            Span _stmt;
-                            if (_sc >= 0) { _stmt = span_trim(span_sub(_suite, _sp, _sp + _sc)); _sp += _sc + 1; }
-                            else { _stmt = span_trim(span_sub(_suite, _sp, _suite.len)); _sp = _suite.len; }
-                            if (_stmt.len > 0) cold_emit_csg_statement_row(file, fn_index, indent + 4, _stmt);
-                        }
-                    }
-                }
-            }
-            continue;
-        }
-
-        /* for call expressions that span multiple lines, merge continuation lines */
-        {
-            int32_t open = cold_span_find_char(trimmed, '(');
-            if (open > 0 && trimmed.len > open + 1) {
-                int32_t depth = 0;
-                for (int32_t i = open; i < trimmed.len; i++) {
-                    if (trimmed.ptr[i] == '(') depth++;
-                    else if (trimmed.ptr[i] == ')') depth--;
-                }
-                if (depth > 0) {
-                    /* parens not balanced: scan ahead for continuation lines */
-                    int32_t call_len = trimmed.len < (int32_t)sizeof(call_buf) - 1 ? trimmed.len : (int32_t)sizeof(call_buf) - 1;
-                    memcpy(call_buf, trimmed.ptr, (size_t)call_len);
-                    call_buf[call_len] = '\0';
-                    int32_t scan = pos;
-                    while (scan < source.len && depth > 0) {
-                        int32_t cs = scan;
-                        while (scan < source.len && source.ptr[scan] != '\n') scan++;
-                        int32_t ce = scan;
-                        if (scan < source.len) scan++;
-                        Span cline = span_sub(source, cs, ce);
-                        Span ctrim = span_trim(cline);
-                        if (ctrim.len <= 0 || cold_line_top_level(cline)) break;
-                        /* track paren depth */
-                        for (int32_t i = 0; i < ctrim.len; i++) {
-                            if (ctrim.ptr[i] == '(') depth++;
-                            else if (ctrim.ptr[i] == ')') depth--;
-                        }
-                        /* append continuation with space */
-                        if (call_len + 1 + ctrim.len < (int32_t)sizeof(call_buf)) {
-                            call_buf[call_len++] = ' ';
-                            memcpy(call_buf + call_len, ctrim.ptr, (size_t)ctrim.len);
-                            call_len += ctrim.len;
-                            call_buf[call_len] = '\0';
-                        }
-                        pos = scan;
-                    }
-                    if (depth == 0) {
-                        /* emit merged call line */
-                        if (!cold_emit_csg_statement_row(file, fn_index, indent,
-                                                          (Span){(const uint8_t *)call_buf, call_len}))
-                            return false;
-                        continue;
-                    }
-                }
-            }
-        }
-
-        if (!cold_emit_csg_statement_row(file, fn_index, indent, trimmed)) return false;
-    }
-    return true;
-}
 
 static bool cold_files_equal(const char *left, const char *right) {
     Span a = source_open(left);
@@ -20019,59 +19160,6 @@ static void cold_collect_body_stats(Symbols *symbols, BodyIR **function_bodies, 
 
 static int32_t cold_compile_csg_type_rows_seq = 0;
 
-static bool cold_compile_csg_type_rows_from_source_into_symbols(Span source, Symbols *symbols, Arena *arena) {
-    /* emit type rows to a temp file, then parse them and add to symbols (skip function rows) */
-    char tmp_path[PATH_MAX];
-    cold_compile_csg_type_rows_seq++;
-    int tmp_len = snprintf(tmp_path, sizeof(tmp_path), "/tmp/cold_csg_types_%ld_%d_%d.csg",
-                          (long)getpid(), symbols ? symbols->function_count : 0, cold_compile_csg_type_rows_seq);
-    if (tmp_len < 0 || (size_t)tmp_len >= sizeof(tmp_path)) return false;
-    FILE *f = fopen(tmp_path, "w");
-    if (!f) return false;
-    if (!cold_emit_csg_type_rows(f, source, true)) { fclose(f); unlink(tmp_path); return false; }
-    fclose(f);
-    Span text = source_open(tmp_path);
-    unlink(tmp_path);
-    if (text.len <= 0) return true; /* no type rows is OK (file may have only functions) */
-    /* manually parse type rows and add to symbols (avoid cold_csg_load which requires functions) */
-    int32_t pos = 0;
-    int32_t parse_safety = 0;
-    ColdCsg csg;
-    memset(&csg, 0, sizeof(csg));
-    csg.arena = arena;
-    csg.symbols = symbols;
-    while (pos < text.len) {
-        if (++parse_safety > 200000) { fprintf(stderr, "[cold_csg] parse safety limit reached\n"); return false; }
-        int32_t ls = pos;
-        while (pos < text.len && text.ptr[pos] != '\n') pos++;
-        int32_t le = pos;
-        if (pos < text.len) pos++;
-        Span line = span_sub(text, ls, le);
-        /* trim leading whitespace only */
-        int32_t ltrim = 0;
-        while (ltrim < line.len && (line.ptr[ltrim] == ' ' || line.ptr[ltrim] == '\t')) ltrim++;
-        int32_t rtrim = line.len;
-        while (rtrim > ltrim && (line.ptr[rtrim - 1] == '\r' || line.ptr[rtrim - 1] == '\n')) rtrim--;
-        line = (Span){line.ptr + ltrim, rtrim - ltrim};
-        if (line.len <= 0 || line.ptr[0] == '#') continue;
-        Span fields[8];
-        int32_t fc = cold_split_tabs(line, fields, 8);
-        if (fc <= 0) continue;
-        if (span_eq(fields[0], "cold_csg_type")) {
-            cold_csg_add_type(&csg, fields, fc);
-        } else if (span_eq(fields[0], "cold_csg_object")) {
-            cold_csg_add_object(&csg, fields, fc);
-        } else if (span_eq(fields[0], "cold_csg_const") && fc >= 3) {
-            symbols_add_const(symbols, fields[2], span_i32(fields[1]));
-        } else if (span_eq(fields[0], "cold_csg_const_str") && fc >= 3) {
-            symbols_add_str_const(symbols, fields[2], fields[1]);
-        }
-    }
-    /* NOTE: intentionally NOT munmap(text) -- object/type names from cold_csg_add_object /
-       cold_csg_add_type point into this mmap. Leak is bounded (one small mmap per import,
-       ~dozens total, freed at process exit). */
-    return true;
-}
 
 static bool cold_read_package_module_prefix(const char *workspace_root, char *prefix_out, size_t cap) {
     /* read cheng-package.toml to get module_prefix, default "cheng" */
@@ -20107,157 +19195,19 @@ static bool cold_read_package_module_prefix(const char *workspace_root, char *pr
     return true;
 }
 
-static bool cold_resolve_import_source_path(const char *workspace_root, Span import_path,
-                                            char *out, size_t cap) {
-    const char *suffix = ".cheng";
-    size_t slen = strlen(suffix);
-    size_t need = strlen(workspace_root) + 1 + slen + (size_t)import_path.len + 16;
-    if (need > cap) return false;
-    /* read module_prefix from cheng-package.toml */
-    char module_prefix[64];
-    cold_read_package_module_prefix(workspace_root, module_prefix, sizeof(module_prefix));
-    size_t mplen = strlen(module_prefix);
-    const char *rel = "src/";
-    int32_t offset = 0;
-    if (import_path.len > (int32_t)mplen && import_path.ptr[(int32_t)mplen] == '/' &&
-        memcmp(import_path.ptr, module_prefix, mplen) == 0) {
-        offset = (int32_t)mplen + 1;
-    }
-    snprintf(out, cap, "%s/%s%.*s%s", workspace_root, rel, import_path.len - offset, import_path.ptr + offset, suffix);
-    return true;
-}
 
 static char cold_active_imports[16][PATH_MAX];
 static int32_t cold_active_import_count = 0;
 
-static bool cold_import_is_active(const char *path) {
-    for (int32_t i = 0; i < cold_active_import_count; i++) {
-        if (strcmp(cold_active_imports[i], path) == 0) return true;
-    }
-    return false;
-}
 
-static void cold_import_push_active(const char *path) {
-    if (cold_active_import_count >= 32) die("too many transitive imports");
-    snprintf(cold_active_imports[cold_active_import_count++], PATH_MAX, "%s", path);
-}
 
-static void cold_import_pop_active(void) {
-    if (cold_active_import_count > 0) cold_active_import_count--;
-}
 
 static char cold_loaded_set[64][PATH_MAX];
 static int32_t cold_loaded_set_count = 0;
 
-static bool cold_already_loaded(const char *path) {
-    for (int32_t i = 0; i < cold_loaded_set_count; i++)
-        if (strcmp(cold_loaded_set[i], path) == 0) return true;
-    return false;
-}
 
-static void cold_mark_loaded(const char *path) {
-    if (cold_loaded_set_count < 64)
-        snprintf(cold_loaded_set[cold_loaded_set_count++], PATH_MAX, "%s", path);
-}
 
 static int cold_import_debug = -1;
-static void cold_compile_csg_load_imported_types(const char *workspace_root,
-                                                  Span source, Symbols *symbols, Arena *arena) {
-    /* walk top-level import directives and load type rows from each imported file */
-    int32_t pos = 0;
-    while (pos < source.len) {
-        int32_t start = pos;
-        while (pos < source.len && source.ptr[pos] != '\n') pos++;
-        int32_t end = pos;
-        if (pos < source.len) pos++;
-        Span line = span_sub(source, start, end);
-        Span trimmed = span_trim(line);
-        if (!cold_span_starts_with(trimmed, "import ")) continue;
-        /* extract import path after "import " */
-        Span rest = span_trim(span_sub(trimmed, 7, trimmed.len));
-        /* extract "as" alias if present */
-        Span alias = {0};
-        int32_t as_pos = -1;
-        for (int32_t i = rest.len - 1; i >= 2; i--) {
-            if (rest.ptr[i] == ' ' && i + 2 < rest.len &&
-                rest.ptr[i - 2] == 'a' && rest.ptr[i - 1] == 's') {
-                as_pos = i - 2;
-                break;
-            }
-        }
-        if (as_pos > 0) {
-            alias = span_trim(span_sub(rest, as_pos + 3, rest.len));
-            rest = span_trim(span_sub(rest, 0, as_pos));
-        }
-        if (rest.len <= 0) continue;
-        if (cold_import_debug < 0) cold_import_debug = getenv("COLD_DBG_IMPORT") ? 1 : 0;
-        char imp_path[PATH_MAX];
-        if (!cold_resolve_import_source_path(workspace_root, rest, imp_path, sizeof(imp_path))) { if (cold_import_debug) fprintf(stderr, "[IMP] skip %.*s (resolve failed)\n", rest.len, rest.ptr); continue; }
-        if (cold_already_loaded(imp_path)) { if (cold_import_debug) fprintf(stderr, "[IMP] skip %s (already loaded)\n", imp_path); continue; }
-        cold_mark_loaded(imp_path);
-        if (cold_import_debug) fprintf(stderr, "[IMP] loading %s\n", imp_path);
-        Span imp_source = source_open(imp_path);
-        if (imp_source.len <= 0) continue;
-        /* cycle detection: check if this import path is already in the active stack */
-        if (cold_import_is_active(imp_path)) {
-            fprintf(stderr, "cheng_cold: import cycle detected: ");
-            for (int32_t ci = 0; ci < cold_active_import_count; ci++)
-                fprintf(stderr, "%s -> ", cold_active_imports[ci]);
-            fprintf(stderr, "%s\n", imp_path);
-            die("import cycle detected");
-        }
-        cold_import_push_active(imp_path);
-        /* remember current object/type counts to detect newly added types */
-        int32_t old_obj_count = symbols->object_count;
-        int32_t old_type_count = symbols->type_count;
-        /* CSG type-row round-trip disabled: types are already collected
-           via cold_collect_import_module_types during signature collection. */
-        if (0 && !cold_compile_csg_type_rows_from_source_into_symbols(imp_source, symbols, arena)) {
-            fprintf(stderr, "[cold_csg] failed to load types from %s\n", imp_path);
-        }
-        /* register aliased names for newly added types (DISABLED - crashes) */
-        if (0 && alias.len > 0) {
-            for (int32_t oi = old_obj_count; oi < symbols->object_count; oi++) {
-                Span orig = symbols->objects[oi].name;
-                if (orig.len <= 0 || !orig.ptr) continue;
-                char aliased[384];
-                int32_t alen = alias.len + 1 + orig.len;
-                if (alen >= (int32_t)sizeof(aliased)) {
-                    fprintf(stderr, "[cold_csg] alias name too long: %.*s.%.*s\n",
-                            alias.len, alias.ptr, orig.len, orig.ptr);
-                    continue;
-                }
-                memcpy(aliased, alias.ptr, (size_t)alias.len);
-                aliased[alias.len] = '.';
-                memcpy(aliased + alias.len + 1, orig.ptr, (size_t)orig.len);
-                aliased[alen] = '\0';
-                uint8_t *buf = arena_alloc(arena, (size_t)(alen + 1));
-                memcpy(buf, aliased, (size_t)alen);
-                symbols->objects[oi].name = (Span){buf, alen};
-            }
-            for (int32_t ti = old_type_count; ti < symbols->type_count; ti++) {
-                Span orig = symbols->types[ti].name;
-                if (orig.len <= 0 || !orig.ptr) continue;
-                char aliased[384];
-                int32_t alen = alias.len + 1 + orig.len;
-                if (alen >= (int32_t)sizeof(aliased)) {
-                    fprintf(stderr, "[cold_csg] alias type name too long: %.*s.%.*s\n",
-                            alias.len, alias.ptr, orig.len, orig.ptr);
-                    continue;
-                }
-                memcpy(aliased, alias.ptr, (size_t)alias.len);
-                aliased[alias.len] = '.';
-                memcpy(aliased + alias.len + 1, orig.ptr, (size_t)orig.len);
-                aliased[alen] = '\0';
-                uint8_t *tbuf = arena_alloc(arena, (size_t)(alen + 1));
-                memcpy(tbuf, aliased, (size_t)alen);
-                symbols->types[ti].name = (Span){tbuf, alen};
-            }
-        }
-        munmap((void *)imp_source.ptr, (size_t)imp_source.len);
-        cold_import_pop_active();
-    }
-}
 
 static bool cold_compile_csg_path_to_macho(const char *out_path,
                                            const char *csg_path,
@@ -20280,8 +19230,7 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
     if (source_path && source_path[0] != '\0' && workspace_root && workspace_root[0] != '\0') {
         Span source = source_open(source_path);
         if (source.len > 0) {
-            /* cold_compile_csg_load_imported_types disabled: types already loaded via collect */
-            if (0) cold_compile_csg_load_imported_types(workspace_root, source, symbols, arena);
+
             munmap((void *)source.ptr, (size_t)source.len);
         }
     }
@@ -20966,7 +19915,6 @@ static bool cold_compile_source_path_to_macho(const char *out_path,
           if (!sm) sm = strstr(src_path, "src/");
           if (sm == src_path) { char rp[PATH_MAX]; if (realpath(src_path, rp)) { const char *s = strstr(rp, "/src/"); if (s) { size_t rl = (size_t)(s - rp); memcpy(ws_root, rp, rl); ws_root[rl] = 0; } } }
           else if (sm) { size_t rl = (size_t)(sm - src_path); if (rl < sizeof(ws_root)) { memcpy(ws_root, src_path, rl); ws_root[rl] = 0; } }
-          if (ws_root[0]) { /* cold_compile_csg_load_imported_types disabled */ }
           else fprintf(stderr, "[WARN] ws_root empty, src_path=%s\n", src_path);
         }
         body_cap = symbols->function_cap;
@@ -21181,7 +20129,6 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
       if (!sm) sm = strstr(src_path, "src/");
       if (sm == src_path) { char rp[PATH_MAX]; if (realpath(src_path, rp)) { const char *s = strstr(rp, "/src/"); if (s) { size_t rl = (size_t)(s - rp); memcpy(ws_root, rp, rl); ws_root[rl] = 0; } } }
       else if (sm) { size_t rl = (size_t)(sm - src_path); if (rl < sizeof(ws_root)) { memcpy(ws_root, src_path, rl); ws_root[rl] = 0; } }
-      if (ws_root[0]) { /* cold_compile_csg_load_imported_types disabled */ }
     }
     body_cap = symbols->function_cap;
     if (body_cap < 256) body_cap = 256;
@@ -21275,11 +20222,16 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
     code_emit(shared, a64_add_imm(LR, 21, 0, true));
     code_emit(shared, a64_ret());
 
+    /* Detect x86_64 target for codegen dispatch */
+    bool use_x64 = (elf_machine == EM_X86_64 || coff_machine == IMAGE_FILE_MACHINE_AMD64);
+    X64Code x64_buf; if (use_x64) { x64_init(&x64_buf, 65536); }
+
     /* First pass: compile each function body into the shared buffer */
     for (int32_t i = 0; i < func_count && i < body_cap; i++) {
         if (!function_bodies[i]) continue;
         BodyIR *body = function_bodies[i];
-        symbol_offset[i] = shared->count;
+        if (use_x64) symbol_offset[i] = x64_buf.len; /* byte offset */
+        else symbol_offset[i] = shared->count;
         if ((uintptr_t)body < 4096 || body->has_fallback ||
             body->block_count == 0 ||
             (body->block_count > 0 && body->block_term[0] < 0)) {
@@ -21311,6 +20263,12 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
             continue;
         }
         codegen_func(shared, body, symbols, &function_patches);
+    }
+
+    if (use_x64) {
+        shared->count = x64_pack_words(&x64_buf, shared->words, shared->cap);
+        for (int32_t i = 0; i < func_count; i++)
+            if (symbol_offset[i] >= 0) symbol_offset[i] /= 4;
     }
 
     /* Resolve inter-function patches; collect relocations for external calls */
