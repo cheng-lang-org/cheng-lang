@@ -396,6 +396,18 @@ Span cold_join_generic_instance(Arena *arena, Span base, Span *args, int32_t arg
     return (Span){ptr, pos};
 }
 
+/* Strip [T, ...] suffix from a generic-instantiated name, e.g. "Some[int32]" -> "Some" */
+static Span cold_span_strip_generic_suffix(Span name) {
+    if (name.len <= 0) return name;
+    if (name.ptr[name.len - 1] != ']') return name;
+    int32_t br = -1;
+    for (int32_t i = 0; i < name.len; i++) {
+        if (name.ptr[i] == '[') { br = i; break; }
+    }
+    if (br > 0) return span_sub(name, 0, br);
+    return name;
+}
+
 Span cold_qualify_import_type(Arena *arena, Span alias, Span type) {
     bool is_var = false;
     Span stripped = cold_type_strip_var(type, &is_var);
@@ -2824,7 +2836,10 @@ bool parser_next_is_qualified_call(Parser *parser) {
     if (!span_eq(parser_peek(parser), ".")) return false;
     (void)parser_token(parser);
     Span part = parser_token(parser);
-    bool ok = part.len > 0 && span_eq(parser_peek(parser), "(");
+    if (part.len <= 0) { parser->pos = saved; return false; }
+    /* Skip generic [T] args after segment name before checking for ( */
+    if (span_eq(parser_peek(parser), "[")) parser_skip_balanced(parser, "[", "]");
+    bool ok = span_eq(parser_peek(parser), "(");
     parser->pos = saved;
     return ok;
 }
@@ -5221,30 +5236,31 @@ int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32_t *kin
         } else if (span_eq(parser_peek(parser), "[")) {
             call_name = parser_take_qualified_after_first(parser, token);
         }
+        /* Try variant constructor first (handles both payloaded and payloadless) */
+        Span stripped_name = cold_span_strip_generic_suffix(call_name);
+        Variant *vc = symbols_find_variant(parser->symbols, stripped_name);
+        if (!vc) {
+            int32_t dot = -1;
+            for (int32_t i = call_name.len - 1; i > 0; i--) {
+                if (call_name.ptr[i] == '.') { dot = i; break; }
+            }
+            if (dot > 0) {
+                Span bare = span_sub(call_name, dot + 1, call_name.len);
+                bare = cold_span_strip_generic_suffix(bare);
+                vc = symbols_find_variant(parser->symbols, bare);
+            }
+        }
+        if (vc) {
+            *kind = SLOT_VARIANT;
+            if (vc->field_count > 0) {
+                return parse_constructor(parser, body, locals, vc);
+            }
+            int32_t vz = symbols_variant_slot_size(parser->symbols, vc);
+            int32_t sl = body_slot(body, SLOT_VARIANT, vz);
+            body_op3(body, BODY_OP_MAKE_VARIANT, sl, vc->tag, -1, 0);
+            return sl;
+        }
         if (!span_eq(parser_peek(parser), "(")) {
-            /* Not followed by '(' — try variant constructor (Type.Variant) */
-            Variant *vc = symbols_find_variant(parser->symbols, call_name);
-            if (!vc) {
-                int32_t dot = -1;
-                for (int32_t i = call_name.len - 1; i > 0; i--) {
-                    if (call_name.ptr[i] == '.') { dot = i; break; }
-                }
-                if (dot > 0) {
-                    vc = symbols_find_variant(parser->symbols,
-                                              span_sub(call_name, dot + 1,
-                                                       call_name.len));
-                }
-            }
-            if (vc) {
-                *kind = SLOT_VARIANT;
-                if (vc->field_count > 0) {
-                    return parse_constructor(parser, body, locals, vc);
-                }
-                int32_t vz = symbols_variant_slot_size(parser->symbols, vc);
-                int32_t sl = body_slot(body, SLOT_VARIANT, vz);
-                body_op3(body, BODY_OP_MAKE_VARIANT, sl, vc->tag, -1, 0);
-                return sl;
-            }
             /* Skip qualified expression that's not a call */
             int32_t zero = body_slot(body, SLOT_I32, 4);
             body_op(body, BODY_OP_I32_CONST, zero, 0, 0);
@@ -5265,6 +5281,7 @@ int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32_t *kin
             if (dot > 0) {
                 Span type_name = span_sub(qualified, 0, dot);
                 Span variant_name = span_sub(qualified, dot + 1, qualified.len);
+                variant_name = cold_span_strip_generic_suffix(variant_name);
                 TypeDef *ty = symbols_find_type(parser->symbols, type_name);
                 if (ty) qualified_variant = type_find_variant(ty, variant_name);
             }
@@ -5277,9 +5294,9 @@ int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32_t *kin
                     }
                 }
                 if (!qualified_variant && dot > 0) {
-                    qualified_variant = symbols_find_variant(parser->symbols,
-                                                             span_sub(qualified, dot + 1,
-                                                                      qualified.len));
+                    Span qv = span_sub(qualified, dot + 1, qualified.len);
+                    qv = cold_span_strip_generic_suffix(qv);
+                    qualified_variant = symbols_find_variant(parser->symbols, qv);
                 }
             }
         }
@@ -5317,6 +5334,7 @@ int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32_t *kin
             if (dot > 0) {
                 Span tn = span_sub(qualified, 0, dot);
                 Span vn = span_sub(qualified, dot + 1, qualified.len);
+                vn = cold_span_strip_generic_suffix(vn);
                 TypeDef *ty = symbols_find_type(parser->symbols, tn);
                 if (ty) {
                     Variant *vc = type_find_variant(ty, vn);
