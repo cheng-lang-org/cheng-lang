@@ -361,12 +361,16 @@ static bool elf_write_exec(const char *path, const uint32_t *code,
 }
 
 /* Minimal ELF64 .o reader for provider archive linking.
-   Extracts .text section and global symbol table from a relocatable .o.
-   Caller frees out_code, out_names, out_offsets. */
+   Extracts .text section, global symbol table, and relocations from a relocatable .o.
+   Caller frees out_code, out_names, out_offsets,
+   out_reloc_offsets, and out_reloc_names. */
 static bool elf64_read_object(const char *path,
                                uint32_t **out_code, int32_t *out_code_words,
                                char ***out_names, int32_t **out_offsets,
-                               int32_t *out_name_count) {
+                               int32_t *out_name_count,
+                               int32_t **out_reloc_offsets,
+                               char ***out_reloc_names,
+                               int32_t *out_reloc_count) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) return false;
     off_t sz = lseek(fd, 0, SEEK_END);
@@ -386,13 +390,14 @@ static bool elf64_read_object(const char *path,
     uint64_t text_off = 0, text_sz = 0;
     uint64_t sym_off = 0, sym_sz = 0, sym_entsize = 0;
     uint64_t str_off = 0, str_sz = 0;
+    int32_t text_idx = -1;
     for (int32_t i = 0; i < shnum; i++) {
         uint64_t s = shoff + (uint64_t)i * shentsize;
         if (s + 64 > (uint64_t)sz) break;
         uint32_t sh_type = *(uint32_t *)(data + s + 4);
         uint64_t sh_offset = *(uint64_t *)(data + s + 24);
         uint64_t sh_size = *(uint64_t *)(data + s + 32);
-        if (sh_type == 1) { text_off = sh_offset; text_sz = sh_size; }        /* SHT_PROGBITS */
+        if (sh_type == 1) { text_off = sh_offset; text_sz = sh_size; text_idx = i; }        /* SHT_PROGBITS */
         else if (sh_type == 2) { sym_off = sh_offset; sym_sz = sh_size; sym_entsize = *(uint64_t *)(data + s + 56); } /* SHT_SYMTAB */
         else if (sh_type == 3) { str_off = sh_offset; str_sz = sh_size; }     /* SHT_STRTAB */
     }
@@ -412,13 +417,69 @@ static bool elf64_read_object(const char *path,
         uint32_t st_name = *(uint32_t *)(data + sp);
         uint8_t st_info = *(uint8_t *)(data + sp + 4);
         uint64_t st_value = *(uint64_t *)(data + sp + 8);
+        uint16_t st_shndx = *(uint16_t *)(data + sp + 14);
         if (st_name > 0 && st_name < str_sz && (st_info >> 4) == 1) { /* STB_GLOBAL */
             const char *sn = (const char *)(data + str_off + st_name);
-            if (sn[0]) { names[nc] = strdup(sn); offsets[nc] = (int32_t)(st_value / 4); nc++; }
+            if (sn[0]) {
+                names[nc] = strdup(sn);
+                offsets[nc] = (st_shndx == (uint16_t)text_idx) ? (int32_t)(st_value / 4) : -1;
+                nc++;
+            }
         }
     }
+
+    /* Read relocations (.rela.text) – entries targeting undefined (external) symbols */
+    int32_t reloc_n = 0;
+    int32_t *reloc_offsets = NULL;
+    char **reloc_names = NULL;
+    if (text_idx >= 0 && sym_entsize > 0) {
+        uint64_t rela_off = 0, rela_sz = 0, rela_entsize = 24;
+        for (int32_t i = 0; i < shnum; i++) {
+            uint64_t s = shoff + (uint64_t)i * shentsize;
+            if (s + 64 > (uint64_t)sz) break;
+            uint32_t sh_type = *(uint32_t *)(data + s + 4);
+            uint32_t sh_info = *(uint32_t *)(data + s + 44);
+            uint64_t sh_entsize = *(uint64_t *)(data + s + 56);
+            if (sh_type == 4 && (int32_t)sh_info == text_idx) { /* SHT_RELA for .text */
+                rela_off = *(uint64_t *)(data + s + 24);
+                rela_sz = *(uint64_t *)(data + s + 32);
+                if (sh_entsize > 0) rela_entsize = sh_entsize;
+                break;
+            }
+        }
+        if (rela_sz > 0 && rela_entsize >= 24) {
+            int32_t max_rela = (int32_t)(rela_sz / rela_entsize);
+            if (max_rela > 0 && max_rela < 100000) {
+                reloc_offsets = (int32_t *)calloc((size_t)max_rela, sizeof(int32_t));
+                reloc_names = (char **)calloc((size_t)max_rela, sizeof(char *));
+                for (int32_t i = 0; i < max_rela; i++) {
+                    uint64_t rp = rela_off + (uint64_t)i * rela_entsize;
+                    if (rp + 24 > (uint64_t)sz) break;
+                    uint64_t r_offset = *(uint64_t *)(data + rp);
+                    uint64_t r_info = *(uint64_t *)(data + rp + 8);
+                    uint32_t sym_idx = (uint32_t)(r_info >> 32);
+                    if (sym_idx == 0 || (uint64_t)sym_idx >= (uint64_t)max_syms) continue;
+                    uint64_t sp = sym_off + (uint64_t)sym_idx * sym_entsize;
+                    if (sp + 16 > (uint64_t)sz) continue;
+                    uint16_t st_shndx = *(uint16_t *)(data + sp + 14);
+                    if (st_shndx != 0) continue; /* defined locally – already resolved */
+                    uint32_t st_name = *(uint32_t *)(data + sp);
+                    if (st_name == 0 || st_name >= str_sz) continue;
+                    const char *sn = (const char *)(data + str_off + st_name);
+                    if (!sn[0]) continue;
+                    reloc_offsets[reloc_n] = (int32_t)r_offset;
+                    reloc_names[reloc_n] = strdup(sn);
+                    reloc_n++;
+                }
+            }
+        }
+    }
+
     free(data);
     *out_code = code; *out_code_words = cw;
     *out_names = names; *out_offsets = offsets; *out_name_count = nc;
+    *out_reloc_offsets = reloc_offsets;
+    *out_reloc_names = reloc_names;
+    *out_reloc_count = reloc_n;
     return true;
 }
