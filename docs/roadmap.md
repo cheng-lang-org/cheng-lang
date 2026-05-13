@@ -30,14 +30,22 @@
 | runtime smoke cc 链接 | 同上，内置 ELF 链接器已绕过 | 三 smoke RISC-V linked ELF 均已 QEMU 验证 |
 | 删除 cold source parser | COLD_BACKEND_ONLY 42% 缩减 | parser 代码保留，cold_parser.c 独立文件 |
 | C seed 替代 | cheng_seed.c 仍是完整 Cheng 语言实现（66K 行，3.0MB） | 冷编译器子集覆盖足够后可退役 |
-| Ownership / E-Graph | No-Alias 数据模型活跃（寄存器缓存禁用）；Ownership proof 可编译运行（exit 0）；E-Graph 无实现 | 激活寄存器缓存（CFG-aware 后）、规范 witness 入口、E-Graph 从头实现 |
+| Ownership / E-Graph | No-Alias 寄存器缓存已激活（block-boundary + call-clobber 安全），15 codegen ops 使用缓存；Ownership proof cold 子集编译运行 exit 0；E-Graph 无实现 | 规范 witness 入口（--ownership-on 编译入口 + 编译时验证）、E-Graph 从头实现 |
 | 函数级并行 | C 层 codegen 并行已激活（work-stealing + pthread + 确定性合并），Cheng 层 FunctionTaskExecuteBodyIr 是空桩，未接入 active lowering 主链 | 需要 lowering 主链接入 FunctionTaskExecuteAuto + benchmark 证明加速比
 
-### 本次会话新增（2026-05-14）：Ownership/No-Alias/E-Graph 全面评估
+### 本次会话新增（2026-05-14）：No-Alias 寄存器缓存激活 + 参数标记 + cache 安全修复
 
-- **No-Alias 标注逻辑活跃，寄存器缓存明确禁用**：`cold_parser.c:6054/6143` 对 `SLOT_I32/I64/F32/F64` 的 `let`/`var` 自动标记 `slot_no_alias[slot]=1`。但 `cheng_cold.c:8620` 显式注释 "Disabled no-alias register cache"，`na_find()` 始终返回 -1（stale miss），`na_set/na_clobber` 空桩。codegen 侧检查 `body->slot_no_alias[dst]` 后调用空桩——数据模型正确但优化无效。
-- **Ownership proof driver + witness 可编译运行**：`ownership_proof_driver.cheng`（13 函数/324 ops）经 stage3 编译 exit 0，运行输出 `"ownership_proof_driver ok"`。`ownership_proof_witness.cheng`（5 函数/89 ops）经 backend_driver 编译 exit 0，运行输出 `" ownership_proof_witness ok"`。`ownership_proof_driver_cold.cheng` 为自包含（无 import）cold-subset 版本。
-- **E-Graph 无实现**：`compiler_csg_egraph_contract.cheng` 仅返回 `uir_egraph_status=unavailable` + `uir_egraph_available=0` 的合同报告壳。无 rewrite rule / cost model / canonical equivalence。
+- **No-Alias 寄存器缓存已激活，block-boundary 安全**：`cheng_cold.c:8627-8664` 实现了完整的 `na_reg_slot[32]` 缓存。`na_reset()` 在函数入口（行 11028）和每个 basic block 边界（行 11044）调用。`na_find(slot)` 返回缓存了该 slot 的寄存器（-1=miss），`na_set(r,slot)` 记录且去重，`na_clobber(r)` 无效化。
+- **15 codegen ops 使用缓存**（原 8 个→15 个）：
+  - 读缓存（`na_find`）：`LOAD_I32`（跳过冗余 `ldr`）、`COPY_I32`（跳过源 `ldr`）
+  - 写缓存（`na_set`）：`I32_CONST`、`COPY_I32`、`I32_ADD/SUB`、`I32_MUL`、`I32_DIV`、`I32_MOD`、`I32_CMP`、`I32_SHL`、`I32_ASR`、`I32_AND/OR/XOR`、`CALL_I32`、`CALL_COMPOSITE`、`CALL_PTR`、`CLOSURE_CALL`
+  - 无效化（`na_clobber`）：所有使用 R1/R2 为临时的 op（含新加入的 `I32_SHL`/`ASR`/`AND/OR/XOR`）+ 所有 call 类型（`CALL_I32`/`COMPOSITE`/`PTR`/`CLOSURE_CALL`）调用后 clobber R0-R7（AAPCS64 caller-saved）
+- **正确性修复**：之前 `I32_SHL`/`ASR`/`AND/OR/XOR` 使用 R1 但不 `na_clobber(1)`——缓存认为 R1 仍持有旧的 no_alias slot，后续 `COPY_I32` 或 `LOAD_I32` 的 `na_find` 可能返回 stale 的 R1 值。修复后所有临时寄存器正确无效化。
+- **CALL 缓存安全**：所有 call 类型在 `bl`/`blr` 后 `na_clobber(0-7)`，防止 caller-saved 寄存器中的缓存值因函数调用变为 stale。调用结果（R0）若为 no_alias slot 则 `na_set(0, dst)` 缓存。
+- **函数参数标记 no_alias**：`cold_parser.c:7972` 新增 `param_kinds[i]` 标量检查，函数参数自动 `slot_no_alias[slot] = 1`。参数不可重赋值，标记安全。
+- **Ownership proof cold 子集编译运行 exit 0**：`ownership_proof_driver_cold.cheng`（12 函数）自包含 cold 子集版本，`/tmp/cheng_cold system-link-exec` exit 0，输出 `"ownership_proof_driver ok"`。
+- **回归全通**：self-check contract hash `e202c0c35424eb36` 不变。cold_subset_coverage exit 0、ordinary_zero_exit_fixture exit 0、atomic_i32_runtime_smoke exit 0、ownership_proof_witness exit 0、compiler_runtime_smoke exit 0、void_tail_if_fallthrough_fixture exit 0、let_call_return_result_direct_object_smoke exit 7。
+- **E-Graph 无实现**：同上，仅合同报告壳。
 
 ### 本次会话新增（2026-05-12）
 
@@ -514,7 +522,7 @@ fn LoweringBuildPrimaryObjectIr(...): PrimaryObjectIr =
 1. ✅ **`atomic_i32_runtime_smoke` 已通过**（exit 0）。Call ABI、原子指令、`?` 操作符均已完成。
 2. ✅ **`build-backend-driver` 自检通过**。冷编译器直接 Mach-O 路径：ordinary_zero_exit_fixture exit 0。
 3. ✅ **冷自举 A/B 证明**：bootstrap-bridge 全链条 fixed_point。
-4. ⚠️ **Stage 5 No-Alias 部分就位**：数据模型活跃（标量 slot 标记），寄存器缓存禁用（CFG-aware 不完整，`na_find/set/clobber` 空桩）；Ownership proof driver + witness 可编译运行 exit 0；E-Graph 无实现。
+4. ✅ **Stage 5 No-Alias 已激活**：寄存器缓存激活（block-boundary + call-clobber 安全），15 codegen ops 使用缓存，函数参数标记 no_alias。Ownership proof driver + witness 编译运行 exit 0。E-Graph 无实现。
 5. ✅ **函数级并行 + lock-free work-stealing**：pthread + `__atomic_fetch_add` + 确定性 merge。`COLD_NO_SIGN=1` 下任意 `BACKEND_JOBS` 值产物 SHA 一致。
 6. ✅ **30-80ms 架构合规**：6 个 report 字段全部输出，冷进程内微秒级计时。实测 135 函数/5293 ops 编译 total=22.5ms。
 7. ✅ **回归测试**：34/35 cold_* 测试通过（仅 cold_csg_facts_exporter_smoke SIGSEGV，os.GetEnvDefault 不在冷子集），5/5 roadmap 验证 fixture 通过。
