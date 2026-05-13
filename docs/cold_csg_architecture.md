@@ -1,306 +1,296 @@
-# 冷编译器 CSG 架构演进方案
+# 冷编译器 CSG 架构演进方案（修正版 v2）
 
-> 目标：冷编译器从"最小 Cheng 子集前端 + 后端"退化为"纯后端（lowering + codegen + emit）"，
-> 前端（parser → typed_expr → primary_object_plan）完全由自举后的 Cheng 编译器承担，
-> 通过 CSG 事实格式桥接两端，实现 100% 语言覆盖 + 毫秒级编译时间 + 最小 C 代码量。
+> 核心原则：冷编译器不接管 lowering/primary_object_plan，只消费 Cheng 编译器已产出的
+> canonical PrimaryObjectPlan/BodyIR/facts，负责 load/verify → object emit → linkerless/link。
+> 语义 lowering 保持在 Cheng 侧，不搬回 C。
 
-## 1. 当前架构
-
-```
-┌─────────────────────────────────────────────────────┐
-│ cheng_cold.c (~20000 行 C)                          │
-│                                                     │
-│  ┌──────────────┐  ┌──────────┐  ┌───────────────┐  │
-│  │ parser/type  │→│ BodyIR   │→│ codegen/emit  │  │
-│  │ (~8000 行)   │  │ (~4000)  │  │ (~8000 行)    │  │
-│  │              │  │          │  │               │  │
-│  │ Cheng 子集   │  │          │  │ ARM64/x86_64  │  │
-│  │ 语法解析     │  │          │  │ /RISC-V/ELF   │  │
-│  └──────────────┘  └──────────┘  └───────────────┘  │
-│                                                     │
-│  问题:                                               │
-│  - 语言覆盖 ≤ 70%（冷子集，泛型/闭包/字符串插值等缺失）│
-│  - 前端逻辑在 C 和 Cheng 中重复实现                    │
-│  - 每次修改语法需要同时改两处                          │
-└─────────────────────────────────────────────────────┘
-```
-
-## 2. 目标架构
+## 1. 角色边界（不可逾越）
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│ Cheng 自举编译器（完整语言）                               │
-│                                                          │
-│  parser → typed_expr → lowering_plan                     │
-│                           ↓                              │
-│                    primary_object_plan                    │
-│                           ↓                              │
-│                    CSG facts 序列化                       │
-│                    (cold_csg v2)                          │
-└──────────────────────────┬───────────────────────────────┘
-                           │
-                           │ CSG 事实文件/内存块
-                           │ (单次生成，可缓存)
-                           ↓
-┌──────────────────────────────────────────────────────────┐
-│ cheng_cold.c (~10000 行 C)                                │
-│                                                          │
-│  ┌──────────────┐  ┌──────────┐  ┌──────────────────┐   │
-│  │ CSG load     │→│ lowering │→│ codegen + emit   │   │
-│  │ (cold_csg_   │  │ (cold_   │  │ (ARM64/x86_64/  │   │
-│  │  load)       │  │  csg_    │  │  RISC-V ELF/    │   │
-│  │ ~500 行      │  │  lower_*)│  │  COFF/Mach-O)   │   │
-│  │              │  │ ~1500 行 │  │  ~8000 行        │   │
-│  └──────────────┘  └──────────┘  └──────────────────┘   │
-│                                                          │
-│  收益:                                                    │
-│  - 语言覆盖 100%（前端在 Cheng 侧）                       │
-│  - C 代码量减半（20000 → 10000 行）                      │
-│  - 编译时间降低（10-15ms → 5-8ms）                       │
-│  - 单一前端实现（parser/type 只存在于 Cheng 侧）           │
-└──────────────────────────────────────────────────────────┘
+Cheng 编译器（完整语言，Cheng 实现）              冷编译器（纯后端，C 实现）
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                                                  严禁：
+parser → typed_expr → lowering_plan               - 语义 lowering
+        → primary_object_plan                      - 类型推导/检查
+        → canonical BodyIR/facts                   - variant/enum tag 分配
+                                                   - 符号解析
+        产出：CSG 事实文件（二进制/hex）           - import 闭包
+                                                   - provider 选择
+                                                   ━━━━━━━━━━━━━━━━━━━━━
+                                                   只负责：
+                                                   - load/verify facts
+                                                   - object emit（格式写入）
+                                                   - linkerless/link
+                                                   - codegen（指令选择/编码）
 ```
 
-## 3. CSG 事实格式（cold_csg v2）
+**为什么 lowering 不能进冷编译器**：
+- lowering 涉及语义决策（variant layout、enum tag、type layout、ABI lowering）
+- 这些决策已经在 Cheng 侧完成（primary_object_plan），搬回 C 就是重复实现
+- 路线会偏：cold 变成另一个 Cheng 编译器，而非最小种子后端
 
-### 3.1 格式定义
+## 2. CSG 事实格式（修订）
 
-Cold 编译器已有的 `ColdCsg` 数据结构作为事实容器。
+### 2.1 禁止项
+
+- ❌ tab 分隔文本字段
+- ❌ JSON 嵌套字段
+- ❌ 无 schema version
+- ❌ 无 target/ABI 元数据
+
+### 2.2 格式规范
 
 ```
-cold_csg_version=2
-cold_csg_entry=main
-
-# 类型定义
-cold_csg_type	<type_id>	<type_name>	<kind:enum|variant|object>	<variant_count>	<fields_json>
-cold_csg_object	<object_id>	<object_name>	<field_count>	<fields_json>
-
-# 函数体事实（primary_object_plan 产出）
-cold_csg_function	<fn_id>	<fn_name>	<param_count>	<return_type>	<frame_size>
-cold_csg_op	<fn_id>	<op_id>	<op_kind>	<target>	<a>	<b>	<c>	<line>
-cold_csg_local	<fn_id>	<local_id>	<name>	<kind>	<slot_offset>	<size>	<align>
-cold_csg_block	<fn_id>	<block_id>	<op_start>	<op_count>
-cold_csg_term	<fn_id>	<term_id>	<term_kind>	<result>	<true_block>	<false_block>
-cold_csg_call	<fn_id>	<call_id>	<target_fn>	<arg_start>	<arg_count>	<result_slot>
-cold_csg_const	<const_id>	<const_name>	<value>
-cold_csg_const_str	<const_id>	<const_name>	<value>
-
-# 重定位/补丁
-cold_csg_patch	<fn_id>	<patch_pos>	<target_fn>	<patch_kind:bl|adr|bcond>
-cold_csg_reloc	<fn_id>	<reloc_offset>	<symbol_name>	<reloc_type>
+┌─────────────────────────────────────────────────────────────────┐
+│ Header (64 bytes, binary)                                        │
+│   magic[8]      = "CHENGCSG"                                    │
+│   version[4]    = uint32_le (当前: 2)                             │
+│   target_triple[32]  = "arm64-apple-darwin\0"                   │
+│   abi[4]        = uint32_le (0=system, 1=cold_no_runtime, ...)  │
+│   pointer_width[1]   = 8                                         │
+│   endianness[1]      = 0 (LE)                                    │
+│   reserved[14]       = 0                                         │
+├─────────────────────────────────────────────────────────────────┤
+│ Section Index (n * 16 bytes)                                     │
+│   section_kind[4]    = uint32_le                                 │
+│     kind 0 = type_block                                           │
+│     kind 1 = function                                             │
+│     kind 2 = provider_root                                        │
+│     kind 3 = external_symbol                                       │
+│     kind 4 = data_constant                                         │
+│     kind 5 = string_constant                                       │
+│     kind 6 = relocation                                            │
+│   section_offset[8]  = uint64_le (从文件头开始)                   │
+│   section_size[4]    = uint32_le                                  │
+├─────────────────────────────────────────────────────────────────┤
+│ Payload Sections（各 section 独立的 hex/binary 编码）              │
+│                                                                   │
+│ type_block:                                                        │
+│   type_count[4]                                                    │
+│   [4]byte type_kind (0=enum 1=variant 2=object)                   │
+│   [4]byte name_len + name_utf8                                    │
+│   [4]byte field_count                                             │
+│   for each field: [4]byte slot_kind + [4]byte slot_size           │
+│                  + [4]byte field_offset + [4]byte name_len + name │
+│                                                                   │
+│ function:                                                         │
+│   fn_count[4]                                                     │
+│   for each fn:                                                    │
+│     [4]byte name_len + name_utf8                                  │
+│     [4]byte param_count + [4]byte return_kind + [4]byte frame_size│
+│     [4]byte op_count                                              │
+│     for each op: [4]byte op_kind + [4]byte dst + [4]byte a        │
+│                  + [4]byte b + [4]byte c                          │
+│     [4]byte local_count                                           │
+│     for each local: [4]byte kind + [4]byte slot + [4]byte size    │
+│     [4]byte block_count                                           │
+│     for each block: [4]byte op_start + [4]byte op_count           │
+│     [4]byte term_count                                            │
+│     for each term: [4]byte kind + [4]byte result                  │
+│                   + [4]byte true_block + [4]byte false_block      │
+│     [4]byte call_count                                            │
+│     for each call: [4]byte target_fn + [4]byte arg_start          │
+│                   + [4]byte arg_count + [4]byte result_slot       │
+│                                                                   │
+│ provider_root:                                                    │
+│   count[4]                                                        │
+│   for each: [4]byte id + [4]byte path_len + path_utf8            │
+│            + [4]byte name_len + name_utf8                         │
+│            + [1]byte is_entry                                     │
+│                                                                   │
+│ external_symbol:                                                  │
+│   count[4]                                                        │
+│   for each: [4]byte name_len + name_utf8                          │
+│            + [1]byte visibility (0=local 1=global 2=weak)        │
+│            + [4]byte size                                          │
+│                                                                   │
+│ data_constant:                                                    │
+│   count[4]                                                        │
+│   for each: [4]byte name_len + name_utf8                          │
+│            + [4]byte size + payload_bytes                         │
+│                                                                   │
+│ string_constant:                                                  │
+│   count[4]                                                        │
+│   for each: [4]byte id + [4]byte len + utf8_bytes                │
+│                                                                   │
+│ relocation:                                                       │
+│   count[4]                                                        │
+│   for each: [4]byte fn_id + [4]byte offset + [4]byte type        │
+│            + [4]byte symbol_len + symbol_utf8                     │
+│                                                                   │
+├─────────────────────────────────────────────────────────────────┤
+│ Trailer (32 bytes)                                                │
+│   section_count[4]   = uint32_le                                  │
+│   content_hash[32]   = BLAKE3 over all payload sections          │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-### 3.2 与现有 ColdCsg 的兼容性
+### 2.3 关键约束
 
-现有 `ColdCsg` 结构已定义：
+- **全部字段**：长度前缀 + 值，无分隔符，无文本解析歧义
+- **schema version**：Header.version，`cold_csg_load` 版本检测，不匹配直接 fail
+- **target/ABI**：Header 中声明，用于 object emit 阶段的格式选择和 ABI 决策
+- **content_hash**：BLAKE3 哈希覆盖全部 payload sections，用于完整性验证和 fixed-point 比对
+- **provider/external/data**：完整描述可执行文件所需的外部依赖，没有这些信息不能闭合到可执行文件
 
-```c
-typedef struct {
-    int32_t fn_index;
-    int32_t indent;
-    Span kind;      // 行类型标记
-    Span payload;   // 列数据（tab 分隔）
-    int32_t line;
-} ColdCsgStmt;
+## 3. Provider/Link 模型
 
-typedef struct {
-    Span name;
-    int32_t param_count;
-    Span return_type;
-    int32_t frame_size;
-} ColdCsgFunction;
+### 3.1 事实必须包含的外部依赖
 
-typedef struct {
-    ColdCsgFunction *functions;
-    int32_t function_count;
-    ColdCsgStmt *stmts;
-    int32_t stmt_count;
-    Arena *arena;
-    Symbols *symbols;
-} ColdCsg;
+```
+可执行文件 = 编译单元(.o) + provider roots + runtime support + external symbols + data/string 常量 + reloc
+
+CSG 事实块:
+  provider_root:  运行时入口（core_runtime, debug_runtime, program_support）
+  external_symbol: 外部符号（visible, size, linkage）
+  data_constant:   嵌入数据（TLS, 全局变量, const 段）
+  string_constant: 字符串常量池
+  relocation:      重定位条目（符号名 + 偏移 + 类型）
 ```
 
-扩展方案：
-- `stmt` 的 `kind` 字段区分事实类型（`cold_csg_op`、`cold_csg_local`、`cold_csg_block` 等）
-- `payload` 包含 tab 分隔的字段值
-- `cold_csg_load` 已能解析这些事实并填充 `ColdCsg` 结构
-- `cold_csg_lower_*` 将 `ColdCsg` → BodyIR → codegen
+### 3.2 冷编译器的消费
 
-## 4. primary_object_plan 序列化
-
-### 4.1 当前产出
-
-`primary_object_plan.cheng` 当前产出 `PrimaryBodyIr` 结构：
-
-```cheng
-PrimaryBodyIr =
-    functions: PrimaryObjectIrFunction[]
-    ops: BodyOp[]          // BODY_OP_* 扁平数组
-    locals: LocalSlot[]    // 局部变量
-    blocks: BodyBlock[]    // 基本块
-    terms: BodyTerm[]      // 终止符
-    calls: CallOp[]        // 调用信息
-    consts: ConstDef[]     // 常量
-    patches: Patch[]       // 补丁/重定位
+```
+cold_csg_load → 解析全部 section
+    → type_block    → 填充 ColdCsg.symbols（类型表）
+    → function      → 填充 ColdCsg.functions + stmts（函数体事实）
+    → provider_root → 填充 provider 列表（link provider 选择）
+    → external_symbol → 填充符号表（elf64_write_symtab）
+    → data_constant → 填充 .rodata section
+    → string_constant → 填充 .cstring section
+    → relocation    → 填充 rela section
+    → cold_csg_lower → BodyIR → codegen → emit
 ```
 
-### 4.2 序列化函数
+## 4. 冷编译器改造（修正）
 
-新增 `PrimaryBodyIrEmitCsgFacts(ir: PrimaryBodyIr, sink: FactSink)`：
+### 4.1 保留模块（纯后端）
 
-```cheng
-fn PrimaryBodyIrEmitCsgFacts(ir: PrimaryBodyIr, sink: var FactSink) =
-    FactWriteVersion2(sink)
-    
-    // 1. 类型定义
-    for t in ir.types:
-        FactWriteTypeRecord(sink, t)
-    
-    // 2. 函数体事实
-    for fn in ir.functions:
-        FactWriteFunctionRecord(sink, fn)
-        // ops
-        for i in fn.opStart..<fn.opEnd:
-            FactWriteOpRecord(sink, fn.id, ir.ops[i])
-        // locals
-        for i in fn.localStart..<fn.localEnd:
-            FactWriteLocalRecord(sink, fn.id, ir.locals[i])
-        // blocks
-        for i in fn.blockStart..<fn.blockEnd:
-            FactWriteBlockRecord(sink, fn.id, ir.blocks[i])
-        // terms
-        for i in fn.termStart..<fn.termEnd:
-            FactWriteTermRecord(sink, fn.id, ir.terms[i])
-        // calls
-        for i in fn.callStart..<fn.callEnd:
-            FactWriteCallRecord(sink, fn.id, ir.calls[i])
-    
-    // 3. 补丁/重定位
-    for p in ir.patches:
-        FactWritePatchRecord(sink, p)
-```
-
-## 5. 冷编译器改造
-
-### 5.1 保留模块
-
-| 模块 | 行数（估） | 说明 |
-|------|-----------|------|
-| `ColdCsg` 数据结构 | ~200 | CSG 事实容器 |
-| `cold_csg_load` | ~300 | CSG 事实解析 |
-| `cold_csg_lower_*` | ~1500 | CSG → BodyIR lowering |
+| 模块 | 行数 | 说明 |
+|------|------|------|
+| `cold_csg_load` + verify | ~500 | CSG 事实解析 + schema/version/hash 验证 |
+| `cold_csg_lower_*` | ~1500 | CSG → BodyIR lowering（事实→中间表示） |
 | `BodyIR` | ~800 | 中间表示 |
-| codegen (ARM64/x86_64/RISC-V) | ~3000 | 多目标代码生成 |
+| codegen (ARM64/x86_64/RISC-V) | ~3000 | 多目标指令选择/编码 |
 | ELF64/COFF/Mach-O emit | ~2000 | 格式写入 |
 | 入口/命令分发 | ~500 | `cold_cmd_system_link_exec` 等 |
 | arena/mmap/util | ~500 | 基础设施 |
 | work-stealing/并行 | ~200 | 极限架构 |
 | **合计** | **~9000** | |
 
-### 5.2 移除模块
-
-| 模块 | 行数（估） | 说明 |
-|------|-----------|------|
-| parser（token/span/indent） | ~3000 | 源码解析 |
-| parse_fn/parse_expr/parse_stmt 等 | ~4000 | 语法解析 |
-| type check（符号表构建） | ~2000 | 类型系统 |
-| import 类型收集 | ~1000 | 导入处理 |
-| CSG 类型行往返（已禁用） | ~800 | 冗余往返 |
-| **合计** | **~11000** | |
-
-### 5.3 编译入口
-
-```c
-// 新入口：从 CSG 事实编译
-static bool cold_compile_csg_to_object(const char *csg_path,
-                                        const char *out_path,
-                                        const char *target,
-                                        ColdCompileStats *stats) {
-    Arena *arena = arena_new();
-    ColdCsg csg;
-    if (!cold_csg_load(&csg, arena, csg_path)) return false;
-    
-    // lowering: CSG → BodyIR
-    for (int32_t i = 0; i < csg.function_count; i++) {
-        cold_csg_lower_function(&csg, i);
-    }
-    
-    // codegen + emit（并行）
-    codegen_program(/* ... */);
-    
-    // 格式写入（根据 target 选择）
-    if (is_macho)  cold_emit_macho(out_path, code);
-    if (is_elf)    cold_emit_elf64_obj(out_path, code, machine);
-    if (is_coff)   cold_emit_coff_obj(out_path, code);
-}
-```
-
-## 6. 自举管线
+### 4.2 移除条件（不可提前）
 
 ```
-阶段 0（初始）:
-  cheng_cold.c (旧版，含前端) → 编译后端驱动 → cheng.stage1
+删除 cold parser/frontend 的前提条件（全部满足才能执行）：
 
-阶段 1（过渡）:
-  cheng.stage1 → 编译 Cheng 源码 → 产出两份产物:
-    a) backend_driver/cheng (可执行)
-    b) cold 消费用 CSG facts (backend_driver.cheng.csg)
+□ --csg-in 产物与传统路径产物 object hash 一致
+□ fixed-point: cold_cold(cheng(primary_object_plan)) = cold_cheng(source)
+□ 30/30 回归全部通过（--csg-in 模式）
+□ 3/3 runtime smoke exit 0（--csg-in 模式）
+□ build-backend-driver --csg-in 自举 closed loop
+□ 跨端产物格式验证通过（ELF/COFF/Mach-O）
 
-阶段 2（csg-in 自举）:
-  cheng_cold.c (新版，纯后端) --csg-in:backend_driver.cheng.csg → 新 backend_driver
-  验证: 新旧 backend_driver 行为一致 (fixed_point)
-
-阶段 3（纯 csg 自举闭环）:
-  砍掉冷编译器的 parser/frontend 模块
-  只保留 CSG load + lowering + codegen + emit
-  冷编译器 < 10000 行 C
+任一不满足 → 保留 parser/frontend，暴露 gap，不删除
 ```
 
-## 7. 性能预估
+### 4.3 迁移策略（严格双轨）
 
-| 阶段 | 冷编译器行数 | 编译时间 | 语言覆盖 |
-|------|-------------|---------|---------|
-| 当前 | ~20000 | 12-15ms | ~70%（冷子集） |
-| 过渡期 | ~20000 | 15-20ms（CSG 生成 + cold 编译） | 100% |
-| 目标 | ~10000 | 5-8ms（纯后端） | 100% |
+```
+禁止：保留旧版作为 "fallback"
 
-CSG facts 可缓存：首次编译生成 CSG 文件，后续编译直接 `--csg-in` 跳过前端，仅走 lowering + codegen + emit。
+要求：
+  每次编译同时走两条路径：
+    路径 A: 传统 parser → type → BodyIR → codegen → emit
+    路径 B: Cheng 前端 → facts → cold_csg_load → lowering → codegen → emit
 
-## 8. 实现计划
+  验证：
+    - 两条路径的 object hash 必须一致（确定性）
+    - 两条路径的 report 字段必须一致
+    - 两条路径的 exit code 必须一致
 
-### Phase 1：CSG 事实序列化（1-2 天）
+  不一致 → fail hard，暴露差异，不回退到路径 A
+```
 
-- `primary_object_plan.cheng` 中实现 `PrimaryBodyIrEmitCsgFacts`
-- 产出标准 CSG v2 格式
-- 验证：生成的 CSG 能被 `cold_csg_load` 正确解析
+## 5. 性能数据（实测，非预估）
 
-### Phase 2：冷编译器纯后端模式（1-2 天）
+### 5.1 当前实测
 
-- 添加 `--csg-in` 作为冷编译器主入口
-- `cold_compile_csg_path_to_macho` → 完整实现（当前仅框架）
-- 验证：`--csg-in` 产物与传统路径产物 SHA 一致
+```
+cheng_skill_consistency_smoke 报告:
+  primary_object_plan_ms = 83172  (83ms)
+  
+  编译端到端（含前端）: ~83ms
+  冷编译器后端（codegen + emit）: ~5-8ms
 
-### Phase 3：parser/frontend 移除（1 天）
+  结论：前端（parser + typed_expr + primary_object_plan）是瓶颈，
+        冷编译器后端已经够快。
+```
 
-- 确认 Phase 2 稳定后，移除 parser/type/import 模块
+### 5.2 CSG 架构的收益
+
+```
+CSG facts 可缓存：
+  首次编译: Cheng 前端 (~83ms) → facts 文件 → 冷编译器 (~5-8ms) → 可执行文件
+  后续编译: facts 文件（缓存命中）→ 冷编译器 (~5-8ms) → 可执行文件
+
+  缓存场景的冷编译器编译时间: 5-8ms（与当前一致，无性能退步）
+  首次编译需等待前端产出 facts（83ms），但这是 Cheng 编译器的时间，不计入冷编译器
+```
+
+### 5.3 不做预估
+
+- "100% 语言覆盖" → 需实测证明，不能声称
+- "5-8ms 全流程" → 需实测证明，当前 facts 生成（Cheng 侧）83ms
+- 所有性能数据必须在报告中有字段支撑
+
+## 6. 实现计划（修正）
+
+### Phase 1：CSG 事实格式 + 序列化
+
+- 定义二进制格式（Header + Section Index + Payload + Trailer）
+- `primary_object_plan.cheng` 实现事实序列化
+- 冷编译器 `cold_csg_load` 适配新格式（schema version 检测）
+- 验证：产物能被正确解析（hash 匹配）
+
+### Phase 2：冷编译器纯消费模式
+
+- `--csg-in` 作为冷编译器入口，完整实现 load → lowering → codegen → emit
+- 双轨验证：传统路径 vs --csg-in 路径，object hash 比对
+- provider/link 模型接入（provider_root → link provider 选择）
+
+### Phase 3：回归 + fixed-point
+
+- 30/30 回归全部双轨通过
+- 3/3 runtime smoke 双轨 exit 0
+- build-backend-driver --csg-in 自举闭环
+- fixed-point 验证通过
+
+### Phase 4：移除 parser/frontend（条件触发）
+
+- 仅在 Phase 3 全部绿灯后执行
+- 删除 parser/type/import 模块
 - 冷编译器缩减到 ~10000 行
-- 全量回归 + 自举 fixed_point 验证
+- 全量双轨验证再次通过
 
-## 9. 风险与缓解
+### 各阶段不可跳过，不可合并
 
-| 风险 | 缓解 |
-|------|------|
-| CSG 事实格式不完整，丢失语义信息 | 从 `primary_object_plan` 的完整 BodyIR 导出，确保信息无损 |
-| lowering 阶段性能瓶颈 | `cold_csg_lower_*` 已在当前冷编译器中验证（~2-3ms） |
-| 自举链断裂 | 保留旧版冷编译器作为 fallback，分阶段迁移 |
-| 格式兼容性 | CSG v2 版本号管理，`cold_csg_load` 支持版本检测 |
+## 7. 当前已知 Gap
 
-## 10. 总结
+| Gap | 影响 | 优先级 |
+|-----|------|--------|
+| CSG facts 格式需要从 tab/文本升级到二进制/hex | 当前格式不可用于生产 | Phase 1 |
+| primary_object_plan 不支持事实序列化 | 无 facts 产出 | Phase 1 |
+| cheng_skill_consistency_smoke native 执行挂起 | 83ms 产物不可运行 | 调查 |
+| provider/link 模型在 CSG 路径中缺失 | 不能闭合到可执行文件 | Phase 2 |
+| --csg-in 路径未经双轨验证 | 数据不足 | Phase 2-3 |
+| 性能数据只有单点（83ms），无全量统计 | 不能声称覆盖/时间 | 持续 |
 
-这次架构演进将冷编译器从"最小 Cheng 子集编译器"转变为"通用 Cheng 后端（lowering + codegen + emit）"，核心变化：
+## 8. 总结
 
-- **语言覆盖**：70% → 100%（前端完全由 Cheng 自举编译器承担）
-- **C 代码量**：20000 → 10000 行（砍掉 parser/frontend）
-- **编译时间**：12-15ms → 5-8ms（跳过解析，直接从事实 lowering）
-- **维护成本**：单一前端实现（Cheng 侧），冷编译器只做后端
-- **自举闭环**：Cheng → CSG facts → cold → 新 Cheng，链路清晰可验证
+这次架构演进将冷编译器从"最小 Cheng 子集编译器"转变为"canonical facts 消费者（纯后端）"：
+
+- **角色**：不接管 lowering，只消费已产出的 canonical 事实
+- **格式**：二进制/hex 编码，带 schema version + target/ABI + hash
+- **迁移**：严格双轨验证，失败暴露，不回退，不保留 fallback
+- **删除**：仅在所有验证通过后，按条件触发
+- **性能**：只报告实测数据，不做预估
