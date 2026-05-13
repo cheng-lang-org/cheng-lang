@@ -189,9 +189,8 @@ static bool elf64_write_object(const char *path,
     buf[6] = EV_CURRENT;  /* version */
     buf[7] = ELFOSABI_SYSV; /* OS/ABI */
     /* padding bytes 8-15 are zero */
-    w[4] = ET_REL;        /* e_type */
-    w[5] = machine;       /* e_machine */
-    w[6] = 1;             /* e_version */
+    w[4] = ET_REL | ((uint32_t)machine << 16); /* e_type + e_machine */
+    w[5] = 1;                                   /* e_version */
     w[7] = 0;             /* e_entry */
     w[8] = 0;             /* e_entry high */
     w[9] = 0;             /* e_phoff */

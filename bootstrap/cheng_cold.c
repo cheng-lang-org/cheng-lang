@@ -21093,15 +21093,42 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
                 name_count++;
             }
 
-            ok = macho_write_object(out_path, shared->words, shared->count,
-                                         func_names, func_offsets,
-                                         name_count, local_count,
-                                         reloc_offsets, reloc_symbols, reloc_count);
+            {
+                bool is_elf = target && strstr(target, "linux") != 0;
+                bool is_coff = target && strstr(target, "windows") != 0;
+                uint16_t em = 0, cm = 0;
+                if (is_elf) {
+                    if (strstr(target, "aarch64")) em = EM_AARCH64;
+                    else if (strstr(target, "riscv64")) em = EM_RISCV;
+                    else if (strstr(target, "x86_64")) em = EM_X86_64;
+                }
+                if (is_coff && strstr(target, "x86_64")) cm = IMAGE_FILE_MACHINE_AMD64;
+                ok = is_elf ? elf64_write_object(out_path, shared->words, shared->count,
+                                                  func_names, func_offsets, name_count, local_count,
+                                                  reloc_offsets, reloc_symbols, reloc_count, em)
+                      : is_coff ? coff_write_object(out_path, shared->words, shared->count,
+                                                     func_names, func_offsets, name_count, local_count,
+                                                     reloc_offsets, reloc_symbols, reloc_count, cm)
+                      : macho_write_object(out_path, shared->words, shared->count,
+                                            func_names, func_offsets, name_count, local_count,
+                                            reloc_offsets, reloc_symbols, reloc_count);
+            }
 
             ColdErrorRecoveryEnabled = false;
             } else {
                 ColdErrorRecoveryEnabled = false;
-                macho_write_object(out_path, shared->words, shared->count, 0, 0, 0, 0, 0, 0, 0);
+                bool is_elf = target && strstr(target, "linux") != 0;
+                bool is_coff = target && strstr(target, "windows") != 0;
+                uint16_t em = 0, cm = 0;
+                if (is_elf) {
+                    if (strstr(target, "aarch64")) em = EM_AARCH64;
+                    else if (strstr(target, "riscv64")) em = EM_RISCV;
+                    else if (strstr(target, "x86_64")) em = EM_X86_64;
+                }
+                if (is_coff && strstr(target, "x86_64")) cm = IMAGE_FILE_MACHINE_AMD64;
+                if (is_elf) elf64_write_object(out_path, shared->words, shared->count, 0, 0, 0, 0, 0, 0, 0, em);
+                else if (is_coff) coff_write_object(out_path, shared->words, shared->count, 0, 0, 0, 0, 0, 0, 0, cm);
+                else macho_write_object(out_path, shared->words, shared->count, 0, 0, 0, 0, 0, 0, 0);
                 ok = true;
             }
 
