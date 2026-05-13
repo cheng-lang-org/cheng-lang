@@ -132,6 +132,7 @@ type
         TypedExprIrStmtFor
         TypedExprIrStmtMatch
         TypedExprIrStmtCase
+        TypedExprIrStmtWhile
 
     TypedExprColdCsgTypeRowKind = enum
         TypedExprColdCsgTypeAdt
@@ -936,6 +937,8 @@ fn TypedExprIrStatementKindText(kind: TypedExprIrStatementKind): str =
         return "match"
     if kind == TypedExprIrStmtCase:
         return "case"
+    if kind == TypedExprIrStmtWhile:
+        return "while"
     return "unsupported"
 
 fn TypedExprColdCsgTypeRowKindText(kind: TypedExprColdCsgTypeRowKind): str =
@@ -2554,6 +2557,7 @@ fn TypedExprIrReportText(ir: var TypedExprIr): str =
     TypedExprReportAppendLine(out, "typed_ir_elif_statement_count", IntToStr(TypedExprIrCountStatementKind(ir, TypedExprIrStmtElif)))
     TypedExprReportAppendLine(out, "typed_ir_else_statement_count", IntToStr(TypedExprIrCountStatementKind(ir, TypedExprIrStmtElse)))
     TypedExprReportAppendLine(out, "typed_ir_for_statement_count", IntToStr(TypedExprIrCountStatementKind(ir, TypedExprIrStmtFor)))
+    TypedExprReportAppendLine(out, "typed_ir_while_statement_count", IntToStr(TypedExprIrCountStatementKind(ir, TypedExprIrStmtWhile)))
     TypedExprReportAppendLine(out, "typed_ir_node_count", IntToStr(ir.nodes.len))
     TypedExprReportAppendLine(out, "typed_ir_return_kinds", TypedExprIrReturnKindListText(ir))
     TypedExprReportAppendLine(out, "typed_ir_param_ref_count", IntToStr(TypedExprIrCountOpKind(ir, TypedExprIrOpParamRef)))
@@ -5513,6 +5517,25 @@ fn TypedExprBindingRhsText(lineRaw: str,
                                                   rhsStartColumn - 1,
                                                   lineRaw.len - rhsStartColumn + 1))
 
+fn TypedExprBindingRhsTextWithContinuation(ctx: var TypedExprSourceContext,
+                                            lineIndex: int32,
+                                            rhsStartColumn: int32): str =
+    if lineIndex < 0 || lineIndex >= ctx.lines.len:
+        return ""
+    var rhsText = TypedExprBindingRhsText(ctx.lines[lineIndex], rhsStartColumn)
+    if rhsText == "" || rhsText[rhsText.len - 1] != '{':
+        return rhsText
+    var cursor = lineIndex + 1
+    while cursor < ctx.lines.len:
+        let rawLine = ctx.lines[cursor]
+        let trimmed = chengpath.PathTrim(parser.ParserStripLineComment(rawLine))
+        if trimmed != "":
+            rhsText = Fmt"{rhsText} {trimmed}"
+            if trimmed == "}":
+                break
+        cursor = cursor + 1
+    return rhsText
+
 fn TypedExprIrCallArgTypesText(ctx: var TypedExprSourceContext,
                                 sourceContexts: var TypedExprSourceContext[],
                                 scope: TypedExprFunctionScope,
@@ -5761,7 +5784,7 @@ fn TypedExprIrAppendLocalDeclStatementsForScope(ir: var TypedExprIr,
         var rhsStartColumn: int32 = -1
         if !TypedExprParseBindingLine(lineRaw, bindingName, bindingType, rhsStartColumn):
             continue
-        let rhsText = TypedExprBindingRhsText(lineRaw, rhsStartColumn)
+        let rhsText = TypedExprBindingRhsTextWithContinuation(ctx, lineNumber - 1, rhsStartColumn)
         if Len(bindingType) <= 0:
             bindingType = TypedExprLiteralBindingType(rhsText)
         if Len(bindingType) <= 0:
@@ -9239,6 +9262,8 @@ fn TypedExprIrAppendUnrepresentedTopLevelBodyStatements(ir: var TypedExprIr,
         let bodyTrim = chengpath.PathTrim(parser.ParserStripLineComment(bodyRaw))
         if bodyTrim == "":
             continue
+        if bodyTrim == "{" || bodyTrim == "}":
+            continue
         if !parser.ParserHasLeadingIndent(bodyRaw):
             break
         let lineIndent = TypedExprLineIndentWidth(bodyRaw)
@@ -9665,7 +9690,8 @@ fn TypedExprExprIsStructuredStatement(expr: parser.NormalizedExpr): bool =
        expr.kind == parser.NormalizedExprElseStmt ||
        expr.kind == parser.NormalizedExprForStmt ||
        expr.kind == parser.NormalizedExprMatchStmt ||
-       expr.kind == parser.NormalizedExprCaseStmt:
+       expr.kind == parser.NormalizedExprCaseStmt ||
+       expr.kind == parser.NormalizedExprWhileStmt:
         return true
     return false
 
@@ -9719,11 +9745,14 @@ fn TypedExprScopeNeedsStructuredStatements(ctx: var TypedExprSourceContext,
         elif expr.kind == parser.NormalizedExprForStmt:
             hasForStatement = true
             hasControlStatement = true
+        elif expr.kind == parser.NormalizedExprWhileStmt:
+            hasControlStatement = true
         elif expr.kind == parser.NormalizedExprIfStmt ||
              expr.kind == parser.NormalizedExprElifStmt ||
              expr.kind == parser.NormalizedExprElseStmt ||
              expr.kind == parser.NormalizedExprMatchStmt ||
-             expr.kind == parser.NormalizedExprCaseStmt:
+             expr.kind == parser.NormalizedExprCaseStmt ||
+             expr.kind == parser.NormalizedExprWhileStmt:
             hasControlStatement = true
     if hasAssignStatement || hasForStatement:
         return true
@@ -10397,6 +10426,8 @@ fn TypedExprControlStatementKindFromExpr(expr: parser.NormalizedExpr): TypedExpr
         return TypedExprIrStmtMatch
     if expr.kind == parser.NormalizedExprCaseStmt:
         return TypedExprIrStmtCase
+    if expr.kind == parser.NormalizedExprWhileStmt:
+        return TypedExprIrStmtWhile
     return TypedExprIrStmtUnsupported
 
 fn TypedExprForBindingNameFromHeader(headerRaw: str): str =
@@ -10438,7 +10469,8 @@ fn TypedExprIrAddControlStatementFromExpr(ir: var TypedExprIr,
         stmt.bindingName = TypedExprForBindingNameFromHeader(stmt.surfaceText)
     stmt.resultType = ""
     if statementKind == TypedExprIrStmtIf ||
-       statementKind == TypedExprIrStmtElif:
+       statementKind == TypedExprIrStmtElif ||
+       statementKind == TypedExprIrStmtWhile:
         stmt.resultType = "bool"
     elif statementKind == TypedExprIrStmtFor:
         stmt.resultType = "range"
@@ -10838,7 +10870,8 @@ fn TypedExprIrAppendStatementsForScopeFromExprLayer(ir: var TypedExprIr,
            expr.kind == parser.NormalizedExprElseStmt ||
            expr.kind == parser.NormalizedExprForStmt ||
            expr.kind == parser.NormalizedExprMatchStmt ||
-           expr.kind == parser.NormalizedExprCaseStmt:
+           expr.kind == parser.NormalizedExprCaseStmt ||
+           expr.kind == parser.NormalizedExprWhileStmt:
             let _ = TypedExprIrAddControlStatementFromExpr(ir,
                                                            ctx,
                                                            sourceContexts,

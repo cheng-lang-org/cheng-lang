@@ -89,6 +89,7 @@
 - `CHENGCSG` BodyIR reader 批量读 blocks/terms/switches/call args/string literals 时必须每次追加前 ensure；只在循环前 ensure 一次会在 main 这类 60+ block 函数上踩内存。
 - cold direct Mach-O 确定性对拍必须固定 codesign identifier；默认 ad-hoc signing 会把输出 basename 写入 CodeDirectory，导致同一 code bytes 不同路径 `cmp` 失败。
 - cold `build-backend-driver` 的 entry semantics 合同必须随 `backend_driver_dispatch_min.cheng` 命令面同步更新；新增命令要同步 dispatch case 数、command string table 和生成版 status marker。
+- Cheng `str` builder 写单字节必须走 `RawmemWriteI8/StrDataPtr`；`out[i] = Char(x)` 会按 `char` 宽度写入，破坏按字节计长的字符串缓冲区。
 
 ## Resolved
 

@@ -996,7 +996,13 @@ fn PrimaryBodyIrLookupSingleFieldMeta(typedIr: texpr.TypedExprIr,
     if ownerType == "" || fieldName == "":
         return false
     if PrimaryObjectTypedIrFieldCount(typedIr, ownerType, fieldName) != 1:
-        return false
+        return PrimaryBodyIrLookupColdCsgFieldMeta(typedIr,
+                                                   ownerType,
+                                                   fieldName,
+                                                   fieldType,
+                                                   fieldOffsetBytes,
+                                                   fieldSizeBytes,
+                                                   fieldAlignBytes)
     fieldType = PrimaryObjectTypedIrFieldTypeText(typedIr, ownerType, fieldName)
     fieldOffsetBytes = PrimaryObjectTypedIrFieldMetric(typedIr, ownerType, fieldName, "offset")
     fieldSizeBytes = PrimaryObjectTypedIrFieldMetric(typedIr, ownerType, fieldName, "size")
@@ -1010,6 +1016,143 @@ fn PrimaryBodyIrLookupSingleFieldMeta(typedIr: texpr.TypedExprIr,
     if fieldAlignBytes <= 0:
         return false
     return true
+
+fn PrimaryBodyIrColdCsgFieldShape(specRaw: str,
+                                   fieldType: var str,
+                                   fieldSizeBytes: var int32,
+                                   fieldAlignBytes: var int32): bool =
+    let spec = strutil.Strip(specRaw)
+    fieldType = ""
+    fieldSizeBytes = 0
+    fieldAlignBytes = 0
+    if spec == "i":
+        fieldType = "int32"
+        fieldSizeBytes = 4
+        fieldAlignBytes = 4
+        return true
+    if spec == "s":
+        fieldType = "str"
+        fieldSizeBytes = 24
+        fieldAlignBytes = 8
+        return true
+    if spec == "v":
+        fieldType = "ptr"
+        fieldSizeBytes = 8
+        fieldAlignBytes = 8
+        return true
+    if len(spec) > 1 && spec[0] == 'a':
+        let countText = strings.SliceBytes(spec, 1, len(spec) - 1)
+        let count = int32(strutil.ParseInt(countText))
+        if count <= 0:
+            return false
+        fieldType = Fmt"int32[{count}]"
+        fieldSizeBytes = count * 4
+        fieldAlignBytes = 4
+        return true
+    return false
+
+fn PrimaryBodyIrColdCsgObjectSpecs(typedIr: texpr.TypedExprIr,
+                                    typeRaw: str): str =
+    let typeName = texpr.TypedExprStripVarType(typeRaw)
+    let typeLeaf = texpr.TypedExprTypeLeafName(typeName)
+    if typeName == "" && typeLeaf == "":
+        return ""
+    var foundSpecs = ""
+    for i in 0..<typedIr.coldCsgTypeRows.len:
+        let row = typedIr.coldCsgTypeRows[i]
+        if row.rowKind != texpr.TypedExprColdCsgTypeObject:
+            continue
+        if row.typeName != typeName && row.typeName != typeLeaf:
+            continue
+        if foundSpecs != "" && foundSpecs != row.specs:
+            return ""
+        foundSpecs = row.specs
+    return foundSpecs
+
+fn PrimaryBodyIrLookupColdCsgObjectLayout(typedIr: texpr.TypedExprIr,
+                                           typeRaw: str,
+                                           sizeBytes: var int32,
+                                           alignBytes: var int32,
+                                           fieldCount: var int32): bool =
+    sizeBytes = 0
+    alignBytes = 1
+    fieldCount = 0
+    let specs = PrimaryBodyIrColdCsgObjectSpecs(typedIr, typeRaw)
+    if specs == "":
+        return false
+    let parts = strutil.Split(specs, ',')
+    var offset: int32
+    var maxAlign: int32 = 1
+    for i in 0..<parts.len:
+        let part = strutil.Strip(parts[i])
+        if part == "":
+            continue
+        let colon = texpr.TypedExprFindTopLevelTextToken(part, ":")
+        if colon <= 0:
+            return false
+        var fieldType: str
+        var fieldSize: int32
+        var fieldAlign: int32
+        if !PrimaryBodyIrColdCsgFieldShape(strings.SliceBytes(part,
+                                                              colon + 1,
+                                                              len(part) - colon - 1),
+                                           fieldType,
+                                           fieldSize,
+                                           fieldAlign):
+            return false
+        offset = PrimaryBodyIrAlignedOffset(offset, fieldAlign)
+        offset = offset + fieldSize
+        if fieldAlign > maxAlign:
+            maxAlign = fieldAlign
+        fieldCount = fieldCount + 1
+    sizeBytes = PrimaryBodyIrAlignedOffset(offset, maxAlign)
+    alignBytes = maxAlign
+    return sizeBytes > 0 && alignBytes > 0
+
+fn PrimaryBodyIrLookupColdCsgFieldMeta(typedIr: texpr.TypedExprIr,
+                                        ownerTypeRaw: str,
+                                        fieldNameRaw: str,
+                                        fieldType: var str,
+                                        fieldOffsetBytes: var int32,
+                                        fieldSizeBytes: var int32,
+                                        fieldAlignBytes: var int32): bool =
+    fieldType = ""
+    fieldOffsetBytes = 0
+    fieldSizeBytes = 0
+    fieldAlignBytes = 0
+    let fieldName = strutil.Strip(fieldNameRaw)
+    let specs = PrimaryBodyIrColdCsgObjectSpecs(typedIr, ownerTypeRaw)
+    if fieldName == "" || specs == "":
+        return false
+    let parts = strutil.Split(specs, ',')
+    var offset: int32
+    for i in 0..<parts.len:
+        let part = strutil.Strip(parts[i])
+        if part == "":
+            continue
+        let colon = texpr.TypedExprFindTopLevelTextToken(part, ":")
+        if colon <= 0:
+            return false
+        let name = strutil.Strip(strings.SliceBytes(part, 0, colon))
+        var currentType: str
+        var currentSize: int32
+        var currentAlign: int32
+        if !PrimaryBodyIrColdCsgFieldShape(strings.SliceBytes(part,
+                                                              colon + 1,
+                                                              len(part) - colon - 1),
+                                           currentType,
+                                           currentSize,
+                                           currentAlign):
+            return false
+        offset = PrimaryBodyIrAlignedOffset(offset, currentAlign)
+        if name == fieldName:
+            fieldType = currentType
+            fieldOffsetBytes = offset
+            fieldSizeBytes = currentSize
+            fieldAlignBytes = currentAlign
+            return true
+        offset = offset + currentSize
+    return false
 
 fn PrimaryBodyIrMaterializeFieldArgSlot(bodyIR: var coreir.BodyIR,
                                          slotNames: var str[],
@@ -1586,6 +1729,8 @@ fn PrimaryBodyIrConditionText(textRaw: str): str =
         text = strutil.Strip(strings.SliceBytes(text, 3, len(text) - 3))
     elif PrimaryStartsWith(text, "elif "):
         text = strutil.Strip(strings.SliceBytes(text, 5, len(text) - 5))
+    elif PrimaryStartsWith(text, "while "):
+        text = strutil.Strip(strings.SliceBytes(text, 6, len(text) - 6))
     if len(text) > 0 && text[len(text) - 1] == ':':
         text = strutil.Strip(strings.SliceBytes(text, 0, len(text) - 1))
     return text
@@ -2444,30 +2589,34 @@ fn PrimaryBodyIrDirectExternalCallTarget(symbolRaw: str): bool =
            symbolRaw == "setMem" ||
            symbolRaw == "cheng_seq_str_add"
 
-fn PrimaryBodyIrAppendNewObjectValue(bodyIR: var coreir.BodyIR,
-                                      slotNames: var str[],
-                                      typedIr: texpr.TypedExprIr,
-                                      sourcePath: str,
-                                      newExprTextRaw: str,
-                                      targetSlot: int32,
-                                      callOrdinal: var int32): bool =
+fn PrimaryBodyIrAppendHeapObjectAllocZero(bodyIR: var coreir.BodyIR,
+                                           slotNames: var str[],
+                                           typedIr: texpr.TypedExprIr,
+                                           sourcePath: str,
+                                           objectTypeText: str,
+                                           targetSlot: int32,
+                                           callOrdinal: var int32): bool =
     if targetSlot < 0 ||
        targetSlot >= bodyIR.localSlots.len ||
        PrimaryBodyIrSlotType(bodyIR, targetSlot) != coreir.LocalPtrTag:
         return false
-    let newTypeText = PrimaryBodyIrWholeCallInnerForHead(newExprTextRaw, "new")
-    if newTypeText == "":
+    if objectTypeText == "":
         return false
     var allocSize: int32
     var allocAlign: int32
     var fieldCount: int32
     if !texpr.TypedExprIrLookupTypeLayout(typedIr,
                                           sourcePath,
-                                          newTypeText,
+                                          objectTypeText,
                                           allocSize,
                                           allocAlign,
                                           fieldCount):
-        return false
+        if !PrimaryBodyIrLookupColdCsgObjectLayout(typedIr,
+                                                   objectTypeText,
+                                                   allocSize,
+                                                   allocAlign,
+                                                   fieldCount):
+            return false
     if allocSize <= 0 || allocAlign <= 0:
         return false
     let sizeSlot = PrimaryBodyIrLocalInitConstSlot(bodyIR,
@@ -2512,6 +2661,134 @@ fn PrimaryBodyIrAppendNewObjectValue(bodyIR: var coreir.BodyIR,
     add(zeroOp.operands, callOrdinal)
     add(bodyIR.ops, zeroOp)
     callOrdinal = callOrdinal + 1
+    return true
+
+fn PrimaryBodyIrAppendNewObjectValue(bodyIR: var coreir.BodyIR,
+                                      slotNames: var str[],
+                                      typedIr: texpr.TypedExprIr,
+                                      sourcePath: str,
+                                      newExprTextRaw: str,
+                                      targetSlot: int32,
+                                      callOrdinal: var int32): bool =
+    let newTypeText = PrimaryBodyIrWholeCallInnerForHead(newExprTextRaw, "new")
+    return PrimaryBodyIrAppendHeapObjectAllocZero(bodyIR,
+                                                  slotNames,
+                                                  typedIr,
+                                                  sourcePath,
+                                                  newTypeText,
+                                                  targetSlot,
+                                                  callOrdinal)
+
+fn PrimaryBodyIrFindTopLevelBrace(text: str): int32 =
+    var parenDepth: int32
+    var bracketDepth: int32
+    for i in 0..<len(text):
+        let ch = text[i]
+        if ch == '(':
+            parenDepth = parenDepth + 1
+        elif ch == ')':
+            parenDepth = parenDepth - 1
+        elif ch == '[':
+            bracketDepth = bracketDepth + 1
+        elif ch == ']':
+            bracketDepth = bracketDepth - 1
+        elif ch == '{' && parenDepth == 0 && bracketDepth == 0:
+            return i
+    return -1
+
+fn PrimaryBodyIrAppendObjectConstructorValue(bodyIR: var coreir.BodyIR,
+                                              slotNames: var str[],
+                                              varI32ParamNames: str[],
+                                              typedIr: texpr.TypedExprIr,
+                                              sourcePath: str,
+                                              targetTypeRaw: str,
+                                              rhsTextRaw: str,
+                                              targetSlot: int32,
+                                              callOrdinal: var int32): bool =
+    let rhsText = strutil.Strip(rhsTextRaw)
+    let bracePos = PrimaryBodyIrFindTopLevelBrace(rhsText)
+    if bracePos <= 0 || len(rhsText) <= bracePos + 1 || rhsText[len(rhsText) - 1] != '}':
+        return false
+    let ctorType = texpr.TypedExprNormalizeTypeText(strutil.Strip(strings.SliceBytes(rhsText, 0, bracePos)))
+    let targetType = texpr.TypedExprNormalizeTypeText(targetTypeRaw)
+    if ctorType == "" || targetType == "" || ctorType != targetType:
+        return false
+    if !PrimaryBodyIrAppendHeapObjectAllocZero(bodyIR,
+                                               slotNames,
+                                               typedIr,
+                                               sourcePath,
+                                               ctorType,
+                                               targetSlot,
+                                               callOrdinal):
+        return false
+    let fieldsText = strings.SliceBytes(rhsText,
+                                        bracePos + 1,
+                                        len(rhsText) - bracePos - 2)
+    let fieldItems = texpr.TypedExprSplitTopLevelCsv(fieldsText)
+    for itemIndex in 0..<fieldItems.len:
+        let item = strutil.Strip(fieldItems[itemIndex])
+        if item == "":
+            continue
+        let colonPos = texpr.TypedExprFindTopLevelTextToken(item, ":")
+        if colonPos <= 0:
+            return false
+        let fieldName = strutil.Strip(strings.SliceBytes(item, 0, colonPos))
+        let valueText = strutil.Strip(strings.SliceBytes(item,
+                                                        colonPos + 1,
+                                                        len(item) - colonPos - 1))
+        if fieldName == "" || valueText == "":
+            return false
+        var fieldType: str
+        var fieldOffsetBytes: int32
+        var fieldSizeBytes: int32
+        var fieldAlignBytes: int32
+        if !PrimaryBodyIrLookupSingleFieldMeta(typedIr,
+                                               ctorType,
+                                               fieldName,
+                                               fieldType,
+                                               fieldOffsetBytes,
+                                               fieldSizeBytes,
+                                               fieldAlignBytes):
+            if !texpr.TypedExprIrLookupFieldPathMeta(typedIr,
+                                                     sourcePath,
+                                                     ctorType,
+                                                     fieldName,
+                                                     fieldType,
+                                                     fieldOffsetBytes,
+                                                     fieldSizeBytes,
+                                                     fieldAlignBytes):
+                return false
+        var fieldTypeKind: int32
+        var fieldShapeSize: int32
+        var fieldShapeAlign: int32
+        PrimaryBodyIrTypeShapeFromText(typedIr,
+                                       sourcePath,
+                                       fieldType,
+                                       fieldTypeKind,
+                                       fieldShapeSize,
+                                       fieldShapeAlign)
+        if fieldSizeBytes <= 0:
+            fieldSizeBytes = fieldShapeSize
+        if fieldSizeBytes <= 0:
+            return false
+        let valueSlot = PrimaryBodyIrScalarValueSlotForText(bodyIR,
+                                                            slotNames,
+                                                            varI32ParamNames,
+                                                            typedIr,
+                                                            sourcePath,
+                                                            valueText,
+                                                            fieldTypeKind)
+        if valueSlot < 0 ||
+           PrimaryLocalSlotSizeOf(bodyIR.localSlots[valueSlot]) < fieldSizeBytes:
+            return false
+        var storeOp: coreir.BodyOp
+        storeOp.kind = coreir.BodyOpFieldStoreTag
+        storeOp.target = targetSlot
+        add(storeOp.operands, targetSlot)
+        add(storeOp.operands, valueSlot)
+        add(storeOp.operands, fieldOffsetBytes)
+        add(storeOp.operands, fieldSizeBytes)
+        add(bodyIR.ops, storeOp)
     return true
 
 fn PrimaryBodyIrAppendStringLiteralValue(bodyIR: var coreir.BodyIR,
@@ -2923,6 +3200,17 @@ fn PrimaryBodyIrAppendLocalDeclInitializer(bodyIR: var coreir.BodyIR,
     if rhsText == "" || targetSlot < 0 || targetSlot >= bodyIR.localSlots.len:
         return false
     let targetTypeKind = PrimaryBodyIrSlotType(bodyIR, targetSlot)
+    if targetTypeKind == coreir.LocalPtrTag &&
+       PrimaryBodyIrAppendObjectConstructorValue(bodyIR,
+                                                 slotNames,
+                                                 varI32ParamNames,
+                                                 typedIr,
+                                                 stmt.sourcePath,
+                                                 stmt.resultType,
+                                                 rhsText,
+                                                 targetSlot,
+                                                 callOrdinal):
+        return true
     if targetTypeKind == coreir.LocalPtrTag &&
        PrimaryBodyIrWholeCallInnerForHead(rhsText, "new") != "":
         return PrimaryBodyIrAppendNewObjectValue(bodyIR,
@@ -3939,6 +4227,23 @@ fn PrimaryBodyIrAppendI32Assign(bodyIR: var coreir.BodyIR,
         PrimaryBodyIrAppendVarI32Store(bodyIR, lhsSlot, targetSlot)
     return true
 
+fn PrimaryBodyIrStructuredBodyEnd(typedIr: texpr.TypedExprIr,
+                                   stmtIndex: int32,
+                                   stmtEndRaw: int32): int32 =
+    var stmtEnd = stmtEndRaw
+    if stmtEnd > typedIr.statements.len:
+        stmtEnd = typedIr.statements.len
+    if stmtIndex < 0 || stmtIndex >= stmtEnd:
+        return stmtEnd
+    let stmt = typedIr.statements[stmtIndex]
+    var bodyEnd = stmtEnd
+    for si in stmtIndex + 1..<stmtEnd:
+        let scanStmt = typedIr.statements[si]
+        if scanStmt.lineIndent > 0 && scanStmt.lineIndent <= stmt.lineIndent:
+            bodyEnd = si
+            break
+    return bodyEnd
+
 fn PrimaryBodyIrBuildForRangeLoop(bodyIR: var coreir.BodyIR,
                                     slotNames: var str[],
                                     nextOpIndex: var int32,
@@ -3949,12 +4254,7 @@ fn PrimaryBodyIrBuildForRangeLoop(bodyIR: var coreir.BodyIR,
                                     stmtEnd: int32,
                                     pendingFalseTerm: var int32): int32 =
     let headerText = strutil.Strip(stmt.surfaceText)
-    var forBodyEnd = stmtEnd
-    for si in stmtIndex + 1..<stmtEnd:
-        let scanStmt = typedIr.statements[si]
-        if scanStmt.lineIndent > 0 && scanStmt.lineIndent <= stmt.lineIndent:
-            forBodyEnd = si
-            break
+    let forBodyEnd = PrimaryBodyIrStructuredBodyEnd(typedIr, stmtIndex, stmtEnd)
     var inPos = -1
     var endCheckN = len(headerText) - 3
     for ci in 0..<endCheckN:
@@ -4012,6 +4312,81 @@ fn PrimaryBodyIrBuildForRangeLoop(bodyIR: var coreir.BodyIR,
     pendingFalseTerm = cbrIdx
     return forBodyEnd
 
+fn PrimaryBodyIrBuildWhileLoopHeader(bodyIR: var coreir.BodyIR,
+                                      slotNames: var str[],
+                                      nextOpIndex: var int32,
+                                      currentBlockStart: var int32,
+                                      typedIr: texpr.TypedExprIr,
+                                      stmt: texpr.TypedExprIrStatement,
+                                      stmtIndex: int32,
+                                      stmtEnd: int32,
+                                      pendingWhileHeaderBlock: var int32,
+                                      pendingWhileCbrTerm: var int32): int32 =
+    let whileBodyEnd = PrimaryBodyIrStructuredBodyEnd(typedIr, stmtIndex, stmtEnd)
+    let condText = PrimaryBodyIrConditionText(stmt.surfaceText)
+    var lhsSlot: int32
+    var rhsSlot: int32
+    var cmpTag: int32
+    if !PrimaryBodyIrEmitConditionOps(bodyIR,
+                                      slotNames,
+                                      typedIr,
+                                      stmt.sourcePath,
+                                      condText,
+                                      lhsSlot,
+                                      rhsSlot,
+                                      cmpTag,
+                                      nextOpIndex):
+        PrimaryBodyIrAppendInvalidOp(bodyIR,
+                                     stmt.lineNumber,
+                                     int32(stmt.kind),
+                                     81,
+                                     0)
+        pendingWhileHeaderBlock = -1
+        pendingWhileCbrTerm = -1
+        return whileBodyEnd
+    var cbrTerm: coreir.BodyTerm
+    cbrTerm.kind = coreir.BodyTermCbrTag
+    cbrTerm.conditionKind = cmpTag
+    cbrTerm.lhsSlot = lhsSlot
+    cbrTerm.rhsSlot = rhsSlot
+    cbrTerm.resultSlot = -1
+    cbrTerm.trueBlock = -1
+    cbrTerm.falseBlock = -1
+    let cbrTermIndex = coreir.BodyIRAppendTerm(bodyIR, cbrTerm)
+    let cbrBlockOpCount = bodyIR.ops.len - currentBlockStart
+    pendingWhileHeaderBlock = coreir.BodyIRAppendBlock(bodyIR,
+                                                       currentBlockStart,
+                                                       cbrBlockOpCount,
+                                                       cbrTermIndex)
+    pendingWhileCbrTerm = cbrTermIndex
+    currentBlockStart = bodyIR.ops.len
+    return whileBodyEnd
+
+fn PrimaryBodyIrCloseWhileLoop(bodyIR: var coreir.BodyIR,
+                                currentBlockStart: var int32,
+                                pendingWhileHeaderBlock: int32,
+                                pendingWhileCbrTerm: int32): bool =
+    if pendingWhileHeaderBlock < 0 ||
+       pendingWhileHeaderBlock >= bodyIR.blocks.len ||
+       pendingWhileCbrTerm < 0 ||
+       pendingWhileCbrTerm >= bodyIR.terms.len:
+        return false
+    var brTerm: coreir.BodyTerm
+    brTerm.kind = coreir.BodyTermBrTag
+    brTerm.trueBlock = pendingWhileHeaderBlock
+    brTerm.falseBlock = -1
+    brTerm.conditionKind = coreir.BodyCondInvalidTag
+    brTerm.lhsSlot = -1
+    brTerm.rhsSlot = -1
+    brTerm.resultSlot = -1
+    let brTermIndex = coreir.BodyIRAppendTerm(bodyIR, brTerm)
+    let backBlockCount = bodyIR.ops.len - currentBlockStart
+    let _ = coreir.BodyIRAppendBlock(bodyIR, currentBlockStart, backBlockCount, brTermIndex)
+    currentBlockStart = bodyIR.ops.len
+    bodyIR.terms[pendingWhileCbrTerm].trueBlock = pendingWhileHeaderBlock + 1
+    bodyIR.terms[pendingWhileCbrTerm].falseBlock = bodyIR.blocks.len
+    return true
+
 fn PrimaryBuildBodyIrFromTypedStatements(
     lowering: lower.LoweringPlanStub,
     typedIr: texpr.TypedExprIr,
@@ -4034,6 +4409,10 @@ fn PrimaryBuildBodyIrFromTypedStatements(
     var pendingForIdxSlot: int32
     var pendingForHdrBlk: int32
     var pendingForCbrTerm: int32
+    var pendingWhileEndIdx: int32
+    var pendingWhileHeaderBlock: int32
+    var pendingWhileCbrTerm: int32
+    var pendingWhileLineNumber: int32
     var pendingCompoundFalseTerms: int32[]
     pendingFalseTerm = -1
     pendingCompoundFalseTerms = []
@@ -4043,9 +4422,27 @@ fn PrimaryBuildBodyIrFromTypedStatements(
     pendingForIdxSlot = -1
     pendingForHdrBlk = -1
     pendingForCbrTerm = -1
+    pendingWhileEndIdx = -1
+    pendingWhileHeaderBlock = -1
+    pendingWhileCbrTerm = -1
+    pendingWhileLineNumber = -1
     PrimaryBodyIrSeedParamSlots(bodyIR, slotNames, typedIr, irFunction)
     let varI32ParamNames = PrimaryBodyIrCollectVarI32ParamNames(irFunction)
     for stmtIndex in typedFn.statementStart..<stmtEnd:
+        if pendingWhileEndIdx > 0 && stmtIndex >= pendingWhileEndIdx:
+            if !PrimaryBodyIrCloseWhileLoop(bodyIR,
+                                            currentBlockStart,
+                                            pendingWhileHeaderBlock,
+                                            pendingWhileCbrTerm):
+                PrimaryBodyIrAppendInvalidOp(bodyIR,
+                                             pendingWhileLineNumber,
+                                             int32(texpr.TypedExprIrStmtWhile),
+                                             82,
+                                             0)
+            pendingWhileEndIdx = -1
+            pendingWhileHeaderBlock = -1
+            pendingWhileCbrTerm = -1
+            pendingWhileLineNumber = -1
         if pendingForEndIdx > 0 && stmtIndex >= pendingForEndIdx:
             var oneSlot = PrimaryBodyIrFindOrCreateSlot(bodyIR, slotNames, "_for_one", coreir.LocalI32Tag)
             var oneInit: coreir.BodyOp
@@ -4649,6 +5046,37 @@ fn PrimaryBuildBodyIrFromTypedStatements(
                     pendingForHdrBlk = bi
                     break
                 bi = bi - 1
+        elif stmt.kind == texpr.TypedExprIrStmtWhile:
+            let whileBodyEnd = PrimaryBodyIrBuildWhileLoopHeader(bodyIR,
+                                                                 slotNames,
+                                                                 nextOpIndex,
+                                                                 currentBlockStart,
+                                                                 typedIr,
+                                                                 stmt,
+                                                                 stmtIndex,
+                                                                 stmtEnd,
+                                                                 pendingWhileHeaderBlock,
+                                                                 pendingWhileCbrTerm)
+            if pendingWhileCbrTerm >= 0:
+                pendingWhileEndIdx = whileBodyEnd
+                pendingWhileLineNumber = stmt.lineNumber
+            else:
+                pendingWhileEndIdx = -1
+                pendingWhileLineNumber = -1
+    if pendingWhileEndIdx > 0:
+        if !PrimaryBodyIrCloseWhileLoop(bodyIR,
+                                        currentBlockStart,
+                                        pendingWhileHeaderBlock,
+                                        pendingWhileCbrTerm):
+            PrimaryBodyIrAppendInvalidOp(bodyIR,
+                                         pendingWhileLineNumber,
+                                         int32(texpr.TypedExprIrStmtWhile),
+                                         82,
+                                         1)
+        pendingWhileEndIdx = -1
+        pendingWhileHeaderBlock = -1
+        pendingWhileCbrTerm = -1
+        pendingWhileLineNumber = -1
     if pendingForEndIdx > 0:
         var fos = PrimaryBodyIrFindOrCreateSlot(bodyIR, slotNames, "_for_one", coreir.LocalI32Tag)
         var foi: coreir.BodyOp

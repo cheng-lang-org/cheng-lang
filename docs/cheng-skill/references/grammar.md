@@ -1,6 +1,6 @@
 # Cheng 语法速查（稳定对齐版）
 
-权威来源：`docs/cheng-formal-spec.md`（版本 2026-02-21）。
+权威来源：`docs/cheng-formal-spec.md`（版本 2026-05-13）。
 本文件只做速查；如有冲突，一律以正式规范为准。
 
 ## 关键结论
@@ -10,11 +10,12 @@
 - 条件表达式支持三目 `cond ? thenExpr : elseExpr`，并按右结合解析。
 - 单参数调用统一写 `f(x)`；`f x` 属于迁移期旧表面，`CHENG_STRICT_CALL_SYNTAX=1` 下报错；禁止 `f (x)`。
 - 类型转换仅允许 `TypeExpr(expr)`。
+- 对象构造支持 `TypeName(field: value)` 与 `TypeName { field: value }`。
 - 导入仅允许归一化模块路径（`<pkg>/<path>`、`std/<name>`）。
 - `cheng/<pkg>/<path>` 为兼容别名，推荐迁移为 `<pkg>/<path>`。
 - 对非相对/非绝对模块路径，解析器可回退尝试 `<workspace>/src/<module>.cheng`。
 - 导出采用 Go 风格：标识符首字符为 ASCII 大写字母即导出；小写字母或 `_` 开头保持模块私有。
-- 代数类型使用 `|` 分隔 variant，例如 `type Option[T] = Some(value: T) | None`；模式匹配写 `match value:`，arm 使用 `=>`，例如 `Some(x) => return x`。
+- 代数类型使用 `|` 分隔 variant，例如 `type Option[T] = Some(value: T) | None`；模式匹配写 `match value:` 后缩进 arms，arm 分隔符固定为 `=>`，例如 `Some(x) => return x`。
 - 内建字符串类型仅 `str`、`cstring`（`string` 非内建类型名）。
 - 编译器 `stage1` 主链路会显式拒绝 `string` 类型名。
 - no-pointer 生产口径下，用户源码模块默认禁指针；旧兼容名 `ABI=v2_noptr` 与 `STAGE1_NO_POINTERS_NON_C_ABI=1` 只保留在内部实现/兼容 gate 中，`@importc/@exportc` 同样不提供裸指针绕过路径。
@@ -68,6 +69,7 @@ fn fallback(value: Option[int32]): int32 =
 - `T()` 仅用于 `object/tuple/Bytes` 的表达式/返回/实参位置；`T[]/T[N]` 不写 `T()`，简单类型默认值同样不写 `T()`。
 - `object/ref object/tuple` 字段可直接写 `name: Type = expr`。
 - 初始化优先级固定为：显式实参 > 字段默认值 > 类型零值。
+- 对象构造支持 `TypeName(field: value)` 与 `TypeName { field: value }`；字段名必须唯一，未知字段必须编译期报错。
 - 字段默认值只允许稳态表达式：字面量（含 `T[]/T[N]` 上下文下的 `[]` 与 `[a, b, ...]`）、复合类型 `T()`、`new(Type)`、纯类型构造与 `if/?:` 组合；禁止引用同对象其他字段与副作用调用。
 - tuple 这轮只支持 typed implicit init 与 `T()`；tuple 字面量/tuple 类型构造必须显式写全所有元素。
 - 只有偏离隐式默认值的字段才写 `= expr`；重复写 `= false`、`= 0`、`= ""`、`= []`、带类型标注的 `= T()` 是编译期硬错误。其余场景直接依赖隐式初始化，再用 `var x: Foo`、`Foo()`、`Foo(changed: ...)`；不要再写 `FooZero()` 之类镜像 helper。
@@ -100,6 +102,7 @@ type
 
 var run: RunResult
 let patched = RunResult(outputText: "ok")
+let patchedBrace = RunResult { outputText: "ok" }
 ```
 
 ## 调用与参数

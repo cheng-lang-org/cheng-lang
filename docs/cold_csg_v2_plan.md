@@ -157,6 +157,8 @@ reloc -> cold linkerless/object linker applies reloc
 ## 当前实测
 
 - `bootstrap/cheng_cold.c` 已实现完整 CSG v2 reader/writer，支持 `--emit:csg-v2`（独立命令）和 `--csg-in`（BodyIR + 指令字两种格式）。
+- 当前自动卡口是 `tools/cold_csg_v2_roundtrip_test.sh`：backend driver 产 `CHENGCSG` section-binary facts，cold reader 连续两次产 `.o`，`cmp` 确定性通过，并验证 writer/reader report、facts 预算、unknown/truncated hard-fail。
+- `CHENG_CSG_V2` text object facts reader 仍保留；它是 PrimaryObjectPlan 指令字 object facts 入口。当前 280B smoke 主线使用 `CHENGCSG` section-binary，不能把两者的验证结论混写。
 - **fixed-point 验证通过**：C writer（`cheng_cold.c`）和 Cheng writer（`primary_object_plan.cheng`）对同一输入产出 **bit-identical** 的 facts 文件（MD5 一致），cold reader 分别消费后产出 **bit-identical** 的可执行文件。
 - `ordinary_zero_exit_fixture`: facts 280 bytes, exe 0.13-0.19ms, exit 0（codesign 后）。
 - `cold_subset_coverage`: facts 19,666 bytes (23 函数/411+ ops), exe 0.15-0.22ms, MD5 一致。
@@ -177,6 +179,12 @@ artifacts/backend_driver/cheng run-host-smokes perf_memory_contract_smoke
 ```
 
 阶段 0 新增命令：
+
+```sh
+tools/cold_csg_v2_roundtrip_test.sh
+```
+
+手工展开：
 
 ```sh
 artifacts/backend_driver/cheng emit-cold-csg-v2 --root:/Users/lbcheng/cheng-lang --in:tests/cheng/backend/fixtures/return_let.cheng --out:/tmp/cheng_csg_v2_zero.facts --report-out:/tmp/cheng_csg_v2_zero.writer.report.txt

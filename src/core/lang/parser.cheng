@@ -48,6 +48,7 @@ type
         NormalizedExprForStmt
         NormalizedExprMatchStmt
         NormalizedExprCaseStmt
+        NormalizedExprWhileStmt
 
     NormalizedExprDetailKind = enum
         NormalizedExprDetailNone
@@ -161,6 +162,7 @@ type
         forStmtCount: int32
         matchStmtCount: int32
         caseStmtCount: int32
+        whileStmtCount: int32
 
     ParsedSourceStub =
         workspaceRoot: str
@@ -307,6 +309,8 @@ fn NormalizedExprKindText(kind: NormalizedExprKind): str =
         return "MatchStmt"
     if kind == NormalizedExprCaseStmt:
         return "CaseStmt"
+    if kind == NormalizedExprWhileStmt:
+        return "WhileStmt"
     return "UnknownExpr"
 
 fn NormalizedExprDetailKindCode(detailKind: NormalizedExprDetailKind): int32 =
@@ -433,6 +437,8 @@ fn NormalizedExprKindCode(kind: NormalizedExprKind): int32 =
         return 16
     if kind == NormalizedExprCaseStmt:
         return 17
+    if kind == NormalizedExprWhileStmt:
+        return 18
     return 0
 
 fn NormalizedExprLookupTextFirstCode(text: str): int32 =
@@ -445,8 +451,8 @@ fn NormalizedExprLookupTextLastCode(text: str): int32 =
         return 0
     return Int32(text[text.len - 1])
 
-fn NormalizedExprLookupInit(minCap: int32): NormalizedExprLookup =
-    var lookup: NormalizedExprLookup
+fn NormalizedExprLookupInitInto(lookup: var NormalizedExprLookup,
+                                  minCap: int32) =
     lookup.slots = []
     lookup.buckets = []
     var cap: int32 = 32
@@ -456,6 +462,10 @@ fn NormalizedExprLookupInit(minCap: int32): NormalizedExprLookup =
         if i % 4096 == 0:
             os.ProcessResourceGuardCheck()
         add(lookup.slots, 0)
+
+fn NormalizedExprLookupInit(minCap: int32): NormalizedExprLookup =
+    var lookup: NormalizedExprLookup
+    NormalizedExprLookupInitInto(lookup, minCap)
     return lookup
 
 fn NormalizedExprLookupDetailKind(kind: NormalizedExprKind,
@@ -519,7 +529,7 @@ fn NormalizedExprLookupKeyMatchesBucket(key: NormalizedExprLookupKey,
            bucket.surfaceFirstCode == key.surfaceFirstCode &&
            bucket.surfaceLastCode == key.surfaceLastCode
 
-fn NormalizedExprLookupSlotForKey(lookup: NormalizedExprLookup,
+fn NormalizedExprLookupSlotForKey(lookup: var NormalizedExprLookup,
                                     key: NormalizedExprLookupKey): int32 =
     if lookup.slots.len <= 0:
         return -1
@@ -539,12 +549,11 @@ fn NormalizedExprLookupSlotForKey(lookup: NormalizedExprLookup,
 
 fn NormalizedExprLookupRehash(lookup: var NormalizedExprLookup,
                                 newCap: int32) =
-    var slots: int32[]
+    lookup.slots = []
     for i in 0..<newCap:
         if i % 4096 == 0:
             os.ProcessResourceGuardCheck()
-        add(slots, 0)
-    lookup.slots = slots
+        add(lookup.slots, 0)
     for bucketIndex in 0..<lookup.buckets.len:
         if bucketIndex % 4096 == 0:
             os.ProcessResourceGuardCheck()
@@ -578,7 +587,7 @@ fn NormalizedExprLookupEnsureBucket(lookup: var NormalizedExprLookup,
                                       detailKind: NormalizedExprDetailKind,
                                       surfaceText: str): int32 =
     if lookup.slots.len <= 0:
-        lookup = NormalizedExprLookupInit(32)
+        NormalizedExprLookupInitInto(lookup, 32)
     if (lookup.buckets.len + 1) * 10 >= lookup.slots.len * 7:
         NormalizedExprLookupGrow(lookup)
     let key = NormalizedExprLookupKeyExact(sourcePath,
@@ -609,7 +618,7 @@ fn NormalizedExprLookupEnsureBucket(lookup: var NormalizedExprLookup,
     lookup.slots[slot] = lookup.buckets.len
     return lookup.buckets.len - 1
 
-fn NormalizedExprLookupBucketIndexExact(lookup: NormalizedExprLookup,
+fn NormalizedExprLookupBucketIndexExact(lookup: var NormalizedExprLookup,
                                           sourcePath: str,
                                           lineNumber: int32,
                                           columnNumber: int32,
@@ -1014,7 +1023,7 @@ fn ParserWriteTextFast(outPtr: ptr,
 fn ParserWriteByteFast(out: var str,
                          writePos: var int32,
                          value: int32) =
-    out[writePos] = Char(value)
+    rawmem_support.RawmemWriteI8(StrDataPtr(out), writePos, int8(value))
     writePos = writePos + 1
 
 fn NormalizedExprMakeId(sourcePath: str,
@@ -1400,6 +1409,8 @@ fn NormalizedExprLayerKindCountsBuild(layer: NormalizedExprLayer): NormalizedExp
             counts.matchStmtCount = counts.matchStmtCount + 1
         elif kind == NormalizedExprCaseStmt:
             counts.caseStmtCount = counts.caseStmtCount + 1
+        elif kind == NormalizedExprWhileStmt:
+            counts.whileStmtCount = counts.whileStmtCount + 1
     return counts
 
 fn NormalizedExprLayerIfCount(layer: NormalizedExprLayer): int32 =
@@ -1449,6 +1460,9 @@ fn NormalizedExprLayerMatchStmtCount(layer: NormalizedExprLayer): int32 =
 
 fn NormalizedExprLayerCaseStmtCount(layer: NormalizedExprLayer): int32 =
     return NormalizedExprLayerCountKind(layer, NormalizedExprCaseStmt)
+
+fn NormalizedExprLayerWhileStmtCount(layer: NormalizedExprLayer): int32 =
+    return NormalizedExprLayerCountKind(layer, NormalizedExprWhileStmt)
 
 fn NormalizedExprLayerCallCount(layer: NormalizedExprLayer): int32 =
     return NormalizedExprLayerCountKind(layer, NormalizedExprCall)
@@ -2501,7 +2515,9 @@ fn ParserAppendSimpleSurfaceExprsLine(sourcePath: str,
                                         NormalizedExprIf,
                                         NormalizedExprDetailIfKeyword,
                                         "if")
-        elif appendResultIntrinsics:
+        elif appendResultIntrinsics &&
+             ParserPreviousNonSpaceChar(lineRaw, i) != '.' &&
+             ParserFindTopLevelTokenRange(lineRaw, stop, lineRaw.len, "=>") < 0:
             let detailKind = ParserResultIntrinsicDetailKindRange(lineRaw, i, stop)
             if detailKind != NormalizedExprDetailNone:
                 let ident = ParserTextSliceFast(lineRaw, i, identLen)
@@ -2808,6 +2824,10 @@ fn ParserAppendControlStmtExprsLine(sourcePath: str,
         kind = NormalizedExprForStmt
         keyword = "for"
         payloadStart = lineStart + 4
+    elif ParserLineRangeStartsWithStatementKeyword(lineRaw, lineStart, lineStop, "while"):
+        kind = NormalizedExprWhileStmt
+        keyword = "while"
+        payloadStart = lineStart + 6
     else:
         return
     let keywordPos = lineStart

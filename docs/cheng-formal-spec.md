@@ -1,6 +1,6 @@
 # Cheng 正式规范（语法与语义）
 
-> 版本：2026-04-20
+> 版本：2026-05-13
 
 > 本文包含两类内容：  
 > 1) `规范性要求`（决定语言语法与语义的行为边界）；  
@@ -14,7 +14,7 @@
 
 ---
 
-## 0.0 实现对齐注记（截至 2026-04-29）
+## 0.0 实现对齐注记（截至 2026-05-13）
 
 - `verify_backend_ffi_slice_shim` 已完成脚本拼接到 native 路径的迁移，缩小脚本失败与构建超时耦合面。
 - `artifacts/tooling_cmd/cheng_tooling` 与 `artifacts/backend_driver/cheng` 在 verify/closure 主链路中的地位是默认路径；脚本仅保留兼容或应急回退，不得成为默认发布入口。
@@ -28,6 +28,7 @@
 - `compile/chengc` 的主验证职责从 shell 入口剥离，工具主链路改走 canonical tooling 命令。
 - no-pointer / Raw Pointer Safety 约束在发布链路中按 hard-fail 收口（ZRPC）。
 - `uirCoreFindTypeDeclByName` 热点路径已加入一次性建表与可重入防护，避免已知死循环与重复扫描；配套的调用计数/超时抽样告警已持续保留。
+- CSG v2 已收口为后端事实格式：`artifacts/backend_driver/cheng emit-cold-csg-v2` 产出 `PrimaryObjectPlan/BodyIR` facts，cold compiler 的 `system-link-exec --csg-in` 只负责加载校验、object emit 与 direct-exe 生成；`tools/cold_csg_v2_roundtrip_test.sh` 是当前确定性往返门禁。
 
 #### 进行中
 
@@ -590,6 +591,7 @@ charLiteral    ::= `'` CHARACTER `'` ;
 - 字段/元素默认值表达式禁止引用同一对象/tuple 的其他字段，禁止副作用调用，禁止依赖求值顺序的写法；违者编译期报错。
 - 与隐式默认值一致的显式初始化是编译期硬错误：带类型标注的 `let/var` 禁止写 `= false` / `= 0` / `= ""` / `= []` / `= T()`，字段/元素默认值也禁止重复声明同样的零值；只保留真正改变默认语义的值。
 - `object` / `ref object` 构造器的具名字段必须唯一；unknown field 与 duplicate field 都是编译期硬错误。
+- `object` / `ref object` 构造器支持 `T(field: value)` 与 `T { field: value }` 两种表面写法；二者共享同一隐式默认值物化、字段唯一性和 unknown field 诊断规则。
 - `tuple` 本轮仅支持 typed implicit init 与 `T()` 物化；tuple 字面量/tuple 类型构造仍要求显式写全所有元素，不支持省略元素后用默认值自动补齐。
 - 字符串类型命名约束：内建字符串类型仅 `str` 与 `cstring`。
 - 字符串 nil 语义（稳定口径）：
@@ -615,7 +617,7 @@ charLiteral    ::= `'` CHARACTER `'` ;
 - 如果只是复合类型零值/默认值构造，不再维护 `FooZero()` 这类无参镜像 helper；直接使用 `var x: Foo`、`Foo()` 或 `new(Foo)`。
 - `new` 的唯一合法表面写法为 `new(TypeExpr)`，返回 zero-init 的 `ref` 值；旧 `new x` / `new(x)` 本地变量分配写法已移除。
 - 空的 `[]` 需要类型上下文（例如已有类型的 `xs = []` / `return []` / 作为实参），否则会报“缺少元素类型”。
-- 类型与值命名空间分离；当 callee 解析为类型且只有一个位置参数时，`T(x)` 表示类型转换；对象构造使用具名字段参数 `T(field: ...)`。
+- 类型与值命名空间分离；当 callee 解析为类型且只有一个位置参数时，`T(x)` 表示类型转换；对象构造使用具名字段参数 `T(field: ...)` 或 brace 形式 `T { field: value }`。
 - C 风格 `(T)(x)` 已移除。
 - `cast[T](x)` 已移除。
 - 单参数调用统一写 `f(x)`；`f x` 只作为迁移期旧表面保留，不属于优雅语法。`f (x)` 非法。
@@ -756,6 +758,7 @@ charLiteral    ::= `'` CHARACTER `'` ;
 - 全语义回归入口：`$TOOLING verify_backend_closedloop` 固定使用 canonical backend driver（`$TOOLING driver-path --path-only`，默认 `artifacts/backend_driver/cheng`）编译并运行 `examples/backend_closedloop_fullspec.cheng`，要求运行返回码为 `0`（默认并固定 `MM=orc`；ORC/Ownership 专项回归见 `examples/test_orc_closedloop.cheng`；跨目标 `self_linker(ELF/COFF)` 与 `linker_abi_core` 门禁默认强制阻断，默认固定 stable driver 口径且不再自动回退 seed/selfhost/release 候选，已移除 prebuilt-obj/link-only 降级路径，不允许 skip 与 compile-only 回退）。
 - 当前活入口收口到两个 Cheng 二进制：`artifacts/bootstrap/cheng.stage3` 负责 bootstrap/tooling/gate，`artifacts/backend_driver/cheng` 负责 ordinary compile、`system-link-exec` 与 host smokes。
 - 当前常用生产回归入口：`artifacts/bootstrap/cheng.stage3 run-production-regression`；它聚合 `build-backend-driver`、`run-host-smokes stage3_command_surface_smoke backend_driver_command_surface_smoke build_backend_driver_report_smoke function_task_contract_smoke function_task_executor_contract_smoke body_ir_dod_soa_contract_smoke body_ir_noalias_proof_smoke cfg_body_ir_contract_smoke compiler_budget_contract_smoke runtime_c_baseline_contract_smoke thread_atomic_orc_runtime_gate_smoke perf_memory_gate_contract_smoke perf_memory_contract_smoke cheng_skill_consistency_smoke dev_hotpatch_100ms_scope_contract_smoke explicit_default_init_positive_smoke explicit_default_init_negative_smoke explicit_default_init_gate_smoke composite_zero_helper_gate_smoke latest_snapshot_port_preserves_live_str_smoke list_literal_nested_call_depth_smoke libp2p_quic_twoproc_server_pre_quic_smoke`、`verify-r2c-react-surface`、`run-cross-target-smokes` 与 `run-stage23-libp2p-smokes`。需要拆分排障时再分别跑子命令。
+- CSG v2 后端事实格式的最小确定性门禁为 `tools/cold_csg_v2_roundtrip_test.sh`；它要求同一 facts 经 cold reader/object writer 两次产物字节一致，并检查 writer/reader report、facts 大小预算和坏输入 hard-fail。
 - production regression smoke contract: `build_backend_driver_report_smoke function_task_contract_smoke function_task_executor_contract_smoke body_ir_dod_soa_contract_smoke body_ir_noalias_proof_smoke cfg_body_ir_contract_smoke compiler_budget_contract_smoke runtime_c_baseline_contract_smoke thread_atomic_orc_runtime_gate_smoke perf_memory_gate_contract_smoke perf_memory_contract_smoke cheng_skill_consistency_smoke dev_hotpatch_100ms_scope_contract_smoke explicit_default_init_positive_smoke explicit_default_init_negative_smoke explicit_default_init_gate_smoke composite_zero_helper_gate_smoke latest_snapshot_port_preserves_live_str_smoke list_literal_nested_call_depth_smoke libp2p_quic_twoproc_server_pre_quic_smoke`
 - 调试优先级固定为“先内建、后外部”：先用 `artifacts/bootstrap/cheng.stage3 debug-report`、`print-asm`、`print-line-map`、`print-symbols`、`print-object`，再看真实产物 `*.compile.log`、`*.run.log`、`*.map`、`*.primary.o.s`；运行崩溃先对 `*.run.log` 跑 `crash-report`，性能先用 `profile-run/profile-report`。只有问题已经落到宿主 C runtime、系统 linker、`libSystem` 或内建产物不足时，才补用 `lldb/gdb/sample`。
 - 当前 live 子命令面不再暴露 `backend_prod_closure`、`backend-prod-publish`、`verify_backend_abi_v2_noptr`、`verify_backend_selfhost_100ms_host`；这些名字只保留在归档 backend-only 文档或内部兼容记录里，不应再当作现行命令。

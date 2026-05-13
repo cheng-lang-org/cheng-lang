@@ -6,7 +6,7 @@ description: Cheng 语言语法与语义、所有权/ORC、并发与模块导入
 # Cheng 编程（稳定版）
 
 ## 维护元数据
-- `last_verified_date`: `2026-04-25`
+- `last_verified_date`: `2026-05-13`
 - `last_verified_commit`: `workspace-local`
 - `upstream_spec`: `docs/cheng-formal-spec.md`
 
@@ -23,12 +23,13 @@ description: Cheng 语言语法与语义、所有权/ORC、并发与模块导入
 - 优先给当前支持写法和最小可编译例子；引用旧写法必须明确标注“已移除/不再支持”。
 - Cheng 没有 tracing GC；内存问题按 ORC retain/release、alloc/free/live、borrow 生命周期解释。
 - 默认公开表面是 no-pointer + borrow/`Send/Sync` 检查；FFI、handle、环引用仍是显式边界，不能说成全域自动安全。
+- 大文件和大仓任务必须先用 Grep/Glob/Bash 定位，再分片读取。任何 `.cheng` 文件的 Read 调用都必须显式传 `limit`，且 `limit <= 200`；已知行号时同时传 `offset` 读取 80-200 行窗口。若 Read 报 token 上限，立刻按行号分片，不要重复同一整文件 Read。
 
 ## 稳定公开表面
 - 模块与包：支持 `module`、`import`、`import ... as ...`、前缀分组导入 `import pkg/[a,b]`、包根 `cheng-package.toml`、`<pkg>/<path>` 模块路径、仓内 `src/` 回退解析；导出规则是 Go 风格首字母大写导出。
 - 包解析与锁定：支持 `package_id`、依赖 channel、`cheng.lock.toml`、内容寻址包缓存、本地包根搜索与源码直发记录；编译期导入不联网，只消费本地解析结果。
 - 顶层声明：支持 `let/var/const`、`type`、`fn`、`iterator`、`macro`、`template`、`concept`、`trait`；旧 `proc/method/converter` 已移除。
-- 例程与类型：支持普通函数、`async fn`、迭代器、匿名函数、闭包、函数指针、泛型/`where`、具名参数、默认参数；支持 `bool`、整数、浮点、`char`、`str`、`cstring`、`nil`、`enum`、代数类型/tagged union（如 `type Option[T] = Some(value: T) | None`）、`set[T]`、`tuple[...]`、`object/ref object`、`var T` 借用、`fn(...)`、点限定类型名、`new(Type)`、`T()` 复合零值物化。
+- 例程与类型：支持普通函数、`async fn`、迭代器、匿名函数、闭包、函数指针、泛型/`where`、具名参数、默认参数；支持 `bool`、整数、浮点、`char`、`str`、`cstring`、`nil`、`enum`、代数类型/tagged union（如 `type Option[T] = Some(value: T) | None`）、`set[T]`、`tuple[...]`、`object/ref object`、`var T` 借用、`fn(...)`、点限定类型名、`new(Type)`、`T()` 复合零值物化、`T { field: value }` 对象构造。
 - 容器与数据：动态序列 `T[]`，定长数组 `T[N]`，字面量 `[]/[a,b]`，列表生成式 `[expr for pat in iter if cond]`，对象字段默认值，tuple 元素默认值，隐式默认值初始化，Table/HashMap 键值迭代。
 - 表达式：成员访问、下标/切片、小括号调用、具名实参、区间 `a..b`/`a..<b`、三目 `?:`、`if/when/case` 表达式、postfix `expr?` 解包、`$x` 字符串化、静态运算符重载、`TypeExpr(expr)` 显式类型转换。
 - 控制流：`if/elif/else`、`match` 模式匹配、`while`、`for ... in ...`、`case/of`、`when`、`block`、`break`、`continue`、`return`、`yield`、`defer`；支持单行 `suite ::= statement`。
@@ -67,6 +68,7 @@ description: Cheng 语言语法与语义、所有权/ORC、并发与模块导入
 ## 默认值与复合类型
 - 带类型标注可省略初始化并走隐式默认值；`T()` 只用于 `object/tuple/Bytes` 默认值物化，`T[]/T[N]` 改用省略初始化或字面量，简单类型不要写 `int32()`/`bool()`/`str()`。
 - `object/ref object/tuple` 字段或元素支持 `name: Type = expr` 默认值语法；初始化优先级固定为“显式实参 > 字段默认值 > 类型零值”。
+- 对象构造支持 `T(field: value)` 与 `T { field: value }`；字段名必须唯一，未知字段必须编译期报错。
 - 字段默认值只允许稳态表达式：字面量（含 `T[]/T[N]` 上下文下的 `[]` 与 `[a, b, ...]`）、复合类型 `T()`、`new(Type)`、纯类型构造与 `if/?:` 组合；禁止引用同一对象其他字段，禁止副作用调用。
 - tuple 这轮只支持 typed implicit init 与 `T()`；tuple 字面量/tuple 类型构造必须显式写全所有元素，不支持省略元素自动补齐。
 - 隐式默认值速记：`bool=false`，整数/枚举=0，浮点=0.0，`char='\0'`，`str/cstring=""`，指针/`ref`/`var`/`void*`=`nil`，复合类型先 zero-init，再应用字段默认值。
@@ -84,6 +86,7 @@ type
 var a: RunResult
 let b = RunResult()
 let c = RunResult(outputText: "ok")
+let d = RunResult { outputText: "ok" }
 ```
 
 ## no-pointer / ZRPC
@@ -102,6 +105,9 @@ let c = RunResult(outputText: "ok")
   - `artifacts/bootstrap/cheng.stage3 build-backend-driver`
   - `artifacts/backend_driver/cheng run-host-smokes perf_memory_contract_smoke`
   - `artifacts/backend_driver/cheng run-host-smokes cheng_skill_consistency_smoke`
+  - `tools/cold_csg_v2_roundtrip_test.sh`
+  - `artifacts/backend_driver/cheng emit-cold-csg-v2 --root:/abs/root --in:/abs/path/file.cheng --out:/tmp/file.csgv2 --target:arm64-apple-darwin --report-out:/tmp/file.csgv2.writer.report.txt`
+  - `cc -std=c11 -O2 -o /tmp/cheng_cold bootstrap/cheng_cold.c && /tmp/cheng_cold system-link-exec --csg-in:/tmp/file.csgv2 --emit:obj --out:/tmp/file.o --target:arm64-apple-darwin --report-out:/tmp/file.reader.report.txt`
   - `artifacts/bootstrap/cheng.stage3 run-stage23-libp2p-smokes`
   - `artifacts/bootstrap/cheng.stage3 run-cross-target-smokes`
   - `artifacts/backend_driver/cheng system-link-exec --root:/abs/root --in:/abs/path/file.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/app`
@@ -117,8 +123,12 @@ let c = RunResult(outputText: "ok")
 - 需要回答“编译理论下界”时，优先看 `perf_memory_contract_smoke` 报告中的 `planner_total_ms`，再看 `*_compile_gap_breakdown`；前提是 `planner_total_ms <= compile_elapsed_ms`。
 - `build-backend-driver` 的候选编译必须强制 `BACKEND_INCREMENTAL=0`、`BACKEND_MULTI_MODULE_CACHE=0`、`CHENG_DISABLE_PRIMARY_OBJECT_CACHE=1`，并默认注入 8GiB RSS 守卫与 `CHENG_PROGRESS=1`。
 - backend driver 的 `system-link-exec` 不支持或 primary/object/native materializer 未就绪时必须硬失败并写报告，不能默认转发到 stage3 掩盖缺口。
+- 纯 Cheng 自举证明只能以 `artifacts/backend_driver/cheng system-link-exec` 的 pure self 结果为准；C seed forced build 只允许人工恢复破损 artifact，不能作为进展、验证或默认刷新路径。
 - 纯 Cheng 自举主线不能继续用源码行字符串扫描扩展 statement 支持；下一步必须消费 parser/typed facts/NormalizedExpr 的结构化 statement/CFG/call sequence IR。
 - `primary_object_emit` 的 `.s` 文本路径只保留为 fallback/debug 对拍；Darwin arm64 主线优先使用 direct object writer，真正生产缺口必须在 Mach-O/ELF/COFF object writer 或 direct-exe 主线补齐，不能用 `.s` fallback 冒充完成。
+- CSG v2 主线由 Cheng backend driver 产 `PrimaryObjectPlan/BodyIR` facts，cold reader 只做 `--csg-in` 加载校验与 object/direct-exe emit；确定性门禁固定用 `tools/cold_csg_v2_roundtrip_test.sh`。
+- 顶层 `runtime/` 与旧 `runtime/native` C 源已不属于主线；纯 Cheng runtime 只保留 `src/core/runtime` provider 与 `src/runtime` Cheng 包源码。新增 runtime bridge 必须落到 `src/core/runtime/*provider*.cheng`，同步 provider module/source mapping/export roots/cache freshness，不得恢复顶层 `runtime/` 或扩展 C 源。
+- RSS 守卫必须保持 process-group 语义：子进程组内存按 pgid 求和，不能用单 pid RSS 替代，也不能 shell 出 `/bin/ps` 作为实现口径。
 
 ## 任务流
 
@@ -159,6 +169,7 @@ let c = RunResult(outputText: "ok")
 
 ## 一致性检查
 - 本地校验命令：`artifacts/backend_driver/cheng run-host-smokes cheng_skill_consistency_smoke`
+- CSG v2 往返校验：`tools/cold_csg_v2_roundtrip_test.sh`
 - CI 镜像根：`docs/cheng-skill`
 - CI 抽样模板：`tests/cheng/skill/hello_cheng_ci_sample.cheng`
 - 镜像资源要求：`references/ownership.md` 必须同步存在于 skill 与 CI 镜像。

@@ -22,6 +22,32 @@ artifacts/backend_driver/cheng system-link-exec \
   --out:/tmp/app
 ```
 
+CSG v2 后端事实格式改动后，先跑往返自检：
+
+```sh
+tools/cold_csg_v2_roundtrip_test.sh
+```
+
+手动检查单个输入时使用：
+
+```sh
+cc -std=c11 -O2 -o /tmp/cheng_cold bootstrap/cheng_cold.c
+
+artifacts/backend_driver/cheng emit-cold-csg-v2 \
+  --root:/Users/lbcheng/cheng-lang \
+  --in:/abs/path/file.cheng \
+  --out:/tmp/file.csgv2 \
+  --target:arm64-apple-darwin \
+  --report-out:/tmp/file.csgv2.writer.report.txt
+
+/tmp/cheng_cold system-link-exec \
+  --csg-in:/tmp/file.csgv2 \
+  --emit:obj \
+  --out:/tmp/file.o \
+  --target:arm64-apple-darwin \
+  --report-out:/tmp/file.reader.report.txt
+```
+
 ## 模块布局
 
 - 编译器内核：`src/core/lang`、`src/core/ir`、`src/core/backend`、`src/core/tooling`、`src/core/runtime`
