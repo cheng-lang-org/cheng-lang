@@ -2885,11 +2885,8 @@ int32_t cold_materialize_fmt_str(BodyIR *body, int32_t slot, int32_t kind) {
         body_op(body, BODY_OP_I64_TO_STR, dst, slot, 0);
         return dst;
     }
-    /* Fmt interpolation with non-str: skip, return 0 */
-    int32_t zero = body_slot(body, SLOT_I32, 4);
-    body_op(body, BODY_OP_I32_CONST, zero, 0, 0);
-    return zero;
-    return slot;
+    die("Fmt interpolation: unsupported type in expression");
+    return 0; /* unreachable */
 }
 
 bool cold_slot_kind_is_str_like(int32_t kind) {
@@ -2977,7 +2974,7 @@ int32_t parse_fmt_literal(Parser *parser, BodyIR *body, Locals *locals, int32_t 
             int32_t expr_slot = parse_expr(&expr_parser, body, locals, &expr_kind);
             parser_ws(&expr_parser);
             if (expr_parser.pos != expr_parser.source.len) {
-                /* Skip unsupported Fmt interpolation tokens */
+                die("Fmt interpolation: cannot fully parse expression");
             }
             expr_slot = cold_materialize_fmt_str(body, expr_slot, expr_kind);
             current = current < 0 ? expr_slot : cold_concat_str_slots(body, current, expr_slot);
