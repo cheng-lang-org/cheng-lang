@@ -11544,23 +11544,36 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
             /* Arena retained in cache for next compilation; skip munmap */
         }
     } else {
+        /* E-Graph DCE: skip codegen for duplicate functions (same normalized hash) */
+        int32_t dedup_count = 0;
+        #define DEDUP_MAP_SIZE 256
+        uint64_t dedup_hash[DEDUP_MAP_SIZE];
+        int32_t dedup_pos[DEDUP_MAP_SIZE];
+        int32_t dedup_n = 0;
+
         for (int32_t i = 0; i < function_count; i++) {
             if (i == entry_function || !reachable_functions[i] ||
                 !function_bodies[i] ||
                 function_bodies[i]->has_fallback) continue;
-            function_pos[i] = code->count;
-            if (cold_diag_dump_per_fn || cold_diag_dump_slots) {
-                fprintf(stderr, "[diag] fn[%d] ", i);
-                cold_diag_fn_name(symbols->functions[i].name);
-                fprintf(stderr, " at word=%d", code->count);
-                BodyIR *b = function_bodies[i];
-                if (b) fprintf(stderr, " slots=%d frame=%d", b->slot_count, b->frame_size);
-                fprintf(stderr, "\n");
-            }
             BodyIR *body = function_bodies[i];
-            if (!cold_body_codegen_ready(body)) {
-                die("cold function body is not codegen-ready");
+            uint64_t h = cold_body_ir_canonical_hash_normalized(body);
+            int32_t dup_idx = -1;
+            for (int32_t di = 0; di < dedup_n; di++) {
+                if (dedup_hash[di] == h) { dup_idx = di; break; }
             }
+            if (dup_idx >= 0) {
+                function_pos[i] = dedup_pos[dup_idx];
+                dedup_count++;
+                continue;
+            }
+            function_pos[i] = code->count;
+            if (dedup_n < DEDUP_MAP_SIZE) {
+                dedup_hash[dedup_n] = h;
+                dedup_pos[dedup_n] = code->count;
+                dedup_n++;
+            }
+            if (!cold_body_codegen_ready(body))
+                die("cold function body is not codegen-ready");
             if (use_rv64)
                 rv64_codegen_func(code, body, symbols, &function_patches);
             else
