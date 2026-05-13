@@ -195,9 +195,11 @@ Span parser_take_type_span(Parser *parser) {
     int32_t type_start = parser->pos;
     Span first = parser_token(parser);
     if (first.len <= 0) die("expected type");
+    Span after_var = first; /* track the base type after stripping var */
     if (span_eq(first, "var")) {
         Span inner = parser_token(parser);
         if (inner.len <= 0) die("expected type after var");
+        after_var = inner;
     }
     for (;;) {
         if (span_eq(parser_peek(parser), "[")) {
@@ -209,6 +211,18 @@ Span parser_take_type_span(Parser *parser) {
             Span part = parser_token(parser);
             if (part.len <= 0) die("expected qualified type segment");
             continue;
+        }
+        /* function type: fn(params): ret_type */
+        if (span_eq(after_var, "fn") && span_eq(parser_peek(parser), "(")) {
+            parser_skip_balanced(parser, "(", ")");
+            parser_ws(parser);
+            if (span_eq(parser_peek(parser), ":")) {
+                (void)parser_token(parser);
+                parser_ws(parser);
+                after_var = parser_token(parser); /* return type's first token */
+                continue; /* continue loop for [bracketed] and .qualified suffixes on return type */
+            }
+            break; /* fn type without return type (unusual but valid) */
         }
         break;
     }
@@ -242,6 +256,8 @@ int32_t cold_param_kind_from_type(Span type) {
     if (cold_parse_str_seq_type(type)) return SLOT_SEQ_STR;
     if (cold_parse_opaque_seq_type(type)) return SLOT_SEQ_OPAQUE;
     if (span_eq(type, "ptr")) return SLOT_OPAQUE;
+    /* function type like fn(int32): int32 → function pointer */
+    if (cold_span_starts_with(type, "fn(")) return is_var ? SLOT_OBJECT_REF : SLOT_PTR;
     if (span_eq(type, "o") || cold_type_has_qualified_name(type)) return SLOT_OPAQUE;
     if (type.len > 1 && type.ptr[0] >= 'A' && type.ptr[0] <= 'Z') return SLOT_VARIANT;
     if (cold_parse_i32_array_type(type, 0)) return SLOT_ARRAY_I32;
@@ -4981,6 +4997,9 @@ int32_t parse_scalar_identity_cast(Parser *parser, BodyIR *body,
 
 int32_t parse_postfix(Parser *parser, BodyIR *body, Locals *locals,
                              int32_t slot, int32_t *kind);
+static int32_t parse_closure_expr(Parser *parser, BodyIR *body, Locals *locals, int32_t *kind);
+int32_t cold_materialize_i32_ref(BodyIR *body, int32_t slot, int32_t *kind);
+int32_t cold_materialize_i64_value(BodyIR *body, int32_t slot, int32_t *kind);
 
 int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32_t *kind) {
     Span token = parser_token(parser);
@@ -5214,6 +5233,10 @@ int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32_t *kin
         *kind = SLOT_I32;
         return slot;
     }
+    /* Anonymous function / closure expression: fn(params): ret = body */
+    if (span_eq(token, "fn") && span_eq(parser_peek(parser), "(")) {
+        return parse_closure_expr(parser, body, locals, kind);
+    }
     /* check if token is a local variable FIRST -- field access on locals is handled by parse_postfix */
     Local *local = locals_find(locals, token);
     if (local) {
@@ -5367,12 +5390,150 @@ int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32_t *kin
         *kind = SLOT_I32;
         return slot;
     }
+    /* Bare function name reference (used as value, e.g. passed as function pointer) */
+    {
+        int32_t fn_idx = symbols_find_fn(parser->symbols, token, 0, 0, 0, (Span){0});
+        if (fn_idx < 0) {
+            /* Try arity-insensitive lookup -- just check if name matches any function */
+            for (int32_t si = 0; si < parser->symbols->function_count; si++) {
+                if (span_same(parser->symbols->functions[si].name, token)) {
+                    fn_idx = si;
+                    break;
+                }
+            }
+        }
+        if (fn_idx >= 0) {
+            int32_t addr_slot = body_slot(body, SLOT_PTR, 8);
+            body_op(body, BODY_OP_FN_ADDR, addr_slot, fn_idx, 0);
+            *kind = SLOT_PTR;
+            return addr_slot;
+        }
+    }
     int32_t off = cold_span_offset(parser->source, token);
     /* Return zero constant and continue */
     int32_t zero = body_slot(body, SLOT_I32, 4);
     body_op(body, BODY_OP_I32_CONST, zero, 0, 0);
     *kind = SLOT_I32;
     return zero;
+}
+
+/* Parse anonymous function/closure expression: fn(params): ret = body
+   The token "fn" has already been consumed; parser is at (params)... */
+static int32_t parse_closure_expr(Parser *parser, BodyIR *body, Locals *locals, int32_t *kind) {
+    if (!parser_take(parser, "(")) die("expected ( in closure");
+    int32_t arity = 0;
+    Span param_names[COLD_MAX_I32_PARAMS];
+    Span param_types[COLD_MAX_I32_PARAMS];
+    int32_t param_kinds[COLD_MAX_I32_PARAMS];
+    int32_t param_sizes[COLD_MAX_I32_PARAMS];
+
+    while (!span_eq(parser_peek(parser), ")")) {
+        Span param = parser_token(parser);
+        if (param.len == 0) die("unterminated closure params");
+        if (arity >= COLD_MAX_I32_PARAMS) die("too many closure params");
+        param_names[arity] = param;
+        param_types[arity] = (Span){0};
+        param_kinds[arity] = SLOT_I32;
+        param_sizes[arity] = 4;
+        if (span_eq(parser_peek(parser), ":")) {
+            (void)parser_token(parser);
+            Span param_type = parser_scope_type(parser, parser_take_type_span(parser));
+            param_types[arity] = param_type;
+            param_kinds[arity] = cold_slot_kind_from_type_with_symbols(parser->symbols, param_type);
+            param_sizes[arity] = cold_param_size_from_type(parser->symbols, param_type, param_kinds[arity]);
+        }
+        arity++;
+        if (span_eq(parser_peek(parser), ",")) (void)parser_token(parser);
+    }
+    if (!parser_take(parser, ")")) die("expected ) in closure");
+
+    Span ret = {0};
+    if (span_eq(parser_peek(parser), ":")) {
+        (void)parser_token(parser);
+        ret = parser_scope_type(parser, parser_take_type_span(parser));
+    }
+    if (!parser_take(parser, "=")) die("expected = in closure expression");
+
+    /* Generate synthetic function name: __anon_N */
+    int32_t closure_id = parser->closure_count++;
+    char anon_name[64];
+    int32_t anon_len = snprintf(anon_name, sizeof(anon_name), "__anon_%d", closure_id);
+    uint8_t *name_copy = arena_alloc(parser->arena, (size_t)anon_len + 1);
+    memcpy(name_copy, anon_name, (size_t)anon_len);
+    name_copy[anon_len] = 0;
+    Span fn_name = (Span){name_copy, anon_len};
+
+    /* Register function symbol */
+    int32_t symbol_index = symbols_add_fn(parser->symbols, fn_name, arity,
+                                          param_kinds, param_sizes, ret);
+
+    /* Create closure BodyIR */
+    BodyIR *closure_body = body_new(parser->arena);
+    closure_body->return_kind = cold_return_kind_from_span(parser->symbols, ret);
+    closure_body->return_size = cold_return_slot_size(parser->symbols, ret, closure_body->return_kind);
+    closure_body->return_type = span_trim(ret);
+    closure_body->debug_name = fn_name;
+
+    Locals closure_locals;
+    locals_init(&closure_locals, parser->arena);
+    if (cold_kind_is_composite(closure_body->return_kind)) {
+        closure_body->sret_slot = body_slot(closure_body, SLOT_PTR, 8);
+    }
+    closure_body->param_count = arity;
+    for (int32_t i = 0; i < arity; i++) {
+        int32_t slot = body_slot(closure_body, param_kinds[i], param_sizes[i]);
+        if (param_kinds[i] == SLOT_ARRAY_I32 && param_sizes[i] > 0) {
+            closure_body->slot_aux[slot] = param_sizes[i] / 4;
+        }
+        Span st = cold_type_strip_var(param_types[i], 0);
+        if (st.len > 0) {
+            uint8_t *copy = arena_alloc(parser->arena, (size_t)(st.len + 1));
+            memcpy(copy, st.ptr, (size_t)st.len);
+            copy[st.len] = 0;
+            st = (Span){copy, st.len};
+        }
+        body_slot_set_type(closure_body, slot, st);
+        closure_body->param_slot[i] = slot;
+        if (param_names[i].len > 0) {
+            uint8_t *cn = arena_alloc(parser->arena, (size_t)(param_names[i].len + 1));
+            memcpy(cn, param_names[i].ptr, (size_t)param_names[i].len);
+            cn[param_names[i].len] = 0;
+            closure_body->param_name[i] = (Span){cn, param_names[i].len};
+        }
+        locals_add(&closure_locals, param_names[i], slot, param_kinds[i]);
+    }
+    int32_t closure_block = body_block(closure_body);
+
+    /* Parse body using same approach as parse_fn */
+    int32_t body_indent = parser_next_indent(parser);
+    int32_t end_block = parse_statements_until(parser, closure_body, &closure_locals,
+                                               closure_block, body_indent, 0, 0);
+    if (closure_body->block_term[end_block] < 0) {
+        if (cold_return_span_is_void(ret)) {
+            int32_t zero_s = body_slot(closure_body, SLOT_I32, 4);
+            body_op(closure_body, BODY_OP_I32_CONST, zero_s, 0, 0);
+            body_op(closure_body, BODY_OP_LOAD_I32, zero_s, 0, 0);
+            int32_t term = body_term(closure_body, BODY_TERM_RET, zero_s, -1, 0, -1, -1);
+            body_end_block(closure_body, end_block, term);
+        } else {
+            int32_t zero_s = body_slot(closure_body, SLOT_I32, 4);
+            body_op(closure_body, BODY_OP_I32_CONST, zero_s, 0, 0);
+            body_op(closure_body, BODY_OP_LOAD_I32, zero_s, 0, 0);
+            int32_t term = body_term(closure_body, BODY_TERM_RET, zero_s, -1, 0, -1, -1);
+            body_end_block(closure_body, end_block, term);
+        }
+    }
+
+    /* Store in function_bodies for codegen */
+    if (parser->function_bodies && symbol_index >= 0 && symbol_index < parser->function_body_cap) {
+        parser->function_bodies[symbol_index] = closure_body;
+    }
+
+    /* Emit function pointer in current body */
+    int32_t addr_slot = body_slot(body, SLOT_PTR, 8);
+    body_op(body, BODY_OP_FN_ADDR, addr_slot, symbol_index, 0);
+    *kind = SLOT_PTR;
+    return addr_slot;
 }
 
 int32_t parse_postfix(Parser *parser, BodyIR *body, Locals *locals,

@@ -4359,6 +4359,8 @@ static int32_t cold_slot_kind_from_type_with_symbols(Symbols *symbols, Span type
     if (span_eq(type, "v")) return SLOT_VARIANT;
     if (span_eq(type, "o")) return SLOT_OPAQUE;
     if (span_eq(type, "ptr")) return SLOT_OPAQUE;
+    /* function type like fn(int32): int32 → function pointer */
+    if (cold_span_starts_with(type, "fn(")) return is_var ? SLOT_OBJECT_REF : SLOT_PTR;
     if (symbols) {
         ObjectDef *obj = symbols_resolve_object(symbols, type);
         if (obj) return obj->is_ref ? SLOT_PTR : SLOT_OBJECT;
@@ -4513,6 +4515,8 @@ int32_t cold_return_kind_from_span(Symbols *symbols, Span ret) {
     ObjectDef *ret_obj = symbols_resolve_object(symbols, ret);
     if (ret_obj) return ret_obj->is_ref ? SLOT_PTR : SLOT_OBJECT;
     if (span_eq(ret, "ptr")) return SLOT_OPAQUE;
+    /* function type like fn(int32): int32 → function pointer */
+    if (cold_span_starts_with(ret, "fn(")) return SLOT_PTR;
     if (cold_type_has_qualified_name(ret)) return SLOT_OPAQUE;
     /* Treat unknown uppercase types and camelCase types as opaque objects */
     if (ret.len > 0 && ((ret.ptr[0] >= 'A' && ret.ptr[0] <= 'Z') ||
@@ -4685,6 +4689,9 @@ typedef struct Parser {
     Span import_alias;
     struct ColdImportSource *import_sources;  /* for import alias resolution in bare names */
     int32_t import_source_count;
+    BodyIR **function_bodies;   /* for storing closure/anonymous function bodies */
+    int32_t function_body_cap;  /* capacity of function_bodies array */
+    int32_t closure_count;      /* counter for generating unique closure names */
 } Parser;
 
 /* ================================================================
@@ -13791,6 +13798,8 @@ static int32_t cold_compile_one_import_direct(Symbols *symbols, const char *path
     Parser parser = {source, 0, symbols->arena, symbols, true /* import_mode */, alias};
     parser.import_sources = local_imports;
     parser.import_source_count = local_import_count;
+    parser.function_bodies = function_bodies;
+    parser.function_body_cap = body_cap;
     fn_pos = 0;
     while (parser.pos < source.len) {
         parser_ws(&parser);
@@ -14231,6 +14240,8 @@ bool cold_compile_source_path_to_macho(const char *out_path,
         Parser parser = {mapped_source, 0, arena, symbols};
         parser.import_sources = import_sources;
         parser.import_source_count = import_source_count;
+        parser.function_bodies = function_bodies;
+        parser.function_body_cap = body_cap;
         while (parser.pos < mapped_source.len) {
             parser_ws(&parser);
             if (parser.pos >= mapped_source.len) break;
@@ -14489,6 +14500,8 @@ bool cold_compile_source_to_object(const char *out_path, const char *src_path, c
     Parser parser = {mapped_source, 0, arena, symbols};
     parser.import_sources = import_sources;
     parser.import_source_count = import_source_count;
+    parser.function_bodies = function_bodies;
+    parser.function_body_cap = body_cap;
     while (parser.pos < mapped_source.len) {
         parser_ws(&parser);
         if (parser.pos >= mapped_source.len) break;
@@ -15056,6 +15069,8 @@ static bool cold_emit_csg_v2_facts_from_source(const char *facts_path,
     Parser parser = {src, 0, arena, symbols};
     parser.import_sources = import_sources;
     parser.import_source_count = import_count;
+    parser.function_bodies = function_bodies;
+    parser.function_body_cap = body_cap;
     while (parser.pos < src.len) {
         parser_ws(&parser);
         if (parser.pos >= src.len) break;
@@ -15310,6 +15325,8 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
         Parser parser = {mapped_source, 0, arena, symbols};
         parser.import_sources = import_sources;
         parser.import_source_count = import_source_count;
+        parser.function_bodies = function_bodies;
+        parser.function_body_cap = body_cap;
         while (parser.pos < mapped_source.len) {
             parser_ws(&parser);
             if (parser.pos >= mapped_source.len) break;

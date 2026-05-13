@@ -548,6 +548,9 @@ typedef struct Parser {
     Span import_alias;
     struct ColdImportSource *import_sources;  /* for import alias resolution in bare names */
     int32_t import_source_count;
+    BodyIR **function_bodies;   /* for storing closure/anonymous function bodies */
+    int32_t function_body_cap;  /* capacity of function_bodies array */
+    int32_t closure_count;      /* counter for generating unique closure names */
 } Parser;
 
 struct ColdImportSource {
