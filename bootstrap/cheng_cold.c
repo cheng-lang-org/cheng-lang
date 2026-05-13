@@ -20685,8 +20685,17 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
     }
 
     if (csg_text.len >= 8 && memcmp(csg_text.ptr, "CHENGCSG", 8) == 0) {
-        /* New record-based format: 8-byte magic + records, no 64-byte header */
-        if (csg_text.len < 64) {
+        uint32_t header_version = 0;
+        if (csg_text.len >= 12) {
+            int32_t version_pos = 8;
+            if (!cold_read_u32(csg_text.ptr, csg_text.len, &version_pos, &header_version)) {
+                munmap((void *)csg_text.ptr, (size_t)csg_text.len);
+                return false;
+            }
+        }
+
+        /* Record-based binary format: 8-byte magic + TLV records, no 64-byte header. */
+        if (header_version != CSG_V2_VERSION) {
             if (!obj_mode) {
                 munmap((void *)csg_text.ptr, (size_t)csg_text.len);
                 return false;
@@ -20791,7 +20800,8 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
             /* Count local symbols (non-"main") */
             int32_t local_count = 0;
             for (int32_t i = 0; i < obj_facts.function_count; i++) {
-                if (strcmp(obj_facts.functions[i].symbol_name, "main") != 0)
+                if (strcmp(obj_facts.functions[i].symbol_name, "main") != 0 &&
+                    strcmp(obj_facts.functions[i].symbol_name, "_main") != 0)
                     local_count++;
             }
 
@@ -20818,8 +20828,15 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
                 stats->code_words = obj_facts.word_count;
                 stats->arena_kb = arena->used / 1024;
                 stats->facts_bytes = (uint64_t)csg_text.len;
+                stats->facts_mmap_us = mmap_done_us >= start_us ? mmap_done_us - start_us : 0;
+                stats->facts_function_count = obj_facts.function_count;
+                stats->facts_word_count = obj_facts.word_count;
+                stats->facts_reloc_count = obj_facts.reloc_count;
                 uint64_t end_us = cold_now_us();
-                if (end_us >= start_us) stats->elapsed_us = end_us - start_us;
+                if (end_us >= start_us) {
+                    stats->facts_total_us = end_us - start_us;
+                    stats->elapsed_us = end_us - start_us;
+                }
             }
             munmap((void *)csg_text.ptr, (size_t)csg_text.len);
             return ok;
