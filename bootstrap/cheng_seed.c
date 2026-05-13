@@ -41968,9 +41968,7 @@ static bool cheng_seed_try_emit_builtin_statement_impl(const ChengSeedSystemLink
         if (elem_size <= 0) {
             return false;
         }
-        clamp_label_id = control_label_index_io != NULL
-                         ? (*control_label_index_io)++
-                         : cheng_seed_next_expr_label_id();
+        clamp_label_id = cheng_seed_next_expr_label_id();
         if (cheng_seed_active_target_is_linux_x86_64()) {
             cheng_seed_text_appendf(out, cap,
                             "  cmpl $0, %s\n"

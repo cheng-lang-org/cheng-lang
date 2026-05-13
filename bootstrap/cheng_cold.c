@@ -1961,14 +1961,7 @@ static bool cold_write_text_file(const char *path, const char *text) {
     return true;
 }
 
-static int32_t cold_span_find_text(Span span, const char *needle) {
-    int32_t n = (int32_t)strlen(needle);
-    if (n <= 0 || span.len < n) return -1;
-    for (int32_t i = 0; i <= span.len - n; i++) {
-        if (memcmp(span.ptr + i, needle, (size_t)n) == 0) return i;
-    }
-    return -1;
-}
+
 
 static int32_t cold_span_find_char(Span span, char needle) {
     for (int32_t i = 0; i < span.len; i++) {
@@ -2015,29 +2008,6 @@ static int32_t cold_span_find_top_level_char(Span span, char needle) {
 
 /* Strip everything from the first ':' onward (the block delimiter), skipping
    ':' inside string/char literals. Handles "if cond: // comment" -> "cond". */
-static Span cold_span_cut_at_block_colon(Span span) {
-    span = span_trim(span);
-    bool in_string = false;
-    bool in_char = false;
-    for (int32_t i = 0; i < span.len; i++) {
-        uint8_t c = span.ptr[i];
-        if (in_string) {
-            if (c == '\\' && i + 1 < span.len) { i++; continue; }
-            if (c == '"') in_string = false;
-            continue;
-        }
-        if (in_char) {
-            if (c == '\\' && i + 1 < span.len) { i++; continue; }
-            if (c == '\'') in_char = false;
-            continue;
-        }
-        if (c == '"') { in_string = true; continue; }
-        if (c == '\'') { in_char = true; continue; }
-        if (c == ':') return span_trim(span_sub(span, 0, i));
-    }
-    return span;
-}
-
 static int32_t cold_line_indent_width(Span line) {
     int32_t indent = 0;
     for (int32_t i = 0; i < line.len; i++) {
@@ -2048,48 +2018,15 @@ static int32_t cold_line_indent_width(Span line) {
     return indent;
 }
 
-static void cold_write_span(FILE *file, Span span) {
-    if (span.len > 0) fwrite(span.ptr, 1, (size_t)span.len, file);
-}
+
 
 /* Write span to CSG file, escaping \t, \n, \\ so CSG tab-delimited format stays valid. */
-static void cold_write_span_csg(FILE *file, Span span) {
-    for (int32_t i = 0; i < span.len; i++) {
-        uint8_t c = span.ptr[i];
-        if (c == '\t') { fputs("\\t", file); }
-        else if (c == '\n') { fputs("\\n", file); }
-        else if (c == '\\') { fputs("\\\\", file); }
-        else { fputc(c, file); }
-    }
-}
 
-static char cold_field_kind_code_from_type(Span type);
-static Span cold_type_strip_var(Span type, bool *is_var);
-static bool cold_parse_i32_array_type(Span type, int32_t *len_out);
+
+
+
 static bool cold_parse_i32_seq_type(Span type);
-static bool cold_parse_str_seq_type(Span type);
-static bool cold_parse_opaque_seq_type(Span type);
-static bool cold_type_has_qualified_name(Span type);
 
-static Span cold_binding_name_from_head(Span head) {
-    head = span_trim(head);
-    int32_t end = 0;
-    while (end < head.len) {
-        uint8_t c = head.ptr[end];
-        if (!(isalnum(c) || c == '_')) break;
-        end++;
-    }
-    return span_sub(head, 0, end);
-}
-
-static char cold_field_kind_code_from_type(Span type) {
-    type = span_trim(type);
-    if (span_eq(type, "str") || span_eq(type, "cstring")) return 's';
-    if (span_eq(type, "int64") || span_eq(type, "uint64")) return 'l';
-    if (cold_parse_i32_seq_type(type)) die("cold ADT payload field cannot be dynamic int32[] yet");
-    if (type.len > 1 && type.ptr[0] >= 'A' && type.ptr[0] <= 'Z') return 'v';
-    return 'i';
-}
 
 
 
@@ -2145,267 +2082,7 @@ static bool cold_type_block_looks_like_object(Span fields) {
 
 
 
-static bool cold_emit_csg_statement_row(FILE *file, int32_t fn_index, int32_t indent, Span trimmed) {
-    if (span_eq(trimmed, "}") || span_eq(trimmed, "{")) {
-        return true;
-    }
-    int32_t arrow = cold_span_find_text(trimmed, "=>");
-    if (arrow > 0) {
-        Span arm = span_trim(span_sub(trimmed, 0, arrow));
-        Span body = span_trim(span_sub(trimmed, arrow + 2, trimmed.len));
-        int32_t open = cold_span_find_char(arm, '(');
-        Span variant = arm;
-        Span bind = {0};
-        if (open > 0) {
-            if (arm.len <= open + 1 || arm.ptr[arm.len - 1] != ')') return false;
-            variant = span_trim(span_sub(arm, 0, open));
-            bind = span_trim(span_sub(arm, open + 1, arm.len - 1));
-        }
-        fprintf(file, "cold_csg_stmt\t%d\t%d\tcase\t", fn_index, indent);
-        cold_write_span(file, variant);
-        fputc('\t', file);
-        cold_write_span(file, bind);
-        fputc('\n', file);
-        if (body.len > 0) {
-            return cold_emit_csg_statement_row(file, fn_index, indent + 4, body);
-        }
-        return true;
-    }
-    if (cold_span_starts_with(trimmed, "match ")) {
-        Span rest = span_trim(span_sub(trimmed, 6, trimmed.len));
-        if (rest.len > 0 && rest.ptr[rest.len - 1] == '{') {
-            rest = span_trim(span_sub(rest, 0, rest.len - 1));
-        }
-        int32_t colon = cold_span_find_char(rest, ':');
-        Span target;
-        if (colon > 0) {
-            target = span_trim(span_sub(rest, 0, colon));
-            Span after = span_trim(span_sub(rest, colon + 1, rest.len));
-            if (after.len > 0) {
-                fprintf(file, "cold_csg_stmt\t%d\t%d\tmatch\t", fn_index, indent);
-                cold_write_span(file, target);
-                fputc('\n', file);
-                return cold_emit_csg_statement_row(file, fn_index, indent + 4, after);
-            }
-        } else {
-            target = span_trim(rest);
-        }
-        fprintf(file, "cold_csg_stmt\t%d\t%d\tmatch\t", fn_index, indent);
-        cold_write_span(file, target);
-        fputc('\n', file);
-        return true;
-    }
-    if (span_eq(trimmed, "return") || cold_span_starts_with(trimmed, "return ")) {
-        Span expr = span_eq(trimmed, "return") ? (Span){0} : span_trim(span_sub(trimmed, 7, trimmed.len));
-        if (expr.len > 1 && expr.ptr[expr.len - 1] == '?') {
-            Span inner = span_sub(expr, 0, expr.len - 1);
-            int32_t depth = 0;
-            for (int32_t i = 0; i < inner.len; i++) {
-                if (inner.ptr[i] == '(') depth++;
-                else if (inner.ptr[i] == ')') depth--;
-            }
-            if (depth == 0) {
-                return false;
-            }
-        }
-        fprintf(file, "cold_csg_stmt\t%d\t%d\treturn\t", fn_index, indent);
-        cold_write_span_csg(file, expr);
-        fputc('\n', file);
-        return true;
-    }
-    if (cold_span_starts_with(trimmed, "let ") || cold_span_starts_with(trimmed, "var ")) {
-        Span rest = span_trim(span_sub(trimmed, 4, trimmed.len));
-        int32_t eq = cold_span_find_char(rest, '=');
-        if (eq <= 0) {
-            int32_t colon = cold_span_find_char(rest, ':');
-            if (colon <= 0) return false;
-            Span name = cold_binding_name_from_head(span_sub(rest, 0, colon));
-            Span type = span_trim(span_sub(rest, colon + 1, rest.len));
-            if (name.len <= 0 || type.len <= 0) return false;
-            fprintf(file, "cold_csg_stmt\t%d\t%d\tdefault\t", fn_index, indent);
-            cold_write_span_csg(file, name);
-            fputc('\t', file);
-            cold_write_span_csg(file, type);
-            fputc('\n', file);
-            return true;
-        }
-        Span head = span_trim(span_sub(rest, 0, eq));
-        Span type = {0};
-        int32_t colon = cold_span_find_char(head, ':');
-        Span name = colon > 0 ? cold_binding_name_from_head(span_sub(head, 0, colon))
-                              : cold_binding_name_from_head(head);
-        if (colon > 0) type = span_trim(span_sub(head, colon + 1, head.len));
-        Span expr = span_trim(span_sub(rest, eq + 1, rest.len));
-        bool has_question = false;
-        if (expr.len > 1 && expr.ptr[expr.len - 1] == '?') {
-            Span inner = span_sub(expr, 0, expr.len - 1);
-            int32_t depth = 0;
-            for (int32_t i = 0; i < inner.len; i++) {
-                if (inner.ptr[i] == '(') depth++;
-                else if (inner.ptr[i] == ')') depth--;
-            }
-            if (depth == 0) {
-                has_question = true;
-                expr = span_trim(inner);
-            }
-        }
-        if (type.len > 0) {
-            fprintf(file, "cold_csg_stmt\t%d\t%d\t%s\t", fn_index, indent, has_question ? "let_q_t" : "var_t");
-            cold_write_span_csg(file, name);
-            fputc('\t', file);
-            cold_write_span_csg(file, type);
-            fputc('\t', file);
-            cold_write_span_csg(file, expr);
-            fputc('\n', file);
-        } else {
-            fprintf(file, "cold_csg_stmt\t%d\t%d\t%s\t", fn_index, indent, has_question ? "let_q" : "var");
-            cold_write_span_csg(file, name);
-            fputc('\t', file);
-            cold_write_span_csg(file, expr);
-            fputc('\n', file);
-        }
-        return true;
-    }
-    /* helper: emit {if,elif,else,while,for} with optional inline suite after ':' */
-    #define EMIT_BLOCK_HEADER(kind, kw_len) do { \
-        Span _head = span_sub(trimmed, kw_len, trimmed.len); \
-        Span _cond = cold_span_cut_at_block_colon(_head); \
-        int32_t _colon = cold_span_find_char(_head, ':'); \
-        fprintf(file, "cold_csg_stmt\t%d\t%d\t%s\t", fn_index, indent, kind); \
-        cold_write_span_csg(file, _cond); \
-        fputc('\n', file); \
-        if (_colon >= 0 && _colon + 1 < _head.len) { \
-            Span _suite = span_trim(span_sub(_head, _colon + 1, _head.len)); \
-            if (_suite.len > 0) { \
-                /* split on ';' for multiple inline statements */ \
-                int32_t _sp = 0; \
-                while (_sp < _suite.len) { \
-                    int32_t _sc = cold_span_find_char(span_sub(_suite, _sp, _suite.len), ';'); \
-                    Span _stmt; \
-                    if (_sc >= 0) { _stmt = span_trim(span_sub(_suite, _sp, _sp + _sc)); _sp += _sc + 1; } \
-                    else { _stmt = span_trim(span_sub(_suite, _sp, _suite.len)); _sp = _suite.len; } \
-                    if (_stmt.len > 0) cold_emit_csg_statement_row(file, fn_index, indent + 4, _stmt); \
-                } \
-            } \
-        } \
-        return true; \
-    } while(0)
 
-    if (cold_span_starts_with(trimmed, "if ")) EMIT_BLOCK_HEADER("if", 3);
-    if (cold_span_starts_with(trimmed, "elif ")) EMIT_BLOCK_HEADER("elif", 5);
-    if (span_eq(cold_span_cut_at_block_colon(trimmed), "else")) {
-        int32_t _colon = cold_span_find_char(trimmed, ':');
-        fprintf(file, "cold_csg_stmt\t%d\t%d\telse\n", fn_index, indent);
-        if (_colon >= 0 && _colon + 1 < trimmed.len) {
-            Span _suite = span_trim(span_sub(trimmed, _colon + 1, trimmed.len));
-            if (_suite.len > 0) cold_emit_csg_statement_row(file, fn_index, indent + 4, _suite);
-        }
-        return true;
-    }
-    if (cold_span_starts_with(trimmed, "while ")) EMIT_BLOCK_HEADER("while", 6);
-    if (cold_span_starts_with(trimmed, "for ")) {
-        Span _head = span_sub(trimmed, 4, trimmed.len);
-        Span payload = cold_span_cut_at_block_colon(_head);
-        int32_t _colon = cold_span_find_char(_head, ':');
-        int32_t in_pos = cold_span_find_text(payload, " in ");
-        if (in_pos <= 0) return false;
-        Span iter = span_trim(span_sub(payload, 0, in_pos));
-        Span range = span_trim(span_sub(payload, in_pos + 4, payload.len));
-        int32_t op = cold_span_find_text(range, "..<");
-        const char *mode = "lt";
-        int32_t op_len = 3;
-        if (op < 0) {
-            op = cold_span_find_text(range, "..");
-            mode = "le";
-            op_len = 2;
-        }
-        if (op <= 0) return false;
-        Span start = span_trim(span_sub(range, 0, op));
-        Span end = span_trim(span_sub(range, op + op_len, range.len));
-        fprintf(file, "cold_csg_stmt\t%d\t%d\tfor_range\t", fn_index, indent);
-        cold_write_span_csg(file, iter);
-        fputc('\t', file);
-        cold_write_span_csg(file, start);
-        fputc('\t', file);
-        cold_write_span_csg(file, end);
-        fprintf(file, "\t%s\n", mode);
-        if (_colon >= 0 && _colon + 1 < _head.len) {
-            Span _suite = span_trim(span_sub(_head, _colon + 1, _head.len));
-            if (_suite.len > 0) {
-                int32_t _sp = 0;
-                while (_sp < _suite.len) {
-                    int32_t _sc = cold_span_find_char(span_sub(_suite, _sp, _suite.len), ';');
-                    Span _stmt;
-                    if (_sc >= 0) { _stmt = span_trim(span_sub(_suite, _sp, _sp + _sc)); _sp += _sc + 1; }
-                    else { _stmt = span_trim(span_sub(_suite, _sp, _suite.len)); _sp = _suite.len; }
-                    if (_stmt.len > 0) cold_emit_csg_statement_row(file, fn_index, indent + 4, _stmt);
-                }
-            }
-        }
-        return true;
-    }
-    if (span_eq(trimmed, "break")) {
-        fprintf(file, "cold_csg_stmt\t%d\t%d\tbreak\n", fn_index, indent);
-        return true;
-    }
-    if (span_eq(trimmed, "continue")) {
-        fprintf(file, "cold_csg_stmt\t%d\t%d\tcontinue\n", fn_index, indent);
-        return true;
-    }
-    int32_t eq = cold_span_find_char(trimmed, '=');
-    if (eq > 0 &&
-        !(eq + 1 < trimmed.len && trimmed.ptr[eq + 1] == '=') &&
-        !(eq > 0 && (trimmed.ptr[eq - 1] == '!' || trimmed.ptr[eq - 1] == '<' || trimmed.ptr[eq - 1] == '>'))) {
-        /* skip fn signature continuations like "b: var X): int32 =" */
-        bool _sig_cont = false;
-        if (eq >= 3 && trimmed.ptr[eq - 1] == ' ') {
-            for (int32_t _i = 0; _i < eq - 2; _i++) {
-                if (trimmed.ptr[_i] == ')' && trimmed.ptr[_i+1] == ':') { _sig_cont = true; break; }
-            }
-        }
-        if (!_sig_cont) {
-        Span name = span_trim(span_sub(trimmed, 0, eq));
-        /* ensure left-hand side is a simple identifier/field (no parens, commas, quotes) */
-        bool lhs_is_simple = true;
-        for (int32_t i = 0; i < name.len; i++) {
-            if (name.ptr[i] == '(' || name.ptr[i] == ',' || name.ptr[i] == '"' || name.ptr[i] == '\'') {
-                lhs_is_simple = false;
-                break;
-            }
-        }
-        if (lhs_is_simple) {
-            Span expr = span_trim(span_sub(trimmed, eq + 1, trimmed.len));
-            fprintf(file, "cold_csg_stmt\t%d\t%d\tassign\t", fn_index, indent);
-            cold_write_span_csg(file, name);
-            fputc('\t', file);
-            cold_write_span_csg(file, expr);
-            fputc('\n', file);
-            return true;
-        }
-        } /* end if (!_sig_cont) */
-    }
-    int32_t open = cold_span_find_char(trimmed, '(');
-    if (open > 0 && trimmed.len > open + 1) {
-        int32_t close = trimmed.len - 1;
-        bool has_question = false;
-        if (trimmed.ptr[close] == '?') {
-            has_question = true;
-            close--;
-        }
-        if (close > open && trimmed.ptr[close] == ')') {
-            Span callee = span_trim(span_sub(trimmed, 0, open));
-            Span args = span_trim(span_sub(trimmed, open + 1, close));
-            fprintf(file, "cold_csg_stmt\t%d\t%d\t%s\t", fn_index, indent, has_question ? "call_q" : "call");
-            cold_write_span_csg(file, callee);
-            fputc('\t', file);
-            cold_write_span_csg(file, args);
-            fputc('\n', file);
-            return true;
-        }
-    }
-    /* unknown statement kind: skip (may be continuation/argument line) */
-    return true;
-}
 
 
 static bool cold_files_equal(const char *left, const char *right) {
