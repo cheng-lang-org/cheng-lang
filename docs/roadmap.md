@@ -202,6 +202,24 @@
   - 冷编译器原型 `bootstrap/cheng_cold.c` 已包含 SoA BodyIR 层面的 `OP_TAG`/`OP_PAYLOAD`/`TM_SWITCH` 支持。
   - 完整编译器（`src/`）待实现：typed_expr 层的代数类型 layout、lowering 的 match→CBR 转换、ARM64 的 SWITCH term 回填。
 
+
+### cheng_seed.c 覆盖度统计（2026-05-14）
+
+| 语言特性 | cheng_seed 引用数 | 冷编译器状态 |
+|---|---|---|
+| Generics | 356 | 基础泛型 variant 构造已实现 |
+| Closures | 68 | 函数指针 + 闭包表达式已实现 |
+| Pattern matching | 131 | match/switch 已支持 |
+| Async | 70 | 未实现 |
+| Algebraic types | 67 | variant/enum 基本支持 |
+| Import/Module | 2209 | direct import + transitive 已支持 |
+| String interpolation | 5 | 未实现 |
+| Error handling (?/Result) | 39 | 未实现 |
+
+冷编译器总行数：~24,000。cheng_seed.c：66,725 行 (3.1MB)。
+核心差距：async/await（70处）、错误处理（39处）、泛型完整实例化（356处中部分已覆盖）。
+
+
 ## 剩余 gap 详细评估
 
 ### 1. provider archive Linux 验证
