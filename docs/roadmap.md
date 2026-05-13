@@ -1,6 +1,21 @@
 # Cheng 工业级路线图
 
-> 口径：只记录当前仓库能证明或必须硬证明的状态。愿景可以写目标，不写成完成。若与实现冲突，以 `docs/cheng-formal-spec.md`、`src/core/tooling/README.md`、当前源码和当前可执行产物为准。
+> 口径：只记录当前仓库能证明或必须硬证明的状态。
+
+## 模块级进度（2026-05-14）
+
+| 模块 | 进度 | 判断 |
+|---|---|---|
+| 冷编译器基础 codegen | 80% | 小/中型 cold subset 可用，direct Mach-O 可运行 |
+| CSG v2 facts 往返 | 70% | roundtrip 36/36 PASS，object 确定性成立 |
+| PrimaryObjectPlan → facts | 60% | 已有 writer/reader，待扩大到完整 backend driver 规模 |
+| cold --csg-in --emit:obj | 70% | 最小 fixture 稳定，更多 runtime/provider case 未闭合 |
+| cold linkerless exe | 45% | provider-free 可行，provider-backed 未闭环 |
+| provider archive | 0-10% | **当前最大缺口**，命令和合同未成主线 |
+| backend driver fixed-point | 20% | A→facts→cold→B→facts→cold→C 未完整稳定 |
+| Ownership / E-Graph | 25% | No-Alias 基础，E-Graph 闭环(rewrite→hash→DCE→report) |
+| C seed 替代 | 30% | 泛型/闭包/函数指针已实现，cheng_seed.c 仍在链中 |
+| 跨端 | 50% | 三架构 exe 均产出，跨端 runtime smoke 未全完成 |愿景可以写目标，不写成完成。若与实现冲突，以 `docs/cheng-formal-spec.md`、`src/core/tooling/README.md`、当前源码和当前可执行产物为准。
 
 ## 当前事实（2026-05-14）
 
