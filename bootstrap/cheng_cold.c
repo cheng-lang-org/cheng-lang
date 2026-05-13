@@ -20298,9 +20298,19 @@ static bool cold_load_csg_v2_facts(
         }
         total_op_count += (int32_t)op_count;
 
-        /* Register function with symbols */
+        /* Register function with symbols — map return_kind to type string */
+        const char *ret_type_str = "int32";
+        switch ((int32_t)return_kind) {
+            case SLOT_I64: ret_type_str = "int64"; break;
+            case SLOT_STR: ret_type_str = "str"; break;
+            case SLOT_PTR: ret_type_str = "ptr"; break;
+            case SLOT_VARIANT: case SLOT_OBJECT: ret_type_str = "ptr"; break;
+            case SLOT_OPAQUE: ret_type_str = "ptr"; break;
+            default: ret_type_str = "int32"; break;
+        }
         int32_t sym_idx = symbols_add_fn(symbols, fn_name, (int32_t)param_count,
-                                          param_kinds, param_sizes, cold_cstr_span(""));
+                                          param_kinds, param_sizes,
+                                          cold_cstr_span(ret_type_str));
 
         /* Mark external functions (no ops = @importc declaration) */
         if ((int32_t)op_count == 0 && sym_idx >= 0 && sym_idx < symbols->function_count)
