@@ -26,6 +26,7 @@
 #define EV_CURRENT       1
 #define ELFOSABI_SYSV    0
 #define ET_REL           1
+#define ET_EXEC          2
 #define EM_AARCH64       183
 #define EM_X86_64        62
 #define EM_RISCV         243
@@ -282,6 +283,75 @@ static bool elf64_write_object(const char *path,
     free(relas);
 
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) { free(buf); return false; }
+    write(fd, buf, total_sz);
+    close(fd);
+    free(buf);
+    return true;
+}
+
+/* Minimal ELF64 static executable writer. Writes code words at 0x400000
+   with a single PT_LOAD segment covering the code. No dynamic linking. */
+static bool elf_write_exec(const char *path, const uint32_t *code,
+                            int32_t code_words, uint16_t machine) {
+    int32_t code_sz = code_words * 4;
+    int32_t hdr_sz = 64;
+    int32_t phdr_sz = 56; /* one PT_LOAD */
+    int32_t phdr_off = hdr_sz;
+    int32_t code_off = hdr_sz + phdr_sz;
+    uint64_t entry = 0x400000 + code_off;
+    int32_t total_sz = code_off + code_sz;
+
+    uint8_t *buf = (uint8_t *)calloc(1, total_sz);
+    if (!buf) return false;
+    uint32_t *w = (uint32_t *)buf;
+
+    /* ELF Header */
+    w[0] = ELF64_MAGIC;
+    buf[4] = ELFCLASS64; buf[5] = ELFDATA2LSB;
+    buf[6] = EV_CURRENT; buf[7] = ELFOSABI_SYSV;
+    w[4] = ET_EXEC | ((uint32_t)machine << 16);
+    w[5] = 1;                        /* e_version */
+    w[6] = (uint32_t)entry;          /* e_entry */
+    w[7] = (uint32_t)(entry >> 32);
+    w[8] = (uint32_t)phdr_off;       /* e_phoff */
+    w[9] = 0;
+    w[10] = 0;                       /* e_shoff */
+    w[11] = 0;
+    w[12] = 0;                       /* e_flags (4 bytes at 0x30) */
+    /* e_ehsize (2) + e_phentsize (2) */
+    buf[0x34] = 64; buf[0x35] = 0;
+    buf[0x36] = (uint8_t)phdr_sz; buf[0x37] = (uint8_t)(phdr_sz >> 8);
+    /* e_phnum (2) + e_shentsize (2) */
+    buf[0x38] = 1; buf[0x39] = 0;
+    buf[0x3A] = 0; buf[0x3B] = 0;
+    /* e_shnum (2) + e_shstrndx (2) */
+    buf[0x3C] = 0; buf[0x3D] = 0;
+    buf[0x3E] = 0; buf[0x3F] = 0;
+
+    /* Program Header: PT_LOAD covering code segment */
+    {
+        uint32_t *ph = (uint32_t *)(buf + phdr_off);
+        ph[0] = 1;                    /* p_type = PT_LOAD */
+        ph[1] = 5;                    /* p_flags = PF_R | PF_X */
+        ph[2] = (uint32_t)code_off;   /* p_offset (low) */
+        ph[3] = 0;                    /* p_offset (high) */
+        ph[4] = (uint32_t)0x400000;   /* p_vaddr (low) */
+        ph[5] = 0;                    /* p_vaddr (high) */
+        ph[6] = (uint32_t)0x400000;   /* p_paddr (low) */
+        ph[7] = 0;                    /* p_paddr (high) */
+        ph[8] = (uint32_t)code_sz;    /* p_filesz (low) */
+        ph[9] = 0;                    /* p_filesz (high) */
+        ph[10] = (uint32_t)code_sz;   /* p_memsz (low) */
+        ph[11] = 0;                   /* p_memsz (high) */
+        ph[12] = 0x1000;              /* p_align (low) */
+        ph[13] = 0;                   /* p_align (high) */
+    }
+
+    /* Copy code words */
+    memcpy(buf + code_off, code, code_sz);
+
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0755);
     if (fd < 0) { free(buf); return false; }
     write(fd, buf, total_sz);
     close(fd);

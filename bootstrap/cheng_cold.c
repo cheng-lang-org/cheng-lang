@@ -21151,7 +21151,23 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
 
         Code *code = code_new(arena, 256);
         codegen_program(code, function_bodies, symbols->function_count, entry_function, symbols);
-        if (output_direct_macho(out_path, code) != 0) return false;
+        {
+            bool is_elf = target && strstr(target, "linux") != 0;
+            bool is_coff = target && strstr(target, "windows") != 0;
+            if (is_elf) {
+                uint16_t em = 0;
+                if (strstr(target, "aarch64")) em = EM_AARCH64;
+                else if (strstr(target, "riscv64")) em = EM_RISCV;
+                else if (strstr(target, "x86_64")) em = EM_X86_64;
+                if (!elf_write_exec(out_path, code->words, code->count, em)) return false;
+            } else if (is_coff) {
+                /* COFF: fall back to obj + recommend linking */
+                fprintf(stderr, "[cheng_cold] COFF exe not yet supported, use --emit:obj\n");
+                return false;
+            } else {
+                if (output_direct_macho(out_path, code) != 0) return false;
+            }
+        }
 
         if (stats) {
             stats->function_count = symbols->function_count;
