@@ -40,6 +40,8 @@
 /* Diagnostics: enable with --diag:dump_per_fn and --diag:dump_slots */
 static bool cold_diag_dump_per_fn = false;
 static bool cold_diag_dump_slots = false;
+static int32_t cold_egraph_rewrite_count = 0;
+static int32_t cold_egraph_dedup_count = 0;
 
 #include "macho_direct.h"
 #include "elf64_direct.h"
@@ -11353,32 +11355,30 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
                                   entry_function, reachable_functions);
 
     /* E-Graph BodyIR rewrite: identity elimination + constant folding */
+    int32_t egraph_rewrite_count = 0;
     for (int32_t i = 0; i < function_count; i++) {
         BodyIR *body = function_bodies[i];
         if (!body || body->has_fallback) continue;
         for (int32_t oi = 0; oi < body->op_count; oi++) {
             int32_t k = body->op_kind[oi];
             int32_t a = body->op_a[oi], b = body->op_b[oi];
+            int32_t orig_kind = k;
             /* Identity: ADD(x, 0) → x, SUB(x, 0) → x */
-            if ((k == BODY_OP_I32_ADD || k == BODY_OP_I32_SUB) && b == 0) {
+            if ((k == BODY_OP_I32_ADD || k == BODY_OP_I32_SUB) && b == 0)
                 body->op_kind[oi] = BODY_OP_COPY_I32;
-                body->op_b[oi] = 0;
-            }
             /* Identity: MUL(x, 1) → x */
-            else if (k == BODY_OP_I32_MUL && b == 1) {
+            else if (k == BODY_OP_I32_MUL && b == 1)
                 body->op_kind[oi] = BODY_OP_COPY_I32;
-                body->op_b[oi] = 0;
-            }
             /* Identity: AND(x, -1) → x, OR(x, 0) → x, XOR(x, 0) → x */
             else if ((k == BODY_OP_I32_AND && b == -1) ||
                      (k == BODY_OP_I32_OR  && b == 0) ||
-                     (k == BODY_OP_I32_XOR && b == 0)) {
+                     (k == BODY_OP_I32_XOR && b == 0))
                 body->op_kind[oi] = BODY_OP_COPY_I32;
-                body->op_b[oi] = 0;
-            }
+            if (body->op_kind[oi] != orig_kind) egraph_rewrite_count++;
         }
     }
-
+    cold_egraph_rewrite_count = egraph_rewrite_count;
+    cold_egraph_rewrite_count = egraph_rewrite_count;
     FunctionPatchList function_patches = {0};
     function_patches.arena = code->arena;
 
@@ -11612,6 +11612,7 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
                         fprintf(stderr, "  %08x\n", code->words[w]);
                 }
             }
+            cold_egraph_dedup_count = dedup_count;
         }
     }
 
@@ -12022,6 +12023,8 @@ typedef struct ColdCompileStats {
     int32_t facts_reloc_count;
     int32_t canonical_hash_count;
     int32_t canonical_normalized_count;
+    int32_t egraph_rewrite_count;
+    int32_t egraph_dedup_count;
     int32_t total_function_count;
 } ColdCompileStats;
 
@@ -13762,6 +13765,8 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
 
         if (stats) {
             stats->function_count = symbols->function_count;
+            stats->egraph_rewrite_count = cold_egraph_rewrite_count;
+            stats->egraph_dedup_count = cold_egraph_dedup_count;
             stats->csg_lowering = 1;
             stats->arena_kb = arena->used / 1024;
             uint64_t end_us = cold_now_us();
@@ -14662,6 +14667,8 @@ static bool cold_write_system_link_exec_report(const char *path,
         fprintf(file, "canonical_hash_count=%d\n", stats->canonical_hash_count);
         fprintf(file, "canonical_normalized_count=%d\n", stats->canonical_normalized_count);
         fprintf(file, "total_function_count=%d\n", stats->total_function_count);
+        fprintf(file, "egraph_rewrite_count=%d\n", stats->egraph_rewrite_count);
+        fprintf(file, "egraph_dedup_count=%d\n", stats->egraph_dedup_count);
         cold_print_elapsed_ms(file, "cold_compile_elapsed_ms", stats->elapsed_us);
     }
     /* 30-80ms cold self-hosting architecture compliance */
@@ -15835,6 +15842,170 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
     return 0;
 }
 
+static bool cold_file_exists_nonempty(const char *path) {
+    struct stat st;
+    return stat(path, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0;
+}
+
+static bool cold_arg_is_value_for_separate_flag(int argc, char **argv, int index) {
+    if (index <= 2 || index >= argc) return false;
+    const char *prev = argv[index - 1];
+    if (!prev || prev[0] == '\0') return false;
+    return strcmp(prev, "--root") == 0 ||
+           strcmp(prev, "--compiler") == 0 ||
+           strcmp(prev, "--label") == 0 ||
+           strcmp(prev, "--tail-only") == 0;
+}
+
+static int cold_run_host_smoke_ordinary(int argc, char **argv, const char *root) {
+    (void)argc;
+    char out_dir[PATH_MAX];
+    char source_path[PATH_MAX];
+    char out_path[PATH_MAX];
+    char report_path[PATH_MAX];
+    cold_join_path(out_dir, sizeof(out_dir), root, "artifacts/hostrun/cold_builtin");
+    if (!cold_mkdir_p(out_dir)) {
+        fprintf(stderr, "[cheng_cold] run-host-smokes: failed to create %s\n", out_dir);
+        return 1;
+    }
+    cold_join_path(source_path, sizeof(source_path), root, "src/tests/ordinary_zero_exit_fixture.cheng");
+    cold_join_path(out_path, sizeof(out_path), out_dir, "ordinary_zero_exit_fixture");
+    snprintf(report_path, sizeof(report_path), "%s.report.txt", out_path);
+    unlink(out_path);
+    unlink(report_path);
+    if (!cold_file_exists_nonempty(source_path)) {
+        fprintf(stderr, "[cheng_cold] run-host-smokes: missing source %s\n", source_path);
+        return 1;
+    }
+    char root_arg[PATH_MAX + 16];
+    char in_arg[PATH_MAX + 16];
+    char out_arg[PATH_MAX + 16];
+    char report_arg[PATH_MAX + 32];
+    snprintf(root_arg, sizeof(root_arg), "--root:%s", root);
+    snprintf(in_arg, sizeof(in_arg), "--in:%s", source_path);
+    snprintf(out_arg, sizeof(out_arg), "--out:%s", out_path);
+    snprintf(report_arg, sizeof(report_arg), "--report-out:%s", report_path);
+    char *compile_argv[] = {
+        argv[0],
+        "system-link-exec",
+        root_arg,
+        in_arg,
+        "--emit:exe",
+        "--target:arm64-apple-darwin",
+        out_arg,
+        report_arg,
+    };
+    int rc = cold_cmd_system_link_exec(8, compile_argv);
+    if (rc != 0) return rc;
+    if (!cold_run_executable_noargs_rc(out_path, 0)) {
+        fprintf(stderr, "[cheng_cold] run-host-smokes: ordinary executable exit mismatch: %s\n", out_path);
+        return 1;
+    }
+    if (!cold_file_contains_text(report_path, "direct_macho=1\n") ||
+        !cold_file_contains_text(report_path, "system_link=0\n") ||
+        !cold_file_contains_text(report_path, "linkerless_image=1\n")) {
+        fprintf(stderr, "[cheng_cold] run-host-smokes: ordinary report mismatch: %s\n", report_path);
+        return 1;
+    }
+    printf("  PASS ordinary_zero_exit_fixture\n");
+    return 0;
+}
+
+static int cold_run_host_smoke_csg_v2_roundtrip(const char *self_path, const char *root) {
+    char script_path[PATH_MAX];
+    char q_root[PATH_MAX * 2];
+    char q_self[PATH_MAX * 2];
+    char cmd[PATH_MAX * 5];
+    cold_join_path(script_path, sizeof(script_path), root, "tools/cold_csg_v2_roundtrip_test.sh");
+    if (!cold_file_exists_nonempty(script_path)) {
+        fprintf(stderr, "[cheng_cold] run-host-smokes: missing script %s\n", script_path);
+        return 1;
+    }
+    if (!cold_shell_quote(q_root, sizeof(q_root), root) ||
+        !cold_shell_quote(q_self, sizeof(q_self), self_path)) return 1;
+    snprintf(cmd, sizeof(cmd),
+             "cd %s && CHENG_BACKEND_DRIVER=%s tools/cold_csg_v2_roundtrip_test.sh",
+             q_root, q_self);
+    if (!cold_run_shell(cmd, "run-host-smokes cold_csg_sidecar_smoke")) return 1;
+    printf("  PASS cold_csg_sidecar_smoke\n");
+    return 0;
+}
+
+static int cold_run_host_smoke_skill_docs(const char *root) {
+    char skill[PATH_MAX];
+    char grammar[PATH_MAX];
+    char spec[PATH_MAX];
+    char intro[PATH_MAX];
+    cold_join_path(skill, sizeof(skill), root, "docs/cheng-skill/SKILL.md");
+    cold_join_path(grammar, sizeof(grammar), root, "docs/cheng-skill/references/grammar.md");
+    cold_join_path(spec, sizeof(spec), root, "docs/cheng-formal-spec.md");
+    cold_join_path(intro, sizeof(intro), root, "docs/cheng-language-introduction.md");
+    if (!cold_file_contains_text(skill, "`last_verified_date`: `2026-05-13`") ||
+        !cold_file_contains_text(skill, "T { field: value }") ||
+        !cold_file_contains_text(skill, "tools/cold_csg_v2_roundtrip_test.sh") ||
+        !cold_file_contains_text(skill, "emit-cold-csg-v2") ||
+        !cold_file_contains_text(grammar, "2026-05-13") ||
+        !cold_file_contains_text(grammar, "TypeName { field: value }") ||
+        !cold_file_contains_text(spec, "版本：2026-05-13") ||
+        !cold_file_contains_text(spec, "CSG v2") ||
+        !cold_file_contains_text(intro, "tools/cold_csg_v2_roundtrip_test.sh")) {
+        fprintf(stderr, "[cheng_cold] run-host-smokes: cheng skill docs mismatch\n");
+        return 1;
+    }
+    const char *home = getenv("HOME");
+    if (home && home[0] != '\0') {
+        char home_skill[PATH_MAX];
+        char home_grammar[PATH_MAX];
+        snprintf(home_skill, sizeof(home_skill), "%s/.codex/skills/cheng语言/SKILL.md", home);
+        snprintf(home_grammar, sizeof(home_grammar), "%s/.codex/skills/cheng语言/references/grammar.md", home);
+        if (cold_file_exists_nonempty(home_skill) && !cold_files_equal(skill, home_skill)) {
+            fprintf(stderr, "[cheng_cold] run-host-smokes: home skill mirror drift\n");
+            return 1;
+        }
+        if (cold_file_exists_nonempty(home_grammar) && !cold_files_equal(grammar, home_grammar)) {
+            fprintf(stderr, "[cheng_cold] run-host-smokes: home grammar mirror drift\n");
+            return 1;
+        }
+    }
+    printf("  PASS cheng_skill_consistency_smoke\n");
+    return 0;
+}
+
+static int cold_cmd_run_host_smokes(int argc, char **argv, const char *self_path) {
+    const char *root_arg = cold_flag_value(argc, argv, "--root");
+    char root[PATH_MAX];
+    if (root_arg && root_arg[0] != '\0') cold_absolute_path(root_arg, root, sizeof(root));
+    else if (!getcwd(root, sizeof(root))) snprintf(root, sizeof(root), ".");
+    bool ran = false;
+    for (int i = 2; i < argc; i++) {
+        const char *arg = argv[i];
+        if (!arg || arg[0] == '\0') continue;
+        if (cold_arg_is_value_for_separate_flag(argc, argv, i)) continue;
+        if (strncmp(arg, "--", 2) == 0) continue;
+        int rc = 0;
+        if (strcmp(arg, "ordinary_zero_exit_fixture") == 0) {
+            rc = cold_run_host_smoke_ordinary(argc, argv, root);
+        } else if (strcmp(arg, "cold_csg_sidecar_smoke") == 0) {
+            rc = cold_run_host_smoke_csg_v2_roundtrip(self_path, root);
+        } else if (strcmp(arg, "cheng_skill_consistency_smoke") == 0) {
+            rc = cold_run_host_smoke_skill_docs(root);
+        } else {
+            fprintf(stderr, "[cheng_cold] run-host-smokes unsupported smoke: %s\n", arg);
+            fprintf(stderr, "[cheng_cold] supported: ordinary_zero_exit_fixture, cold_csg_sidecar_smoke, cheng_skill_consistency_smoke\n");
+            return 2;
+        }
+        if (rc != 0) return rc;
+        ran = true;
+    }
+    if (!ran) {
+        fprintf(stderr, "[cheng_cold] run-host-smokes requires explicit smoke name\n");
+        fprintf(stderr, "[cheng_cold] supported: ordinary_zero_exit_fixture, cold_csg_sidecar_smoke, cheng_skill_consistency_smoke\n");
+        return 2;
+    }
+    printf("cheng_cold run-host-smokes ok\n");
+    return 0;
+}
+
 /* cold_parser.c included here so all cheng_cold.c static functions are visible */
 #ifndef COLD_BACKEND_ONLY
 #define COLD_CHENG_INCLUDE
@@ -15948,6 +16119,9 @@ int main(int argc, char **argv) {
         int32_t rc = cold_cmd_system_link_exec(new_argc, (char **)new_argv);
         free(new_argv);
         return rc;
+    }
+    if (argc >= 2 && strcmp(argv[1], "run-host-smokes") == 0) {
+        return cold_cmd_run_host_smokes(argc, argv, argv[0]);
     }
 #ifdef COLD_BACKEND_ONLY
     fprintf(stderr, "cheng_cold (backend-only): unknown command '%s'\n", argv[1] ? argv[1] : "(none)");
