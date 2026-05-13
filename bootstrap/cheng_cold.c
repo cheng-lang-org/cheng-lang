@@ -1258,6 +1258,14 @@ static uint64_t cold_fnv1a64_update_cstr(uint64_t hash, const char *text) {
     return cold_fnv1a64_update(hash, (Span){(const uint8_t *)text, (int32_t)strlen(text)});
 }
 
+static uint64_t cold_fnv1a64_update_bytes(uint64_t hash, const uint8_t *ptr, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        hash ^= (uint64_t)ptr[i];
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
 static Span cold_cstr_span(const char *text) {
     return (Span){(const uint8_t *)text, (int32_t)strlen(text)};
 }
@@ -11668,7 +11676,7 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
                 cold_diag_fn_name(symbols->functions[patch.target_function].name);
                 fputc('\n', stderr);
             }
-            code->words[patch.pos] = use_rv64 ? rv_addi(RV_A0, RV_ZERO, 0) : 0xD2800000u;
+            code->words[patch.pos] = use_rv64 ? rv_addi(RV_A0, RV_ZERO, 1) : 0xD2800020u;
             continue;
         }
         int32_t delta = function_pos[patch.target_function] - patch.pos;
@@ -12073,6 +12081,7 @@ typedef struct ColdCompileStats {
     int32_t provider_archive_member_count;
     uint64_t provider_archive_hash;
     int32_t unresolved_symbol_count;
+    int32_t provider_object_count;
 } ColdCompileStats;
 
 static void cold_print_exec_phase_report(FILE *file, ColdCompileStats *stats) {
@@ -13328,7 +13337,8 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
                                            const char *workspace_root,
                                            const char *target,
                                            ColdCompileStats *stats,
-                                           bool obj_mode) {
+                                           bool obj_mode,
+                                           const char *provider_objects) {
     uint64_t start_us = cold_now_us();
     if (stats) memset(stats, 0, sizeof(*stats));
     Arena *arena = mmap(0, sizeof(Arena), PROT_READ | PROT_WRITE,
@@ -14663,7 +14673,11 @@ static bool cold_write_system_link_exec_report(const char *path,
     fprintf(file, "system_link_exec=%d\n", success ? 1 : 0);
     fprintf(file, "real_backend_codegen=%d\n", success ? 1 : 0);
     fputs("cold_system_link_exec=1\n", file);
-    fputs("system_link_exec_scope=cold_subset_direct_macho\n", file);
+    if (stats && stats->link_object) {
+        fputs("system_link_exec_scope=cold_link_object\n", file);
+    } else {
+        fputs("system_link_exec_scope=cold_subset_direct_macho\n", file);
+    }
     fputs("full_backend_codegen=0\n", file);
     fprintf(file, "target=%s\n", target ? target : "");
     fprintf(file, "emit=%s\n", emit ? emit : "");
@@ -14750,6 +14764,18 @@ static uint64_t cold_u64le(const uint8_t *p) {
     uint64_t lo = cold_u32le(p);
     uint64_t hi = cold_u32le(p + 4);
     return lo | (hi << 32);
+}
+
+static void cold_put_u32le(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)(v & 0xFFu);
+    p[1] = (uint8_t)((v >> 8) & 0xFFu);
+    p[2] = (uint8_t)((v >> 16) & 0xFFu);
+    p[3] = (uint8_t)((v >> 24) & 0xFFu);
+}
+
+static void cold_put_u64le(uint8_t *p, uint64_t v) {
+    cold_put_u32le(p, (uint32_t)(v & 0xFFFFFFFFu));
+    cold_put_u32le(p + 4, (uint32_t)(v >> 32));
 }
 
 static bool cold_file_range_ok(int32_t len, uint64_t off, uint64_t size) {
@@ -15582,6 +15608,9 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
     const char *report_path = cold_flag_value(argc, argv, "--report-out");
     const char *target = cold_flag_value(argc, argv, "--target");
     const char *emit = cold_flag_value(argc, argv, "--emit");
+    const char *link_object_path = cold_flag_value(argc, argv, "--link-object");
+    const char *provider_archive_path = cold_flag_value(argc, argv, "--provider-archive");
+    const char *provider_objects = cold_flag_value(argc, argv, "--provider-objects");
     if (!target || target[0] == '\0') target = "arm64-apple-darwin";
     if (!emit || emit[0] == '\0') emit = "exe";
     if ((!csg_out_path || csg_out_path[0] == '\0') &&
@@ -15609,10 +15638,12 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
         fprintf(stderr, "[cheng_cold] cannot combine --csg-in and --csg-out\n");
         return 2;
     }
-    if ((!source_path || source_path[0] == '\0') && (!csg_in_path || csg_in_path[0] == '\0')) {
+    if ((!source_path || source_path[0] == '\0') &&
+        (!csg_in_path || csg_in_path[0] == '\0') &&
+        (!link_object_path || link_object_path[0] == '\0')) {
         cold_write_system_link_exec_report(report_path, false, source_path, csg_in_path, out_path,
                                            target, emit, 0, "missing --in");
-        fprintf(stderr, "[cheng_cold] missing --in:<source> or --csg-in:<facts>\n");
+        fprintf(stderr, "[cheng_cold] missing --in:<source>, --csg-in:<facts>, or --link-object:<obj>\n");
         return 2;
     }
 #ifdef COLD_BACKEND_ONLY
@@ -15669,12 +15700,62 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
         fprintf(stderr, "[cheng_cold] unsupported emit: %s\n", emit);
         return 2;
     }
+    if (link_object_path && link_object_path[0] != '\0') {
+        ColdCompileStats stats = {0};
+        stats.link_object = 1;
+        if ((source_path && source_path[0] != '\0') ||
+            (csg_in_path && csg_in_path[0] != '\0') ||
+            (csg_out_path && csg_out_path[0] != '\0')) {
+            cold_write_system_link_exec_report(report_path, false, link_object_path, provider_archive_path, out_path,
+                                               target, emit, &stats, "cannot combine --link-object with source or csg input");
+            fprintf(stderr, "[cheng_cold] cannot combine --link-object with --in/--csg-in/--csg-out\n");
+            return 2;
+        }
+        if (strcmp(emit, "exe") != 0) {
+            cold_write_system_link_exec_report(report_path, false, link_object_path, provider_archive_path, out_path,
+                                               target, emit, &stats, "--link-object requires --emit:exe");
+            fprintf(stderr, "[cheng_cold] --link-object requires --emit:exe\n");
+            return 2;
+        }
+        if (provider_archive_path && provider_archive_path[0] != '\0') {
+            cold_write_system_link_exec_report(report_path, false, link_object_path, provider_archive_path, out_path,
+                                               target, emit, &stats, "provider archive link not implemented");
+            fprintf(stderr, "[cheng_cold] --provider-archive link not implemented\n");
+            return 2;
+        }
+        if (!is_elf) {
+            cold_write_system_link_exec_report(report_path, false, link_object_path, provider_archive_path, out_path,
+                                               target, emit, &stats, "--link-object currently requires ELF target");
+            fprintf(stderr, "[cheng_cold] --link-object currently requires ELF target\n");
+            return 2;
+        }
+        if (!cold_link_elf64_object_to_exec(link_object_path, out_path, target, &stats)) {
+            cold_write_system_link_exec_report(report_path, false, link_object_path, provider_archive_path, out_path,
+                                               target, emit, &stats, "link object failed");
+            fprintf(stderr, "[cheng_cold] link object failed: %s\n", link_object_path);
+            return 2;
+        }
+        cold_write_system_link_exec_report(report_path, true, link_object_path, provider_archive_path, out_path,
+                                           target, emit, &stats, "");
+        printf("system_link_exec=1\n");
+        printf("real_backend_codegen=1\n");
+        printf("system_link_exec_scope=cold_link_object\n");
+        cold_print_elapsed_ms(stdout, "cold_compile_elapsed_ms", stats.elapsed_us);
+        printf("output=%s\n", out_path);
+        return 0;
+    }
+    if (provider_archive_path && provider_archive_path[0] != '\0') {
+        cold_write_system_link_exec_report(report_path, false, source_path, provider_archive_path, out_path,
+                                           target, emit, 0, "--provider-archive requires --link-object");
+        fprintf(stderr, "[cheng_cold] --provider-archive requires --link-object\n");
+        return 2;
+    }
     /* --emit:obj = emit real Mach-O object file (.o) with symbols */
     if (strcmp(emit, "obj") == 0) {
         if (csg_in_path && csg_in_path[0] != '\0') {
             ColdCompileStats stats = {0};
             if (!cold_compile_csg_path_to_macho(out_path, csg_in_path, 0, 0,
-                                                target, &stats, true)) {
+                                                target, &stats, true, provider_objects)) {
                 cold_write_system_link_exec_report(report_path, false, source_path, csg_in_path, out_path,
                                                    target, emit, &stats, "cold csg v2 object emit failed");
                 return 2;
@@ -15905,7 +15986,7 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
 
         if (effective_csg_path && effective_csg_path[0]) {
             /* CSG path: compile facts → primary .o */
-            if (!cold_compile_csg_path_to_macho(primary_o, effective_csg_path, 0, 0, target, &stats, true)) {
+            if (!cold_compile_csg_path_to_macho(primary_o, effective_csg_path, 0, 0, target, &stats, true, 0)) {
                 fprintf(stderr, "[cheng_cold] --link-providers: csg primary compile failed\n");
                 return 2;
             }
@@ -15997,7 +16078,7 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
     } else if (effective_csg_path && effective_csg_path[0]) {
         compiled = cold_compile_csg_path_to_macho(out_path, effective_csg_path, source_path,
                                                   workspace_root[0] ? workspace_root : 0,
-                                                  target, &stats, false);
+                                                  target, &stats, false, 0);
 #ifndef COLD_BACKEND_ONLY
     } else {
         compiled = cold_compile_source_path_to_macho(out_path, source_path, false, &stats);
