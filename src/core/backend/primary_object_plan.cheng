@@ -2561,6 +2561,35 @@ fn PrimaryBodyIrAppendZeroLocalSlot(bodyIR: var coreir.BodyIR,
     callOrdinal = callOrdinal + 1
     return true
 
+fn PrimaryBodyIrAppendSeqStrAddValueSlot(bodyIR: var coreir.BodyIR,
+                                          seqSlot: int32,
+                                          valueSlot: int32,
+                                          callOrdinal: var int32): bool =
+    if seqSlot < 0 ||
+       seqSlot >= bodyIR.localSlots.len ||
+       valueSlot < 0 ||
+       valueSlot >= bodyIR.localSlots.len:
+        return false
+    if PrimaryBodyIrSlotType(bodyIR, seqSlot) != coreir.LocalAggregateTag ||
+       PrimaryBodyIrSlotType(bodyIR, valueSlot) != coreir.LocalStrTag:
+        return false
+    var call: coreir.CallOp
+    call.targetSymbol = "cheng_seq_str_add"
+    call.resultSlot = -1
+    call.resultPassKind = coreir.BodyCallPassStackValueTag
+    add(call.argSlots, coreir.CallArgSlotAddress(seqSlot))
+    add(call.argPassKinds, coreir.BodyCallPassParamAddressTag)
+    add(call.argSlots, valueSlot)
+    add(call.argPassKinds, coreir.BodyCallPassStackValueTag)
+    add(bodyIR.callSequence, call)
+    var op: coreir.BodyOp
+    op.kind = coreir.BodyOpCallTag
+    op.target = -1
+    add(op.operands, callOrdinal)
+    add(bodyIR.ops, op)
+    callOrdinal = callOrdinal + 1
+    return true
+
 fn PrimaryBodyIrAppendSeqStrAddBuiltin(bodyIR: var coreir.BodyIR,
                                         slotNames: var str[],
                                         typedIr: texpr.TypedExprIr,
@@ -2611,18 +2640,240 @@ fn PrimaryBodyIrAppendSeqStrAddBuiltin(bodyIR: var coreir.BodyIR,
        valueSlot >= bodyIR.localSlots.len ||
        PrimaryBodyIrSlotType(bodyIR, valueSlot) != coreir.LocalStrTag:
         return false
+    return PrimaryBodyIrAppendSeqStrAddValueSlot(bodyIR,
+                                                 seqSlot,
+                                                 valueSlot,
+                                                 callOrdinal)
+
+fn PrimaryBodyIrFmtLiteralPayload(textRaw: str): str =
+    let text = strutil.Strip(textRaw)
+    if len(text) < 5:
+        return ""
+    if !PrimaryStartsWith(text, "Fmt"):
+        return ""
+    var quotePos = 3
+    while quotePos < len(text) && (text[quotePos] == ' ' || text[quotePos] == '\t'):
+        quotePos = quotePos + 1
+    if quotePos >= len(text) || text[quotePos] != '"':
+        return ""
+    if text[len(text) - 1] != '"':
+        return ""
+    return strings.SliceBytes(text, quotePos + 1, len(text) - quotePos - 2)
+
+fn PrimaryBodyIrAppendFmtPieceSlot(bodyIR: var coreir.BodyIR,
+                                    slotNames: var str[],
+                                    targetSlot: int32,
+                                    seqSlot: int32,
+                                    pieceSlot: int32,
+                                    callOrdinal: var int32): bool =
+    let _ = targetSlot
+    return PrimaryBodyIrAppendSeqStrAddValueSlot(bodyIR,
+                                                 seqSlot,
+                                                 pieceSlot,
+                                                 callOrdinal)
+
+fn PrimaryBodyIrAppendFmtLiteralPiece(bodyIR: var coreir.BodyIR,
+                                       slotNames: var str[],
+                                       targetSlot: int32,
+                                       seqSlot: int32,
+                                       literalText: str,
+                                       pieceIndex: int32,
+                                       callOrdinal: var int32): bool =
+    let litSlot = PrimaryBodyIrFindOrCreateSlot(bodyIR,
+                                                slotNames,
+                                                Fmt"{bodyIR.localSlots[targetSlot].name}#fmt_lit#{pieceIndex}",
+                                                coreir.LocalStrTag)
+    if litSlot < 0:
+        return false
+    let quoted = Fmt"\"{literalText}\""
+    if !PrimaryBodyIrAppendStringLiteralValue(bodyIR,
+                                              slotNames,
+                                              quoted,
+                                              litSlot,
+                                              callOrdinal):
+        return false
+    return PrimaryBodyIrAppendFmtPieceSlot(bodyIR,
+                                           slotNames,
+                                           targetSlot,
+                                           seqSlot,
+                                           litSlot,
+                                           callOrdinal)
+
+fn PrimaryBodyIrAppendFmtExprPiece(bodyIR: var coreir.BodyIR,
+                                    slotNames: var str[],
+                                    targetSlot: int32,
+                                    seqSlot: int32,
+                                    exprTextRaw: str,
+                                    pieceIndex: int32,
+                                    callOrdinal: var int32): bool =
+    let exprText = strutil.Strip(exprTextRaw)
+    if exprText == "":
+        return false
+    var valueSlot = PrimaryBodyIrFindArgSlot(slotNames, exprText)
+    if valueSlot < 0 && PrimaryBodyIrTextIsStringLiteral(exprText):
+        valueSlot = PrimaryBodyIrFindOrCreateSlot(bodyIR,
+                                                  slotNames,
+                                                  Fmt"{bodyIR.localSlots[targetSlot].name}#fmt_expr_lit#{pieceIndex}",
+                                                  coreir.LocalStrTag)
+        if valueSlot < 0 ||
+           !PrimaryBodyIrAppendStringLiteralValue(bodyIR,
+                                                  slotNames,
+                                                  exprText,
+                                                  valueSlot,
+                                                  callOrdinal):
+            return false
+    if valueSlot < 0 ||
+       valueSlot >= bodyIR.localSlots.len ||
+       PrimaryBodyIrSlotType(bodyIR, valueSlot) != coreir.LocalStrTag:
+        return false
+    return PrimaryBodyIrAppendFmtPieceSlot(bodyIR,
+                                           slotNames,
+                                           targetSlot,
+                                           seqSlot,
+                                           valueSlot,
+                                           callOrdinal)
+
+fn PrimaryBodyIrAppendFmtLiteralValue(bodyIR: var coreir.BodyIR,
+                                       slotNames: var str[],
+                                       rhsText: str,
+                                       targetSlot: int32,
+                                       callOrdinal: var int32): bool =
+    if targetSlot < 0 ||
+       targetSlot >= bodyIR.localSlots.len ||
+       PrimaryBodyIrSlotType(bodyIR, targetSlot) != coreir.LocalStrTag:
+        return false
+    let payload = PrimaryBodyIrFmtLiteralPayload(rhsText)
+    if payload == "":
+        return false
+    let seqSlot = PrimaryBodyIrFindOrCreateSlotSized(bodyIR,
+                                                     slotNames,
+                                                     Fmt"{bodyIR.localSlots[targetSlot].name}#fmt_parts",
+                                                     coreir.LocalAggregateTag,
+                                                     16,
+                                                     8)
+    if seqSlot < 0:
+        return false
+    if !PrimaryBodyIrAppendZeroLocalSlot(bodyIR,
+                                         slotNames,
+                                         seqSlot,
+                                         callOrdinal):
+        return false
+    var currentLiteral = ""
+    var pieceIndex: int32
+    var i: int32
+    while i < len(payload):
+        let ch = payload[i]
+        if ch == '{':
+            if i + 1 < len(payload) && payload[i + 1] == '{':
+                currentLiteral = Fmt"{currentLiteral}{{"
+                i = i + 2
+                continue
+            if len(currentLiteral) > 0:
+                if !PrimaryBodyIrAppendFmtLiteralPiece(bodyIR,
+                                                       slotNames,
+                                                       targetSlot,
+                                                       seqSlot,
+                                                       currentLiteral,
+                                                       pieceIndex,
+                                                       callOrdinal):
+                    return false
+                pieceIndex = pieceIndex + 1
+                currentLiteral = ""
+            let exprStart = i + 1
+            var exprEnd = -1
+            var inExprString = false
+            var inExprChar = false
+            var parenDepth: int32
+            var bracketDepth: int32
+            var braceDepth: int32
+            var cursor = exprStart
+            while cursor < len(payload):
+                let exprCh = payload[cursor]
+                if !inExprChar && exprCh == '"' && (cursor <= 0 || payload[cursor - 1] != '\\'):
+                    inExprString = !inExprString
+                    cursor = cursor + 1
+                    continue
+                if !inExprString && exprCh == '\'' && (cursor <= 0 || payload[cursor - 1] != '\\'):
+                    inExprChar = !inExprChar
+                    cursor = cursor + 1
+                    continue
+                if inExprString || inExprChar:
+                    cursor = cursor + 1
+                    continue
+                if exprCh == '(':
+                    parenDepth = parenDepth + 1
+                elif exprCh == ')':
+                    if parenDepth > 0:
+                        parenDepth = parenDepth - 1
+                elif exprCh == '[':
+                    bracketDepth = bracketDepth + 1
+                elif exprCh == ']':
+                    if bracketDepth > 0:
+                        bracketDepth = bracketDepth - 1
+                elif exprCh == '{':
+                    braceDepth = braceDepth + 1
+                elif exprCh == '}':
+                    if parenDepth == 0 && bracketDepth == 0 && braceDepth == 0:
+                        exprEnd = cursor
+                        break
+                    if braceDepth > 0:
+                        braceDepth = braceDepth - 1
+                cursor = cursor + 1
+            if exprEnd < exprStart:
+                return false
+            let exprText = strings.SliceBytes(payload, exprStart, exprEnd - exprStart)
+            if !PrimaryBodyIrAppendFmtExprPiece(bodyIR,
+                                                slotNames,
+                                                targetSlot,
+                                                seqSlot,
+                                                exprText,
+                                                pieceIndex,
+                                                callOrdinal):
+                return false
+            pieceIndex = pieceIndex + 1
+            i = exprEnd + 1
+            continue
+        if ch == '}':
+            if i + 1 < len(payload) && payload[i + 1] == '}':
+                currentLiteral = Fmt"{currentLiteral}}}"
+                i = i + 2
+                continue
+            return false
+        currentLiteral = Fmt"{currentLiteral}{strings.CharToStr(ch)}"
+        i = i + 1
+    if len(currentLiteral) > 0 || pieceIndex == 0:
+        if !PrimaryBodyIrAppendFmtLiteralPiece(bodyIR,
+                                               slotNames,
+                                               targetSlot,
+                                               seqSlot,
+                                               currentLiteral,
+                                               pieceIndex,
+                                               callOrdinal):
+            return false
+        pieceIndex = pieceIndex + 1
+    let sepSlot = PrimaryBodyIrFindOrCreateSlot(bodyIR,
+                                                slotNames,
+                                                Fmt"{bodyIR.localSlots[targetSlot].name}#fmt_sep",
+                                                coreir.LocalStrTag)
+    if sepSlot < 0 ||
+       !PrimaryBodyIrAppendStringLiteralValue(bodyIR,
+                                              slotNames,
+                                              "\"\"",
+                                              sepSlot,
+                                              callOrdinal):
+        return false
     var call: coreir.CallOp
-    call.targetSymbol = "cheng_seq_str_add"
-    call.resultSlot = -1
-    call.resultPassKind = coreir.BodyCallPassStackValueTag
-    add(call.argSlots, coreir.CallArgSlotAddress(seqSlot))
-    add(call.argPassKinds, coreir.BodyCallPassParamAddressTag)
-    add(call.argSlots, valueSlot)
+    call.targetSymbol = "cheng_strutils_join_bridge"
+    call.resultSlot = targetSlot
+    call.resultPassKind = coreir.BodyCallPassSretResultTag
+    add(call.argSlots, seqSlot)
+    add(call.argPassKinds, coreir.BodyCallPassStackValueTag)
+    add(call.argSlots, sepSlot)
     add(call.argPassKinds, coreir.BodyCallPassStackValueTag)
     add(bodyIR.callSequence, call)
     var op: coreir.BodyOp
     op.kind = coreir.BodyOpCallTag
-    op.target = -1
+    op.target = targetSlot
     add(op.operands, callOrdinal)
     add(bodyIR.ops, op)
     callOrdinal = callOrdinal + 1
@@ -2655,6 +2906,13 @@ fn PrimaryBodyIrAppendLocalDeclInitializer(bodyIR: var coreir.BodyIR,
                                                      rhsText,
                                                      targetSlot,
                                                      callOrdinal)
+    if targetTypeKind == coreir.LocalStrTag &&
+       PrimaryBodyIrFmtLiteralPayload(rhsText) != "":
+        return PrimaryBodyIrAppendFmtLiteralValue(bodyIR,
+                                                  slotNames,
+                                                  rhsText,
+                                                  targetSlot,
+                                                  callOrdinal)
     if targetTypeKind == coreir.LocalI32Tag &&
        PrimaryBodyIrUInt8PtrDerefPointerText(rhsText) != "":
         return PrimaryBodyIrAppendUInt8PtrDerefLoad(bodyIR,
@@ -3516,6 +3774,13 @@ fn PrimaryBodyIrAppendI32Assign(bodyIR: var coreir.BodyIR,
     let lhsSlot = PrimaryBodyIrFindSlotIndex(slotNames, lhsName)
     if lhsSlot < 0:
         return false
+    if PrimaryBodyIrSlotType(bodyIR, lhsSlot) == coreir.LocalStrTag &&
+       PrimaryBodyIrFmtLiteralPayload(rhsText) != "":
+        return PrimaryBodyIrAppendFmtLiteralValue(bodyIR,
+                                                  slotNames,
+                                                  rhsText,
+                                                  lhsSlot,
+                                                  callOrdinal)
     if PrimaryBodyIrSlotType(bodyIR, lhsSlot) == coreir.LocalI32Tag &&
        PrimaryBodyIrConditionHasAnd(rhsText):
         return PrimaryBodyIrAppendBoolConditionAssign(bodyIR,
@@ -3525,6 +3790,62 @@ fn PrimaryBodyIrAppendI32Assign(bodyIR: var coreir.BodyIR,
                                                       rhsText,
                                                       lhsSlot)
     let lhsIsVarI32 = PrimaryBodyIrNameInList(varI32ParamNames, lhsName)
+    if stmt.callTarget != "":
+        var resultSlot = lhsSlot
+        var copyCallResultToLhs = false
+        let resultTypeText = PrimaryBodyIrResolvedCallResultType(typedIr, stmt)
+        if lhsIsVarI32:
+            resultSlot = PrimaryBodyIrFindOrCreateSlot(bodyIR,
+                                                       slotNames,
+                                                       PrimaryBodyIrVarI32ValueSlotName(lhsName),
+                                                       coreir.LocalI32Tag)
+        elif PrimaryBodyIrSlotType(bodyIR, lhsSlot) == coreir.LocalStrTag ||
+             PrimaryBodyIrSlotType(bodyIR, lhsSlot) == coreir.LocalAggregateTag:
+            var tempResultType = resultTypeText
+            if tempResultType == "" || tempResultType == "unknown":
+                tempResultType = stmt.resultType
+            if tempResultType == "" || tempResultType == "unknown":
+                return false
+            resultSlot = PrimaryBodyIrFindOrCreateTypedSlot(bodyIR,
+                                                            slotNames,
+                                                            typedIr,
+                                                            PrimaryBodyIrCallResultLayoutSourcePath(stmt),
+                                                            Fmt"{lhsName}#call_result#{stmt.lineNumber}",
+                                                            tempResultType)
+            if resultSlot < 0:
+                return false
+            copyCallResultToLhs = true
+        elif resultTypeText != "":
+            var resultTypeKind: int32
+            var resultSizeBytes: int32
+            var resultAlignBytes: int32
+            PrimaryBodyIrTypeShapeFromText(typedIr,
+                                           PrimaryBodyIrCallResultLayoutSourcePath(stmt),
+                                           resultTypeText,
+                                           resultTypeKind,
+                                           resultSizeBytes,
+                                           resultAlignBytes)
+            if resultTypeKind != PrimaryBodyIrSlotType(bodyIR, lhsSlot):
+                return false
+        let _ = PrimaryBodyIrAppendCallOp(bodyIR,
+                                          slotNames,
+                                          lowering,
+                                          typedIr,
+                                          typedFn,
+                                          irFunction,
+                                          stmt,
+                                          resultSlot,
+                                          varI32ParamNames,
+                                          callOrdinal)
+        if lhsIsVarI32:
+            PrimaryBodyIrAppendVarI32Store(bodyIR, lhsSlot, resultSlot)
+        elif copyCallResultToLhs:
+            var copyOp: coreir.BodyOp
+            copyOp.kind = coreir.BodyOpCopyLocalTag
+            copyOp.target = lhsSlot
+            add(copyOp.operands, resultSlot)
+            add(bodyIR.ops, copyOp)
+        return true
     if !lhsIsVarI32 && PrimaryBodyIrSlotType(bodyIR, lhsSlot) != coreir.LocalI32Tag:
         let rhsSlot = PrimaryBodyIrFindArgSlot(slotNames, rhsText)
         if rhsSlot >= 0:
