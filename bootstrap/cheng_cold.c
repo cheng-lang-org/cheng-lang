@@ -21162,30 +21162,51 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
             return ok;
         }
 
-        Code *code = code_new(arena, 256);
-        codegen_program(code, function_bodies, symbols->function_count, entry_function, symbols, target);
-        {
-            bool is_elf = target && strstr(target, "linux") != 0;
-            bool is_coff = target && strstr(target, "windows") != 0;
-            if (is_elf) {
-                uint16_t em = 0;
-                if (strstr(target, "aarch64")) em = EM_AARCH64;
-                else if (strstr(target, "riscv64")) em = EM_RISCV;
-                else if (strstr(target, "x86_64")) em = EM_X86_64;
-                if (!elf_write_exec(out_path, code->words, code->count, em)) return false;
-            } else if (is_coff) {
-                /* COFF: fall back to obj + recommend linking */
-                fprintf(stderr, "[cheng_cold] COFF exe not yet supported, use --emit:obj\n");
-                return false;
-            } else {
-                if (output_direct_macho(out_path, code) != 0) return false;
+        bool is_x64 = target && strstr(target, "x86_64") != 0;
+        if (is_x64) {
+            /* x86_64 uses byte-level codegen (X64Code) → pack to 32-bit words */
+            X64Code x64;
+            x64_init(&x64, 65536);
+            FunctionPatchList x64_patches = {0};
+            x64_patches.arena = arena;
+            for (int32_t i = 0; i < symbols->function_count; i++) {
+                if (!function_bodies[i]) continue;
+                BodyIR *body = function_bodies[i];
+                if ((uintptr_t)body < 4096 || body->has_fallback) continue;
+                x64_codegen_func(&x64, body, symbols, &x64_patches);
+            }
+            Code *code = code_new(arena, (x64.len / 4) + 256);
+            code->count = x64_pack_words(&x64, code->words, code->cap);
+            uint16_t em = EM_X86_64;
+            if (!elf_write_exec(out_path, code->words, code->count, em)) return false;
+            if (stats) { stats->code_words = code->count; stats->csg_lowering = 1; }
+        } else {
+            Code *code = code_new(arena, 256);
+            codegen_program(code, function_bodies, symbols->function_count, entry_function, symbols, target);
+            {
+                bool is_elf = target && strstr(target, "linux") != 0;
+                bool is_coff = target && strstr(target, "windows") != 0;
+                if (is_elf) {
+                    uint16_t em = 0;
+                    if (strstr(target, "aarch64")) em = EM_AARCH64;
+                    else if (strstr(target, "riscv64")) em = EM_RISCV;
+                    else em = EM_X86_64;
+                    if (!elf_write_exec(out_path, code->words, code->count, em)) return false;
+                } else if (is_coff) {
+                    fprintf(stderr, "[cheng_cold] COFF exe not yet supported, use --emit:obj\n");
+                    return false;
+                } else {
+                    if (output_direct_macho(out_path, code) != 0) return false;
+                }
+            }
+            if (stats) {
+                stats->code_words = code->count;
             }
         }
 
         if (stats) {
             stats->function_count = symbols->function_count;
             stats->csg_lowering = 1;
-            stats->code_words = code->count;
             stats->arena_kb = arena->used / 1024;
             uint64_t end_us = cold_now_us();
             if (start_us > 0 && end_us >= start_us) stats->elapsed_us = end_us - start_us;
