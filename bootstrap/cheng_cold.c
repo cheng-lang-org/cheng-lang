@@ -11405,15 +11405,45 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
     cold_mark_reachable_functions(symbols, function_bodies, function_count,
                                   entry_function, reachable_functions);
 
-    /* E-Graph BodyIR rewrite: identity elimination + constant folding */
+    /* E-Graph BodyIR rewrite: identity elimination + constant folding + copy elimination */
     int32_t egraph_rewrite_count = 0;
     for (int32_t i = 0; i < function_count; i++) {
         BodyIR *body = function_bodies[i];
         if (!body || body->has_fallback) continue;
+        /* Build slot→op mapping for constant/copy folding */
+        int32_t *slot_writer = arena_alloc(code->arena, (size_t)body->slot_count * sizeof(int32_t));
+        for (int32_t si = 0; si < body->slot_count; si++) slot_writer[si] = -1;
         for (int32_t oi = 0; oi < body->op_count; oi++) {
+            int32_t dst = body->op_dst[oi];
+            if (dst >= 0 && dst < body->slot_count) slot_writer[dst] = oi;
             int32_t k = body->op_kind[oi];
             int32_t a = body->op_a[oi], b = body->op_b[oi];
             int32_t orig_kind = k;
+            /* Constant folding: arithmetic with two I32_CONST operands */
+            int32_t a_op = (a >= 0 && a < body->slot_count) ? slot_writer[a] : -1;
+            int32_t b_op = (b >= 0 && b < body->slot_count) ? slot_writer[b] : -1;
+            bool a_const = (a_op >= 0 && body->op_kind[a_op] == BODY_OP_I32_CONST);
+            bool b_const = (b_op >= 0 && body->op_kind[b_op] == BODY_OP_I32_CONST);
+            if (a_const && b_const) {
+                int32_t va = body->op_a[a_op];
+                int32_t vb = body->op_a[b_op];
+                int32_t result = 0;
+                bool folded = true;
+                if (k == BODY_OP_I32_ADD) result = va + vb;
+                else if (k == BODY_OP_I32_SUB) result = va - vb;
+                else if (k == BODY_OP_I32_MUL) result = va * vb;
+                else if (k == BODY_OP_I32_AND) result = va & vb;
+                else if (k == BODY_OP_I32_OR)  result = va | vb;
+                else folded = false;
+                if (folded) {
+                    body->op_kind[oi] = BODY_OP_I32_CONST;
+                    body->op_a[oi] = result;
+                    body->op_b[oi] = 0;
+                    body->op_c[oi] = 0;
+                    egraph_rewrite_count++;
+                    continue;
+                }
+            }
             /* Identity: ADD(x, 0) → x, SUB(x, 0) → x */
             if ((k == BODY_OP_I32_ADD || k == BODY_OP_I32_SUB) && b == 0)
                 body->op_kind[oi] = BODY_OP_COPY_I32;
@@ -11425,10 +11455,17 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
                      (k == BODY_OP_I32_OR  && b == 0) ||
                      (k == BODY_OP_I32_XOR && b == 0))
                 body->op_kind[oi] = BODY_OP_COPY_I32;
+            /* Double COPY elimination: COPY(COPY(x)) → COPY(x) */
+            else if (k == BODY_OP_COPY_I32) {
+                int32_t src_op = (a >= 0 && a < body->slot_count) ? slot_writer[a] : -1;
+                if (src_op >= 0 && body->op_kind[src_op] == BODY_OP_COPY_I32) {
+                    body->op_a[oi] = body->op_a[src_op];
+                    egraph_rewrite_count++;
+                }
+            }
             if (body->op_kind[oi] != orig_kind) egraph_rewrite_count++;
         }
     }
-    cold_egraph_rewrite_count = egraph_rewrite_count;
     cold_egraph_rewrite_count = egraph_rewrite_count;
     FunctionPatchList function_patches = {0};
     function_patches.arena = code->arena;
@@ -14968,7 +15005,6 @@ static bool cold_link_elf64_object_to_exec(const char *object_path,
 
     int32_t text_idx = -1;
     int32_t symtab_idx = -1;
-    int32_t rela_text_idx = -1;
     for (int32_t i = 0; i < (int32_t)shnum; i++) {
         const Elf64_Shdr *sh = &shdrs[i];
         if (!cold_file_range_ok(obj.len, sh->sh_offset, sh->sh_size)) goto done;
@@ -14978,12 +15014,17 @@ static bool cold_link_elf64_object_to_exec(const char *object_path,
             text_idx = i;
         } else if (sh->sh_type == SHT_SYMTAB) {
             symtab_idx = i;
-        } else if (sh->sh_type == SHT_RELA &&
-                   cold_elf_section_name_eq(shstr_data, shstr->sh_size, sh->sh_name, ".rela.text")) {
-            rela_text_idx = i;
         }
     }
     if (text_idx <= 0 || symtab_idx <= 0) goto done;
+    int32_t rela_text_idx = -1;
+    for (int32_t i = 0; i < (int32_t)shnum; i++) {
+        const Elf64_Shdr *sh = &shdrs[i];
+        if (sh->sh_type == SHT_RELA && sh->sh_info == (uint32_t)text_idx) {
+            rela_text_idx = i;
+            break;
+        }
+    }
 
     const Elf64_Shdr *text = &shdrs[text_idx];
     if ((text->sh_size % 4) != 0 || text->sh_size > (uint64_t)INT32_MAX * 4ULL) goto done;
@@ -15077,8 +15118,8 @@ static const char *cold_object_format_for_target_cstr(const char *target) {
     if (!target) return "";
     if (strcmp(target, "arm64-apple-darwin") == 0) return "macho";
     if (strcmp(target, "aarch64-unknown-linux-gnu") == 0 ||
-        strcmp(target, "x86_64-unknown-linux-gnu") == 0 ||
         strcmp(target, "riscv64-unknown-linux-gnu") == 0) return "elf";
+    if (strcmp(target, "x86_64-unknown-linux-gnu") == 0) return "";
     if (strcmp(target, "x86_64-pc-windows-msvc") == 0 ||
         strcmp(target, "aarch64-pc-windows-msvc") == 0) return "coff";
     return "";
@@ -15313,7 +15354,6 @@ static bool cold_read_elf64_relocatable_view(const uint8_t *data,
 
     int32_t text_idx = -1;
     int32_t symtab_idx = -1;
-    int32_t rela_idx = -1;
     for (int32_t i = 0; i < (int32_t)shnum; i++) {
         const Elf64_Shdr *sh = &shdrs[i];
         if (!cold_file_range_ok(len, sh->sh_offset, sh->sh_size)) return false;
@@ -15323,12 +15363,17 @@ static bool cold_read_elf64_relocatable_view(const uint8_t *data,
             text_idx = i;
         } else if (sh->sh_type == SHT_SYMTAB) {
             symtab_idx = i;
-        } else if (sh->sh_type == SHT_RELA &&
-                   cold_elf_section_name_eq(shstr_data, shstr->sh_size, sh->sh_name, ".rela.text")) {
-            rela_idx = i;
         }
     }
     if (text_idx <= 0 || symtab_idx <= 0) return false;
+    int32_t rela_idx = -1;
+    for (int32_t i = 0; i < (int32_t)shnum; i++) {
+        const Elf64_Shdr *sh = &shdrs[i];
+        if (sh->sh_type == SHT_RELA && sh->sh_info == (uint32_t)text_idx) {
+            rela_idx = i;
+            break;
+        }
+    }
     const Elf64_Shdr *text = &shdrs[text_idx];
     if ((text->sh_size % 4) != 0 || text->sh_size > (uint64_t)INT32_MAX * 4ULL) return false;
     const Elf64_Shdr *symtab = &shdrs[symtab_idx];
@@ -15430,14 +15475,20 @@ static bool cold_link_relocs_for_object(ColdElfObjectView *obj,
         const char *sym_name = cold_elf_symbol_name(obj, sym_index);
         if (sym->st_shndx == (uint16_t)obj->text_idx) {
             if ((sym->st_value % 4) != 0 || sym->st_value / 4 >= (uint64_t)obj->word_count) return false;
-            target_word = base_word + (int32_t)(sym->st_value / 4) + (int32_t)(reloc->r_addend / 4);
+            if ((reloc->r_addend % 4) != 0) return false;
+            int64_t local_word = (int64_t)(sym->st_value / 4) + (reloc->r_addend / 4);
+            if (local_word < 0 || local_word >= obj->word_count) return false;
+            target_word = base_word + (int32_t)local_word;
         } else if (sym->st_shndx == 0 && provider && provider_export &&
                    sym_name && strcmp(sym_name, provider_export) == 0) {
             int32_t provider_sym = cold_elf_find_defined_symbol(provider, provider_export);
             if (provider_sym < 0) return false;
             const Elf64_Sym *ps = &provider->syms[provider_sym];
             if ((ps->st_value % 4) != 0 || ps->st_value / 4 >= (uint64_t)provider->word_count) return false;
-            target_word = provider_base_word + (int32_t)(ps->st_value / 4) + (int32_t)(reloc->r_addend / 4);
+            if ((reloc->r_addend % 4) != 0) return false;
+            int64_t provider_word = (int64_t)(ps->st_value / 4) + (reloc->r_addend / 4);
+            if (provider_word < 0 || provider_word >= provider->word_count) return false;
+            target_word = provider_base_word + (int32_t)provider_word;
             if (stats) stats->provider_resolved_symbol_count++;
         } else if (sym->st_shndx == 0) {
             if (stats) {
@@ -15536,6 +15587,114 @@ done:
     if (primary_span.len > 0) munmap((void *)primary_span.ptr, (size_t)primary_span.len);
     if (archive_span.len > 0) munmap((void *)archive_span.ptr, (size_t)archive_span.len);
     return ok;
+}
+
+static bool cold_write_provider_archive_pack_report(const char *path,
+                                                    bool ok,
+                                                    const char *target,
+                                                    const char *object_path,
+                                                    const char *archive_path,
+                                                    const char *export_symbol,
+                                                    int32_t member_count,
+                                                    uint64_t archive_hash,
+                                                    const char *error) {
+    if (!path || path[0] == '\0') return true;
+    char parent[PATH_MAX];
+    if (cold_parent_dir(path, parent, sizeof(parent)) && !cold_mkdir_p(parent)) return false;
+    FILE *file = fopen(path, "w");
+    if (!file) return false;
+    fprintf(file, "provider_archive_pack=%d\n", ok ? 1 : 0);
+    fprintf(file, "provider_archive=%d\n", ok ? 1 : 0);
+    fprintf(file, "target=%s\n", target ? target : "");
+    fprintf(file, "object=%s\n", object_path ? object_path : "");
+    fprintf(file, "output=%s\n", archive_path ? archive_path : "");
+    fprintf(file, "provider_export=%s\n", export_symbol ? export_symbol : "");
+    fprintf(file, "provider_archive_member_count=%d\n", member_count);
+    fprintf(file, "provider_object_count=%d\n", ok ? member_count : 0);
+    fprintf(file, "provider_export_count=%d\n", ok ? 1 : 0);
+    fprintf(file, "provider_archive_hash=%016llx\n", (unsigned long long)archive_hash);
+    fputs("system_link=0\n", file);
+    fputs("linkerless_image=1\n", file);
+    if (error && error[0] != '\0') fprintf(file, "error=%s\n", error);
+    fclose(file);
+    return true;
+}
+
+static int cold_cmd_provider_archive_pack(int argc, char **argv) {
+    const char *target = cold_flag_value(argc, argv, "--target");
+    const char *object_path = cold_flag_value(argc, argv, "--object");
+    const char *out_path = cold_flag_value(argc, argv, "--out");
+    const char *export_symbol = cold_flag_value(argc, argv, "--export");
+    const char *module = cold_flag_value(argc, argv, "--module");
+    const char *source = cold_flag_value(argc, argv, "--source");
+    const char *report_path = cold_flag_value(argc, argv, "--report-out");
+    if (!target || target[0] == '\0') target = "arm64-apple-darwin";
+    if (!object_path || object_path[0] == '\0') {
+        cold_write_provider_archive_pack_report(report_path, false, target, object_path, out_path,
+                                                export_symbol, 0, 0, "missing --object");
+        fprintf(stderr, "[cheng_cold] provider-archive-pack requires --object:<obj>\n");
+        return 2;
+    }
+    if (!out_path || out_path[0] == '\0') {
+        cold_write_provider_archive_pack_report(report_path, false, target, object_path, out_path,
+                                                export_symbol, 0, 0, "missing --out");
+        fprintf(stderr, "[cheng_cold] provider-archive-pack requires --out:<archive>\n");
+        return 2;
+    }
+    if (!export_symbol || export_symbol[0] == '\0') {
+        cold_write_provider_archive_pack_report(report_path, false, target, object_path, out_path,
+                                                export_symbol, 0, 0, "missing --export");
+        fprintf(stderr, "[cheng_cold] provider-archive-pack requires --export:<symbol>\n");
+        return 2;
+    }
+    uint16_t machine = cold_elf_machine_for_target(target);
+    if (machine == 0) {
+        cold_write_provider_archive_pack_report(report_path, false, target, object_path, out_path,
+                                                export_symbol, 0, 0, "provider archive requires ELF target");
+        fprintf(stderr, "[cheng_cold] provider-archive-pack currently requires ELF target\n");
+        return 2;
+    }
+    Span object = source_open(object_path);
+    if (object.len <= 0) {
+        cold_write_provider_archive_pack_report(report_path, false, target, object_path, out_path,
+                                                export_symbol, 0, 0, "object open failed");
+        fprintf(stderr, "[cheng_cold] provider object open failed: %s\n", object_path);
+        return 2;
+    }
+    ColdElfObjectView view;
+    bool valid = cold_read_elf64_relocatable_view(object.ptr, object.len, target, &view);
+    bool has_export = valid && cold_elf_find_defined_symbol(&view, export_symbol) >= 0;
+    if (object.len > 0) munmap((void *)object.ptr, (size_t)object.len);
+    if (!valid) {
+        cold_write_provider_archive_pack_report(report_path, false, target, object_path, out_path,
+                                                export_symbol, 0, 0, "invalid provider object");
+        fprintf(stderr, "[cheng_cold] invalid provider object: %s\n", object_path);
+        return 2;
+    }
+    if (!has_export) {
+        cold_write_provider_archive_pack_report(report_path, false, target, object_path, out_path,
+                                                export_symbol, 0, 0, "provider export not defined");
+        fprintf(stderr, "[cheng_cold] provider export not defined: %s\n", export_symbol);
+        return 2;
+    }
+    int32_t member_count = 0;
+    uint64_t archive_hash = 0;
+    if (!cold_write_provider_archive(out_path, target, object_path, module, source, export_symbol,
+                                     &member_count, &archive_hash) ||
+        member_count != 1 ||
+        !cold_verify_provider_archive(out_path, target, &member_count, &archive_hash)) {
+        cold_write_provider_archive_pack_report(report_path, false, target, object_path, out_path,
+                                                export_symbol, 0, 0, "provider archive write failed");
+        fprintf(stderr, "[cheng_cold] provider archive write failed: %s\n", out_path);
+        return 2;
+    }
+    cold_write_provider_archive_pack_report(report_path, true, target, object_path, out_path,
+                                            export_symbol, member_count, archive_hash, "");
+    printf("provider_archive_pack=1\n");
+    printf("provider_archive_member_count=%d\n", member_count);
+    printf("provider_archive_hash=%016llx\n", (unsigned long long)archive_hash);
+    printf("output=%s\n", out_path);
+    return 0;
 }
 
 /* Compile source to Mach-O object file (.o) with symbol table */
@@ -16319,19 +16478,20 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
             fprintf(stderr, "[cheng_cold] --link-object requires --emit:exe\n");
             return 2;
         }
-        if (provider_archive_path && provider_archive_path[0] != '\0') {
-            cold_write_system_link_exec_report(report_path, false, link_object_path, provider_archive_path, out_path,
-                                               target, emit, &stats, "provider archive link not implemented");
-            fprintf(stderr, "[cheng_cold] --provider-archive link not implemented\n");
-            return 2;
-        }
         if (!is_elf) {
             cold_write_system_link_exec_report(report_path, false, link_object_path, provider_archive_path, out_path,
                                                target, emit, &stats, "--link-object currently requires ELF target");
             fprintf(stderr, "[cheng_cold] --link-object currently requires ELF target\n");
             return 2;
         }
-        if (!cold_link_elf64_object_to_exec(link_object_path, out_path, target, &stats)) {
+        bool linked = false;
+        if (provider_archive_path && provider_archive_path[0] != '\0') {
+            linked = cold_link_elf64_object_with_provider_archive(link_object_path, provider_archive_path,
+                                                                  out_path, target, &stats);
+        } else {
+            linked = cold_link_elf64_object_to_exec(link_object_path, out_path, target, &stats);
+        }
+        if (!linked) {
             cold_write_system_link_exec_report(report_path, false, link_object_path, provider_archive_path, out_path,
                                                target, emit, &stats, "link object failed");
             fprintf(stderr, "[cheng_cold] link object failed: %s\n", link_object_path);
@@ -17038,6 +17198,9 @@ int main(int argc, char **argv) {
 #endif
     if (argc >= 2 && strcmp(argv[1], "status") == 0) {
         return cold_cmd_status(argc, argv);
+    }
+    if (argc >= 2 && strcmp(argv[1], "provider-archive-pack") == 0) {
+        return cold_cmd_provider_archive_pack(argc, argv);
     }
     if (argc >= 2 && (strcmp(argv[1], "system-link-exec") == 0 ||
                       strcmp(argv[1], "--system-link-exec") == 0)) {
