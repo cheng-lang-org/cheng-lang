@@ -17147,15 +17147,27 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
             }
         }
     } else if (kind == BODY_OP_CALL_I32) {
-        if (a < 0 || a >= symbols->function_count) die("invalid function call target");
-        FnDef *fn = &symbols->functions[a];
-        int32_t stack_bytes = codegen_load_call_args(code, body, fn, b);
-        int32_t call_pos = code->count;
-        code_emit(code, a64_bl(0));
-        function_patches_add(function_patches, call_pos, a);
-        if (stack_bytes > 0) a64_emit_add_large(code, SP, SP, stack_bytes, true);
-        int32_t ret_kind = cold_return_kind_from_span(symbols, fn->ret);
-        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], ret_kind == SLOT_I64 || ret_kind == SLOT_PTR || ret_kind == SLOT_OPAQUE);
+        /* Auto-register missing call targets as external symbols */
+        if (a >= symbols->function_count) {
+            char tmp[64];
+            snprintf(tmp, sizeof(tmp), "__ext_fn_%d", a);
+            a = symbols_add_fn(symbols, cold_cstr_span(tmp), 0, 0, 0, cold_cstr_span("int32"));
+            if (a >= 0 && a < symbols->function_count)
+                symbols->functions[a].is_external = true;
+        }
+        if (a < 0 || a >= symbols->function_count) {
+            code_emit(code, a64_movz(R0, 0, 0));
+            a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
+        } else {
+            FnDef *fn = &symbols->functions[a];
+            int32_t stack_bytes = codegen_load_call_args(code, body, fn, b);
+            int32_t call_pos = code->count;
+            code_emit(code, a64_bl(0));
+            function_patches_add(function_patches, call_pos, a);
+            if (stack_bytes > 0) a64_emit_add_large(code, SP, SP, stack_bytes, true);
+            int32_t ret_kind = cold_return_kind_from_span(symbols, fn->ret);
+            a64_emit_str_sp_off(code, R0, body->slot_offset[dst], ret_kind == SLOT_I64 || ret_kind == SLOT_PTR || ret_kind == SLOT_OPAQUE);
+        }
     } else if (kind == BODY_OP_COPY_I32) {
         int __cr2 = na_find(a);
         if (__cr2 >= 0) { if (__cr2 != 0) code_emit(code, a64_add_imm(R0, __cr2, 0, false)); }
@@ -17367,21 +17379,29 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
     } else if (kind == BODY_OP_SEQ_OPAQUE_REMOVE) {
         codegen_seq_opaque_remove(code, body, dst, a, b);
     } else if (kind == BODY_OP_CALL_COMPOSITE) {
-        if (a < 0 || a >= symbols->function_count) die("invalid function call target");
-        FnDef *fn = &symbols->functions[a];
-        int32_t ret_kind = cold_return_kind_from_span(symbols, fn->ret);
-        if (ret_kind != SLOT_I32 && ret_kind != SLOT_I64 && ret_kind != SLOT_PTR && ret_kind != SLOT_OPAQUE) {
-            a64_emit_add_large(code, 8, SP, body->slot_offset[dst], true);
+        if (a >= symbols->function_count) {
+            char tmp[64];
+            snprintf(tmp, sizeof(tmp), "__ext_fn_%d", a);
+            a = symbols_add_fn(symbols, cold_cstr_span(tmp), 0, 0, 0, cold_cstr_span("int32"));
+            if (a >= 0 && a < symbols->function_count)
+                symbols->functions[a].is_external = true;
         }
-        int32_t stack_bytes = codegen_load_call_args(code, body, fn, b);
-        int32_t call_pos = code->count;
-        code_emit(code, a64_bl(0));
-        function_patches_add(function_patches, call_pos, a);
-        if (stack_bytes > 0) a64_emit_add_large(code, SP, SP, stack_bytes, true);
-        if (ret_kind == SLOT_I32) {
-            a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
-        } else if (ret_kind == SLOT_I64 || ret_kind == SLOT_PTR || ret_kind == SLOT_OPAQUE) {
-            a64_emit_str_sp_off(code, R0, body->slot_offset[dst], true);
+        if (a >= 0 && a < symbols->function_count) {
+            FnDef *fn = &symbols->functions[a];
+            int32_t ret_kind = cold_return_kind_from_span(symbols, fn->ret);
+            if (ret_kind != SLOT_I32 && ret_kind != SLOT_I64 && ret_kind != SLOT_PTR && ret_kind != SLOT_OPAQUE) {
+                a64_emit_add_large(code, 8, SP, body->slot_offset[dst], true);
+            }
+            int32_t stack_bytes = codegen_load_call_args(code, body, fn, b);
+            int32_t call_pos = code->count;
+            code_emit(code, a64_bl(0));
+            function_patches_add(function_patches, call_pos, a);
+            if (stack_bytes > 0) a64_emit_add_large(code, SP, SP, stack_bytes, true);
+            if (ret_kind == SLOT_I32) {
+                a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
+            } else if (ret_kind == SLOT_I64 || ret_kind == SLOT_PTR || ret_kind == SLOT_OPAQUE) {
+                a64_emit_str_sp_off(code, R0, body->slot_offset[dst], true);
+            }
         }
     } else if (kind == BODY_OP_COPY_COMPOSITE) {
         int32_t src_kind = body->slot_kind[a];
