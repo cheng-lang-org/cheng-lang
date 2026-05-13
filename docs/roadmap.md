@@ -23,10 +23,10 @@
 
 **未完成（不能写成已成立）**
 
-- **provider archive 生成与链接**：`--csg-in --link-providers` 未对接
-- **runtime/provider smoke CSG 路径**：compiler_runtime/thread_atomic_orc 的 .o 无法被 cc 链接（Mach-O 点号符号限制，ELF 内置链接器可绕过）
+- **provider archive 生成与链接**：`--csg-in --link-providers` 在 macOS 上受 Mach-O 点号符号限制，Linux ELF 路径可行
+- **runtime smoke cc 链接**：compiler_runtime/thread_atomic_orc 的 .o 无法被 macOS cc 链接（Mach-O 点号符号限制）。内置 ELF 链接器已绕过：三 smoke 均产出 RISC-V linked ELF executable
 - **backend driver CSG fixed-point**：writer fixed-point 成立，reader→自身替代未验证
-- **删除 cold source parser/import**：COLD_BACKEND_ONLY 已守卫但 parser 代码保留
+- **删除 cold source parser/import**：COLD_BACKEND_ONLY 已守卫，42% 缩减。parser 代码保留
 - **C seed 替代**：`cheng_seed.c`（66000 行）仍为 Cheng 完整语言实现，不可移除
 - **Ownership / E-Graph**：No-Alias 有基础，Ownership/E-Graph 不能算完成
 - **函数级并行**：有实现痕迹，active 主链证明不足
