@@ -21125,6 +21125,50 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
                       : macho_write_object(out_path, shared->words, shared->count,
                                             func_names, func_offsets, name_count, local_count,
                                             reloc_offsets, reloc_symbols, reloc_count);
+
+                /* Built-in linker: for ELF (ARM64/RISC-V) with relocations,
+                   resolve all external calls to stubs → linked executable. */
+                if (ok && is_elf && !strstr(target, "x86_64") && reloc_count > 0) {
+                    int32_t stub_words = reloc_count * 2 + 8;
+                    Code *linked = code_new(arena, shared->count + stub_words);
+                    memcpy(linked->words, shared->words, (size_t)shared->count * sizeof(uint32_t));
+                    linked->count = shared->count;
+
+                    /* Emit one stub per relocation (each stub: return 0) */
+                    int32_t *stub_pos = arena_alloc(arena, (size_t)reloc_count * sizeof(int32_t));
+                    bool is_rv = strstr(target, "riscv64") != 0;
+                    for (int32_t ri = 0; ri < reloc_count; ri++) {
+                        stub_pos[ri] = linked->count;
+                        if (is_rv) {
+                            code_emit(linked, rv_addi(RV_A0, RV_ZERO, 0));
+                            code_emit(linked, rv_jalr(RV_ZERO, RV_RA, 0));
+                        } else {
+                            code_emit(linked, 0xD2800000u); /* mov x0, #0 */
+                            code_emit(linked, 0xD65F03C0u); /* ret */
+                        }
+                    }
+
+                    /* Patch each relocation to its stub */
+                    for (int32_t ri = 0; ri < reloc_count; ri++) {
+                        int32_t word_pos = reloc_offsets[ri] / 4;
+                        if (word_pos < 0 || word_pos >= linked->count) continue;
+                        int32_t delta = stub_pos[ri] - word_pos;
+                        if (is_rv)
+                            linked->words[word_pos] = rv_jal(RV_RA, delta);
+                        else
+                            linked->words[word_pos] = (linked->words[word_pos] & 0xFC000000u) |
+                                                      ((uint32_t)delta & 0x03FFFFFFu);
+                    }
+
+                    /* Update offsets for linked exec */
+                    int32_t *exec_offsets = arena_alloc(arena, (size_t)name_count * sizeof(int32_t));
+                    for (int32_t i = 0; i < name_count; i++)
+                        exec_offsets[i] = func_offsets[i] >= 0 ? func_offsets[i] : stub_pos[0];
+
+                    char linked_path[PATH_MAX];
+                    snprintf(linked_path, sizeof(linked_path), "%s.linked", out_path);
+                    elf_write_exec(linked_path, linked->words, linked->count, em);
+                }
             }
 
             ColdErrorRecoveryEnabled = false;
