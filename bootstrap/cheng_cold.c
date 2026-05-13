@@ -20980,7 +20980,7 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
         if (entry_function < 0) return false;
 
         if (obj_mode) {
-            /* Install SIGSEGV/SIGBUS handlers for codegen error recovery */
+            /* Install SIGSEGV/SIGBUS handlers + outer setjmp for die() recovery */
             struct sigaction sa_segv_old, sa_bus_old, sa_crash;
             memset(&sa_crash, 0, sizeof(sa_crash));
             sa_crash.sa_handler = cold_sigsegv_die_handler;
@@ -21036,7 +21036,7 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
                 if (patch.target_function < 0 || patch.target_function >= func_count) continue;
                 int32_t target_off = symbol_offset[patch.target_function];
                 if (target_off < 0) {
-                    reloc_offsets[reloc_count] = (int32_t)patch.pos;
+                    reloc_offsets[reloc_count] = (int32_t)patch.pos * 4; /* byte offset */
                     reloc_symbols[reloc_count] = patch.target_function;
                     reloc_count++;
                     continue;
