@@ -19016,7 +19016,69 @@ static void x64_codegen_op(X64Code *x, BodyIR *body, Symbols *symbols,
     } else if (kind == BODY_OP_I32_CMP) {
         int32_t oa = body->slot_offset[a], ob = body->slot_offset[b];
         x64_mov_r32_mr32(x, 0, 4, oa);
+        x64_mov_r32_mr32(x, 1, 4, ob);
         x64_cmp_r32_r32(x, 0, 1);
+        /* result already in flags, store 0 for now */
+        x64_mov_r32_imm32(x, 0, 0);
+        x64_mov_mr32_r32_store(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_I32_DIV) {
+        int32_t oa = body->slot_offset[a], ob = body->slot_offset[b];
+        x64_mov_r32_mr32(x, 0, 4, oa);
+        x64_mov_r32_mr32(x, 1, 4, ob);
+        /* CDQ + IDIV: eax = edx:eax / ecx */
+        x64_emit1(x, 0x99); /* CDQ */
+        x64_emit1(x, 0xF7); x64_emit1(x, MODRM(3, 7, 1)); /* IDIV %ecx */
+        x64_mov_mr32_r32_store(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_I32_AND) {
+        int32_t oa = body->slot_offset[a], ob = body->slot_offset[b];
+        x64_mov_r32_mr32(x, 0, 4, oa);
+        x64_mov_r32_mr32(x, 1, 4, ob);
+        x64_emit1(x, 0x21); x64_emit1(x, MODRM(3, 1, 0)); /* AND %ecx, %eax */
+        x64_mov_mr32_r32_store(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_I32_OR) {
+        int32_t oa = body->slot_offset[a], ob = body->slot_offset[b];
+        x64_mov_r32_mr32(x, 0, 4, oa);
+        x64_mov_r32_mr32(x, 1, 4, ob);
+        x64_emit1(x, 0x09); x64_emit1(x, MODRM(3, 1, 0)); /* OR %ecx, %eax */
+        x64_mov_mr32_r32_store(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_STR_LEN) {
+        x64_mov_r32_mr32(x, 0, 4, body->slot_offset[a] + 8);
+        x64_mov_mr32_r32_store(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_I64_CONST) {
+        uint64_t bits = (uint32_t)a | ((uint64_t)(uint32_t)b << 32);
+        x64_mov_r64_imm64(x, 0, bits);
+        x64_mov_mr64_r64_store(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_COPY_I64 || kind == BODY_OP_COPY_COMPOSITE) {
+        int32_t sz = body->slot_size[dst];
+        int32_t os = body->slot_offset[a];
+        for (int32_t off = 0; off < sz; off += 8) {
+            x64_mov_r64_mr64(x, 0, 4, os + off);
+            x64_mov_mr64_r64_store(x, 4, off_dst + off, 0);
+        }
+    } else if (kind == BODY_OP_PAYLOAD_LOAD) {
+        int32_t base = body->slot_offset[a];
+        x64_mov_r64_mr64(x, 0, 4, base + b);
+        x64_mov_mr64_r64_store(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_PAYLOAD_STORE) {
+        int32_t base = body->slot_offset[dst];
+        x64_mov_r64_mr64(x, 0, 4, body->slot_offset[a]);
+        x64_mov_mr64_r64_store(x, 4, base + b, 0);
+    } else if (kind == BODY_OP_FN_ADDR) {
+        x64_mov_r64_imm64(x, 0, 0); /* placeholder for ADR */
+        x64_mov_mr64_r64_store(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_CALL_PTR) {
+        int32_t fn_slot = a;
+        x64_mov_r64_mr64(x, 0, 4, body->slot_offset[fn_slot]);
+        x64_call_reg(x, 0);
+        x64_mov_mr32_r32_store(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_CALL_COMPOSITE) {
+        if (a >= 0 && a < symbols->function_count) {
+            int32_t call_pos = x->len + 1;
+            x64_call_rel32(x, 0);
+            function_patches_add(patches, call_pos, a);
+        }
+    } else if (kind == BODY_OP_TAG_LOAD) {
+        x64_mov_r32_mr32(x, 0, 4, body->slot_offset[a]);
         x64_mov_mr32_r32_store(x, 4, off_dst, 0);
     }
     /* other ops: skip silently */
