@@ -7,15 +7,15 @@
 | 模块 | 进度 | 判断 |
 |---|---|---|
 | 冷编译器基础 codegen | 80% | 小/中型 cold subset 可用，direct Mach-O 可运行 |
-| CSG v2 facts 往返 | 70% | roundtrip 36/36 PASS，object 确定性成立 |
+| CSG v2 facts 往返 | 75% | roundtrip 42/42 PASS，object/exe 确定性成立 |
 | PrimaryObjectPlan → facts | 60% | 已有 writer/reader，待扩大到完整 backend driver 规模 |
 | cold --csg-in --emit:obj | 70% | 最小 fixture 稳定，更多 runtime/provider case 未闭合 |
-| cold linkerless exe | 45% | provider-free 可行，provider-backed 未闭环 |
-| provider archive | 0-10% | **当前最大缺口**，命令和合同未成主线 |
+| cold linkerless exe | 55% | provider-free 可行；单 provider archive 链路已闭环，runtime archive 未闭合 |
+| provider archive | 45% | `provider-archive-pack` + `--link-object --provider-archive` 已入门禁，当前只支持单 ELF member/export |
 | backend driver fixed-point | 20% | A→facts→cold→B→facts→cold→C 未完整稳定 |
-| Ownership / E-Graph | 25% | No-Alias 基础，E-Graph 闭环(rewrite→hash→DCE→report) |
+| Ownership / E-Graph | 25% | No-Alias 局部标量基础；E-Graph mutating rewrite 已禁用，仅保留 hash/dedup/report |
 | C seed 替代 | 30% | 泛型/闭包/函数指针已实现，cheng_seed.c 仍在链中 |
-| 跨端 | 50% | 三架构 exe 均产出，跨端 runtime smoke 未全完成 |愿景可以写目标，不写成完成。若与实现冲突，以 `docs/cheng-formal-spec.md`、`src/core/tooling/README.md`、当前源码和当前可执行产物为准。
+| 跨端 | 60% | 三架构 exe + COFF obj 均产出，CI 中有 COFF 格式验证 |愿景可以写目标，不写成完成。若与实现冲突，以 `docs/cheng-formal-spec.md`、`src/core/tooling/README.md`、当前源码和当前可执行产物为准。
 
 ## 当前事实（2026-05-14）
 
@@ -25,12 +25,13 @@
 
 - **冷编译器三架构 codegen**：ARM64/x86_64/RISC-V 全 133 BodyIR ops 覆盖
 - **ordinary provider-free direct Mach-O**：`ordinary_zero_exit_fixture` 直接编译运行 exit 0
-- **CSG v2 facts 往返**：`tools/cold_csg_v2_roundtrip_test.sh` 36/36 PASS
+- **CSG v2 facts 往返**：`tools/cold_csg_v2_roundtrip_test.sh` 42/42 PASS
   - Cheng writer → facts → cold reader → .o → cmp（确定性验证）
   - 错误输入 hard-fail（unknown record、truncated）
   - report 字段全输出（facts_bytes/mmap_ms/verify_ms/decode_ms/total_ms）
 - **三架构 ELF/Mach-O exe 直出**：ARM64 Mach-O + RISC-V/x86_64 ELF64 executable
-- **内置 ELF 链接器**：obj 路径自动产出 `.linked` 可执行文件
+- **内置 ELF 链接器**：obj 路径自动产出 `.linked` 可执行文件，`--link-object` 可显式消费 ELF `.o`
+- **provider archive 最小闭环**：`provider-archive-pack` 生成 `.chenga`，`system-link-exec --link-object --provider-archive` 解析 primary undefined symbol 并链接单个 provider ELF member，report 锁 `provider_resolved_symbol_count=1`、`system_link=0`、`linkerless_image=1`
 - **fixed-point**：C writer 与 Cheng writer 对同一输入产出 bit-identical facts
 - **文件拆分**：`cold_parser.c` 独立，`COLD_BACKEND_ONLY` 42% 缩减（590KB→344KB）
 - **跨端编译**：ARM64 Mach-O + RISC-V/x86_64 ELF64 obj + exe
@@ -41,14 +42,22 @@
 
 | gap | 状态 | 下一步 |
 |---|---|---|
-| provider archive 生成与链接 | macOS cc 被 Mach-O 点号符号阻断 | Linux runner 上验证 `--csg-in --link-providers` 用 GNU ld/lld 链接 ELF .o |
+| provider archive 生成与链接 | 单 provider ELF member/export 已由 cold linkerless 链路闭合；runtime 多 member/export archive 未闭合 | 扩展 archive schema 到多 member/export，并把 runtime provider 预编译 archive 接入 |
 | runtime smoke cc 链接 | 同上，内置 ELF 链接器已绕过 | 三 smoke RISC-V linked ELF 均已 QEMU 验证 |
 | 删除 cold source parser | COLD_BACKEND_ONLY 42% 缩减 | parser 代码保留，cold_parser.c 独立文件 |
 | C seed 替代 | cheng_seed.c 仍是完整 Cheng 语言实现（66K 行，3.0MB） | 冷编译器子集覆盖足够后可退役 |
-| Ownership / E-Graph | No-Alias 寄存器缓存已激活（block-boundary + call-clobber 安全），15 codegen ops 使用缓存；Ownership proof cold 子集编译运行 exit 0；E-Graph 无实现 | 规范 witness 入口（--ownership-on 编译入口 + 编译时验证）、E-Graph 从头实现 |
+| Ownership / E-Graph | No-Alias 只对局部标量可用；函数参数 no_alias 标记已撤销；E-Graph mutating rewrite 会破坏 direct Mach-O smoke，已禁用；Ownership proof cold 子集编译运行 exit 0 | 规范 witness 入口（--ownership-on 编译入口 + 编译时验证）；E-Graph 先做只读等价证明，再允许 rewrite |
 | 函数级并行 | C 层 codegen 并行已激活（work-stealing + pthread + 确定性合并），Cheng 层 FunctionTaskExecuteBodyIr 是空桩，未接入 active lowering 主链 | 需要 lowering 主链接入 FunctionTaskExecuteAuto + benchmark 证明加速比
 
-### 本次会话新增（2026-05-14）：No-Alias 寄存器缓存激活 + 参数标记 + cache 安全修复
+### 本次会话修正（2026-05-14）：provider archive 最小闭环 + E-Graph 错误优化禁用
+
+- **provider archive 最小闭环已落地**：`provider-archive-pack` 接受 `--target/--object/--export/--module/--source/--out/--report-out`，写 `.chenga` archive、member count、export count、hash 和 report。`system-link-exec --link-object:<primary.o> --provider-archive:<provider.chenga> --emit:exe` 在 cold 内部读取 ELF relocatable object 和 archive，解析 undefined symbol，应用 call relocation，生成 ELF executable。
+- **门禁已更新**：`tools/cold_csg_v2_roundtrip_test.sh` 从旧的 `provider_archive_hard_fail` 改为正向 `provider_archive_forward`，并增加 `provider_archive_corrupt_magic_hard_fail`、`provider_archive_missing_export_pack_fail`。当前结果为 **42/42 PASS**。
+- **当前边界**：archive 只支持单 ELF member、单 export，目标限定在当前 cold ELF reloc linker 支持的 AArch64/RISC-V；runtime provider archive 的多 member/export 和 provider root 选择仍未完成。
+- **E-Graph mutating rewrite 已禁用**：原先的 identity/constant/copy rewrite 会把 build-backend-driver 的 system-link smoke 从正确 exit 77 编成 exit 85。当前仅保留 canonical hash/dedup/report，rewrite count 固定为 0，后续 E-Graph 必须先做只读等价证明和运行门禁，再允许改写 BodyIR。
+- **函数参数 no_alias 标记已撤销**：参数参与跨 block/call 后的值流，直接标记为 no_alias 会污染寄存器缓存假设。No-Alias 当前只对明确局部标量 slot 生效。
+
+### 历史记录（2026-05-14）：No-Alias 寄存器缓存激活 + cache 安全修复
 
 - **No-Alias 寄存器缓存已激活，block-boundary 安全**：`cheng_cold.c:8627-8664` 实现了完整的 `na_reg_slot[32]` 缓存。`na_reset()` 在函数入口（行 11028）和每个 basic block 边界（行 11044）调用。`na_find(slot)` 返回缓存了该 slot 的寄存器（-1=miss），`na_set(r,slot)` 记录且去重，`na_clobber(r)` 无效化。
 - **15 codegen ops 使用缓存**（原 8 个→15 个）：
@@ -57,10 +66,10 @@
   - 无效化（`na_clobber`）：所有使用 R1/R2 为临时的 op（含新加入的 `I32_SHL`/`ASR`/`AND/OR/XOR`）+ 所有 call 类型（`CALL_I32`/`COMPOSITE`/`PTR`/`CLOSURE_CALL`）调用后 clobber R0-R7（AAPCS64 caller-saved）
 - **正确性修复**：之前 `I32_SHL`/`ASR`/`AND/OR/XOR` 使用 R1 但不 `na_clobber(1)`——缓存认为 R1 仍持有旧的 no_alias slot，后续 `COPY_I32` 或 `LOAD_I32` 的 `na_find` 可能返回 stale 的 R1 值。修复后所有临时寄存器正确无效化。
 - **CALL 缓存安全**：所有 call 类型在 `bl`/`blr` 后 `na_clobber(0-7)`，防止 caller-saved 寄存器中的缓存值因函数调用变为 stale。调用结果（R0）若为 no_alias slot 则 `na_set(0, dst)` 缓存。
-- **函数参数标记 no_alias**：`cold_parser.c:7972` 新增 `param_kinds[i]` 标量检查，函数参数自动 `slot_no_alias[slot] = 1`。参数不可重赋值，标记安全。
+- **函数参数标记 no_alias 已撤销**：不能把参数当成本地 no_alias slot 处理；后续若重启参数 no_alias，必须有 CFG/SSA 证明和 system-link smoke 门禁。
 - **Ownership proof cold 子集编译运行 exit 0**：`ownership_proof_driver_cold.cheng`（12 函数）自包含 cold 子集版本，`/tmp/cheng_cold system-link-exec` exit 0，输出 `"ownership_proof_driver ok"`。
 - **回归全通**：self-check contract hash `e202c0c35424eb36` 不变。cold_subset_coverage exit 0、ordinary_zero_exit_fixture exit 0、atomic_i32_runtime_smoke exit 0、ownership_proof_witness exit 0、compiler_runtime_smoke exit 0、void_tail_if_fallthrough_fixture exit 0、let_call_return_result_direct_object_smoke exit 7。
-- **E-Graph 无实现**：同上，仅合同报告壳。
+- **E-Graph 无可用 rewrite**：同上，仅合同报告壳；错误的 mutating rewrite 已禁用。
 
 ### 本次会话新增（2026-05-12）
 
@@ -237,19 +246,19 @@
 
 ## 剩余 gap 详细评估
 
-### 1. provider archive Linux 验证
+### 1. provider archive 扩展到 runtime provider
 
-**当前状态**：`--csg-in --link-providers` 命令行接口已实现。Built-in ELF 链接器可产出 `.linked` 可执行文件（三架构已证明）。但 macOS 上 `cc` 链接 `.o` 时因 Mach-O 目标文件包含点号符号（如 `_PrimaryBodyIrGeneralCfgWordCount`）被系统链接器拒绝。
+**当前状态**：最小 provider archive 已成为 cold linkerless 主线入口。`provider-archive-pack` 能把一个 provider ELF `.o` 和一个 export 写入 `.chenga`；`system-link-exec --link-object --provider-archive` 能把 primary object 的 undefined symbol 解析到 archive member，并生成 ELF executable。该链路由 `tools/cold_csg_v2_roundtrip_test.sh` 的 `provider_archive_forward` 锁定。
 
-**阻断原因**：Mach-O 符号命名规范不允许点号（`.`），而冷编译器生成的符号名包含点号。这不是代码 bug，是 Mach-O 格式的 ABI 约束。GNU ld/lld 在 ELF 目标文件上无此限制。
+**阻断原因**：当前 archive schema 只有单 member / 单 export，足够证明 linkerless provider 链路，但不够承载 runtime provider archive。runtime provider 需要多 member、多 export、target/machine 校验、重复导出 hard-fail、primary/provider 定义冲突 hard-fail、provider root 精确选择。
 
 **完成条件**：
-1. Linux amd64 或 aarch64 环境上运行 `--csg-in --link-providers`，对象文件为 ELF64 `.o`
-2. 系统 `cc`（GCC/Clang with GNU ld or lld）链接后产出可执行文件
-3. 运行可执行文件，退出码与直接编译一致
-4. report 中 `provider_object_count>0`，`standalone_no_runtime=0`
+1. `.chenga` 支持多个 ELF relocatable member 和多个 export
+2. export 表唯一，重复导出、错 target、错 machine、截断 object、缺 symbol 全部 hard-fail
+3. runtime provider 预编译 archive 可被 `--link-object --provider-archive` 消费
+4. report 中 `provider_object_count>0`、`provider_archive_member_count>0`、`provider_resolved_symbol_count>0`、`unresolved_symbol_count=0`、`system_link=0`
 
-**预计工作量**：~1 天（环境搭建 + 验证）。代码本身不需要改动，只需在 Linux runner（CI 或本地 VM）上执行现有命令行。
+**预计工作量**：~2-4 天。不能用 `cc/ar` 或 `--link-providers` 代替 archive 主线。
 
 ---
 
@@ -280,7 +289,8 @@
 ### 3. Ownership / E-Graph
 
 **当前状态**：
-- **No-Alias 数据模型活跃，寄存器缓存禁用**：`slot_no_alias[]` 数组随 slot 分配（`cheng_cold.c:3422`），`cold_parser.c:6054/6143` 对 `SLOT_I32/I64/F32/F64` 的 `let`/`var` 局部变量自动标记 `slot_no_alias[slot]=1`，默认初始化为 `0`（`cheng_cold.c:3559`）。**但寄存器缓存优化被明确禁用**（`cheng_cold.c:8620` 注释 `"Disabled no-alias register cache: correctness first until it is CFG-aware."`），`na_find()/na_set()/na_clobber()` 都是空桩（`cheng_cold.c:8620-8624`），`na_find()` 始终返回 -1（缓存未命中）。codegen 侧 `slot_no_alias[dst]` 检查存在但调用空桩 `na_set()`，无实际优化效果。标记逻辑健全但优化无效。
+- **No-Alias 数据模型活跃**：`slot_no_alias[]` 数组随 slot 分配，局部标量 `let/var` 可标记 no_alias。函数参数 no_alias 标记已撤销，避免跨 block/call 值流污染寄存器缓存。
+- **E-Graph rewrite 禁用**：identity/constant/copy mutating rewrite 已证明会把 system-link smoke 编错（exit 77 → 85），当前 `egraph_rewrite_count=0`。保留的是 canonical hash/dedup/report，不把它写成 E-Graph 已实现。
 - **Ownership proof driver 可编译运行**：共 3 个文件：
   - `src/tests/ownership_proof_driver.cheng`：完整 Cheng 版，import `ownership.cheng` 模块。编译命令 `artifacts/bootstrap/cheng.stage3 system-link-exec --root:... --in:src/tests/ownership_proof_driver.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/ownership_proof_driver`。13 函数/324 ops/86 blocks，runs with `EXIT=0`，输出 `"ownership_proof_driver ok"`。
   - `src/tests/ownership_proof_driver_cold.cheng`：独立实现（无 import），自包含 OwnershipCtx + transfer/borrow/release。含 `OwnershipError（Ok/DoubleMove/MoveAfterBorrow）`、transfer state machine、shared borrow with refcount。
@@ -288,14 +298,14 @@
 - **E-Graph**：仅 contract 报告壳 `src/core/tooling/compiler_csg_egraph_contract.cheng`，返回 `uir_egraph_status=unavailable` + `uir_egraph_available=0`。**无任何 rewrite rule、cost model、canonical equivalence 的实现。**
 
 **阻断原因**：
-1. E-Graph 需要从零实现：cost model + rewrite rules（UIR 层的 canonical form equivalence），属于语义特化主线，与当前 codegen 正确性闭环不在同一轨道。CSG egraph 合同壳只是报告字段占位。
+1. E-Graph 需要从零实现：先做只读等价证明 + cost model，再允许 rewrite。任何 rewrite 都必须绑定 direct Mach-O smoke、CSG roundtrip 和 provider archive gate。
 2. Ownership proof 已有可运行的 driver + witness，但未规范化：没有专用编译入口（`--ownership-on` flag）、没有 CI 集成、没有 phase-off 证明、没有编译时验证（当前在 runtime 验证）。
 3. No-Alias 寄存器缓存禁用是因为 CFG-aware 不完整：`na_find()` 是单值追踪，不支持 CFG block 间的值传播，可能产生 stale 或漏优化。标记逻辑健全（标量 slot），聚合类型（struct/tuple payload）无影响。
 
 **完成条件**：
-1. **No-Alias 寄存器缓存激活**：使 `na_find()/na_set()/na_clobber()` 实现 CFG-aware 的值追踪，benchmark 证明减少冗余 `ldr` 指令。
+1. **No-Alias 寄存器缓存稳定化**：只对 CFG 证明安全的局部标量 slot 启用，参数 no_alias 重新启用前必须有 SSA/CFG 证明和回归门禁。
 2. **Ownership proof 规范化**：`--ownership-on` 编译入口 + 编译时验证（非 runtime）+ CI smoke + phase-off 证明。
-3. **E-Graph**：UIR egraph 管线从零实现，含合法的 cost model、rewrite rules、canonical equivalence 证明。
+3. **E-Graph**：UIR egraph 管线从零实现，含合法的 cost model、rewrite rules、canonical equivalence 证明；rewrite 默认关闭，证明通过后再打开。
 4. **phase-off surface** 上置为 false——不允许 phase-off 而声称 proof-backed 通过。
 
 **预计工作量**：
@@ -517,8 +527,8 @@ fn LoweringBuildPrimaryObjectIr(...): PrimaryObjectIr =
 |---|---|---|
 | no-pointer ABI | 公开表面默认不暴露裸指针 | `Slice/Handle/Borrow/Tuple out-param` 都要有 compile-fail 和 runtime smoke |
 | BodyIR DoD/SoA | 有合同 smoke | 继续锁定 flat arrays、local noalias flags、cstring side table |
-| Ownership/No-Alias | No-Alias 数据模型活跃（`cold_parser.c:6054/6143` 标量 slot 标记）；寄存器缓存禁用（`na_find/set/clobber` 空桩，`cheng_cold.c:8620`）；Ownership proof driver + witness 可编译运行（`EXIT=0`） | 激活 CFG-aware 寄存器缓存；`--ownership-on` 编译入口 + 编译时验证；E-Graph 从零实现 |
-| CSG egraph | canonical graph equivalence 合同可见 | UIR egraph 当前不可用，后续接 cost model 和 rewrite rules |
+| Ownership/No-Alias | No-Alias 数据模型活跃，局部标量可用；函数参数 no_alias 已撤销；Ownership proof driver + witness 可编译运行（`EXIT=0`） | CFG/SSA 证明后再扩大 no_alias 范围；`--ownership-on` 编译入口 + 编译时验证 |
+| CSG egraph | canonical hash/dedup/report 可见；mutating rewrite 已禁用 | UIR egraph 当前不可用，先做只读等价证明和 cost model，再接 rewrite rules |
 | SIMD | 当前闭环未要求 | 先完成 UIR 向量类型、合法性分析、寄存器映射 |
 
 验收必须绑定 runtime surface 与 phase-contract surface；没有 ownership-on driver 或 compile stamp，就不能写成优化已生效。
@@ -555,7 +565,7 @@ fn LoweringBuildPrimaryObjectIr(...): PrimaryObjectIr =
 1. ✅ **`atomic_i32_runtime_smoke` 已通过**（exit 0）。Call ABI、原子指令、`?` 操作符均已完成。
 2. ✅ **`build-backend-driver` 自检通过**。冷编译器直接 Mach-O 路径：ordinary_zero_exit_fixture exit 0。
 3. ✅ **冷自举 A/B 证明**：bootstrap-bridge 全链条 fixed_point。
-4. ✅ **Stage 5 No-Alias 已激活**：寄存器缓存激活（block-boundary + call-clobber 安全），15 codegen ops 使用缓存，函数参数标记 no_alias。Ownership proof driver + witness 编译运行 exit 0。E-Graph 无实现。
+4. ✅ **Stage 5 No-Alias 局部标量已激活**：Ownership proof driver + witness 编译运行 exit 0。函数参数 no_alias 已撤销；E-Graph mutating rewrite 已禁用，不能写成完成。
 5. ✅ **函数级并行 + lock-free work-stealing**：pthread + `__atomic_fetch_add` + 确定性 merge。`COLD_NO_SIGN=1` 下任意 `BACKEND_JOBS` 值产物 SHA 一致。
 6. ✅ **30-80ms 架构合规**：6 个 report 字段全部输出，冷进程内微秒级计时。实测 135 函数/5293 ops 编译 total=22.5ms。
 7. ✅ **回归测试**：34/35 cold_* 测试通过（仅 cold_csg_facts_exporter_smoke SIGSEGV，os.GetEnvDefault 不在冷子集），5/5 roadmap 验证 fixture 通过。
