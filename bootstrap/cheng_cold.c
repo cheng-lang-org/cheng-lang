@@ -3812,6 +3812,28 @@ static uint64_t cold_body_ir_canonical_hash_normalized(BodyIR *body) {
             if (a > b) { int32_t t = a; a = b; b = t; }
         }
 
+        /* SHL(x,0)/ASR(x,0) -> COPY(x) for hash normalization */
+        if ((kind == BODY_OP_I32_SHL || kind == BODY_OP_I32_ASR) &&
+            slot_def && b >= 0 && b < body->slot_count) {
+            int32_t def = slot_def[b];
+            if (def >= 0 && def < body->op_count &&
+                body->op_kind[def] == BODY_OP_I32_CONST &&
+                body->op_a[def] == 0) {
+                kind = BODY_OP_COPY_I32;
+                b = 0;
+            }
+        }
+        if ((kind == BODY_OP_I64_SHL || kind == BODY_OP_I64_ASR) &&
+            slot_def && b >= 0 && b < body->slot_count) {
+            int32_t def = slot_def[b];
+            if (def >= 0 && def < body->op_count &&
+                body->op_kind[def] == BODY_OP_I64_CONST &&
+                body->op_a[def] == 0 && body->op_b[def] == 0) {
+                kind = BODY_OP_COPY_I64;
+                b = 0;
+            }
+        }
+
         h ^= ((uint64_t)kind * 0xc6a4a7935bd1e995ull);
         h = (h << 7) | (h >> 57);
         h ^= ((uint64_t)a * 0xc6a4a7935bd1e995ull);
@@ -11405,70 +11427,93 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
     cold_mark_reachable_functions(symbols, function_bodies, function_count,
                                   entry_function, reachable_functions);
 
-    /* E-Graph BodyIR rewrite: identity elimination + constant folding + copy elimination */
-    int32_t egraph_rewrite_count = 0;
-    for (int32_t i = 0; i < function_count; i++) {
-        BodyIR *body = function_bodies[i];
-        if (!body || body->has_fallback) continue;
-        /* Build slot→op mapping for constant/copy folding */
-        int32_t *slot_writer = arena_alloc(code->arena, (size_t)body->slot_count * sizeof(int32_t));
-        for (int32_t si = 0; si < body->slot_count; si++) slot_writer[si] = -1;
+    cold_egraph_rewrite_count = 0;
+    FunctionPatchList function_patches = {0};
+    function_patches.arena = code->arena;
+
+    /* E-Graph rewrite: normalize reachable function bodies.
+       Associative flattening + shift-by-zero elimination. */
+    for (int32_t fn = 0; fn < function_count; fn++) {
+        if (!reachable_functions[fn] || !function_bodies[fn] ||
+            function_bodies[fn]->has_fallback) continue;
+        BodyIR *body = function_bodies[fn];
+        int32_t slot_count = body->slot_count;
+        if (slot_count <= 0) continue;
+
+        /* Build slot_writer: track which op writes each slot */
+        int32_t *slot_writer = (int32_t *)calloc((size_t)slot_count, sizeof(int32_t));
+        if (!slot_writer) continue;
+        for (int32_t i = 0; i < slot_count; i++) slot_writer[i] = -1;
         for (int32_t oi = 0; oi < body->op_count; oi++) {
             int32_t dst = body->op_dst[oi];
-            if (dst >= 0 && dst < body->slot_count) slot_writer[dst] = oi;
+            if (dst >= 0 && dst < slot_count) slot_writer[dst] = oi;
+        }
+
+        /* Build use_count for safe reassociation */
+        int32_t *use_count = (int32_t *)calloc((size_t)slot_count, sizeof(int32_t));
+        if (use_count) {
+            for (int32_t oi = 0; oi < body->op_count; oi++) {
+                int32_t a = body->op_a[oi], b = body->op_b[oi];
+                if (a >= 0 && a < slot_count) use_count[a]++;
+                if (b >= 0 && b < slot_count) use_count[b]++;
+            }
+        }
+
+        for (int32_t oi = 0; oi < body->op_count; oi++) {
             int32_t k = body->op_kind[oi];
-            int32_t a = body->op_a[oi], b = body->op_b[oi];
-            int32_t orig_kind = k;
-            /* Constant folding: arithmetic with two I32_CONST operands */
-            int32_t a_op = (a >= 0 && a < body->slot_count) ? slot_writer[a] : -1;
-            int32_t b_op = (b >= 0 && b < body->slot_count) ? slot_writer[b] : -1;
-            bool a_const = (a_op >= 0 && body->op_kind[a_op] == BODY_OP_I32_CONST);
-            bool b_const = (b_op >= 0 && body->op_kind[b_op] == BODY_OP_I32_CONST);
-            if (a_const && b_const) {
-                int32_t va = body->op_a[a_op];
-                int32_t vb = body->op_a[b_op];
-                int32_t result = 0;
-                bool folded = true;
-                if (k == BODY_OP_I32_ADD) result = va + vb;
-                else if (k == BODY_OP_I32_SUB) result = va - vb;
-                else if (k == BODY_OP_I32_MUL) result = va * vb;
-                else if (k == BODY_OP_I32_AND) result = va & vb;
-                else if (k == BODY_OP_I32_OR)  result = va | vb;
-                else folded = false;
-                if (folded) {
-                    body->op_kind[oi] = BODY_OP_I32_CONST;
-                    body->op_a[oi] = result;
-                    body->op_b[oi] = 0;
-                    body->op_c[oi] = 0;
-                    egraph_rewrite_count++;
+            int32_t a_slot = body->op_a[oi];
+            int32_t b_slot = body->op_b[oi];
+
+            /* Shift/ASR by zero -> COPY */
+            if ((k == BODY_OP_I32_SHL || k == BODY_OP_I32_ASR) &&
+                b_slot >= 0 && b_slot < slot_count) {
+                int32_t b_op = slot_writer[b_slot];
+                if (b_op >= 0 &&
+                    body->op_kind[b_op] == BODY_OP_I32_CONST &&
+                    body->op_a[b_op] == 0) {
+                    body->op_kind[oi] = BODY_OP_COPY_I32;
+                    cold_egraph_rewrite_count++;
                     continue;
                 }
             }
-            /* Identity: ADD(x, 0) → x, SUB(x, 0) → x */
-            if ((k == BODY_OP_I32_ADD || k == BODY_OP_I32_SUB) && b == 0)
-                body->op_kind[oi] = BODY_OP_COPY_I32;
-            /* Identity: MUL(x, 1) → x */
-            else if (k == BODY_OP_I32_MUL && b == 1)
-                body->op_kind[oi] = BODY_OP_COPY_I32;
-            /* Identity: AND(x, -1) → x, OR(x, 0) → x, XOR(x, 0) → x */
-            else if ((k == BODY_OP_I32_AND && b == -1) ||
-                     (k == BODY_OP_I32_OR  && b == 0) ||
-                     (k == BODY_OP_I32_XOR && b == 0))
-                body->op_kind[oi] = BODY_OP_COPY_I32;
-            /* Double COPY elimination: COPY(COPY(x)) → COPY(x) */
-            else if (k == BODY_OP_COPY_I32) {
-                int32_t src_op = (a >= 0 && a < body->slot_count) ? slot_writer[a] : -1;
-                if (src_op >= 0 && body->op_kind[src_op] == BODY_OP_COPY_I32) {
-                    body->op_a[oi] = body->op_a[src_op];
-                    egraph_rewrite_count++;
+            if ((k == BODY_OP_I64_SHL || k == BODY_OP_I64_ASR) &&
+                b_slot >= 0 && b_slot < slot_count) {
+                int32_t b_op = slot_writer[b_slot];
+                if (b_op >= 0 &&
+                    body->op_kind[b_op] == BODY_OP_I64_CONST &&
+                    body->op_a[b_op] == 0 && body->op_b[b_op] == 0) {
+                    body->op_kind[oi] = BODY_OP_COPY_I64;
+                    cold_egraph_rewrite_count++;
+                    continue;
                 }
             }
-            if (body->op_kind[oi] != orig_kind) egraph_rewrite_count++;
+
+            /* Associative flattening: ADD(a, ADD(x, y)) -> ADD(ADD(a, x), y)
+               Only when inner ADD result is used exactly once. */
+            if (k == BODY_OP_I32_ADD && b_slot >= 0 &&
+                b_slot < slot_count && use_count) {
+                int32_t b_op = slot_writer[b_slot];
+                if (b_op >= 0 && body->op_kind[b_op] == BODY_OP_I32_ADD) {
+                    int32_t inner_dst = body->op_dst[b_op];
+                    if (inner_dst >= 0 && inner_dst < slot_count &&
+                        use_count[inner_dst] == 1) {
+                        int32_t x = body->op_a[b_op];
+                        int32_t y = body->op_b[b_op];
+                        /* Reassociate: inner ADD becomes ADD(a_slot, x);
+                           outer ADD becomes ADD(inner_dst, y). */
+                        body->op_a[b_op] = a_slot;
+                        body->op_b[b_op] = x;
+                        body->op_a[oi] = inner_dst;
+                        body->op_b[oi] = y;
+                        cold_egraph_rewrite_count++;
+                    }
+                }
+            }
         }
+
+        free(use_count);
+        free(slot_writer);
     }
-    cold_egraph_rewrite_count = egraph_rewrite_count;
-    FunctionPatchList function_patches = {0};
-    function_patches.arena = code->arena;
 
     bool use_rv64 = target && strstr(target, "riscv64") != 0;
 
@@ -13752,7 +13797,11 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
                     char **prov_names[MAX_PROVIDER_OBJECTS];
                     int32_t *prov_offsets[MAX_PROVIDER_OBJECTS];
                     int32_t prov_nc[MAX_PROVIDER_OBJECTS];
+                    int32_t *prov_reloc_offsets[MAX_PROVIDER_OBJECTS];
+                    char **prov_reloc_names[MAX_PROVIDER_OBJECTS];
+                    int32_t prov_reloc_count[MAX_PROVIDER_OBJECTS];
                     int32_t provider_count = 0;
+                    int32_t provider_resolved_count = 0;
 
                     if (provider_objects && provider_objects[0]) {
                         char paths_buf[4096];
@@ -13772,7 +13821,10 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
                                         &prov_code_words[provider_count],
                                         &prov_names[provider_count],
                                         &prov_offsets[provider_count],
-                                        &prov_nc[provider_count])) {
+                                        &prov_nc[provider_count],
+                                        &prov_reloc_offsets[provider_count],
+                                        &prov_reloc_names[provider_count],
+                                        &prov_reloc_count[provider_count])) {
                                     fprintf(stderr, "[cheng_cold] warning: failed to read provider object: %s\n", p);
                                 } else {
                                     provider_count++;
@@ -13847,6 +13899,52 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
                         linked->count += prov_code_words[pi];
                     }
 
+                    /* Cross-provider reference resolution:
+                       Build combined symbol table from ALL provider .o global symbols,
+                       then resolve each provider's own relocations against it. */
+                    if (provider_count > 1) {
+                        /* Count total provider symbols */
+                        int32_t total_prov_syms = 0;
+                        for (int32_t pi = 0; pi < provider_count; pi++)
+                            total_prov_syms += prov_nc[pi];
+                        typedef struct { const char *name; int32_t pi; int32_t off; } ProvSym;
+                        ProvSym *prov_syms = arena_alloc(arena, (size_t)(total_prov_syms > 0 ? total_prov_syms : 1) * sizeof(ProvSym));
+                        int32_t ps_count = 0;
+                        for (int32_t pi = 0; pi < provider_count; pi++) {
+                            for (int32_t ni = 0; ni < prov_nc[pi]; ni++) {
+                                if (prov_offsets[pi][ni] >= 0) {
+                                    prov_syms[ps_count].name = prov_names[pi][ni];
+                                    prov_syms[ps_count].pi   = pi;
+                                    prov_syms[ps_count].off  = prov_offsets[pi][ni];
+                                    ps_count++;
+                                }
+                            }
+                        }
+                        /* Resolve each provider's relocations */
+                        for (int32_t pi = 0; pi < provider_count; pi++) {
+                            for (int32_t ri = 0; ri < prov_reloc_count[pi]; ri++) {
+                                const char *target = prov_reloc_names[pi][ri];
+                                int32_t call_word = provider_start[pi] + prov_reloc_offsets[pi][ri] / 4;
+                                int32_t target_word = -1;
+                                for (int32_t ci = 0; ci < ps_count; ci++) {
+                                    if (strcmp(target, prov_syms[ci].name) == 0) {
+                                        target_word = provider_start[prov_syms[ci].pi] + prov_syms[ci].off;
+                                        break;
+                                    }
+                                }
+                                if (target_word >= 0) {
+                                    int32_t delta = target_word - call_word;
+                                    if (is_rv)
+                                        linked->words[call_word] = rv_jal(RV_RA, delta);
+                                    else
+                                        linked->words[call_word] = (linked->words[call_word] & 0xFC000000u) |
+                                                                   ((uint32_t)delta & 0x03FFFFFFu);
+                                    provider_resolved_count++;
+                                }
+                            }
+                        }
+                    }
+
                     /* Set stub_pos for provider-resolved relocations */
                     for (int32_t ri = 0; ri < reloc_count; ri++) {
                         if (provider_target[ri] < 0) continue;
@@ -13893,6 +13991,11 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
                     elf_write_exec(linked_path, linked->words, linked->count, em);
 
                     if (stats) stats->provider_object_count = provider_count;
+                    if (stats) {
+                        int32_t primary_resolved = reloc_count - stub_count;
+                        if (primary_resolved < 0) primary_resolved = 0;
+                        stats->provider_resolved_symbol_count = primary_resolved + provider_resolved_count;
+                    }
 
                     /* Free provider resources */
                     for (int32_t pi = 0; pi < provider_count; pi++) {
@@ -13901,6 +14004,12 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
                             free(prov_names[pi][ni]);
                         free(prov_names[pi]);
                         free(prov_offsets[pi]);
+                        if (prov_reloc_offsets[pi]) free(prov_reloc_offsets[pi]);
+                        if (prov_reloc_names[pi]) {
+                            for (int32_t ri = 0; ri < prov_reloc_count[pi]; ri++)
+                                free(prov_reloc_names[pi][ri]);
+                            free(prov_reloc_names[pi]);
+                        }
                     }
                 }
             }
@@ -13965,6 +14074,133 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
             {
                 bool is_elf = target && strstr(target, "linux") != 0;
                 bool is_coff = target && strstr(target, "windows") != 0;
+                bool is_rv = strstr(target, "riscv64") != 0;
+
+                /* If --provider-objects is set and target is ELF (AARCH64/RISC-V),
+                   read provider .o files and link them into the executable. */
+                bool provider_is_rv = is_rv;
+                int32_t exe_provider_count = 0;
+                int32_t exe_provider_resolved = 0;
+                if (is_elf && !strstr(target, "x86_64") && provider_objects && provider_objects[0]) {
+                    #define EXE_MAX_PROV 64
+                    uint32_t *ep_code[EXE_MAX_PROV];
+                    int32_t ep_code_words[EXE_MAX_PROV];
+                    char **ep_names[EXE_MAX_PROV];
+                    int32_t *ep_offsets[EXE_MAX_PROV];
+                    int32_t ep_nc[EXE_MAX_PROV];
+                    int32_t *ep_reloc_offsets[EXE_MAX_PROV];
+                    char **ep_reloc_names[EXE_MAX_PROV];
+                    int32_t ep_reloc_count[EXE_MAX_PROV];
+
+                    char paths_buf[4096];
+                    size_t plen = strlen(provider_objects);
+                    if (plen >= sizeof(paths_buf)) plen = sizeof(paths_buf) - 1;
+                    memcpy(paths_buf, provider_objects, plen);
+                    paths_buf[plen] = '\0';
+                    char *p = paths_buf;
+                    while (p && *p && exe_provider_count < EXE_MAX_PROV) {
+                        char *comma = strchr(p, ',');
+                        if (comma) *comma = '\0';
+                        if (*p) {
+                            if (!elf64_read_object(p,
+                                    &ep_code[exe_provider_count],
+                                    &ep_code_words[exe_provider_count],
+                                    &ep_names[exe_provider_count],
+                                    &ep_offsets[exe_provider_count],
+                                    &ep_nc[exe_provider_count],
+                                    &ep_reloc_offsets[exe_provider_count],
+                                    &ep_reloc_names[exe_provider_count],
+                                    &ep_reloc_count[exe_provider_count])) {
+                                fprintf(stderr, "[cheng_cold] warning: failed to read provider object: %s\n", p);
+                            } else {
+                                exe_provider_count++;
+                            }
+                        }
+                        p = comma ? comma + 1 : 0;
+                    }
+
+                    /* Compute total provider code size */
+                    int32_t exe_total_prov_words = 0;
+                    for (int32_t pi = 0; pi < exe_provider_count; pi++)
+                        exe_total_prov_words += ep_code_words[pi];
+
+                    /* Grow code buffer to hold provider code */
+                    int32_t new_cap = code->count + exe_total_prov_words + 64;
+                    if (new_cap > code->cap) {
+                        uint32_t *new_words = arena_alloc(arena, (size_t)new_cap * sizeof(uint32_t));
+                        memcpy(new_words, code->words, (size_t)code->count * sizeof(uint32_t));
+                        code->words = new_words;
+                        code->cap = new_cap;
+                    }
+
+                    int32_t *ep_provider_start = arena_alloc(arena, (size_t)(exe_provider_count > 0 ? exe_provider_count : 1) * sizeof(int32_t));
+                    for (int32_t pi = 0; pi < exe_provider_count; pi++) {
+                        ep_provider_start[pi] = code->count;
+                        memcpy(code->words + code->count,
+                               ep_code[pi],
+                               (size_t)ep_code_words[pi] * sizeof(uint32_t));
+                        code->count += ep_code_words[pi];
+                    }
+
+                    /* Build combined symbol table for cross-provider resolution */
+                    if (exe_provider_count > 1) {
+                        int32_t total_syms = 0;
+                        for (int32_t pi = 0; pi < exe_provider_count; pi++)
+                            total_syms += ep_nc[pi];
+                        typedef struct { const char *name; int32_t pi; int32_t off; } ExeProvSym;
+                        ExeProvSym *ps = arena_alloc(arena, (size_t)(total_syms > 0 ? total_syms : 1) * sizeof(ExeProvSym));
+                        int32_t psc = 0;
+                        for (int32_t pi = 0; pi < exe_provider_count; pi++) {
+                            for (int32_t ni = 0; ni < ep_nc[pi]; ni++) {
+                                if (ep_offsets[pi][ni] >= 0) {
+                                    ps[psc].name = ep_names[pi][ni];
+                                    ps[psc].pi = pi;
+                                    ps[psc].off = ep_offsets[pi][ni];
+                                    psc++;
+                                }
+                            }
+                        }
+                        for (int32_t pi = 0; pi < exe_provider_count; pi++) {
+                            for (int32_t ri = 0; ri < ep_reloc_count[pi]; ri++) {
+                                const char *target = ep_reloc_names[pi][ri];
+                                int32_t call_word = ep_provider_start[pi] + ep_reloc_offsets[pi][ri] / 4;
+                                int32_t target_word = -1;
+                                for (int32_t ci = 0; ci < psc; ci++) {
+                                    if (strcmp(target, ps[ci].name) == 0) {
+                                        target_word = ep_provider_start[ps[ci].pi] + ps[ci].off;
+                                        break;
+                                    }
+                                }
+                                if (target_word >= 0) {
+                                    int32_t delta = target_word - call_word;
+                                    if (provider_is_rv)
+                                        code->words[call_word] = rv_jal(RV_RA, delta);
+                                    else
+                                        code->words[call_word] = (code->words[call_word] & 0xFC000000u) |
+                                                                 ((uint32_t)delta & 0x03FFFFFFu);
+                                    exe_provider_resolved++;
+                                }
+                            }
+                        }
+                    }
+
+                    /* Free provider resources */
+                    for (int32_t pi = 0; pi < exe_provider_count; pi++) {
+                        free(ep_code[pi]);
+                        for (int32_t ni = 0; ni < ep_nc[pi]; ni++)
+                            free(ep_names[pi][ni]);
+                        free(ep_names[pi]);
+                        free(ep_offsets[pi]);
+                        if (ep_reloc_offsets[pi]) free(ep_reloc_offsets[pi]);
+                        if (ep_reloc_names[pi]) {
+                            for (int32_t ri = 0; ri < ep_reloc_count[pi]; ri++)
+                                free(ep_reloc_names[pi][ri]);
+                            free(ep_reloc_names[pi]);
+                        }
+                    }
+                    #undef EXE_MAX_PROV
+                }
+
                 if (is_elf) {
                     uint16_t em = 0;
                     if (strstr(target, "aarch64")) em = EM_AARCH64;
@@ -13976,6 +14212,11 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
                     return false;
                 } else {
                     if (output_direct_macho(out_path, code) != 0) return false;
+                }
+
+                if (stats && exe_provider_count > 0) {
+                    stats->provider_object_count = exe_provider_count;
+                    stats->provider_resolved_symbol_count = exe_provider_resolved;
                 }
             }
             if (stats) {
@@ -16840,7 +17081,7 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
     } else if (effective_csg_path && effective_csg_path[0]) {
         compiled = cold_compile_csg_path_to_macho(out_path, effective_csg_path, source_path,
                                                   workspace_root[0] ? workspace_root : 0,
-                                                  target, &stats, false, 0);
+                                                  target, &stats, false, provider_objects);
 #ifndef COLD_BACKEND_ONLY
     } else {
         compiled = cold_compile_source_path_to_macho(out_path, source_path, false, &stats);
