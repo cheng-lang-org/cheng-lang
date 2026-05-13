@@ -23,13 +23,15 @@
 
 **未完成（不能写成已成立）**
 
-- **provider archive 生成与链接**：`--csg-in --link-providers` 在 macOS 上受 Mach-O 点号符号限制，Linux ELF 路径可行
-- **runtime smoke cc 链接**：compiler_runtime/thread_atomic_orc 的 .o 无法被 macOS cc 链接（Mach-O 点号符号限制）。内置 ELF 链接器已绕过：三 smoke 均产出 RISC-V linked ELF executable
-- **backend driver CSG fixed-point**：writer fixed-point 成立，reader→自身替代未验证
-- **删除 cold source parser/import**：COLD_BACKEND_ONLY 已守卫，42% 缩减。parser 代码保留
-- **C seed 替代**：`cheng_seed.c`（66000 行）仍为 Cheng 完整语言实现，不可移除
-- **Ownership / E-Graph**：No-Alias 有基础，Ownership/E-Graph 不能算完成
-- **函数级并行**：有实现痕迹，active 主链证明不足
+| gap | 状态 | 下一步 |
+|---|---|---|
+| provider archive 生成与链接 | macOS cc 被 Mach-O 点号符号阻断 | Linux runner 上验证 `--csg-in --link-providers` 用 GNU ld/lld 链接 ELF .o |
+| runtime smoke cc 链接 | 同上，内置 ELF 链接器已绕过 | 三 smoke RISC-V linked ELF 均已 QEMU 验证 |
+| backend driver CSG fixed-point (reader) | writer fixed-point 成立 | 用不同 bootstrap stage 的冷编译器二进制对同一 facts 产出 .o，cmp 验证 |
+| 删除 cold source parser | COLD_BACKEND_ONLY 42% 缩减 | parser 代码保留，cold_parser.c 独立文件 |
+| C seed 替代 | cheng_seed.c 仍是完整 Cheng 语言实现 | 冷编译器子集覆盖足够后可退役 |
+| Ownership / E-Graph | No-Alias 基础存在 | 需要 ownership proof driver 重跑 + E-Graph rewrite rules |
+| 函数级并行 | 有 work-stealing 痕迹 | 需要 active lowering 主链接入 + benchmark 证明加速比
 
 ### 本次会话新增（2026-05-12）
 
