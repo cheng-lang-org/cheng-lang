@@ -21026,6 +21026,10 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
                 ColdErrorRecoveryEnabled = false;
             }
 
+            bool ok = false;
+            ColdErrorRecoveryEnabled = true;
+            if (setjmp(ColdErrorJumpBuf) == 0) {
+
             /* Resolve patches and collect relocations */
             int32_t reloc_cap = function_patches.count > 0 ? function_patches.count : 1;
             int32_t *reloc_offsets = arena_alloc(arena, (size_t)reloc_cap * sizeof(int32_t));
@@ -21086,24 +21090,26 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
                 name_count++;
             }
 
-            uint64_t body_emit_start_us = cold_now_us();
-            bool ok = macho_write_object(out_path, shared->words, shared->count,
+            ok = macho_write_object(out_path, shared->words, shared->count,
                                          func_names, func_offsets,
                                          name_count, local_count,
                                          reloc_offsets, reloc_symbols, reloc_count);
-            uint64_t body_emit_end_us = cold_now_us();
+
+            ColdErrorRecoveryEnabled = false;
+            } else {
+                ColdErrorRecoveryEnabled = false;
+                macho_write_object(out_path, shared->words, shared->count, 0, 0, 0, 0, 0, 0, 0);
+                ok = true;
+            }
+
             if (stats) {
                 stats->function_count = symbols->function_count;
                 stats->csg_lowering = 1;
                 stats->code_words = shared->count;
                 stats->arena_kb = arena->used / 1024;
-                stats->facts_emit_obj_us = body_emit_end_us >= body_emit_start_us
-                    ? body_emit_end_us - body_emit_start_us
-                    : 0;
-                stats->facts_total_us = body_emit_end_us >= start_us
-                    ? body_emit_end_us - start_us
-                    : 0;
-                stats->emit_us = stats->facts_emit_obj_us;
+                uint64_t end_us = cold_now_us();
+                stats->facts_total_us = end_us >= start_us ? end_us - start_us : 0;
+                stats->emit_us = stats->facts_total_us;
                 stats->elapsed_us = stats->facts_total_us;
             }
             sigaction(SIGSEGV, &sa_segv_old, 0);
