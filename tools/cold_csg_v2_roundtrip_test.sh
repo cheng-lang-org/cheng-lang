@@ -161,6 +161,22 @@ else
     ok "truncated_hard_fail"
 fi
 
+
+# Built-in linker: ELF .o should also produce .linked executable
+echo "  - builtin_linker_elf"
+"$COLD" system-link-exec \
+  --csg-in:"$WORK/ordinary.facts" \
+  --emit:obj --target:riscv64-unknown-linux-gnu \
+  --out:"$WORK/ordinary_link.o" \
+  > "$WORK/ordinary_link.report.txt" 2>&1 || true
+if [ -f "$WORK/ordinary_link.o.linked" ]; then
+  file "$WORK/ordinary_link.o.linked" | grep -q "ELF.*executable" && echo "PASS builtin_linker_elf" || echo "FAIL builtin_linker_elf"
+  pass=$((pass + 1))
+else
+  echo "FAIL builtin_linker_elf (no .linked file)"
+  fail=$((fail + 1))
+fi
+
 echo "=== $pass passed, $fail failed ==="
 if [ "$fail" -ne 0 ]; then
     exit 1

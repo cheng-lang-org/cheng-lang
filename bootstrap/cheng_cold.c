@@ -21126,9 +21126,9 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
                                             func_names, func_offsets, name_count, local_count,
                                             reloc_offsets, reloc_symbols, reloc_count);
 
-                /* Built-in linker: for ELF (ARM64/RISC-V) with relocations,
-                   resolve all external calls to stubs → linked executable. */
-                if (ok && is_elf && !strstr(target, "x86_64") && reloc_count > 0) {
+                /* Built-in linker: for ELF (ARM64/RISC-V), always produce
+                   linked executable alongside the .o file. */
+                if (ok && is_elf && !strstr(target, "x86_64")) {
                     int32_t stub_words = reloc_count * 2 + 8;
                     Code *linked = code_new(arena, shared->count + stub_words);
                     memcpy(linked->words, shared->words, (size_t)shared->count * sizeof(uint32_t));
