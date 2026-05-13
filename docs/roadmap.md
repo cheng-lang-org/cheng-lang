@@ -2,20 +2,34 @@
 
 > 口径：只记录当前仓库能证明或必须硬证明的状态。愿景可以写目标，不写成完成。若与实现冲突，以 `docs/cheng-formal-spec.md`、`src/core/tooling/README.md`、当前源码和当前可执行产物为准。
 
-## 当前事实（2026-05-13）
+## 当前事实（2026-05-14）
 
-### 里程碑：路线图 0-7 全部收敛（2026-05-13）
+### 可信进度：CSG v2 毫秒级后端主线前半段
 
-- **30/30 冷编译器回归**，**35/35 stdlib 全编译**（100%）
-- **冷编译器自举闭环**：冷编译器(C) → `build-backend-driver`(15ms) → Cheng 工具链 → 编译普通 Cheng 程序 + combined kernel(exit 42)
-- **C seed 最小化**：冷编译器 20572 行（从 21726 清理 1154 行 CSG/死代码），`cheng_seed.c` 在 bootstrap chain 中保留
-- **跨端编译**：4 ISA (ARM64/x86_64/RISC-V 64) × 3 格式 (Mach-O/ELF64/COFF) 全部接入编译管线
-- **泛型单态化完成**：`make_pair[int32](10)→42`，`identity[int32](42)→42`，`core/option Some/IsSome/Get→42`
-- **闭包支持**：`closure_new`/`closure_call`/`closure_env` 三个内置函数，ARM64 codegen 完整
-- **CSG 管线清理**：源码路径冗余往返已删除（-1121 行），核心 CSG IR 保留（`--csg-in` 模式）
-- **极限架构三特性**：解析去重 + arena 复用 + 无锁 work-stealing(Chase-Lev)
-- **所有权证明**：`ownership_proof_driver_cold` + `ownership_proof_witness` 通过
-- **编译时间**：12-15ms（低于 30ms 目标）
+**已成立（可复现验证）**
+
+- **冷编译器三架构 codegen**：ARM64/x86_64/RISC-V 全 133 BodyIR ops 覆盖
+- **ordinary provider-free direct Mach-O**：`ordinary_zero_exit_fixture` 直接编译运行 exit 0
+- **CSG v2 facts 往返**：`tools/cold_csg_v2_roundtrip_test.sh` 36/36 PASS
+  - Cheng writer → facts → cold reader → .o → cmp（确定性验证）
+  - 错误输入 hard-fail（unknown record、truncated）
+  - report 字段全输出（facts_bytes/mmap_ms/verify_ms/decode_ms/total_ms）
+- **三架构 ELF/Mach-O exe 直出**：ARM64 Mach-O + RISC-V/x86_64 ELF64 executable
+- **内置 ELF 链接器**：obj 路径自动产出 `.linked` 可执行文件
+- **fixed-point**：C writer 与 Cheng writer 对同一输入产出 bit-identical facts
+- **文件拆分**：`cold_parser.c` 独立，`COLD_BACKEND_ONLY` 42% 缩减（590KB→344KB）
+- **跨端编译**：ARM64 Mach-O + RISC-V/x86_64 ELF64 obj + exe
+- **编译时间**：exe 路径 0.2-2ms，source 路径 12-15ms
+
+**未完成（不能写成已成立）**
+
+- **provider archive 生成与链接**：`--csg-in --link-providers` 未对接
+- **runtime/provider smoke CSG 路径**：compiler_runtime/thread_atomic_orc 的 .o 无法被 cc 链接（Mach-O 点号符号限制，ELF 内置链接器可绕过）
+- **backend driver CSG fixed-point**：writer fixed-point 成立，reader→自身替代未验证
+- **删除 cold source parser/import**：COLD_BACKEND_ONLY 已守卫但 parser 代码保留
+- **C seed 替代**：`cheng_seed.c`（66000 行）仍为 Cheng 完整语言实现，不可移除
+- **Ownership / E-Graph**：No-Alias 有基础，Ownership/E-Graph 不能算完成
+- **函数级并行**：有实现痕迹，active 主链证明不足
 
 ### 本次会话新增（2026-05-12）
 
