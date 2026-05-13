@@ -22641,6 +22641,53 @@ static bool cold_emit_csg_v2_facts(const char *path, BodyIR **function_bodies,
     return true;
 }
 
+/* Emit CSG v2 facts from source as a sidecar (used by --csg-out flag).
+   Opens source, compiles with imports, calls cold_emit_csg_v2_facts. */
+static bool cold_emit_csg_v2_facts_from_source(const char *facts_path,
+                                                const char *source_path,
+                                                const char *target) {
+    Arena *arena = mmap(0, sizeof(Arena), PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (arena == MAP_FAILED) return false;
+    Symbols *symbols = symbols_new(arena);
+    Span src = source_open(source_path);
+    if (src.len <= 0) return false;
+    cold_collect_imported_function_signatures(symbols, src);
+    cold_collect_function_signatures(symbols, src);
+    cold_collect_all_transitive_imports(symbols, src);
+    ColdImportSource import_sources[64];
+    int32_t import_count = cold_collect_direct_import_sources(src, import_sources, 64);
+    int32_t body_cap = symbols->function_cap;
+    if (body_cap < 256) body_cap = 256;
+    BodyIR **function_bodies = arena_alloc(arena, (size_t)body_cap * sizeof(BodyIR *));
+    memset(function_bodies, 0, (size_t)body_cap * sizeof(BodyIR *));
+    ColdErrorRecoveryEnabled = true;
+    if (setjmp(ColdErrorJumpBuf) == 0) {
+        cold_compile_imported_bodies_no_recurse(symbols, src, function_bodies, body_cap);
+    }
+    ColdErrorRecoveryEnabled = false;
+    /* Parse main source */
+    Parser parser = {src, 0, arena, symbols};
+    parser.import_sources = import_sources;
+    parser.import_source_count = import_count;
+    while (parser.pos < src.len) {
+        parser_ws(&parser);
+        if (parser.pos >= src.len) break;
+        Span next = parser_peek(&parser);
+        if (span_eq(next, "type")) parse_type(&parser);
+        else if (span_eq(next, "const")) parse_const(&parser);
+        else if (span_eq(next, "fn")) {
+            int32_t si = -1;
+            BodyIR *body = parse_fn(&parser, &si);
+            if (si >= 0 && si < body_cap) function_bodies[si] = body;
+        } else parser_line(&parser);
+    }
+    bool ok = cold_emit_csg_v2_facts(facts_path, function_bodies,
+                                      symbols->function_count, symbols, target);
+    munmap((void *)src.ptr, (size_t)src.len);
+    return ok;
+}
+
 static int cold_cmd_system_link_exec(int argc, char **argv) {
     const char *source_path = cold_flag_value(argc, argv, "--in");
     const char *csg_in_path = cold_flag_value(argc, argv, "--csg-in");
@@ -22697,6 +22744,7 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
         return 2;
     }
 #endif
+    bool csg_sidecar = false;
     if (csg_out_path && csg_out_path[0] != '\0') {
         if (!source_path || source_path[0] == '\0') {
             cold_write_system_link_exec_report(report_path, false, source_path, csg_out_path, out_path,
@@ -22704,7 +22752,13 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
             fprintf(stderr, "[cheng_cold] --csg-out requires --in:<source>\n");
             return 2;
         }
-        effective_csg_path = csg_out_path;
+        /* If --csg-in is also set, --csg-out is the output path for CSG compilation.
+           Otherwise, --csg-out is a sidecar: compile from source AND emit CSG facts. */
+        if (csg_in_path && csg_in_path[0] != '\0') {
+            effective_csg_path = csg_out_path;
+        } else {
+            csg_sidecar = true;
+        }
     }
     if (!out_path || out_path[0] == '\0') {
         cold_write_system_link_exec_report(report_path, false, source_path, effective_csg_path, out_path,
@@ -23049,6 +23103,47 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
                                                   target, &stats, false);
     } else {
         compiled = cold_compile_source_path_to_macho(out_path, source_path, false, &stats);
+    }
+    /* Emit CSG v2 facts as sidecar when --csg-out is present */
+    if (compiled && csg_sidecar && csg_out_path && csg_out_path[0]) {
+        Arena *sc_arena = mmap(0, sizeof(Arena), PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (sc_arena != MAP_FAILED) {
+            Symbols *sc_sym = symbols_new(sc_arena);
+            Span sc_src = source_open(source_path);
+            if (sc_src.len > 0) {
+                cold_collect_imported_function_signatures(sc_sym, sc_src);
+                cold_collect_function_signatures(sc_sym, sc_src);
+                cold_collect_all_transitive_imports(sc_sym, sc_src);
+                ColdImportSource sc_imp[64];
+                int32_t sc_imp_c = cold_collect_direct_import_sources(sc_src, sc_imp, 64);
+                int32_t sc_bcap = sc_sym->function_cap;
+                if (sc_bcap < 256) sc_bcap = 256;
+                BodyIR **sc_bodies = arena_alloc(sc_arena, (size_t)sc_bcap * sizeof(BodyIR *));
+                memset(sc_bodies, 0, (size_t)sc_bcap * sizeof(BodyIR *));
+                ColdErrorRecoveryEnabled = true;
+                if (setjmp(ColdErrorJumpBuf) == 0)
+                    cold_compile_imported_bodies_no_recurse(sc_sym, sc_src, sc_bodies, sc_bcap);
+                ColdErrorRecoveryEnabled = false;
+                Parser sc_parser = {sc_src, 0, sc_arena, sc_sym};
+                sc_parser.import_sources = sc_imp;
+                sc_parser.import_source_count = sc_imp_c;
+                while (sc_parser.pos < sc_src.len) {
+                    parser_ws(&sc_parser);
+                    if (sc_parser.pos >= sc_src.len) break;
+                    Span next = parser_peek(&sc_parser);
+                    if (span_eq(next, "type")) parse_type(&sc_parser);
+                    else if (span_eq(next, "const")) parse_const(&sc_parser);
+                    else if (span_eq(next, "fn")) {
+                        int32_t si = -1;
+                        BodyIR *b = parse_fn(&sc_parser, &si);
+                        if (si >= 0 && si < sc_bcap) sc_bodies[si] = b;
+                    } else parser_line(&sc_parser);
+                }
+                cold_emit_csg_v2_facts(csg_out_path, sc_bodies, sc_sym->function_count, sc_sym, target);
+                munmap((void *)sc_src.ptr, (size_t)sc_src.len);
+            }
+        }
     }
     if (!compiled) {
         cold_write_system_link_exec_report(report_path, false, source_path, effective_csg_path, out_path,
