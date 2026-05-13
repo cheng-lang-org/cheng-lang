@@ -19548,6 +19548,7 @@ typedef struct {
     uint64_t facts_verify_us;
     uint64_t facts_decode_us;
     uint64_t facts_emit_obj_us;
+    uint64_t facts_emit_exe_us;
     uint64_t facts_total_us;
     int32_t facts_function_count;
     int32_t facts_word_count;
@@ -20108,6 +20109,10 @@ static bool cold_compile_canonical_csg_v2_primary_object(const char *out_path,
                                                          ColdCompileStats *stats,
                                                          uint64_t start_us,
                                                          uint64_t mmap_done_us) {
+    if (csg_text.len <= 0 ||
+        csg_text.len > (int32_t)CSG_V2_BUDGET_MAX_FACTS_BYTES) {
+        return false;
+    }
     int32_t function_count = 0;
     int32_t word_count = 0;
     int32_t reloc_count = 0;
@@ -20115,6 +20120,9 @@ static bool cold_compile_canonical_csg_v2_primary_object(const char *out_path,
     if (!cold_csg_v2_count_primary_records(csg_text, &function_count, &word_count, &reloc_count)) {
         return false;
     }
+    if (function_count <= 0 || function_count > CSG_V2_BUDGET_MAX_FN_COUNT) return false;
+    if (word_count < 0 || word_count > CSG_V2_BUDGET_MAX_OP_COUNT) return false;
+    if (reloc_count < 0 || reloc_count > CSG_V2_BUDGET_MAX_OP_COUNT) return false;
     uint64_t verify_end_us = cold_now_us();
     ColdCsgV2PrimaryObject facts;
     if (!cold_csg_v2_decode_primary_object(csg_text, arena,
@@ -20224,10 +20232,25 @@ static bool cold_load_csg_v2_facts(
 
     uint32_t sec_kind[10], sec_size[10];
     uint64_t sec_offset[10];
+    uint64_t section_data_end = 0;
     for (uint32_t si = 0; si < section_count; si++) {
         if (!cold_read_u32(data, data_len, &pos, &sec_kind[si])) return false;
         if (!cold_read_u64(data, data_len, &pos, &sec_offset[si])) return false;
         if (!cold_read_u32(data, data_len, &pos, &sec_size[si])) return false;
+        if (sec_offset[si] > (uint64_t)data_len) return false;
+        if ((uint64_t)sec_size[si] > (uint64_t)data_len - sec_offset[si]) return false;
+        uint64_t end = sec_offset[si] + (uint64_t)sec_size[si];
+        if (end > section_data_end) section_data_end = end;
+    }
+    if (section_data_end > (uint64_t)data_len) return false;
+    if ((uint64_t)data_len - section_data_end != CSG_V2_TRAILER_SIZE) return false;
+    {
+        int32_t tpos = (int32_t)section_data_end;
+        uint32_t trailer_section_count = 0;
+        if (!cold_read_u32(data, data_len, &tpos, &trailer_section_count)) return false;
+        if (trailer_section_count != section_count) return false;
+        tpos += CSG_V2_HASH_SIZE;
+        if (tpos != data_len) return false;
     }
 
     /* 3. Parse string section (kind=5) */
@@ -20521,6 +20544,13 @@ static uint32_t cold_read_csg_v2_u32_le(const uint8_t *data, int32_t *pos) {
     return v;
 }
 
+static bool cold_read_csg_v2_u32_le_checked(const uint8_t *data,
+                                            int32_t data_len,
+                                            int32_t *pos,
+                                            uint32_t *out) {
+    return cold_read_u32(data, data_len, pos, out);
+}
+
 static char *cold_read_csg_v2_obj_str(Arena *arena, const uint8_t *data, int32_t *pos) {
     uint32_t len = cold_read_csg_v2_u32_le(data, pos);
     char *s = (char *)(data + *pos);
@@ -20530,6 +20560,27 @@ static char *cold_read_csg_v2_obj_str(Arena *arena, const uint8_t *data, int32_t
     memcpy(copy, s, (size_t)len);
     copy[len] = '\0';
     return copy;
+}
+
+static bool cold_read_csg_v2_obj_str_checked(Arena *arena,
+                                             const uint8_t *data,
+                                             int32_t payload_end,
+                                             int32_t *pos,
+                                             char **out) {
+    uint32_t len = 0;
+    if (!cold_read_csg_v2_u32_le_checked(data, payload_end, pos, &len)) return false;
+    if (len > (uint32_t)INT32_MAX) return false;
+    if (*pos < 0 || *pos > payload_end - (int32_t)len) return false;
+    if (len == 0) {
+        *out = "";
+        return true;
+    }
+    char *copy = arena_alloc(arena, (size_t)len + 1);
+    memcpy(copy, data + *pos, (size_t)len);
+    copy[len] = '\0';
+    *pos += (int32_t)len;
+    *out = copy;
+    return true;
 }
 
 typedef struct {
@@ -20567,32 +20618,41 @@ static bool cold_load_csg_v2_obj_facts(
 
     /* Magic */
     if (data_len < 8 || memcmp(data, "CHENGCSG", 8) != 0) return false;
+    if (data_len > CSG_V2_BUDGET_MAX_FACTS_BYTES) return false;
     pos = 8;
 
     /* Parse records */
     while (pos + 6 <= data_len) {
         uint32_t kind = (uint32_t)data[pos] | ((uint32_t)data[pos+1] << 8);
         pos += 2;
-        uint32_t payload_size = cold_read_csg_v2_u32_le(data, &pos);
+        uint32_t payload_size = 0;
+        if (!cold_read_csg_v2_u32_le_checked(data, data_len, &pos, &payload_size)) return false;
+        if (payload_size > (uint32_t)INT32_MAX) return false;
         if (pos + (int32_t)payload_size > data_len) return false;
         int32_t payload_end = pos + (int32_t)payload_size;
 
         switch (kind) {
         case 1: /* target_triple */
-            facts->target_triple = cold_read_csg_v2_obj_str(arena, data, &pos);
+            if (!cold_read_csg_v2_obj_str_checked(arena, data, payload_end,
+                                                  &pos, &facts->target_triple)) return false;
             break;
         case 2: /* object_format */
-            facts->object_format = cold_read_csg_v2_obj_str(arena, data, &pos);
+            if (!cold_read_csg_v2_obj_str_checked(arena, data, payload_end,
+                                                  &pos, &facts->object_format)) return false;
             break;
         case 3: /* entry_symbol */
-            facts->entry_symbol = cold_read_csg_v2_obj_str(arena, data, &pos);
+            if (!cold_read_csg_v2_obj_str_checked(arena, data, payload_end,
+                                                  &pos, &facts->entry_symbol)) return false;
             break;
         case 4: { /* function */
-            uint32_t item_id = cold_read_csg_v2_u32_le(data, &pos);
-            uint32_t word_offset = cold_read_csg_v2_u32_le(data, &pos);
-            uint32_t word_count = cold_read_csg_v2_u32_le(data, &pos);
-            char *sym = cold_read_csg_v2_obj_str(arena, data, &pos);
-            char *kind_str = cold_read_csg_v2_obj_str(arena, data, &pos);
+            uint32_t item_id = 0, word_offset = 0, word_count = 0;
+            char *sym = 0;
+            char *kind_str = 0;
+            if (!cold_read_csg_v2_u32_le_checked(data, payload_end, &pos, &item_id)) return false;
+            if (!cold_read_csg_v2_u32_le_checked(data, payload_end, &pos, &word_offset)) return false;
+            if (!cold_read_csg_v2_u32_le_checked(data, payload_end, &pos, &word_count)) return false;
+            if (!cold_read_csg_v2_obj_str_checked(arena, data, payload_end, &pos, &sym)) return false;
+            if (!cold_read_csg_v2_obj_str_checked(arena, data, payload_end, &pos, &kind_str)) return false;
             if (facts->function_count >= facts->function_cap) {
                 int32_t new_cap = facts->function_cap ? facts->function_cap * 2 : 8;
                 CsgV2ObjFunction *new_fns = arena_alloc(arena,
@@ -20612,18 +20672,23 @@ static bool cold_load_csg_v2_obj_facts(
             break;
         }
         case 5: { /* instruction_words (batched) */
+            if ((payload_size % 4) != 0) return false;
             int32_t word_count = (int32_t)payload_size / 4;
+            if (word_count < 0 || word_count > CSG_V2_BUDGET_MAX_OP_COUNT) return false;
             facts->words = arena_alloc(arena, (size_t)word_count * sizeof(uint32_t));
             for (int32_t i = 0; i < word_count; i++) {
-                facts->words[i] = cold_read_csg_v2_u32_le(data, &pos);
+                if (!cold_read_csg_v2_u32_le_checked(data, payload_end,
+                                                     &pos, &facts->words[i])) return false;
             }
             facts->word_count = word_count;
             break;
         }
         case 6: { /* reloc */
-            uint32_t src_id = cold_read_csg_v2_u32_le(data, &pos);
-            uint32_t word_off = cold_read_csg_v2_u32_le(data, &pos);
-            char *target = cold_read_csg_v2_obj_str(arena, data, &pos);
+            uint32_t src_id = 0, word_off = 0;
+            char *target = 0;
+            if (!cold_read_csg_v2_u32_le_checked(data, payload_end, &pos, &src_id)) return false;
+            if (!cold_read_csg_v2_u32_le_checked(data, payload_end, &pos, &word_off)) return false;
+            if (!cold_read_csg_v2_obj_str_checked(arena, data, payload_end, &pos, &target)) return false;
             if (facts->reloc_count >= facts->reloc_cap) {
                 int32_t new_cap = facts->reloc_cap ? facts->reloc_cap * 2 : 8;
                 uint32_t *new_src = arena_alloc(arena,
@@ -20652,10 +20717,17 @@ static bool cold_load_csg_v2_obj_facts(
             break;
         }
         default:
-            pos = payload_end; /* skip unknown records */
-            break;
+            return false;
         }
+        if (pos != payload_end) return false;
     }
+    if (pos != data_len) return false;
+    if (facts->function_count <= 0 ||
+        facts->function_count > CSG_V2_BUDGET_MAX_FN_COUNT) return false;
+    if (facts->word_count < 0 ||
+        facts->word_count > CSG_V2_BUDGET_MAX_OP_COUNT) return false;
+    if (facts->reloc_count < 0 ||
+        facts->reloc_count > CSG_V2_BUDGET_MAX_OP_COUNT) return false;
     return true;
 }
 
@@ -20721,11 +20793,13 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
                 return false;
             }
             CsgV2ObjFacts obj_facts;
+            uint64_t obj_decode_start_us = cold_now_us();
             if (!cold_load_csg_v2_obj_facts(csg_text.ptr, csg_text.len,
                                              &obj_facts, arena)) {
                 munmap((void *)csg_text.ptr, (size_t)csg_text.len);
                 return false;
             }
+            uint64_t obj_decode_end_us = cold_now_us();
             if (obj_facts.function_count <= 0 || obj_facts.word_count <= 0) {
                 munmap((void *)csg_text.ptr, (size_t)csg_text.len);
                 return false;
@@ -20826,6 +20900,7 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
             }
 
             bool ok;
+            uint64_t obj_emit_start_us = cold_now_us();
             if (is_elf) {
                 ok = elf64_write_object(out_path, obj_facts.words, obj_facts.word_count,
                                         names, offsets, name_count, local_count,
@@ -20841,6 +20916,7 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
                                         names, offsets, name_count, local_count,
                                         reloc_offsets, reloc_symbols, obj_facts.reloc_count);
             }
+            uint64_t obj_emit_end_us = cold_now_us();
 
             if (stats) {
                 stats->function_count = obj_facts.function_count;
@@ -20849,14 +20925,25 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
                 stats->arena_kb = arena->used / 1024;
                 stats->facts_bytes = (uint64_t)csg_text.len;
                 stats->facts_mmap_us = mmap_done_us >= start_us ? mmap_done_us - start_us : 0;
+                stats->facts_verify_us = obj_decode_start_us >= mmap_done_us
+                    ? obj_decode_start_us - mmap_done_us
+                    : 0;
+                stats->facts_decode_us = obj_decode_end_us >= obj_decode_start_us
+                    ? obj_decode_end_us - obj_decode_start_us
+                    : 0;
+                stats->facts_emit_obj_us = obj_emit_end_us >= obj_emit_start_us
+                    ? obj_emit_end_us - obj_emit_start_us
+                    : 0;
                 stats->facts_function_count = obj_facts.function_count;
                 stats->facts_word_count = obj_facts.word_count;
                 stats->facts_reloc_count = obj_facts.reloc_count;
-                uint64_t end_us = cold_now_us();
+                uint64_t end_us = obj_emit_end_us;
                 if (end_us >= start_us) {
                     stats->facts_total_us = end_us - start_us;
                     stats->elapsed_us = end_us - start_us;
                 }
+                stats->parse_us = stats->facts_verify_us + stats->facts_decode_us;
+                stats->emit_us = stats->facts_emit_obj_us;
             }
             munmap((void *)csg_text.ptr, (size_t)csg_text.len);
             return ok;
@@ -20915,7 +21002,11 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
                 symbol_offset[i] = shared->count;
                 if ((uintptr_t)body < 4096 || body->has_fallback ||
                     body->block_count == 0) {
+                    /* Emit stub for degraded/external function bodies */
+                    code_emit(shared, a64_stp_pre(FP, LR, SP, -16));
+                    code_emit(shared, a64_add_imm(FP, SP, 0, true));
                     code_emit(shared, a64_movz(R0, 0, 0));
+                    code_emit(shared, a64_ldp_post(FP, LR, SP, 16));
                     code_emit(shared, a64_ret());
                     continue;
                 }
@@ -20926,8 +21017,11 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
                     codegen_func(shared, body, symbols, &function_patches);
                 } else {
                     shared->count = saved_count;
-                    code_emit(shared, a64_movz(R0, 0, 0));
-                    code_emit(shared, a64_ret());
+                    ColdErrorRecoveryEnabled = false;
+                    sigaction(SIGSEGV, &sa_segv_old, 0);
+                    sigaction(SIGBUS,  &sa_bus_old, 0);
+                    munmap((void *)csg_text.ptr, (size_t)csg_text.len);
+                    return false;
                 }
                 ColdErrorRecoveryEnabled = false;
             }
@@ -20992,15 +21086,25 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
                 name_count++;
             }
 
+            uint64_t body_emit_start_us = cold_now_us();
             bool ok = macho_write_object(out_path, shared->words, shared->count,
-                                          func_names, func_offsets,
-                                          name_count, local_count,
-                                          reloc_offsets, reloc_symbols, reloc_count);
+                                         func_names, func_offsets,
+                                         name_count, local_count,
+                                         reloc_offsets, reloc_symbols, reloc_count);
+            uint64_t body_emit_end_us = cold_now_us();
             if (stats) {
                 stats->function_count = symbols->function_count;
                 stats->csg_lowering = 1;
                 stats->code_words = shared->count;
                 stats->arena_kb = arena->used / 1024;
+                stats->facts_emit_obj_us = body_emit_end_us >= body_emit_start_us
+                    ? body_emit_end_us - body_emit_start_us
+                    : 0;
+                stats->facts_total_us = body_emit_end_us >= start_us
+                    ? body_emit_end_us - start_us
+                    : 0;
+                stats->emit_us = stats->facts_emit_obj_us;
+                stats->elapsed_us = stats->facts_total_us;
             }
             sigaction(SIGSEGV, &sa_segv_old, 0);
             sigaction(SIGBUS,  &sa_bus_old, 0);
@@ -21855,6 +21959,9 @@ static bool cold_write_system_link_exec_report(const char *path,
     fputs("full_backend_codegen=0\n", file);
     fprintf(file, "target=%s\n", target ? target : "");
     fprintf(file, "emit=%s\n", emit ? emit : "");
+    if (emit && strcmp(emit, "csg-v2") == 0) {
+        fprintf(file, "cold_csg_v2_writer_status=%s\n", success ? "ok" : "fail");
+    }
     fprintf(file, "source=%s\n", source_path ? source_path : "");
     fprintf(file, "csg_input=%s\n", csg_path ? csg_path : "");
     fprintf(file, "output=%s\n", out_path ? out_path : "");
@@ -21885,11 +21992,13 @@ static bool cold_write_system_link_exec_report(const char *path,
         fprintf(file, "facts_verify_us=%llu\n", (unsigned long long)stats->facts_verify_us);
         fprintf(file, "facts_decode_us=%llu\n", (unsigned long long)stats->facts_decode_us);
         fprintf(file, "facts_emit_obj_us=%llu\n", (unsigned long long)stats->facts_emit_obj_us);
+        fprintf(file, "facts_emit_exe_us=%llu\n", (unsigned long long)stats->facts_emit_exe_us);
         fprintf(file, "facts_total_us=%llu\n", (unsigned long long)stats->facts_total_us);
         cold_print_elapsed_ms(file, "facts_mmap_ms", stats->facts_mmap_us);
         cold_print_elapsed_ms(file, "facts_verify_ms", stats->facts_verify_us);
         cold_print_elapsed_ms(file, "facts_decode_ms", stats->facts_decode_us);
         cold_print_elapsed_ms(file, "facts_emit_obj_ms", stats->facts_emit_obj_us);
+        cold_print_elapsed_ms(file, "facts_emit_exe_ms", stats->facts_emit_exe_us);
         cold_print_elapsed_ms(file, "facts_total_ms", stats->facts_total_us);
         fprintf(file, "facts_function_count=%d\n", stats->facts_function_count);
         fprintf(file, "facts_word_count=%d\n", stats->facts_word_count);
@@ -22263,12 +22372,16 @@ static bool cold_emit_csg_v2_facts(const char *path, BodyIR **function_bodies,
                                     int32_t func_count, Symbols *symbols,
                                     const char *target) {
     if (!function_bodies || !symbols || func_count <= 0) return false;
-    /* Count functions to serialize: those with valid bodies AND external declarations */
+    /* Count functions to serialize: valid bodies plus explicit external declarations. */
     int32_t valid_count = 0;
     for (int32_t i = 0; i < func_count; i++) {
         BodyIR *b = function_bodies[i];
         if (b && !b->has_fallback) valid_count++;
-        else if (symbols->functions[i].name.len > 0) valid_count++; /* external declaration */
+        else if (symbols->functions[i].name.len > 0 &&
+                 symbols->functions[i].is_external) valid_count++;
+        else if (symbols->functions[i].name.len > 0) {
+            return false;
+        }
     }
     if (valid_count <= 0) return false;
 
@@ -22364,6 +22477,12 @@ static bool cold_emit_csg_v2_facts(const char *path, BodyIR **function_bodies,
             /* name: u32 len + utf8 bytes */
             cold_emit_csg_v2_str(f, symbols->functions[fi].name);
             if (!b || b->has_fallback) {
+                if (!symbols->functions[fi].is_external) {
+                    fclose(f);
+                    free(unique_strs);
+                    free(str_id_map);
+                    return false;
+                }
                 /* External declaration: no params, no ops, no slots */
                 cold_emit_csg_v2_u32(f, 0); /* param_count */
                 cold_emit_csg_v2_u32(f, SLOT_I32); /* return_kind */
@@ -22785,9 +22904,16 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
             return 2;
         }
 
+        ColdCompileStats stats = {0};
+        struct stat csg_st;
+        if (stat(out_path, &csg_st) == 0 && csg_st.st_size > 0) {
+            stats.facts_bytes = (uint64_t)csg_st.st_size;
+        }
+        stats.csg_lowering = 1;
+        stats.function_count = symbols->function_count;
         munmap((void *)mapped_source.ptr, (size_t)mapped_source.len);
         cold_write_system_link_exec_report(report_path, true, source_path, out_path, out_path,
-                                           target, emit, 0, "");
+                                           target, emit, &stats, "");
         return 0;
     }
     /* derive workspace root from source path for import resolution */
