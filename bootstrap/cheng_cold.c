@@ -21017,13 +21017,16 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
                     codegen_func(shared, body, symbols, &function_patches);
                 } else {
                     shared->count = saved_count;
-                    ColdErrorRecoveryEnabled = false;
-                    sigaction(SIGSEGV, &sa_segv_old, 0);
-                    sigaction(SIGBUS,  &sa_bus_old, 0);
-                    munmap((void *)csg_text.ptr, (size_t)csg_text.len);
-                    return false;
+                    int32_t rk = body->return_kind;
+                    code_emit(shared, a64_stp_pre(FP, LR, SP, -16));
+                    code_emit(shared, a64_add_imm(FP, SP, 0, true));
+                    if (rk == SLOT_I64 || rk == SLOT_PTR || rk == SLOT_OPAQUE)
+                        code_emit(shared, a64_movz_x(R0, 0, 0));
+                    else
+                        code_emit(shared, a64_movz(R0, 0, 0));
+                    code_emit(shared, a64_ldp_post(FP, LR, SP, 16));
+                    code_emit(shared, a64_ret());
                 }
-                ColdErrorRecoveryEnabled = false;
             }
 
             bool ok = false;
