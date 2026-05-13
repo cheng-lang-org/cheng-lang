@@ -118,6 +118,10 @@ W char* cheng_read_file_bridge(const char* p) { static char buf[65536]; FILE* f=
 W void echo(const char* s) { puts(s); }
 W void* c_malloc(size_t sz) { return malloc(sz); }
 W void atomicPanicRaw(const char* msg) { cheng_panic_cstring_and_exit(msg); }
+/* Aliases for Cheng's module-qualified names (e.g. atomic.Malloc → c_malloc) */
+__asm__(".globl _atomic.Malloc\n_atomic.Malloc = _c_malloc");
+__asm__(".globl _atomic.c_malloc\n_atomic.c_malloc = _c_malloc");
+__asm__(".globl _atomic.atomicPanicRaw\n_atomic.atomicPanicRaw = _atomicPanicRaw");
 /* Atomic bridge functions for std/atomic provider.
    These use GCC __atomic builtins which generate proper ARM64 atomic instructions
    (ldar/stlr/ldaxr/stlxr) matching the cold compiler's inline codegen. */

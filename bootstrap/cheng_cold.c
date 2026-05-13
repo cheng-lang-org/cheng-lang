@@ -20302,7 +20302,11 @@ static bool cold_load_csg_v2_facts(
         int32_t sym_idx = symbols_add_fn(symbols, fn_name, (int32_t)param_count,
                                           param_kinds, param_sizes, cold_cstr_span(""));
 
-        /* Create BodyIR */
+        /* Mark external functions (no ops = @importc declaration) */
+        if ((int32_t)op_count == 0 && sym_idx >= 0 && sym_idx < symbols->function_count)
+            symbols->functions[sym_idx].is_external = true;
+
+        /* Create BodyIR (null body for external functions) */
         BodyIR *body = body_new(arena);
         body->frame_size = (int32_t)frame_size;
         body->return_kind = (int32_t)return_kind;
@@ -20447,7 +20451,8 @@ static bool cold_load_csg_v2_facts(
         }
 
         fn_list[fi].symbol_index = sym_idx;
-        fn_list[fi].body = body;
+        /* External functions: no codegen, left as undefined symbol */
+        fn_list[fi].body = (op_count == 0) ? NULL : body;
     }
 
     /* 5. Build function_bodies array */
@@ -20889,15 +20894,27 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
             int32_t *func_offsets = arena_alloc(arena, (size_t)max_names * sizeof(int32_t));
             int32_t name_count = 0, local_count = 0;
             for (int32_t i = 0; i < func_count; i++) {
-                if (symbol_offset[i] < 0) continue;
                 Span nm = symbols->functions[i].name;
-                char *name_buf = arena_alloc(arena, (size_t)(nm.len + 2));
-                memcpy(name_buf, nm.ptr, (size_t)nm.len);
-                name_buf[nm.len] = '\0';
-                func_names[name_count] = name_buf;
-                func_offsets[name_count] = symbol_offset[i];
-                name_count++;
-                if (!span_eq(nm, "main")) local_count++;
+                if (nm.len <= 0) continue;
+                bool is_ext = symbols->functions[i].is_external;
+                if (symbol_offset[i] >= 0) {
+                    /* Defined function */
+                    char *name_buf = arena_alloc(arena, (size_t)(nm.len + 2));
+                    memcpy(name_buf, nm.ptr, (size_t)nm.len);
+                    name_buf[nm.len] = '\0';
+                    func_names[name_count] = name_buf;
+                    func_offsets[name_count] = symbol_offset[i];
+                    name_count++;
+                    if (!span_eq(nm, "main")) local_count++;
+                } else if (is_ext) {
+                    /* External/undefined function: offset=-1 → N_UNDF */
+                    char *name_buf = arena_alloc(arena, (size_t)(nm.len + 2));
+                    memcpy(name_buf, nm.ptr, (size_t)nm.len);
+                    name_buf[nm.len] = '\0';
+                    func_names[name_count] = name_buf;
+                    func_offsets[name_count] = -1;
+                    name_count++;
+                }
             }
             for (int32_t ri = 0; ri < reloc_count; ri++) {
                 int32_t sym_idx = reloc_symbols[ri];
