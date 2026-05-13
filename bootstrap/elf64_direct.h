@@ -1,13 +1,10 @@
-/* elf64_direct.h -- Self-contained ELF64 object file (.o) writer.
+/* elf64_direct.h -- Self-contained ELF64 object file (.o) reader + writer.
  *
- * Writes a minimal but complete ELF64 relocatable object for aarch64
+ * Writes/reads minimal ELF64 relocatable objects for aarch64, riscv64,
  * or x86_64 linux targets.  Symbols + relocations for external linkage.
  *
- * Usage:
- *   elf64_write_object(path, code, code_words, names, offsets,
- *                      name_count, local_count,
- *                      reloc_offsets, reloc_symbols, reloc_count,
- *                      machine);
+ * Reader: elf64_read_object() extracts .text + symbol table from a .o file.
+ * Writer: elf64_write_object() / elf_write_exec() produce .o / executable.
  */
 
 #include <stdio.h>
@@ -160,7 +157,7 @@ static bool elf64_write_object(const char *path,
         uint32_t type = (machine == EM_AARCH64) ? R_AARCH64_CALL26 :
                         (machine == EM_RISCV)   ? R_RISCV_CALL :
                         R_X86_64_PLT32;
-        relas[i].r_info = ((uint64_t)type << 32) | (uint64_t)sym;
+        relas[i].r_info = ((uint64_t)sym << 32) | (uint64_t)type;
         relas[i].r_addend = 0;
     }
     int32_t rela_size = nreloc * (int32_t)sizeof(Elf64_Rela);
@@ -192,19 +189,23 @@ static bool elf64_write_object(const char *path,
     /* padding bytes 8-15 are zero */
     w[4] = ET_REL | ((uint32_t)machine << 16); /* e_type + e_machine */
     w[5] = 1;                                   /* e_version */
-    w[7] = 0;             /* e_entry */
-    w[8] = 0;             /* e_entry high */
-    w[9] = 0;             /* e_phoff */
-    w[10] = 0;            /* e_phoff high */
-    w[11] = (uint32_t)(hdr_sz + shdr_sz); /* e_shoff: after header */
-    w[12] = 0;            /* e_shoff high */
-    w[13] = 0;            /* e_flags */
-    w[14] = hdr_sz;       /* e_ehsize */
-    w[15] = 0;            /* e_phentsize */
-    w[16] = 0;            /* e_phnum */
-    w[17] = (uint32_t)sizeof(Elf64_Shdr); /* e_shentsize */
-    w[18] = shnum;        /* e_shnum */
-    w[19] = shstrtab_idx; /* e_shstrndx */
+    w[6] = 0;             /* e_entry low */
+    w[7] = 0;             /* e_entry high */
+    w[8] = 0;             /* e_phoff low */
+    w[9] = 0;             /* e_phoff high */
+    w[10] = (uint32_t)hdr_sz; /* e_shoff low */
+    w[11] = 0;            /* e_shoff high */
+    w[12] = 0;            /* e_flags */
+    buf[0x34] = (uint8_t)hdr_sz;
+    buf[0x35] = (uint8_t)(hdr_sz >> 8);
+    buf[0x36] = 0; buf[0x37] = 0; /* e_phentsize */
+    buf[0x38] = 0; buf[0x39] = 0; /* e_phnum */
+    buf[0x3A] = (uint8_t)sizeof(Elf64_Shdr);
+    buf[0x3B] = (uint8_t)(sizeof(Elf64_Shdr) >> 8);
+    buf[0x3C] = (uint8_t)shnum;
+    buf[0x3D] = (uint8_t)(shnum >> 8);
+    buf[0x3E] = (uint8_t)shstrtab_idx;
+    buf[0x3F] = (uint8_t)(shstrtab_idx >> 8);
 
     /* Section headers start after ELF header */
     Elf64_Shdr *shdrs = (Elf64_Shdr *)(buf + hdr_sz);
@@ -356,5 +357,68 @@ static bool elf_write_exec(const char *path, const uint32_t *code,
     write(fd, buf, total_sz);
     close(fd);
     free(buf);
+    return true;
+}
+
+/* Minimal ELF64 .o reader for provider archive linking.
+   Extracts .text section and global symbol table from a relocatable .o.
+   Caller frees out_code, out_names, out_offsets. */
+static bool elf64_read_object(const char *path,
+                               uint32_t **out_code, int32_t *out_code_words,
+                               char ***out_names, int32_t **out_offsets,
+                               int32_t *out_name_count) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return false;
+    off_t sz = lseek(fd, 0, SEEK_END);
+    lseek(fd, 0, SEEK_SET);
+    if (sz < 64) { close(fd); return false; }
+    uint8_t *data = (uint8_t *)malloc((size_t)sz);
+    if (!data) { close(fd); return false; }
+    read(fd, data, (size_t)sz);
+    close(fd);
+
+    if (*(uint32_t *)data != ELF64_MAGIC) { free(data); return false; }
+    uint64_t shoff = *(uint64_t *)(data + 0x28);
+    uint16_t shnum = *(uint16_t *)(data + 0x3C);
+    uint16_t shentsize = *(uint16_t *)(data + 0x3A);
+    if (shnum == 0 || shentsize < 64) { free(data); return false; }
+
+    uint64_t text_off = 0, text_sz = 0;
+    uint64_t sym_off = 0, sym_sz = 0, sym_entsize = 0;
+    uint64_t str_off = 0, str_sz = 0;
+    for (int32_t i = 0; i < shnum; i++) {
+        uint64_t s = shoff + (uint64_t)i * shentsize;
+        if (s + 64 > (uint64_t)sz) break;
+        uint32_t sh_type = *(uint32_t *)(data + s + 4);
+        uint64_t sh_offset = *(uint64_t *)(data + s + 24);
+        uint64_t sh_size = *(uint64_t *)(data + s + 32);
+        if (sh_type == 1) { text_off = sh_offset; text_sz = sh_size; }        /* SHT_PROGBITS */
+        else if (sh_type == 2) { sym_off = sh_offset; sym_sz = sh_size; sym_entsize = *(uint64_t *)(data + s + 56); } /* SHT_SYMTAB */
+        else if (sh_type == 3) { str_off = sh_offset; str_sz = sh_size; }     /* SHT_STRTAB */
+    }
+    if (text_sz == 0 || sym_sz == 0 || str_sz == 0) { free(data); return false; }
+
+    int32_t cw = (int32_t)(text_sz / 4);
+    uint32_t *code = (uint32_t *)malloc((size_t)cw * sizeof(uint32_t));
+    memcpy(code, data + text_off, (size_t)text_sz);
+
+    int32_t max_syms = (int32_t)(sym_sz / (sym_entsize > 0 ? sym_entsize : 24));
+    char **names = (char **)calloc((size_t)max_syms, sizeof(char *));
+    int32_t *offsets = (int32_t *)calloc((size_t)max_syms, sizeof(int32_t));
+    int32_t nc = 0;
+    for (int32_t i = 0; i < max_syms && nc < max_syms; i++) {
+        uint64_t sp = sym_off + (uint64_t)i * sym_entsize;
+        if (sp + 24 > (uint64_t)sz) break;
+        uint32_t st_name = *(uint32_t *)(data + sp);
+        uint8_t st_info = *(uint8_t *)(data + sp + 4);
+        uint64_t st_value = *(uint64_t *)(data + sp + 8);
+        if (st_name > 0 && st_name < str_sz && (st_info >> 4) == 1) { /* STB_GLOBAL */
+            const char *sn = (const char *)(data + str_off + st_name);
+            if (sn[0]) { names[nc] = strdup(sn); offsets[nc] = (int32_t)(st_value / 4); nc++; }
+        }
+    }
+    free(data);
+    *out_code = code; *out_code_words = cw;
+    *out_names = names; *out_offsets = offsets; *out_name_count = nc;
     return true;
 }

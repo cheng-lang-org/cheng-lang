@@ -2133,6 +2133,15 @@ static bool cold_file_contains_text(const char *path, const char *needle) {
     return ok;
 }
 
+static bool cold_file_starts_with_text(const char *path, const char *prefix) {
+    Span haystack = source_open(path);
+    int32_t n = (int32_t)strlen(prefix);
+    bool ok = haystack.len >= n && n > 0 &&
+              memcmp(haystack.ptr, prefix, (size_t)n) == 0;
+    if (haystack.len > 0) munmap((void *)haystack.ptr, (size_t)haystack.len);
+    return ok;
+}
+
 static bool cold_run_shell(const char *cmd, const char *label) {
     int rc = system(cmd);
     if (rc == 0) return true;
@@ -2938,11 +2947,17 @@ int cold_cmd_build_backend_driver(int argc, char **argv, const char *self_path) 
     char smoke_exe[PATH_MAX];
     char smoke_report[PATH_MAX];
     char smoke_stdout[PATH_MAX];
+    char smoke_csg_exe[PATH_MAX];
+    char smoke_csg_report[PATH_MAX];
+    char smoke_csg_stdout[PATH_MAX];
     if (!cold_path_with_suffix(smoke_source, sizeof(smoke_source), out_path, ".system-link-smoke.cheng")) return 1;
     if (!cold_path_with_suffix(smoke_csg, sizeof(smoke_csg), out_path, ".system-link-smoke.csg.txt")) return 1;
     if (!cold_path_with_suffix(smoke_exe, sizeof(smoke_exe), out_path, ".system-link-smoke")) return 1;
     if (!cold_path_with_suffix(smoke_report, sizeof(smoke_report), out_path, ".system-link-smoke.report.txt")) return 1;
     if (!cold_path_with_suffix(smoke_stdout, sizeof(smoke_stdout), out_path, ".system-link-smoke.stdout")) return 1;
+    if (!cold_path_with_suffix(smoke_csg_exe, sizeof(smoke_csg_exe), out_path, ".system-link-smoke.csg-in")) return 1;
+    if (!cold_path_with_suffix(smoke_csg_report, sizeof(smoke_csg_report), out_path, ".system-link-smoke.csg-in.report.txt")) return 1;
+    if (!cold_path_with_suffix(smoke_csg_stdout, sizeof(smoke_csg_stdout), out_path, ".system-link-smoke.csg-in.stdout")) return 1;
     if (!cold_write_text_file(smoke_source,
                               "fn touch(x: int32): int32 =\n"
                               "    return x\n"
@@ -2978,20 +2993,34 @@ int cold_cmd_build_backend_driver(int argc, char **argv, const char *self_path) 
     char q_out_flag[PATH_MAX * 5 + 64];
     char q_report_flag[PATH_MAX * 5 + 64];
     char q_smoke_stdout[PATH_MAX * 5 + 8];
+    char q_csg_in_flag[PATH_MAX * 5 + 64];
+    char q_csg_in_out_flag[PATH_MAX * 5 + 64];
+    char q_csg_in_report_flag[PATH_MAX * 5 + 64];
+    char q_csg_in_stdout[PATH_MAX * 5 + 8];
     char in_flag[PATH_MAX + 16];
     char smoke_out_flag[PATH_MAX + 16];
     char smoke_report_flag[PATH_MAX + 32];
     char smoke_csg_flag[PATH_MAX + 16];
+    char smoke_csg_in_flag[PATH_MAX + 16];
+    char smoke_csg_in_out_flag[PATH_MAX + 16];
+    char smoke_csg_in_report_flag[PATH_MAX + 32];
     snprintf(in_flag, sizeof(in_flag), "--in:%s", smoke_source);
     snprintf(smoke_csg_flag, sizeof(smoke_csg_flag), "--csg-out:%s", smoke_csg);
     snprintf(smoke_out_flag, sizeof(smoke_out_flag), "--out:%s", smoke_exe);
     snprintf(smoke_report_flag, sizeof(smoke_report_flag), "--report-out:%s", smoke_report);
+    snprintf(smoke_csg_in_flag, sizeof(smoke_csg_in_flag), "--csg-in:%s", smoke_csg);
+    snprintf(smoke_csg_in_out_flag, sizeof(smoke_csg_in_out_flag), "--out:%s", smoke_csg_exe);
+    snprintf(smoke_csg_in_report_flag, sizeof(smoke_csg_in_report_flag), "--report-out:%s", smoke_csg_report);
     if (!cold_shell_quote(q_out, sizeof(q_out), out_path) ||
         !cold_shell_quote(q_in_flag, sizeof(q_in_flag), in_flag) ||
         !cold_shell_quote(q_csg_flag, sizeof(q_csg_flag), smoke_csg_flag) ||
         !cold_shell_quote(q_out_flag, sizeof(q_out_flag), smoke_out_flag) ||
         !cold_shell_quote(q_report_flag, sizeof(q_report_flag), smoke_report_flag) ||
-        !cold_shell_quote(q_smoke_stdout, sizeof(q_smoke_stdout), smoke_stdout)) return 1;
+        !cold_shell_quote(q_smoke_stdout, sizeof(q_smoke_stdout), smoke_stdout) ||
+        !cold_shell_quote(q_csg_in_flag, sizeof(q_csg_in_flag), smoke_csg_in_flag) ||
+        !cold_shell_quote(q_csg_in_out_flag, sizeof(q_csg_in_out_flag), smoke_csg_in_out_flag) ||
+        !cold_shell_quote(q_csg_in_report_flag, sizeof(q_csg_in_report_flag), smoke_csg_in_report_flag) ||
+        !cold_shell_quote(q_csg_in_stdout, sizeof(q_csg_in_stdout), smoke_csg_stdout)) return 1;
     snprintf(cmd, sizeof(cmd), "%s system-link-exec %s %s %s %s > %s",
              q_out, q_in_flag, q_csg_flag, q_out_flag, q_report_flag, q_smoke_stdout);
     if (!cold_run_shell(cmd, "backend driver candidate system-link-exec")) return 1;
@@ -3005,9 +3034,23 @@ int cold_cmd_build_backend_driver(int argc, char **argv, const char *self_path) 
         fprintf(stderr, "[cheng_cold] system-link smoke report mismatch: %s\n", smoke_report);
         return 1;
     }
-    if (!cold_file_contains_text(smoke_csg, "cold_csg_stmt\t1\t4\tfor_range\ti\t0\t5\tlt\n") ||
-        !cold_file_contains_text(smoke_csg, "cold_csg_stmt\t1\t4\tif\t!(x < 0) && x > 70\n")) {
-        fprintf(stderr, "[cheng_cold] generated system-link smoke csg mismatch: %s\n", smoke_csg);
+    if (!cold_file_starts_with_text(smoke_csg, "CHENGCSG")) {
+        fprintf(stderr, "[cheng_cold] generated system-link smoke csg-v2 mismatch: %s\n", smoke_csg);
+        return 1;
+    }
+    snprintf(cmd, sizeof(cmd), "%s system-link-exec %s %s %s > %s",
+             q_out, q_csg_in_flag, q_csg_in_out_flag, q_csg_in_report_flag, q_csg_in_stdout);
+    if (!cold_run_shell(cmd, "backend driver candidate csg-in system-link-exec")) return 1;
+    if (!cold_run_executable_noargs_rc(smoke_csg_exe, 77)) {
+        fprintf(stderr, "[cheng_cold] csg-in smoke executable exit mismatch: %s\n", smoke_csg_exe);
+        return 1;
+    }
+    if (!cold_file_contains_text(smoke_csg_report, "system_link_exec=1\n") ||
+        !cold_file_contains_text(smoke_csg_report, "real_backend_codegen=1\n") ||
+        !cold_file_contains_text(smoke_csg_report, "cold_csg_lowering=1\n") ||
+        !cold_file_contains_text(smoke_csg_report, "linkerless_image=1\n") ||
+        !cold_file_contains_text(smoke_csg_report, "system_link=0\n")) {
+        fprintf(stderr, "[cheng_cold] csg-in smoke report mismatch: %s\n", smoke_csg_report);
         return 1;
     }
 
@@ -12026,6 +12069,10 @@ typedef struct ColdCompileStats {
     int32_t egraph_rewrite_count;
     int32_t egraph_dedup_count;
     int32_t total_function_count;
+    int32_t link_object;
+    int32_t provider_archive_member_count;
+    uint64_t provider_archive_hash;
+    int32_t unresolved_symbol_count;
 } ColdCompileStats;
 
 static void cold_print_exec_phase_report(FILE *file, ColdCompileStats *stats) {
@@ -14669,6 +14716,11 @@ static bool cold_write_system_link_exec_report(const char *path,
         fprintf(file, "total_function_count=%d\n", stats->total_function_count);
         fprintf(file, "egraph_rewrite_count=%d\n", stats->egraph_rewrite_count);
         fprintf(file, "egraph_dedup_count=%d\n", stats->egraph_dedup_count);
+        fprintf(file, "link_object=%d\n", stats->link_object);
+        fprintf(file, "provider_archive_member_count=%d\n", stats->provider_archive_member_count);
+        fprintf(file, "provider_archive_hash=%016llx\n",
+                (unsigned long long)stats->provider_archive_hash);
+        fprintf(file, "unresolved_symbol_count=%d\n", stats->unresolved_symbol_count);
         cold_print_elapsed_ms(file, "cold_compile_elapsed_ms", stats->elapsed_us);
     }
     /* 30-80ms cold self-hosting architecture compliance */
@@ -14683,6 +14735,179 @@ static bool cold_write_system_link_exec_report(const char *path,
     if (error && error[0] != '\0') fprintf(file, "error=%s\n", error);
     fclose(file);
     return true;
+}
+
+static uint16_t cold_u16le(const uint8_t *p) {
+    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+static uint32_t cold_u32le(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static uint64_t cold_u64le(const uint8_t *p) {
+    uint64_t lo = cold_u32le(p);
+    uint64_t hi = cold_u32le(p + 4);
+    return lo | (hi << 32);
+}
+
+static bool cold_file_range_ok(int32_t len, uint64_t off, uint64_t size) {
+    if (off > (uint64_t)len) return false;
+    if (size > (uint64_t)len - off) return false;
+    return true;
+}
+
+static uint16_t cold_elf_machine_for_target(const char *target) {
+    if (!target) return 0;
+    if (strcmp(target, "aarch64-unknown-linux-gnu") == 0) return EM_AARCH64;
+    if (strcmp(target, "riscv64-unknown-linux-gnu") == 0) return EM_RISCV;
+    return 0;
+}
+
+static bool cold_elf_section_name_eq(const char *strtab,
+                                     uint64_t strtab_size,
+                                     uint32_t off,
+                                     const char *name) {
+    size_t name_len = strlen(name);
+    if ((uint64_t)off >= strtab_size) return false;
+    if (name_len > strtab_size - (uint64_t)off - 1) return false;
+    return memcmp(strtab + off, name, name_len) == 0 &&
+           strtab[off + name_len] == '\0';
+}
+
+static bool cold_link_elf64_object_to_exec(const char *object_path,
+                                           const char *out_path,
+                                           const char *target,
+                                           ColdCompileStats *stats) {
+    uint64_t start_us = cold_now_us();
+    Span obj = source_open(object_path);
+    if (obj.len < 64) return false;
+    const uint8_t *data = obj.ptr;
+    bool ok = false;
+    uint32_t *words = 0;
+
+    uint16_t expected_machine = cold_elf_machine_for_target(target);
+    if (expected_machine == 0) goto done;
+    if (memcmp(data, "\x7F""ELF", 4) != 0) goto done;
+    if (data[4] != ELFCLASS64 || data[5] != ELFDATA2LSB || data[6] != EV_CURRENT) goto done;
+    if (cold_u16le(data + 0x10) != ET_REL) goto done;
+    uint16_t machine = cold_u16le(data + 0x12);
+    if (machine != expected_machine) goto done;
+    if (cold_u32le(data + 0x14) != EV_CURRENT) goto done;
+
+    uint64_t shoff = cold_u64le(data + 0x28);
+    uint16_t shentsize = cold_u16le(data + 0x3A);
+    uint16_t shnum = cold_u16le(data + 0x3C);
+    uint16_t shstrndx = cold_u16le(data + 0x3E);
+    if (shentsize != sizeof(Elf64_Shdr) || shnum == 0 || shstrndx >= shnum) goto done;
+    if (!cold_file_range_ok(obj.len, shoff, (uint64_t)shentsize * shnum)) goto done;
+    const Elf64_Shdr *shdrs = (const Elf64_Shdr *)(data + shoff);
+    const Elf64_Shdr *shstr = &shdrs[shstrndx];
+    if (shstr->sh_type != SHT_STRTAB) goto done;
+    if (!cold_file_range_ok(obj.len, shstr->sh_offset, shstr->sh_size)) goto done;
+    const char *shstr_data = (const char *)(data + shstr->sh_offset);
+
+    int32_t text_idx = -1;
+    int32_t symtab_idx = -1;
+    int32_t rela_text_idx = -1;
+    for (int32_t i = 0; i < (int32_t)shnum; i++) {
+        const Elf64_Shdr *sh = &shdrs[i];
+        if (!cold_file_range_ok(obj.len, sh->sh_offset, sh->sh_size)) goto done;
+        if (sh->sh_type == SHT_PROGBITS &&
+            (sh->sh_flags & SHF_EXECINSTR) &&
+            cold_elf_section_name_eq(shstr_data, shstr->sh_size, sh->sh_name, ".text")) {
+            text_idx = i;
+        } else if (sh->sh_type == SHT_SYMTAB) {
+            symtab_idx = i;
+        } else if (sh->sh_type == SHT_RELA &&
+                   cold_elf_section_name_eq(shstr_data, shstr->sh_size, sh->sh_name, ".rela.text")) {
+            rela_text_idx = i;
+        }
+    }
+    if (text_idx <= 0 || symtab_idx <= 0) goto done;
+
+    const Elf64_Shdr *text = &shdrs[text_idx];
+    if ((text->sh_size % 4) != 0 || text->sh_size > (uint64_t)INT32_MAX * 4ULL) goto done;
+    int32_t word_count = (int32_t)(text->sh_size / 4);
+    words = (uint32_t *)calloc(word_count > 0 ? (size_t)word_count : 1, sizeof(uint32_t));
+    if (!words) goto done;
+    if (text->sh_size > 0) memcpy(words, data + text->sh_offset, (size_t)text->sh_size);
+
+    const Elf64_Shdr *symtab = &shdrs[symtab_idx];
+    if (symtab->sh_entsize != sizeof(Elf64_Sym) || symtab->sh_link >= shnum) goto done;
+    if ((symtab->sh_size % sizeof(Elf64_Sym)) != 0) goto done;
+    const Elf64_Shdr *strtab = &shdrs[symtab->sh_link];
+    if (strtab->sh_type != SHT_STRTAB) goto done;
+    if (!cold_file_range_ok(obj.len, strtab->sh_offset, strtab->sh_size)) goto done;
+    const Elf64_Sym *syms = (const Elf64_Sym *)(data + symtab->sh_offset);
+    int32_t sym_count = (int32_t)(symtab->sh_size / sizeof(Elf64_Sym));
+
+    int32_t reloc_count = 0;
+    int32_t unresolved_count = 0;
+    if (rela_text_idx > 0) {
+        const Elf64_Shdr *rela = &shdrs[rela_text_idx];
+        if (rela->sh_entsize != sizeof(Elf64_Rela) ||
+            rela->sh_link != (uint32_t)symtab_idx ||
+            rela->sh_info != (uint32_t)text_idx ||
+            (rela->sh_size % sizeof(Elf64_Rela)) != 0) {
+            goto done;
+        }
+        const Elf64_Rela *relas = (const Elf64_Rela *)(data + rela->sh_offset);
+        reloc_count = (int32_t)(rela->sh_size / sizeof(Elf64_Rela));
+        for (int32_t i = 0; i < reloc_count; i++) {
+            uint32_t sym_index = (uint32_t)(relas[i].r_info >> 32);
+            uint32_t type = (uint32_t)(relas[i].r_info & 0xFFFFFFFFu);
+            if (sym_index >= (uint32_t)sym_count) goto done;
+            if ((relas[i].r_offset % 4) != 0 || relas[i].r_offset >= text->sh_size) goto done;
+            const Elf64_Sym *sym = &syms[sym_index];
+            if (sym->st_shndx == 0) {
+                unresolved_count++;
+                continue;
+            }
+            if (sym->st_shndx != (uint16_t)text_idx) goto done;
+            int64_t target_byte = (int64_t)sym->st_value + relas[i].r_addend;
+            if (target_byte < 0 || target_byte >= (int64_t)text->sh_size ||
+                (target_byte % 4) != 0) {
+                goto done;
+            }
+            int32_t word_pos = (int32_t)(relas[i].r_offset / 4);
+            int32_t target_word = (int32_t)(target_byte / 4);
+            int32_t delta = target_word - word_pos;
+            if (machine == EM_AARCH64 && type == R_AARCH64_CALL26) {
+                if (delta < -(1 << 25) || delta >= (1 << 25)) goto done;
+                words[word_pos] = (words[word_pos] & 0xFC000000u) |
+                                  ((uint32_t)delta & 0x03FFFFFFu);
+            } else if (machine == EM_RISCV &&
+                       (type == R_RISCV_CALL || type == R_RISCV_CALL_PLT)) {
+                if (delta < -(1 << 20) || delta >= (1 << 20)) goto done;
+                words[word_pos] = rv_jal(RV_RA, delta);
+            } else {
+                goto done;
+            }
+        }
+    }
+    if (unresolved_count != 0) {
+        if (stats) stats->unresolved_symbol_count = unresolved_count;
+        goto done;
+    }
+    if (!elf_write_exec(out_path, words, word_count, machine)) goto done;
+    if (stats) {
+        stats->link_object = 1;
+        stats->provider_archive_member_count = 0;
+        stats->provider_archive_hash = 0;
+        stats->unresolved_symbol_count = 0;
+        stats->code_words = word_count;
+        stats->facts_reloc_count = reloc_count;
+        stats->elapsed_us = cold_now_us() - start_us;
+        stats->emit_us = stats->elapsed_us;
+    }
+    ok = true;
+
+done:
+    if (words) free(words);
+    if (obj.len > 0) munmap((void *)obj.ptr, (size_t)obj.len);
+    return ok;
 }
 
 /* Compile source to Mach-O object file (.o) with symbol table */
@@ -15813,9 +16038,37 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
                         if (si >= 0 && si < sc_bcap) sc_bodies[si] = b;
                     } else parser_line(&sc_parser);
                 }
-                cold_emit_csg_v2_facts(csg_out_path, sc_bodies, sc_sym->function_count, sc_sym, target);
+                if (!cold_emit_csg_v2_facts(csg_out_path, sc_bodies, sc_sym->function_count, sc_sym, target)) {
+                    munmap((void *)sc_src.ptr, (size_t)sc_src.len);
+                    cold_write_system_link_exec_report(report_path, false, source_path, csg_out_path, out_path,
+                                                       target, emit, &stats, "csg sidecar emit failed");
+                    fprintf(stderr, "[cheng_cold] csg sidecar emit failed: %s\n", csg_out_path);
+                    return 2;
+                }
+                stats.csg_lowering = 1;
+                stats.facts_function_count = sc_sym->function_count;
+                struct stat sc_st;
+                if (stat(csg_out_path, &sc_st) != 0 || sc_st.st_size <= 0 ||
+                    !cold_file_starts_with_text(csg_out_path, "CHENGCSG")) {
+                    munmap((void *)sc_src.ptr, (size_t)sc_src.len);
+                    cold_write_system_link_exec_report(report_path, false, source_path, csg_out_path, out_path,
+                                                       target, emit, &stats, "csg sidecar verification failed");
+                    fprintf(stderr, "[cheng_cold] csg sidecar verification failed: %s\n", csg_out_path);
+                    return 2;
+                }
+                stats.facts_bytes = (uint64_t)sc_st.st_size;
                 munmap((void *)sc_src.ptr, (size_t)sc_src.len);
+            } else {
+                cold_write_system_link_exec_report(report_path, false, source_path, csg_out_path, out_path,
+                                                   target, emit, &stats, "csg sidecar source_open failed");
+                fprintf(stderr, "[cheng_cold] csg sidecar source_open failed: %s\n", source_path);
+                return 2;
             }
+        } else {
+            cold_write_system_link_exec_report(report_path, false, source_path, csg_out_path, out_path,
+                                               target, emit, &stats, "csg sidecar arena allocation failed");
+            fprintf(stderr, "[cheng_cold] csg sidecar arena allocation failed\n");
+            return 2;
         }
     }
 #else /* COLD_BACKEND_ONLY */
