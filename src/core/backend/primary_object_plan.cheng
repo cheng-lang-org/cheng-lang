@@ -45,6 +45,9 @@ type
         firstZeroValueSlotOffset: int32
         firstZeroTermIndex: int32
         firstZeroTermKind: int32
+        firstZeroBlockIndex: int32
+        firstZeroWordInnerOffset: int32
+        firstZeroCallTarget: str
 
     PrimaryObjectError =
         functionName: str
@@ -1118,13 +1121,29 @@ fn PrimaryBodyIrParamCopyCount(bodyIR: coreir.BodyIR): int32 =
             count = count + 1
     return count
 
+fn PrimaryBodyIrStackAdjustWordCount(bytesRaw: int32): int32 =
+    var bytes = bytesRaw
+    var count: int32
+    while bytes > 4095:
+        count = count + 1
+        bytes = bytes - 4095
+    if bytes > 0:
+        count = count + 1
+    return count
+
+fn PrimaryBodyIrStackAddressWordCount(offsetBytes: int32): int32 =
+    if offsetBytes < 0:
+        return 0
+    if offsetBytes == 0:
+        return 1
+    return PrimaryBodyIrStackAdjustWordCount(offsetBytes)
+
 fn PrimaryBodyIrPrologueWordCount(bodyIR: coreir.BodyIR): int32 =
-    var frameBytes = PrimaryBodyIrFrameBytes(bodyIR)
-    var extraSub = 0
-    while frameBytes > 4095:
-        extraSub = extraSub + 1
-        frameBytes = frameBytes - 4095
-    return 4 + extraSub + PrimaryBodyIrParamSaveCount(bodyIR)
+    let frameBytes = PrimaryBodyIrFrameBytes(bodyIR)
+    return PrimaryBodyIrStackAdjustWordCount(frameBytes) + 3 + PrimaryBodyIrParamSaveCount(bodyIR)
+
+fn PrimaryBodyIrFrameRestoreWordCount(bodyIR: coreir.BodyIR): int32 =
+    return PrimaryBodyIrStackAdjustWordCount(PrimaryBodyIrFrameBytes(bodyIR)) + 2
 
 fn PrimaryBodyIrLocalReg(slotId: int32): int32 =
     var reg = a64.A64X9 + slotId
@@ -1198,7 +1217,13 @@ fn PrimaryBodyIrCallArgWordCount(bodyIR: coreir.BodyIR,
     if coreir.CallArgSlotIsCString(argSlot):
         return 2
     if coreir.CallArgSlotIsAddress(argSlot):
-        return 1
+        let slotId = coreir.CallArgSlotAddressId(argSlot)
+        let slotOffset = PrimaryBodyIrLocalStackOffset(bodyIR,
+                                                       slotId,
+                                                       PrimaryBodyIrFrameBytes(bodyIR),
+                                                       PrimaryBodyIrParamSaveOffset(bodyIR),
+                                                       PrimaryBodyIrParamSaveCount(bodyIR))
+        return PrimaryBodyIrStackAddressWordCount(slotOffset)
     return PrimaryBodyIrLoadSlotWordCount(bodyIR, argSlot)
 
 fn PrimaryIncomingParamStackOffset(frameBytes: int32,
@@ -1238,7 +1263,14 @@ fn PrimaryBodyIrLoadSlotWordCount(bodyIR: coreir.BodyIR,
         return 1
     if slotType == coreir.LocalStrTag ||
        slotType == coreir.LocalAggregateTag:
-        return 1
+        if PrimaryBodyIrLocalIsParam(bodyIR.localSlots[slotIndex]):
+            return 1
+        let stackOffset = PrimaryBodyIrLocalStackOffset(bodyIR,
+                                                       slotIndex,
+                                                       PrimaryBodyIrFrameBytes(bodyIR),
+                                                       PrimaryBodyIrParamSaveOffset(bodyIR),
+                                                       PrimaryBodyIrParamSaveCount(bodyIR))
+        return PrimaryBodyIrStackAddressWordCount(stackOffset)
     return 0
 
 fn PrimaryBodyIrStoreSlotWordCount(bodyIR: coreir.BodyIR,
@@ -5275,10 +5307,7 @@ fn PrimaryBodyIRLoadSlotToReg(words: var int32[],
         if PrimaryBodyIrLocalIsParam(bodyIR.localSlots[slotIndex]):
             words[offset] = Value(a64.A64EncLdrImm(true, reg, a64.A64SP, int64(stackOffset)))
             return offset + 1
-        if stackOffset > 4095:
-            return -1
-        words[offset] = Value(a64.A64EncAddImm(true, reg, a64.A64SP, stackOffset))
-        return offset + 1
+        return PrimaryBodyIRFillStackAddressToReg(words, offset, reg, stackOffset)
     return -1
 
 fn PrimaryBodyIRStoreRegToSlot(words: var int32[],
@@ -5333,10 +5362,7 @@ fn PrimaryBodyIRLoadStrValueAddressToReg(words: var int32[],
                                                a64.A64SP,
                                                int64(stackOffset)))
         return offset + 1
-    if stackOffset > 4095:
-        return -1
-    words[offset] = Value(a64.A64EncAddImm(true, reg, a64.A64SP, stackOffset))
-    return offset + 1
+    return PrimaryBodyIRFillStackAddressToReg(words, offset, reg, stackOffset)
 
 fn PrimaryBodyIRStrEqLiteralWordCount(bodyIR: coreir.BodyIR,
                                        op: coreir.BodyOp): int32 =
@@ -5463,6 +5489,31 @@ fn PrimaryBodyIRCopySlot(words: var int32[],
         pos = pos + 2
     return pos
 
+fn PrimaryBodyIRFillStackAddressToReg(words: var int32[],
+                                       offset: int32,
+                                       reg: int32,
+                                       stackOffsetRaw: int32): int32 =
+    if offset < 0 || offset >= words.len || stackOffsetRaw < 0:
+        return -1
+    var pos = offset
+    var remain = stackOffsetRaw
+    if remain > 4095:
+        words[pos] = Value(a64.A64EncAddImm(true, reg, a64.A64SP, 4095))
+        pos = pos + 1
+        remain = remain - 4095
+        while remain > 4095:
+            if pos >= words.len:
+                return -1
+            words[pos] = Value(a64.A64EncAddImm(true, reg, reg, 4095))
+            pos = pos + 1
+            remain = remain - 4095
+        if pos >= words.len:
+            return -1
+        words[pos] = Value(a64.A64EncAddImm(true, reg, reg, remain))
+        return pos + 1
+    words[pos] = Value(a64.A64EncAddImm(true, reg, a64.A64SP, remain))
+    return pos + 1
+
 fn PrimaryBodyIRFillCallArgToReg(words: var int32[],
                                   offset: int32,
                                   bodyIR: coreir.BodyIR,
@@ -5496,10 +5547,7 @@ fn PrimaryBodyIRFillCallArgToReg(words: var int32[],
                                                        frameBytes,
                                                        paramSaveOffset,
                                                        paramSaveCount)
-        if slotOffset < 0 || slotOffset > 4095:
-            return -1
-        words[offset] = Value(a64.A64EncAddImm(true, reg, a64.A64SP, slotOffset))
-        return offset + 1
+        return PrimaryBodyIRFillStackAddressToReg(words, offset, reg, slotOffset)
     return PrimaryBodyIRLoadSlotToReg(words,
                                       offset,
                                       bodyIR,
@@ -5564,10 +5612,9 @@ fn PrimaryBodyIRFillCallOp(words: var int32[],
                                                         frameBytes,
                                                         paramSaveOffset,
                                                         paramSaveCount)
-        if resultOffset < 0 || resultOffset > 4095 || pos >= words.len:
+        pos = PrimaryBodyIRFillStackAddressToReg(words, pos, a64.A64X8, resultOffset)
+        if pos < 0:
             return -1
-        words[pos] = Value(a64.A64EncAddImm(true, a64.A64X8, a64.A64SP, resultOffset))
-        pos = pos + 1
     if pos >= words.len:
         return -1
     words[pos] = a64.A64EncBlPlaceholder()
@@ -6096,35 +6143,29 @@ fn PrimaryBodyIRFillBlockOp(words: var int32[],
         let subKind = op.operands[0]
         if subKind == coreir.BodyBranchIfLocalNilReturnI32ConstTag:
             let returnValue = op.operands[2]
-            if pos + 4 >= words.len:
+            let restoreCount = PrimaryBodyIrFrameRestoreWordCount(bodyIR)
+            if pos + 2 >= words.len:
                 return -1
-            words[pos] = Value(a64.A64EncCbnz(false, a64.A64X9, int64(4)))
+            words[pos] = Value(a64.A64EncCbnz(false, a64.A64X9, int64(2 + restoreCount)))
             words[pos + 1] = a64.A64EncMovz(false, 0, returnValue & 65535, 0)
-            words[pos + 2] = Value(a64.A64EncLdp64(a64.A64FP, a64.A64LR, a64.A64SP, int64(0)))
-            words[pos + 3] = Value(a64.A64EncAddImm(true, a64.A64SP, a64.A64SP, frameBytes))
-            words[pos + 4] = a64.A64EncRet()
-            return pos + 5
+            return PrimaryBodyIRFillFrameRestore(words, pos + 2, frameBytes)
         if subKind == coreir.BodyBranchIfLocalLeZeroReturnI32ConstTag:
             let returnValue = op.operands[2]
-            if pos + 5 >= words.len:
+            let restoreCount = PrimaryBodyIrFrameRestoreWordCount(bodyIR)
+            if pos + 3 >= words.len:
                 return -1
             words[pos] = Value(a64.A64EncCmpImm(false, a64.A64X9, 0))
-            words[pos + 1] = Value(a64.A64EncBCond(4, a64.A64CondGT))
+            words[pos + 1] = Value(a64.A64EncBCond(int64(2 + restoreCount), a64.A64CondGT))
             words[pos + 2] = a64.A64EncMovz(false, 0, returnValue & 65535, 0)
-            words[pos + 3] = Value(a64.A64EncLdp64(a64.A64FP, a64.A64LR, a64.A64SP, int64(0)))
-            words[pos + 4] = Value(a64.A64EncAddImm(true, a64.A64SP, a64.A64SP, frameBytes))
-            words[pos + 5] = a64.A64EncRet()
-            return pos + 6
+            return PrimaryBodyIRFillFrameRestore(words, pos + 3, frameBytes)
         if subKind == coreir.BodyBranchIfLocalLeZeroReturnCallNoargTag:
-            if pos + 5 >= words.len:
+            let restoreCount = PrimaryBodyIrFrameRestoreWordCount(bodyIR)
+            if pos + 3 >= words.len:
                 return -1
             words[pos] = Value(a64.A64EncCmpImm(false, a64.A64X9, 0))
-            words[pos + 1] = Value(a64.A64EncBCond(4, a64.A64CondGT))
+            words[pos + 1] = Value(a64.A64EncBCond(int64(2 + restoreCount), a64.A64CondGT))
             words[pos + 2] = a64.A64EncBlPlaceholder()
-            words[pos + 3] = Value(a64.A64EncLdp64(a64.A64FP, a64.A64LR, a64.A64SP, int64(0)))
-            words[pos + 4] = Value(a64.A64EncAddImm(true, a64.A64SP, a64.A64SP, frameBytes))
-            words[pos + 5] = a64.A64EncRet()
-            return pos + 6
+            return PrimaryBodyIRFillFrameRestore(words, pos + 3, frameBytes)
         if subKind == coreir.BodyBranchIfLocalLeZeroCallArg0ReturnI32ConstTag:
             if op.operands.len < 4 || pos + 7 >= words.len:
                 return -1
@@ -6132,18 +6173,21 @@ fn PrimaryBodyIRFillBlockOp(words: var int32[],
             let returnValue = op.operands[3]
             if arg0Slot < 0 || arg0Slot >= bodyIR.localSlots.len:
                 return -1
+            let restoreCount = PrimaryBodyIrFrameRestoreWordCount(bodyIR)
+            let argLoadWords = PrimaryBodyIrLoadSlotWordCount(bodyIR, arg0Slot)
+            if argLoadWords <= 0:
+                return -1
             words[pos] = Value(a64.A64EncCmpImm(false, a64.A64X9, 0))
-            words[pos + 1] = Value(a64.A64EncBCond(6, a64.A64CondGT))
+            words[pos + 1] = Value(a64.A64EncBCond(int64(argLoadWords + restoreCount + 3), a64.A64CondGT))
             var skipLoad = PrimaryBodyIRLoadSlotToReg(words, pos + 2, bodyIR, arg0Slot, a64.A64X0, frameBytes, paramSaveOffset, paramSaveCount)
             words[skipLoad] = a64.A64EncBlPlaceholder()
             words[skipLoad + 1] = a64.A64EncMovz(false, 0, returnValue & 65535, 0)
-            words[skipLoad + 2] = Value(a64.A64EncLdp64(a64.A64FP, a64.A64LR, a64.A64SP, int64(0)))
-            words[skipLoad + 3] = Value(a64.A64EncAddImm(true, a64.A64SP, a64.A64SP, frameBytes))
-            words[skipLoad + 4] = a64.A64EncRet()
-            return skipLoad + 5
+            return PrimaryBodyIRFillFrameRestore(words, skipLoad + 2, frameBytes)
         return -1
-    words[offset] = a64.A64EncNop()
-    return offset + 1
+    if op.kind == coreir.BodyOpReturnTag:
+        words[offset] = a64.A64EncNop()
+        return offset + 1
+    return -1
 
 fn PrimaryBodyIRFillBlockOps(words: var int32[], offset: int32, bodyIR: coreir.BodyIR, bi: int32, oi: int32, endOi: int32): int32 =
     if offset < 0:
@@ -6152,9 +6196,7 @@ fn PrimaryBodyIRFillBlockOps(words: var int32[], offset: int32, bodyIR: coreir.B
         return offset
     let nextOffset = PrimaryBodyIRFillBlockOp(words, offset, bodyIR, bi, oi)
     if nextOffset < 0:
-        if offset < words.len:
-            words[offset] = a64.A64EncNop()
-        return PrimaryBodyIRFillBlockOps(words, offset + 1, bodyIR, bi, oi + 1, endOi)
+        return -1
     return PrimaryBodyIRFillBlockOps(words, nextOffset, bodyIR, bi, oi + 1, endOi)
 
 fn PrimaryBodyIRFillBlockTerm(words: var int32[], offset: int32, bodyIR: coreir.BodyIR, bi: int32): int32 =
@@ -6257,6 +6299,32 @@ fn PrimaryBodyIRFillBlockTerm(words: var int32[], offset: int32, bodyIR: coreir.
                                                 paramSaveCount)
     return -1
 
+fn PrimaryBodyIRFillSpAdd(words: var int32[], offset: int32, frameBytesRaw: int32): int32 =
+    var pos = offset
+    var frameBytes = frameBytesRaw
+    while frameBytes > 4095:
+        if pos < 0 || pos >= words.len:
+            return -1
+        words[pos] = Value(a64.A64EncAddImm(true, a64.A64SP, a64.A64SP, 4095))
+        pos = pos + 1
+        frameBytes = frameBytes - 4095
+    if frameBytes > 0:
+        if pos < 0 || pos >= words.len:
+            return -1
+        words[pos] = Value(a64.A64EncAddImm(true, a64.A64SP, a64.A64SP, frameBytes))
+        pos = pos + 1
+    return pos
+
+fn PrimaryBodyIRFillFrameRestore(words: var int32[], offset: int32, frameBytes: int32): int32 =
+    if offset < 0 || offset >= words.len:
+        return -1
+    words[offset] = Value(a64.A64EncLdp64(a64.A64FP, a64.A64LR, a64.A64SP, int64(0)))
+    var pos = PrimaryBodyIRFillSpAdd(words, offset + 1, frameBytes)
+    if pos < 0 || pos >= words.len:
+        return -1
+    words[pos] = a64.A64EncRet()
+    return pos + 1
+
 fn PrimaryBodyIRFillBlockTermReturn(words: var int32[],
                                      offset: int32,
                                      term: coreir.BodyTerm,
@@ -6276,7 +6344,8 @@ fn PrimaryBodyIRFillBlockTermReturn(words: var int32[],
                                                              paramSaveOffset,
                                                              paramSaveCount)
             let returnBufferOffset = PrimaryBodyIrReturnBufferSaveOffset(bodyIR)
-            if sourceOffset < 0 || returnBufferOffset < 0 || offset + 9 >= words.len:
+            let restoreCount = PrimaryBodyIrFrameRestoreWordCount(bodyIR)
+            if sourceOffset < 0 || returnBufferOffset < 0 || offset + 6 + restoreCount > words.len:
                 return -1
             words[offset] = Value(a64.A64EncLdrImm(true, a64.A64X8, a64.A64SP, int64(returnBufferOffset)))
             var pos = offset + 1
@@ -6290,10 +6359,7 @@ fn PrimaryBodyIRFillBlockTermReturn(words: var int32[],
                                                         a64.A64X8,
                                                         int64(copyIndex * 8)))
                 pos = pos + 2
-            words[pos] = Value(a64.A64EncLdp64(a64.A64FP, a64.A64LR, a64.A64SP, int64(0)))
-            words[pos + 1] = Value(a64.A64EncAddImm(true, a64.A64SP, a64.A64SP, frameBytes))
-            words[pos + 2] = a64.A64EncRet()
-            return pos + 3
+            return PrimaryBodyIRFillFrameRestore(words, pos, frameBytes)
         let loadPos = PrimaryBodyIRLoadSlotToReg(words,
                                                   offset,
                                                   bodyIR,
@@ -6302,21 +6368,13 @@ fn PrimaryBodyIRFillBlockTermReturn(words: var int32[],
                                                   frameBytes,
                                                   paramSaveOffset,
                                                   paramSaveCount)
-        if loadPos < 0 || loadPos + 2 >= words.len:
+        if loadPos < 0:
             return -1
-        words[loadPos] = Value(a64.A64EncLdp64(a64.A64FP, a64.A64LR, a64.A64SP, int64(0)))
-        words[loadPos + 1] = Value(a64.A64EncAddImm(true, a64.A64SP, a64.A64SP, frameBytes))
-        words[loadPos + 2] = a64.A64EncRet()
-        return loadPos + 3
+        return PrimaryBodyIRFillFrameRestore(words, loadPos, frameBytes)
     if term.resultSlot < 0 &&
        term.operands.len >= 1 &&
        term.operands[0] == coreir.LocalInvalidTag:
-        if offset + 2 >= words.len:
-            return -1
-        words[offset] = Value(a64.A64EncLdp64(a64.A64FP, a64.A64LR, a64.A64SP, int64(0)))
-        words[offset + 1] = Value(a64.A64EncAddImm(true, a64.A64SP, a64.A64SP, frameBytes))
-        words[offset + 2] = a64.A64EncRet()
-        return offset + 3
+        return PrimaryBodyIRFillFrameRestore(words, offset, frameBytes)
     if offset + 3 >= words.len:
         return -1
     let hasOperands = term.operands.len >= 1
@@ -6346,23 +6404,16 @@ fn PrimaryBodyIRFillBlockTermReturn(words: var int32[],
             words[offset] = a64.A64EncMovz(false, 0, 0, 0)
     else:
         words[offset] = a64.A64EncMovz(false, 0, 0, 0)
-    words[offset + 1] = Value(a64.A64EncLdp64(a64.A64FP, a64.A64LR, a64.A64SP, int64(0)))
-    words[offset + 2] = Value(a64.A64EncAddImm(true, a64.A64SP, a64.A64SP, frameBytes))
-    words[offset + 3] = a64.A64EncRet()
-    return offset + 4
+    return PrimaryBodyIRFillFrameRestore(words, offset + 1, frameBytes)
 
 fn PrimaryBodyIRFillBlock(words: var int32[], offset: int32, bodyIR: coreir.BodyIR, bi: int32): int32 =
     let block = bodyIR.blocks[bi]
     let afterOps = PrimaryBodyIRFillBlockOps(words, offset, bodyIR, bi, block.opStart, block.opStart + block.opCount)
     if afterOps < 0:
-        if offset < words.len:
-            words[offset] = a64.A64EncNop()
-        afterOps = offset + 1
+        return -1
     let afterTerm = PrimaryBodyIRFillBlockTerm(words, afterOps, bodyIR, bi)
     if afterTerm < 0:
-        if afterOps < words.len:
-            words[afterOps] = a64.A64EncNop()
-        return afterOps + 1
+        return -1
     return afterTerm
 
 fn PrimaryBodyIRFillBlocks(words: var int32[], offset: int32, bodyIR: coreir.BodyIR, bi: int32, endBi: int32): int32 =
@@ -6372,9 +6423,7 @@ fn PrimaryBodyIRFillBlocks(words: var int32[], offset: int32, bodyIR: coreir.Bod
         return offset
     let nextOffset = PrimaryBodyIRFillBlock(words, offset, bodyIR, bi)
     if nextOffset < 0:
-        if offset < words.len:
-            words[offset] = a64.A64EncNop()
-        return PrimaryBodyIRFillBlocks(words, offset + 1, bodyIR, bi + 1, endBi)
+        return -1
     return PrimaryBodyIRFillBlocks(words, nextOffset, bodyIR, bi + 1, endBi)
 
 fn PrimaryBodyIRFillWords(words: var int32[], wordOffset: int32, wordCount: int32, bodyIR: coreir.BodyIR): int32 =
@@ -6432,13 +6481,10 @@ fn PrimaryFillOneFunction(words: var int32[],
         let offset = functionWordOffsets[i]
         let emitted = PrimaryBodyIRFillWords(words, offset, wordCount, bodyIR)
         if emitted >= 0:
-            if emitted > 0 && emitted != wordCount:
+            if emitted != wordCount:
                 return false
             return true
-        return PrimaryFillInstructionWordsForFunction(words,
-                                                       functionWordOffsets[i],
-                                                       functionWordCounts[i],
-                                                       functionBodyKinds[i])
+        return false
     return PrimaryFillInstructionWordsForFunction(words,
                                                    functionWordOffsets[i],
                                                    functionWordCounts[i],
@@ -6972,7 +7018,15 @@ fn PrimaryBodyIRCallBlRelOffset(bodyIR: coreir.BodyIR,
             return -1
         offset = offset + argWords + 1
     if PrimaryBodyIRCallHasIndirectResult(bodyIR, call):
-        offset = offset + 1
+        let resultOffset = PrimaryBodyIrLocalStackOffset(bodyIR,
+                                                        call.resultSlot,
+                                                        PrimaryBodyIrFrameBytes(bodyIR),
+                                                        PrimaryBodyIrParamSaveOffset(bodyIR),
+                                                        PrimaryBodyIrParamSaveCount(bodyIR))
+        let resultAddressWords = PrimaryBodyIrStackAddressWordCount(resultOffset)
+        if resultAddressWords <= 0:
+            return -1
+        offset = offset + resultAddressWords
     return offset
 
 fn PrimaryBodyIRCallWordCount(bodyIR: coreir.BodyIR,
@@ -7150,19 +7204,34 @@ fn PrimaryBodyIROpSizeAt(bodyIR: coreir.BodyIR,
     if op.kind == coreir.BodyOpBranchTag:
         if op.operands.len >= 3:
             let subKind = op.operands[0]
+            let guardSlot = op.operands[1]
+            if guardSlot < 0 || guardSlot >= bodyIR.localSlots.len:
+                return 0
+            let guardWords = PrimaryBodyIrLoadSlotWordCount(bodyIR, guardSlot)
+            if guardWords <= 0:
+                return 0
+            let restoreCount = PrimaryBodyIrFrameRestoreWordCount(bodyIR)
             if subKind == coreir.BodyBranchIfLocalNilReturnI32ConstTag:
-                return 6
+                return guardWords + 2 + restoreCount
             if subKind == coreir.BodyBranchIfLocalLeZeroReturnI32ConstTag ||
                subKind == coreir.BodyBranchIfLocalLeZeroReturnCallNoargTag:
-                return 7
+                return guardWords + 3 + restoreCount
             if subKind == coreir.BodyBranchIfLocalLeZeroCallArg0ReturnI32ConstTag:
-                return 9
+                if op.operands.len < 4:
+                    return 0
+                let arg0Slot = op.operands[2]
+                if arg0Slot < 0 || arg0Slot >= bodyIR.localSlots.len:
+                    return 0
+                let argWords = PrimaryBodyIrLoadSlotWordCount(bodyIR, arg0Slot)
+                if argWords <= 0:
+                    return 0
+                return guardWords + argWords + 4 + restoreCount
         return 0
     if op.kind == coreir.BodyOpStrEqTag:
         if op.operands.len >= 2:
             return 32
         return 0
-    return 1
+    return 0
 
 fn PrimaryBodyIROpSize(op: coreir.BodyOp): int32 =
     if op.kind == coreir.BodyOpCallTag:
@@ -7184,16 +7253,21 @@ fn PrimaryBodyIRTermSize(bodyIR: coreir.BodyIR, termIndex: int32): int32 =
         return 1
     if kind == coreir.BodyTermReturnTag:
         let term = bodyIR.terms[termIndex]
+        let restoreCount = PrimaryBodyIrFrameRestoreWordCount(bodyIR)
         if term.resultSlot < 0 &&
            term.operands.len >= 1 &&
            term.operands[0] == coreir.LocalInvalidTag:
-            return 3
+            return restoreCount
         if term.resultSlot >= 0 && term.resultSlot < bodyIR.localSlots.len:
             let resultType = bodyIR.localSlots[term.resultSlot].typeKind
             if resultType == coreir.LocalStrTag ||
                resultType == coreir.LocalAggregateTag:
-                return 10
-        return 4
+                return 7 + restoreCount
+            let loadWords = PrimaryBodyIrLoadSlotWordCount(bodyIR, term.resultSlot)
+            if loadWords <= 0:
+                return 0
+            return loadWords + restoreCount
+        return 1 + restoreCount
     return 0
 
 fn PrimaryBodyIREmitWord(bodyIR: coreir.BodyIR, wordOffset: int32): int32 =
@@ -7426,6 +7500,87 @@ fn PrimaryObjectMissingLineNumber(lowering: lower.LoweringPlanStub,
         return irFunction.statements[0].lineNumber
     return irFunction.bodyLineNumber
 
+fn PrimaryObjectPlanCaptureBodyIrOpDetail(detail: var PrimaryObjectErrorBodyIrDetail,
+                                           bodyIR: coreir.BodyIR,
+                                           opIndex: int32) =
+    if opIndex < 0 || opIndex >= bodyIR.ops.len:
+        return
+    let op = bodyIR.ops[opIndex]
+    detail.firstZeroOpIndex = opIndex
+    detail.firstZeroOpKind = op.kind
+    detail.firstZeroOpTarget = op.target
+    if op.operands.len > 0:
+        detail.firstZeroOpOperand0 = op.operands[0]
+    if op.operands.len > 1:
+        detail.firstZeroOpOperand1 = op.operands[1]
+    if op.operands.len > 2:
+        detail.firstZeroOpOperand2 = op.operands[2]
+    if op.operands.len > 3:
+        detail.firstZeroOpOperand3 = op.operands[3]
+    if op.kind == coreir.BodyOpCallTag && op.operands.len > 0:
+        let callOrdinal = op.operands[0]
+        if callOrdinal >= 0 && callOrdinal < bodyIR.callSequence.len:
+            detail.firstZeroCallTarget = bodyIR.callSequence[callOrdinal].targetSymbol
+    if op.operands.len > 0:
+        let baseSlot = op.operands[0]
+        if baseSlot >= 0 && baseSlot < bodyIR.localSlots.len:
+            let slot = bodyIR.localSlots[baseSlot]
+            detail.firstZeroBaseSlotName = slot.name
+            detail.firstZeroBaseSlotType = slot.typeKind
+            detail.firstZeroBaseSlotSize = PrimaryLocalSlotSizeOf(slot)
+            detail.firstZeroBaseSlotOffset = slot.stackOffset
+    if op.operands.len > 1:
+        let valueSlot = op.operands[1]
+        if valueSlot >= 0 && valueSlot < bodyIR.localSlots.len:
+            let slot = bodyIR.localSlots[valueSlot]
+            detail.firstZeroValueSlotName = slot.name
+            detail.firstZeroValueSlotType = slot.typeKind
+            detail.firstZeroValueSlotSize = PrimaryLocalSlotSizeOf(slot)
+            detail.firstZeroValueSlotOffset = slot.stackOffset
+
+fn PrimaryObjectPlanCaptureBodyIrWordDetail(detail: var PrimaryObjectErrorBodyIrDetail,
+                                             bodyIR: coreir.BodyIR,
+                                             relWordOffset: int32) =
+    detail.firstZeroBlockIndex = -1
+    detail.firstZeroWordInnerOffset = -1
+    if relWordOffset < 0:
+        return
+    let prologueCount = PrimaryBodyIrPrologueWordCount(bodyIR)
+    if relWordOffset < prologueCount:
+        detail.firstZeroOpIndex = -2
+        detail.firstZeroOpKind = -2
+        detail.firstZeroWordInnerOffset = relWordOffset
+        return
+    var cursor = prologueCount
+    for bi in 0..<bodyIR.blocks.len:
+        let block = bodyIR.blocks[bi]
+        var opStart = block.opStart
+        if opStart < 0:
+            opStart = 0
+        var opEnd = block.opStart + block.opCount
+        if opEnd > bodyIR.ops.len:
+            opEnd = bodyIR.ops.len
+        for oi in opStart..<opEnd:
+            let opSize = PrimaryBodyIROpSizeAt(bodyIR, oi)
+            if opSize <= 0:
+                continue
+            if relWordOffset >= cursor && relWordOffset < cursor + opSize:
+                detail.firstZeroBlockIndex = bi
+                detail.firstZeroWordInnerOffset = relWordOffset - cursor
+                PrimaryObjectPlanCaptureBodyIrOpDetail(detail, bodyIR, oi)
+                return
+            cursor = cursor + opSize
+        let termSize = PrimaryBodyIRTermSize(bodyIR, block.termIndex)
+        if termSize > 0:
+            if relWordOffset >= cursor && relWordOffset < cursor + termSize:
+                detail.firstZeroBlockIndex = bi
+                detail.firstZeroTermIndex = block.termIndex
+                detail.firstZeroWordInnerOffset = relWordOffset - cursor
+                if block.termIndex >= 0 && block.termIndex < bodyIR.terms.len:
+                    detail.firstZeroTermKind = bodyIR.terms[block.termIndex].kind
+                return
+            cursor = cursor + termSize
+
 fn PrimaryObjectPlanCaptureBodyIrDetails(detail: var PrimaryObjectErrorBodyIrDetail,
                                           bodyIR: coreir.BodyIR) =
     detail.opCount = bodyIR.ops.len
@@ -7435,38 +7590,14 @@ fn PrimaryObjectPlanCaptureBodyIrDetails(detail: var PrimaryObjectErrorBodyIrDet
     detail.slotCount = bodyIR.localSlots.len
     detail.firstZeroOpIndex = -1
     detail.firstZeroTermIndex = -1
+    detail.firstZeroBlockIndex = -1
+    detail.firstZeroWordInnerOffset = -1
     for opIndex in 0..<bodyIR.ops.len:
         let op = bodyIR.ops[opIndex]
         if op.kind != coreir.BodyOpInvalidTag &&
            PrimaryBodyIROpSizeAt(bodyIR, opIndex) > 0:
             continue
-        detail.firstZeroOpIndex = opIndex
-        detail.firstZeroOpKind = op.kind
-        detail.firstZeroOpTarget = op.target
-        if op.operands.len > 0:
-            detail.firstZeroOpOperand0 = op.operands[0]
-        if op.operands.len > 1:
-            detail.firstZeroOpOperand1 = op.operands[1]
-        if op.operands.len > 2:
-            detail.firstZeroOpOperand2 = op.operands[2]
-        if op.operands.len > 3:
-            detail.firstZeroOpOperand3 = op.operands[3]
-        if op.operands.len > 0:
-            let baseSlot = op.operands[0]
-            if baseSlot >= 0 && baseSlot < bodyIR.localSlots.len:
-                let slot = bodyIR.localSlots[baseSlot]
-                detail.firstZeroBaseSlotName = slot.name
-                detail.firstZeroBaseSlotType = slot.typeKind
-                detail.firstZeroBaseSlotSize = PrimaryLocalSlotSizeOf(slot)
-                detail.firstZeroBaseSlotOffset = slot.stackOffset
-        if op.operands.len > 1:
-            let valueSlot = op.operands[1]
-            if valueSlot >= 0 && valueSlot < bodyIR.localSlots.len:
-                let slot = bodyIR.localSlots[valueSlot]
-                detail.firstZeroValueSlotName = slot.name
-                detail.firstZeroValueSlotType = slot.typeKind
-                detail.firstZeroValueSlotSize = PrimaryLocalSlotSizeOf(slot)
-                detail.firstZeroValueSlotOffset = slot.stackOffset
+        PrimaryObjectPlanCaptureBodyIrOpDetail(detail, bodyIR, opIndex)
         break
     for termIndex in 0..<bodyIR.terms.len:
         if PrimaryBodyIRTermSize(bodyIR, termIndex) > 0:
@@ -8249,11 +8380,11 @@ fn PrimaryObjectPlanFillAndCheckPhase(state: var PrimaryObjectPlanPhaseState,
                     plan.error.wordRelOffset = wordIndex - startWord
                     break
             if functionIndex < state.planBodyIRs.len:
-                plan.error.bodyIrDetail.opCount = state.planBodyIRs[functionIndex].ops.len
-                plan.error.bodyIrDetail.termCount = state.planBodyIRs[functionIndex].terms.len
-                plan.error.bodyIrDetail.blockCount = state.planBodyIRs[functionIndex].blocks.len
-                plan.error.bodyIrDetail.callCount = state.planBodyIRs[functionIndex].callSequence.len
-                plan.error.bodyIrDetail.slotCount = state.planBodyIRs[functionIndex].localSlots.len
+                PrimaryObjectPlanCaptureBodyIrDetails(plan.error.bodyIrDetail,
+                                                       state.planBodyIRs[functionIndex])
+                PrimaryObjectPlanCaptureBodyIrWordDetail(plan.error.bodyIrDetail,
+                                                          state.planBodyIRs[functionIndex],
+                                                          plan.error.wordRelOffset)
                 if state.planBodyIRs[functionIndex].terms.len > 0:
                     let term = state.planBodyIRs[functionIndex].terms[state.planBodyIRs[functionIndex].terms.len - 1]
                     plan.error.bodyIrDetail.lastTermKind = term.kind

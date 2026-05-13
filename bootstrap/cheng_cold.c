@@ -19243,39 +19243,6 @@ static void cold_collect_body_stats(Symbols *symbols, BodyIR **function_bodies, 
 static int32_t cold_compile_csg_type_rows_seq = 0;
 
 
-static bool cold_read_package_module_prefix(const char *workspace_root, char *prefix_out, size_t cap) {
-    /* read cheng-package.toml to get module_prefix, default "cheng" */
-    char toml_path[PATH_MAX];
-    snprintf(toml_path, sizeof(toml_path), "%s/cheng-package.toml", workspace_root);
-    Span toml = source_open(toml_path);
-    if (toml.len <= 0) { snprintf(prefix_out, cap, "cheng"); return true; }
-    int32_t pos = 0;
-    while (pos < toml.len) {
-        int32_t ls = pos;
-        while (pos < toml.len && toml.ptr[pos] != '\n') pos++;
-        int32_t le = pos;
-        if (pos < toml.len) pos++;
-        Span line = span_trim(span_sub(toml, ls, le));
-        if (cold_span_starts_with(line, "module_prefix")) {
-            int32_t eq = cold_span_find_char(line, '=');
-            if (eq > 0) {
-                Span val = span_trim(span_sub(line, eq + 1, line.len));
-                if (val.len > 0 && val.len < (int32_t)cap) {
-                    /* strip quotes if present */
-                    if (val.ptr[0] == '"' && val.ptr[val.len - 1] == '"')
-                        val = span_sub(val, 1, val.len - 1);
-                    memcpy(prefix_out, val.ptr, (size_t)val.len);
-                    prefix_out[val.len] = '\0';
-                    munmap((void *)toml.ptr, (size_t)toml.len);
-                    return true;
-                }
-            }
-        }
-    }
-    munmap((void *)toml.ptr, (size_t)toml.len);
-    snprintf(prefix_out, cap, "cheng");
-    return true;
-}
 
 
 static char cold_active_imports[16][PATH_MAX];

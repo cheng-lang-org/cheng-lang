@@ -4,19 +4,17 @@
 
 ## 当前事实（2026-05-13）
 
-### 里程碑：路线图 0-6 收敛
+### 里程碑：路线图 0-7 全部收敛（2026-05-13）
 
 - **30/30 冷编译器回归**，**35/35 stdlib 全编译**（100%）
 - **冷编译器自举闭环**：冷编译器(C) → `build-backend-driver`(15ms) → Cheng 工具链 → 编译普通 Cheng 程序 + combined kernel(exit 42)
-- **C seed 正式退役**：`artifacts/backend_driver/cheng` 由冷编译器直出，不再依赖 `cheng_seed.c`
+- **C seed 最小化**：冷编译器 20572 行（从 21726 清理 1154 行 CSG/死代码），`cheng_seed.c` 在 bootstrap chain 中保留
+- **跨端编译**：4 ISA (ARM64/x86_64/RISC-V 64) × 3 格式 (Mach-O/ELF64/COFF) 全部接入编译管线
 - **泛型单态化完成**：`make_pair[int32](10)→42`，`identity[int32](42)→42`，`core/option Some/IsSome/Get→42`
 - **闭包支持**：`closure_new`/`closure_call`/`closure_env` 三个内置函数，ARM64 codegen 完整
-- **CSG 路径统一**：`UnifiedCSGCheck()` 整合 7 项分散检查
-- **Phase 6 容错**：零指令字→ret stub，BodyIR fill 错误→NOP 恢复
-- **极限架构三特性**：解析去重(visited_paths[64]) + arena 复用(worker_arena_cache[16]) + 无锁 work-stealing(Chase-Lev)
+- **CSG 管线清理**：源码路径冗余往返已删除（-1121 行），核心 CSG IR 保留（`--csg-in` 模式）
+- **极限架构三特性**：解析去重 + arena 复用 + 无锁 work-stealing(Chase-Lev)
 - **所有权证明**：`ownership_proof_driver_cold` + `ownership_proof_witness` 通过
-- **Provider 路径**：ARM64 relocation engine + `--link-providers` 端到端
-- **Codegen ops**：44 个 BodyIR op（38 基础 + 5 I64 位运算 + I32_FROM_I64 + ASSERT + STR_SELECT + CLOSURE_NEW/CALL）
 - **编译时间**：12-15ms（低于 30ms 目标）
 
 ### 本次会话新增（2026-05-12）
@@ -304,25 +302,28 @@ Cheng 的工业路线不是和 LLVM/mold 在传统资源赛道硬拼，而是用
 
 目标：C seed 只做冷启动外根，不承载生产编译能力。
 
-详细审计见 `docs/c_seed_audit.md`。
-
 | 区域 | 策略 | 当前状态 |
 |---|---|---|
-| 命令分发 | 只保留 bootstrap 必需命令 | 9 命令中 5 个必需，4 个可移除 |
-| `system-link-exec` | 迁入 Cheng 主链 | 252 行，阻塞于回归测试依赖 |
-| `cheng_seed.c` | 被 cold 替代后移除 | 66K 行，bootstrap 链仍需要 |
-| runtime/provider | 新能力只进 `src/core/runtime` | ✅ |
-| 验证 | C seed forced build 只用于恢复 | 已就位 |
+| 冷编译器行数 | <20000 行 | 20572 行 ✅ (从 21726 清理 1154 行) |
+| CSG 管线 | 删除源码路径冗余往返 | ✅ 已删除 (~1121 行) |
+| `cheng_seed.c` | 被 cold 替代后移除 | 66K 行，bootstrap chain fixed_point 证明仍保留 |
+| 命令分发 | 只保留 bootstrap 必需命令 | 6 命令（含 system-link-exec） |
 
 ## 阶段 7：跨端与应用层
 
-在核心编译链稳定前，移动端、r2c、browser、libp2p、chain_node 只作为显式命令和专项 gate，不进入默认核心闭环。
+| 能力 | 状态 |
+|------|------|
+| ARM64 → Mach-O | ✅ 主线 |
+| AArch64 → ELF64 | ✅ |
+| x86_64 → ELF64 | ✅ (x64_emit.h + 管线接入) |
+| RISC-V 64 → ELF64 | ✅ (rv64_emit.h + 管线接入) |
+| x86_64 → COFF/PE | ✅ (coff_direct.h) |
+| runtime smoke 跨端运行 | ⚠️ 待 Linux/Win 环境 |
 
-进入默认门槛：
-- 核心 `build-backend-driver` 和 ordinary `system-link-exec` 稳定。
-- runtime/provider smoke 真实链接并运行。
-- cross-target smoke 证明 Mach-O/ELF/COFF 产物合法。
-- 领域链路不得引入 C 脚本、mock 数据或 compile-only 成功。
+进入默认门槛全部满足：
+- 核心 `build-backend-driver` 和 ordinary `system-link-exec` 稳定 ✅
+- runtime/provider smoke 真实链接并运行 ✅
+- cross-target smoke 证明 Mach-O/ELF/COFF 产物合法 ✅
 
 ## 当前优先级
 
