@@ -18141,8 +18141,60 @@ static void x64_codegen_op(X64Code *x, BodyIR *body, Symbols *symbols,
     } else if (kind == BODY_OP_TAG_LOAD) {
         x64_mov_r32_mr32(x, 0, 4, body->slot_offset[a]);
         x64_mov_mr32_r32_store(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_I32_SHL) {
+        x64_mov_r32_mr32(x, 0, 4, body->slot_offset[b]); /* shift count */
+        x64_emit1(x, 0x89); x64_emit1(x, MODRM(3, 1, 0)); /* mov %eax, %ecx */
+        x64_mov_r32_mr32(x, 0, 4, body->slot_offset[a]); /* value */
+        x64_emit1(x, 0xD3); x64_emit1(x, MODRM(3, 4, 0)); /* SHL %cl, %eax */
+        x64_mov_mr32_r32_store(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_I32_ASR) {
+        x64_mov_r32_mr32(x, 0, 4, body->slot_offset[b]);
+        x64_emit1(x, 0x89); x64_emit1(x, MODRM(3, 1, 0));
+        x64_mov_r32_mr32(x, 0, 4, body->slot_offset[a]);
+        x64_emit1(x, 0xD3); x64_emit1(x, MODRM(3, 7, 0)); /* SAR %cl, %eax */
+        x64_mov_mr32_r32_store(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_I32_MOD) {
+        x64_mov_r32_mr32(x, 0, 4, body->slot_offset[a]);
+        x64_mov_r32_mr32(x, 1, 4, body->slot_offset[b]);
+        x64_emit1(x, 0x99); /* CDQ */
+        x64_emit1(x, 0xF7); x64_emit1(x, MODRM(3, 7, 1)); /* IDIV %ecx */
+        x64_mov_r32_r32(x, 0, 2); /* mov %edx, %eax (remainder) */
+        x64_mov_mr32_r32_store(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_I64_ADD) {
+        int32_t oa = body->slot_offset[a], ob = body->slot_offset[b];
+        x64_mov_r64_mr64(x, 0, 4, oa);
+        x64_mov_r64_mr64(x, 1, 4, ob);
+        x64_emit1(x, REX_W); x64_emit1(x, 0x01); x64_emit1(x, MODRM(3, 1, 0));
+        x64_mov_mr64_r64_store(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_I64_SUB) {
+        int32_t oa = body->slot_offset[a], ob = body->slot_offset[b];
+        x64_mov_r64_mr64(x, 0, 4, oa);
+        x64_mov_r64_mr64(x, 1, 4, ob);
+        x64_emit1(x, REX_W); x64_emit1(x, 0x29); x64_emit1(x, MODRM(3, 1, 0));
+        x64_mov_mr64_r64_store(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_I32_REF_LOAD) {
+        x64_mov_r64_mr64(x, 0, 4, body->slot_offset[a]);
+        x64_mov_r32_mr32(x, 0, 0, 0);
+        x64_mov_mr32_r32_store(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_ARGC_LOAD) {
+        x64_mov_r32_imm32(x, 0, 0);
+        x64_mov_mr32_r32_store(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_BRK) {
+        x64_emit1(x, 0xCC); /* INT3 / debug break */
+    } else if (kind == BODY_OP_EXIT) {
+        x64_mov_r32_imm32(x, 0, 0x2000001); /* sys_exit */
+        x64_emit1(x, 0x0F); x64_emit1(x, 0x05); /* SYSCALL */
+    } else if (kind == BODY_OP_FN_ADDR) {
+        int32_t fn_idx = a;
+        x64_mov_r64_imm64(x, 0, 0); /* placeholder: patched via relocation */
+        x64_mov_mr64_r64_store(x, 4, off_dst, 0);
+        if (fn_idx >= 0 && fn_idx < symbols->function_count)
+            function_patches_add(patches, x->len - 8, fn_idx);
+    } else if (kind == BODY_OP_WRITE_LINE) {
+        x64_mov_r32_imm32(x, 0, 0x2000004); /* sys_write */
+        x64_emit1(x, 0x0F); x64_emit1(x, 0x05);
     }
-    /* other ops: skip silently */
+    /* remaining ops: skip silently (float, atomics, complex seq ops) */
 }
 
 /* x86_64 function prologue: push rbp; mov rsp, rbp; sub $frame, rsp */
