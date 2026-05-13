@@ -18223,6 +18223,116 @@ static int32_t x64_pack_words(X64Code *x, uint32_t *words, int32_t max_words) {
     return wc;
 }
 
+/* ---- RISC-V 64 codegen (fixed 32-bit words, reuses Code struct) ---- */
+
+static void rv64_codegen_op(Code *code, BodyIR *body, Symbols *symbols,
+                            FunctionPatchList *patches, int32_t op) {
+    int32_t kind = body->op_kind[op], dst = body->op_dst[op];
+    int32_t a = body->op_a[op], b = body->op_b[op];
+    int32_t off_dst = body->slot_offset[dst];
+    if (kind == BODY_OP_I32_CONST) {
+        rv_li(code->words, &code->count, RV_T0, a);
+        code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_COPY_I32) {
+        code_emit(code, rv_lw(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_I32_ADD) {
+        code_emit(code, rv_lw(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_lw(RV_T1, RV_SP, (int16_t)body->slot_offset[b]));
+        code_emit(code, rv_addw(RV_T0, RV_T0, RV_T1));
+        code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_I32_SUB) {
+        code_emit(code, rv_lw(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_lw(RV_T1, RV_SP, (int16_t)body->slot_offset[b]));
+        code_emit(code, rv_subw(RV_T0, RV_T0, RV_T1));
+        code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_I32_MUL) {
+        code_emit(code, rv_lw(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_lw(RV_T1, RV_SP, (int16_t)body->slot_offset[b]));
+        code_emit(code, rv_mulw(RV_T0, RV_T0, RV_T1));
+        code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_CALL_I32) {
+        int32_t call_pos = code->count;
+        code_emit(code, rv_jal(RV_RA, 0));
+        function_patches_add(patches, call_pos, a);
+        code_emit(code, rv_sw(RV_A0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_STR_LITERAL) {
+        rv_li(code->words, &code->count, RV_T0, 0);
+        code_emit(code, rv_sd(RV_T0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_STR_LEN) {
+        code_emit(code, rv_lw(RV_T0, RV_SP, (int16_t)(body->slot_offset[a] + 8)));
+        code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_I64_CONST) {
+        uint64_t bits = (uint32_t)a | ((uint64_t)(uint32_t)b << 32);
+        rv_li(code->words, &code->count, RV_T0, (int32_t)bits);
+        rv_li(code->words, &code->count, RV_T1, (int32_t)(bits >> 32));
+        code_emit(code, rv_slli(RV_T1, RV_T1, 32));
+        code_emit(code, rv_or(RV_T0, RV_T0, RV_T1));
+        code_emit(code, rv_sd(RV_T0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_COPY_I64 || kind == BODY_OP_COPY_COMPOSITE) {
+        int32_t sz = body->slot_size[dst], os = body->slot_offset[a];
+        for (int32_t off = 0; off < sz; off += 8) {
+            code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)(os + off)));
+            code_emit(code, rv_sd(RV_T0, RV_SP, (int16_t)(off_dst + off)));
+        }
+    } else if (kind == BODY_OP_PAYLOAD_LOAD) {
+        code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)(body->slot_offset[a] + b)));
+        code_emit(code, rv_sd(RV_T0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_PAYLOAD_STORE) {
+        code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_sd(RV_T0, RV_SP, (int16_t)(body->slot_offset[dst] + b)));
+    } else if (kind == BODY_OP_TAG_LOAD) {
+        code_emit(code, rv_lw(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_FN_ADDR) {
+        rv_li(code->words, &code->count, RV_T0, 0);
+        code_emit(code, rv_sd(RV_T0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_CALL_PTR) {
+        code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_jalr(RV_RA, RV_T0, 0));
+        code_emit(code, rv_sw(RV_A0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_CALL_COMPOSITE) {
+        int32_t call_pos = code->count;
+        code_emit(code, rv_jal(RV_RA, 0));
+        function_patches_add(patches, call_pos, a);
+    } else if (kind == BODY_OP_I32_CMP) {
+        code_emit(code, rv_lw(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_lw(RV_T1, RV_SP, (int16_t)body->slot_offset[b]));
+        code_emit(code, rv_slt(RV_T0, RV_T1, RV_T0));
+    }
+    /* remaining ops: skip silently */
+}
+
+static void rv64_codegen_prologue(Code *code, int32_t frame_size) {
+    code_emit(code, rv_addi(RV_SP, RV_SP, -16));
+    code_emit(code, rv_sd(RV_RA, RV_SP, 0));
+    code_emit(code, rv_sd(RV_S0, RV_SP, 8));
+    code_emit(code, rv_addi(RV_S0, RV_SP, 0));
+    if (frame_size > 0)
+        code_emit(code, rv_addi(RV_SP, RV_SP, (int16_t)(-frame_size & 0xFFF)));
+}
+
+static void rv64_codegen_epilogue(Code *code, int32_t frame_size) {
+    if (frame_size > 0)
+        code_emit(code, rv_addi(RV_SP, RV_SP, (int16_t)(frame_size & 0xFFF)));
+    code_emit(code, rv_ld(RV_RA, RV_SP, 0));
+    code_emit(code, rv_ld(RV_S0, RV_SP, 8));
+    code_emit(code, rv_addi(RV_SP, RV_SP, 16));
+    code_emit(code, rv_jalr(RV_ZERO, RV_RA, 0));
+}
+
+static void rv64_codegen_func(Code *code, BodyIR *body, Symbols *symbols,
+                              FunctionPatchList *patches) {
+    rv64_codegen_prologue(code, body->frame_size);
+    for (int32_t bi = 0; bi < body->block_count; bi++) {
+        int32_t bs = body->block_op_start[bi];
+        int32_t be = bs + body->block_op_count[bi];
+        for (int32_t oi = bs; oi < be; oi++)
+            rv64_codegen_op(code, body, symbols, patches, oi);
+    }
+    rv64_codegen_epilogue(code, body->frame_size);
+}
+
 static void codegen_switch(Code *code, BodyIR *body, PatchList *patches, int32_t term) {
     int32_t tag_slot = body->term_value[term];
     int32_t count = body->term_case_count[term];
@@ -20196,6 +20306,7 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
 
     /* Detect x86_64 target for codegen dispatch */
     bool use_x64 = (elf_machine == EM_X86_64 || coff_machine == IMAGE_FILE_MACHINE_AMD64);
+    bool use_rv64 = (elf_machine == EM_RISCV);
     X64Code x64_buf; if (use_x64) { x64_init(&x64_buf, 65536); }
 
     /* First pass: compile each function body into the shared buffer */
@@ -20209,6 +20320,11 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
             (body->block_count > 0 && body->block_term[0] < 0)) {
             /* Emit stub that zero-initializes the return slot */
             symbol_offset[i] = shared->count;
+            if (use_rv64) {
+                code_emit(shared, rv_addi(RV_A0, RV_ZERO, 0));
+                code_emit(shared, rv_jalr(RV_ZERO, RV_RA, 0));
+                continue;
+            }
             if (body->return_kind == SLOT_STR && body->slot_offset) {
                 code_emit(shared, a64_movz(R0, 0, 0));
                 a64_emit_str_sp_off(shared, R0, body->slot_offset[0], true);
@@ -20234,7 +20350,10 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
             }
             continue;
         }
-        codegen_func(shared, body, symbols, &function_patches);
+        if (use_rv64)
+            rv64_codegen_func(shared, body, symbols, &function_patches);
+        else
+            codegen_func(shared, body, symbols, &function_patches);
     }
 
     if (use_x64) {
