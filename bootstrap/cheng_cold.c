@@ -8617,11 +8617,44 @@ static void codegen_seq_opaque_remove(Code *code, BodyIR *body, int32_t seq_slot
     code_emit(code, a64_str_imm(R0, R2, 0, false));
 }
 
-/* Disabled no-alias register cache: correctness first until it is CFG-aware. */
-static void na_reset(void) { }
-static int na_find(int32_t s) { (void)s; return -1; }
-static void na_set(int r, int32_t s) { (void)r; (void)s; }
-static void na_clobber(int r) { (void)r; }
+/* No-alias register cache.
+ * For no_alias slots (scalar locals), the value lives on the stack but is
+ * also cached in a register.  Since no_alias slots never alias each other,
+ * the cached register value is valid until the register is reused for a
+ * different purpose.  The cache is invalidated at basic block boundaries
+ * so it remains correct across CFG joins. */
+#define NA_CACHE_SIZE 32
+static int32_t na_reg_slot[NA_CACHE_SIZE]; /* [register] -> slot, -1 = empty */
+
+/* Reset entire cache (function entry or block boundary). */
+static void na_reset(void) {
+    for (int i = 0; i < NA_CACHE_SIZE; i++) na_reg_slot[i] = -1;
+}
+
+/* Return the register caching slot s, or -1 if not cached. */
+static int na_find(int32_t s) {
+    for (int i = 0; i < NA_CACHE_SIZE; i++) {
+        if (na_reg_slot[i] == s) return i;
+    }
+    return -1;
+}
+
+/* Cache that register r now holds slot s.  If another register was
+ * already caching s, invalidate that stale copy. */
+static void na_set(int r, int32_t s) {
+    if (r >= 0 && r < NA_CACHE_SIZE) {
+        /* Invalidate any other register caching this slot */
+        for (int i = 0; i < NA_CACHE_SIZE; i++) {
+            if (i != r && na_reg_slot[i] == s) na_reg_slot[i] = -1;
+        }
+        na_reg_slot[r] = s;
+    }
+}
+
+/* Register r is being reused for another purpose; invalidate its entry. */
+static void na_clobber(int r) {
+    if (r >= 0 && r < NA_CACHE_SIZE) na_reg_slot[r] = -1;
+}
 
 static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
                        FunctionPatchList *function_patches, int32_t op) {
@@ -11001,6 +11034,7 @@ static void codegen_func(Code *code, BodyIR *body, Symbols *symbols,
     patches.arena = code->arena;
 
     for (int32_t block = 0; block < body->block_count; block++) {
+        na_reset(); /* Invalidate no-alias cache at block boundary (CFG safety) */
         block_pos[block] = code->count;
         int32_t start = body->block_op_start[block];
         int32_t end = start + body->block_op_count[block];
