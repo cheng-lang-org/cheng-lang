@@ -11,7 +11,10 @@ DRIVER="${CHENG_BACKEND_DRIVER:-artifacts/backend_driver/cheng}"
 TARGET="${CHENG_CSG_V2_TARGET:-arm64-apple-darwin}"
 WORK="${CHENG_CSG_V2_WORK:-/tmp/cheng_csg_v2_roundtrip}"
 
-if [ ! -x "$COLD" ]; then
+if [ ! -x "$COLD" ] ||
+   [ bootstrap/cheng_cold.c -nt "$COLD" ] ||
+   [ bootstrap/elf64_direct.h -nt "$COLD" ] ||
+   [ bootstrap/rv64_emit.h -nt "$COLD" ]; then
     cc -std=c11 -O2 -o "$COLD" bootstrap/cheng_cold.c
 fi
 
@@ -202,6 +205,84 @@ if [ -f "$WORK/ordinary_link_d1.o.linked" ] && [ -f "$WORK/ordinary_link_d2.o.li
   fi
 else
   echo "FAIL builtin_linker_determinism (missing linked files)"
+  fail=$((fail + 1))
+fi
+
+# Explicit link-object entry: consume the ELF .o and produce the same executable.
+echo "  - link_object_explicit"
+rm -f "$WORK/ordinary_link_explicit" "$WORK/ordinary_link_explicit.report.txt"
+if "$COLD" system-link-exec \
+  --link-object:"$WORK/ordinary_link_d1.o" \
+  --emit:exe --target:riscv64-unknown-linux-gnu \
+  --out:"$WORK/ordinary_link_explicit" \
+  --report-out:"$WORK/ordinary_link_explicit.report.txt" \
+  > "$WORK/ordinary_link_explicit.stdout" 2>&1; then
+  if cmp -s "$WORK/ordinary_link_d1.o.linked" "$WORK/ordinary_link_explicit" &&
+     grep -q '^link_object=1$' "$WORK/ordinary_link_explicit.report.txt" &&
+     grep -q '^unresolved_symbol_count=0$' "$WORK/ordinary_link_explicit.report.txt" &&
+     grep -q '^system_link=0$' "$WORK/ordinary_link_explicit.report.txt"; then
+    echo "PASS link_object_explicit"
+    pass=$((pass + 1))
+  else
+    echo "FAIL link_object_explicit (output/report mismatch)"
+    fail=$((fail + 1))
+  fi
+else
+  echo "FAIL link_object_explicit (command failed)"
+  fail=$((fail + 1))
+fi
+
+# Provider archives must not be silently accepted until the archive reader exists.
+echo "  - provider_archive_hard_fail"
+if "$COLD" system-link-exec \
+  --link-object:"$WORK/ordinary_link_d1.o" \
+  --provider-archive:"$WORK/missing-provider.chenga" \
+  --emit:exe --target:riscv64-unknown-linux-gnu \
+  --out:"$WORK/provider_archive_should_not_exist" \
+  --report-out:"$WORK/provider_archive_hard_fail.report.txt" \
+  > "$WORK/provider_archive_hard_fail.stdout" 2>&1; then
+  echo "FAIL provider_archive_hard_fail"
+  fail=$((fail + 1))
+else
+  echo "PASS provider_archive_hard_fail"
+  pass=$((pass + 1))
+fi
+
+# Reader fixed-point: two exe runs from same facts are bit-identical
+echo "  - reader_fixedpoint_exe"
+rm -f "$WORK/fp_exe_a" "$WORK/fp_exe_b"
+COLD_NO_SIGN=1 "$COLD" system-link-exec \
+  --csg-in:"$WORK/ordinary.facts" \
+  --emit:exe --target:arm64-apple-darwin \
+  --out:"$WORK/fp_exe_a" > /dev/null 2>&1
+COLD_NO_SIGN=1 "$COLD" system-link-exec \
+  --csg-in:"$WORK/ordinary.facts" \
+  --emit:exe --target:arm64-apple-darwin \
+  --out:"$WORK/fp_exe_b" > /dev/null 2>&1
+if cmp -s "$WORK/fp_exe_a" "$WORK/fp_exe_b" 2>/dev/null; then
+  echo "PASS reader_fixedpoint_exe"
+  pass=$((pass + 1))
+else
+  echo "FAIL reader_fixedpoint_exe"
+  fail=$((fail + 1))
+fi
+
+# Reader fixed-point: RISC-V ELF target
+echo "  - reader_fixedpoint_exe_riscv"
+rm -f "$WORK/fp_rv_a" "$WORK/fp_rv_b"
+COLD_NO_SIGN=1 "$COLD" system-link-exec \
+  --csg-in:"$WORK/ordinary.facts" \
+  --emit:exe --target:riscv64-unknown-linux-gnu \
+  --out:"$WORK/fp_rv_a" > /dev/null 2>&1
+COLD_NO_SIGN=1 "$COLD" system-link-exec \
+  --csg-in:"$WORK/ordinary.facts" \
+  --emit:exe --target:riscv64-unknown-linux-gnu \
+  --out:"$WORK/fp_rv_b" > /dev/null 2>&1
+if [ -f "$WORK/fp_rv_a" ] && [ -f "$WORK/fp_rv_b" ] && cmp -s "$WORK/fp_rv_a" "$WORK/fp_rv_b"; then
+  echo "PASS reader_fixedpoint_exe_riscv"
+  pass=$((pass + 1))
+else
+  echo "FAIL reader_fixedpoint_exe_riscv"
   fail=$((fail + 1))
 fi
 
