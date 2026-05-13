@@ -18927,7 +18927,7 @@ static void cold_mark_reachable_functions(Symbols *symbols,
 
 static void codegen_program(Code *code, BodyIR **function_bodies,
                             int32_t function_count, int32_t entry_function,
-                            Symbols *symbols) {
+                            Symbols *symbols, const char *target) {
     if (entry_function < 0 || entry_function >= function_count ||
         !function_bodies[entry_function]) die("missing entry function body");
 
@@ -18941,37 +18941,44 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
     FunctionPatchList function_patches = {0};
     function_patches.arena = code->arena;
 
-    /* The Mach-O entry starts at this trampoline; function calls to the entry
-       symbol must still target the real body below. */
-    code_emit(code, a64_add_imm(19, R0, 0, true));
-    code_emit(code, a64_add_imm(20, R1, 0, true));
-    code_emit(code, a64_add_imm(21, LR, 0, true));
-    code_emit(code, a64_add_imm(22, R2, 0, true));
-    int32_t entry_call_pos = code->count;
-    code_emit(code, a64_bl(0));
-    code_emit(code, a64_add_imm(LR, 21, 0, true));
-    code_emit(code, a64_ret());
+    bool use_rv64 = target && strstr(target, "riscv64") != 0;
+
+    /* Entry trampoline: architecture-specific */
+    int32_t entry_call_pos = 0;
+    if (use_rv64) {
+        code_emit(code, rv_addi(RV_S0, RV_A0, 0));
+        code_emit(code, rv_addi(RV_S1, RV_A1, 0));
+        entry_call_pos = code->count;
+        code_emit(code, rv_jal(RV_RA, 0));
+        code_emit(code, rv_jalr(RV_ZERO, RV_RA, 0));
+    } else {
+        code_emit(code, a64_add_imm(19, R0, 0, true));
+        code_emit(code, a64_add_imm(20, R1, 0, true));
+        code_emit(code, a64_add_imm(21, LR, 0, true));
+        code_emit(code, a64_add_imm(22, R2, 0, true));
+        entry_call_pos = code->count;
+        code_emit(code, a64_bl(0));
+        code_emit(code, a64_add_imm(LR, 21, 0, true));
+        code_emit(code, a64_ret());
+    }
 
     /* Real entry function body starts here */
     int32_t entry_body_pos = code->count;
     function_pos[entry_function] = entry_body_pos;
-    if (cold_diag_dump_per_fn || cold_diag_dump_slots) {
-        fprintf(stderr, "[diag] entry fn ");
-        cold_diag_fn_name(symbols->functions[entry_function].name);
-        fprintf(stderr, " at word=%d", code->count);
-        BodyIR *eb = function_bodies[entry_function];
-        if (eb) fprintf(stderr, " slots=%d frame=%d", eb->slot_count, eb->frame_size);
-        fprintf(stderr, "\n");
-    }
     {
         BodyIR *entry_body = function_bodies[entry_function];
-        if (!cold_body_codegen_ready(entry_body)) {
+        if (!cold_body_codegen_ready(entry_body))
             die("entry cold function body is not codegen-ready");
-        }
-        codegen_func(code, entry_body, symbols, &function_patches);
+        if (use_rv64)
+            rv64_codegen_func(code, entry_body, symbols, &function_patches);
+        else
+            codegen_func(code, entry_body, symbols, &function_patches);
     }
-    /* Patch trampoline BL to jump to real entry body */
-    code->words[entry_call_pos] = a64_bl(entry_body_pos - entry_call_pos);
+    /* Patch trampoline to jump to real entry body */
+    if (use_rv64)
+        code->words[entry_call_pos] = rv_jal(RV_RA, entry_body_pos - entry_call_pos);
+    else
+        code->words[entry_call_pos] = a64_bl(entry_body_pos - entry_call_pos);
     if (cold_diag_dump_per_fn || cold_diag_dump_slots) {
         fprintf(stderr, "[diag] entry fn ");
         cold_diag_fn_name(symbols->functions[entry_function].name);
@@ -19140,7 +19147,10 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
             if (!cold_body_codegen_ready(body)) {
                 die("cold function body is not codegen-ready");
             }
-            codegen_func(code, body, symbols, &function_patches);
+            if (use_rv64)
+                rv64_codegen_func(code, body, symbols, &function_patches);
+            else
+                codegen_func(code, body, symbols, &function_patches);
             if (cold_diag_dump_per_fn || cold_diag_dump_slots) {
                 fprintf(stderr, "[diag] fn[%d] end at word=%d (count=%d)\n", i, code->count, code->count - function_pos[i]);
                 if (cold_diag_dump_per_fn) {
@@ -19160,12 +19170,14 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
                 cold_diag_fn_name(symbols->functions[patch.target_function].name);
                 fputc('\n', stderr);
             }
-            code->words[patch.pos] = 0xD2800000u; /* mov x0, #0 */;
+            code->words[patch.pos] = use_rv64 ? rv_addi(RV_A0, RV_ZERO, 0) : 0xD2800000u;
             continue;
         }
         int32_t delta = function_pos[patch.target_function] - patch.pos;
         uint32_t ins = code->words[patch.pos];
-        if ((ins & 0xFC000000u) == 0x10000000u) {
+        if (use_rv64) {
+            code->words[patch.pos] = rv_jal(RV_RA, delta);
+        } else if ((ins & 0xFC000000u) == 0x10000000u) {
             code->words[patch.pos] = a64_adr(ins & 0x1Fu, delta * 4);
         } else {
             code->words[patch.pos] = (ins & 0xFC000000u) | ((uint32_t)delta & 0x03FFFFFFu);
@@ -19177,8 +19189,9 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
                     function_pos[patch.target_function], delta, code->words[patch.pos]);
         }
     }
-    code->words[entry_call_pos] = (code->words[entry_call_pos] & 0xFC000000u) |
-                                  ((uint32_t)(function_pos[entry_function] - entry_call_pos) & 0x03FFFFFFu);
+    if (!use_rv64)
+        code->words[entry_call_pos] = (code->words[entry_call_pos] & 0xFC000000u) |
+                                      ((uint32_t)(function_pos[entry_function] - entry_call_pos) & 0x03FFFFFFu);
 }
 
 static void code_patch_bcond(Code *code, int32_t pos, int32_t target) {
@@ -21150,7 +21163,7 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
         }
 
         Code *code = code_new(arena, 256);
-        codegen_program(code, function_bodies, symbols->function_count, entry_function, symbols);
+        codegen_program(code, function_bodies, symbols->function_count, entry_function, symbols, target);
         {
             bool is_elf = target && strstr(target, "linux") != 0;
             bool is_coff = target && strstr(target, "windows") != 0;
@@ -21335,7 +21348,7 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
     if (entry_function < 0) return false;
 
     Code *code = code_new(arena, 256);
-    codegen_program(code, function_bodies, symbols->function_count, entry_function, symbols);
+    codegen_program(code, function_bodies, symbols->function_count, entry_function, symbols, 0);
     if (output_direct_macho(out_path, code) != 0) return false;
 
     if (stats) {
@@ -21954,7 +21967,7 @@ static bool cold_compile_source_path_to_macho(const char *out_path,
         cold_compile_reachable_import_bodies(symbols, function_bodies, body_cap,
                                              main_function, import_sources,
                                              import_source_count);
-        codegen_program(code, function_bodies, symbols->function_count, main_function, symbols);
+        codegen_program(code, function_bodies, symbols->function_count, main_function, symbols, 0);
     }
 
     uint64_t codegen_end_us = cold_now_us();
