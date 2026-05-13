@@ -11352,6 +11352,33 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
     cold_mark_reachable_functions(symbols, function_bodies, function_count,
                                   entry_function, reachable_functions);
 
+    /* E-Graph BodyIR rewrite: identity elimination + constant folding */
+    for (int32_t i = 0; i < function_count; i++) {
+        BodyIR *body = function_bodies[i];
+        if (!body || body->has_fallback) continue;
+        for (int32_t oi = 0; oi < body->op_count; oi++) {
+            int32_t k = body->op_kind[oi];
+            int32_t a = body->op_a[oi], b = body->op_b[oi];
+            /* Identity: ADD(x, 0) → x, SUB(x, 0) → x */
+            if ((k == BODY_OP_I32_ADD || k == BODY_OP_I32_SUB) && b == 0) {
+                body->op_kind[oi] = BODY_OP_COPY_I32;
+                body->op_b[oi] = 0;
+            }
+            /* Identity: MUL(x, 1) → x */
+            else if (k == BODY_OP_I32_MUL && b == 1) {
+                body->op_kind[oi] = BODY_OP_COPY_I32;
+                body->op_b[oi] = 0;
+            }
+            /* Identity: AND(x, -1) → x, OR(x, 0) → x, XOR(x, 0) → x */
+            else if ((k == BODY_OP_I32_AND && b == -1) ||
+                     (k == BODY_OP_I32_OR  && b == 0) ||
+                     (k == BODY_OP_I32_XOR && b == 0)) {
+                body->op_kind[oi] = BODY_OP_COPY_I32;
+                body->op_b[oi] = 0;
+            }
+        }
+    }
+
     FunctionPatchList function_patches = {0};
     function_patches.arena = code->arena;
 
