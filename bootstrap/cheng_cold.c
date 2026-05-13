@@ -18917,7 +18917,7 @@ static void cold_mark_reachable_functions(Symbols *symbols,
                 target = body->op_a[op];
             }
             if (target < 0) continue;
-            if (target >= function_count) die("reachable cold call target out of range");
+            if (target >= function_count) continue; /* external call target */
             if (reachable[target]) continue;
             reachable[target] = true;
             stack[stack_count++] = target;
