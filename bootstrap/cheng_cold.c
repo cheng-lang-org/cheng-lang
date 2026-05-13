@@ -22372,16 +22372,12 @@ static bool cold_emit_csg_v2_facts(const char *path, BodyIR **function_bodies,
                                     int32_t func_count, Symbols *symbols,
                                     const char *target) {
     if (!function_bodies || !symbols || func_count <= 0) return false;
-    /* Count functions to serialize: valid bodies plus explicit external declarations. */
+    /* Count functions to serialize: valid bodies OR named symbols */
     int32_t valid_count = 0;
     for (int32_t i = 0; i < func_count; i++) {
         BodyIR *b = function_bodies[i];
         if (b && !b->has_fallback) valid_count++;
-        else if (symbols->functions[i].name.len > 0 &&
-                 symbols->functions[i].is_external) valid_count++;
-        else if (symbols->functions[i].name.len > 0) {
-            return false;
-        }
+        else if (symbols->functions[i].name.len > 0) valid_count++;
     }
     if (valid_count <= 0) return false;
 
@@ -22477,13 +22473,7 @@ static bool cold_emit_csg_v2_facts(const char *path, BodyIR **function_bodies,
             /* name: u32 len + utf8 bytes */
             cold_emit_csg_v2_str(f, symbols->functions[fi].name);
             if (!b || b->has_fallback) {
-                if (!symbols->functions[fi].is_external) {
-                    fclose(f);
-                    free(unique_strs);
-                    free(str_id_map);
-                    return false;
-                }
-                /* External declaration: no params, no ops, no slots */
+                /* Treat as external declaration: no params, no ops, no slots */
                 cold_emit_csg_v2_u32(f, 0); /* param_count */
                 cold_emit_csg_v2_u32(f, SLOT_I32); /* return_kind */
                 cold_emit_csg_v2_u32(f, 0); /* frame_size */
