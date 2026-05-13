@@ -12078,10 +12078,15 @@ typedef struct ColdCompileStats {
     int32_t egraph_dedup_count;
     int32_t total_function_count;
     int32_t link_object;
+    int32_t provider_archive;
     int32_t provider_archive_member_count;
     uint64_t provider_archive_hash;
+    int32_t provider_export_count;
+    int32_t provider_resolved_symbol_count;
+    int32_t link_reloc_count;
     int32_t unresolved_symbol_count;
     int32_t provider_object_count;
+    char first_unresolved_symbol[COLD_NAME_CAP];
 } ColdCompileStats;
 
 static void cold_print_exec_phase_report(FILE *file, ColdCompileStats *stats) {
@@ -13697,28 +13702,139 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
                                             reloc_offsets, reloc_symbols, reloc_count);
 
                 /* Built-in linker: for ELF (ARM64/RISC-V), always produce
-                   linked executable alongside the .o file. */
+                   linked executable alongside the .o file.
+                   If --provider-objects is set, read provider .o files and
+                   resolve external relocations against them. */
                 if (ok && is_elf && !strstr(target, "x86_64")) {
-                    int32_t stub_words = reloc_count * 2 + 8;
-                    Code *linked = code_new(arena, shared->count + stub_words);
-                    memcpy(linked->words, shared->words, (size_t)shared->count * sizeof(uint32_t));
-                    linked->count = shared->count;
-
-                    /* Emit one stub per relocation (each stub: return 0) */
-                    int32_t *stub_pos = arena_alloc(arena, (size_t)reloc_count * sizeof(int32_t));
                     bool is_rv = strstr(target, "riscv64") != 0;
-                    for (int32_t ri = 0; ri < reloc_count; ri++) {
-                        stub_pos[ri] = linked->count;
-                        if (is_rv) {
-                            code_emit(linked, rv_addi(RV_A0, RV_ZERO, 0));
-                            code_emit(linked, rv_jalr(RV_ZERO, RV_RA, 0));
-                        } else {
-                            code_emit(linked, 0xD2800000u); /* mov x0, #0 */
-                            code_emit(linked, 0xD65F03C0u); /* ret */
+
+                    /* --- Read provider .o files if specified --- */
+                    #define MAX_PROVIDER_OBJECTS 64
+                    uint32_t *prov_code[MAX_PROVIDER_OBJECTS];
+                    int32_t prov_code_words[MAX_PROVIDER_OBJECTS];
+                    char **prov_names[MAX_PROVIDER_OBJECTS];
+                    int32_t *prov_offsets[MAX_PROVIDER_OBJECTS];
+                    int32_t prov_nc[MAX_PROVIDER_OBJECTS];
+                    int32_t provider_count = 0;
+
+                    if (provider_objects && provider_objects[0]) {
+                        char paths_buf[4096];
+                        size_t plen = strlen(provider_objects);
+                        if (plen >= sizeof(paths_buf))
+                            plen = sizeof(paths_buf) - 1;
+                        memcpy(paths_buf, provider_objects, plen);
+                        paths_buf[plen] = '\0';
+
+                        char *p = paths_buf;
+                        while (p && *p && provider_count < MAX_PROVIDER_OBJECTS) {
+                            char *comma = strchr(p, ',');
+                            if (comma) *comma = '\0';
+                            if (*p) {
+                                if (!elf64_read_object(p,
+                                        &prov_code[provider_count],
+                                        &prov_code_words[provider_count],
+                                        &prov_names[provider_count],
+                                        &prov_offsets[provider_count],
+                                        &prov_nc[provider_count])) {
+                                    fprintf(stderr, "[cheng_cold] warning: failed to read provider object: %s\n", p);
+                                } else {
+                                    provider_count++;
+                                }
+                            }
+                            p = comma ? comma + 1 : 0;
                         }
                     }
 
-                    /* Patch each relocation to its stub */
+                    /* Determine which relocations resolve to providers */
+                    int32_t stub_count = 0;
+                    int32_t *provider_target = arena_alloc(arena, (size_t)reloc_count * sizeof(int32_t));
+                    for (int32_t ri = 0; ri < reloc_count; ri++) {
+                        provider_target[ri] = -1;
+                        int32_t sym_idx = reloc_symbols[ri];
+                        if (sym_idx < 0 || sym_idx >= func_count) { stub_count++; continue; }
+                        Span nm = symbols->functions[sym_idx].name;
+                        if (nm.len <= 0) { stub_count++; continue; }
+                        char name_buf[1024];
+                        int32_t nlen = nm.len < 1023 ? nm.len : 1023;
+                        memcpy(name_buf, nm.ptr, (size_t)nlen);
+                        name_buf[nlen] = '\0';
+                        const char *short_name = name_buf;
+                        for (int32_t k = nlen - 1; k > 0; k--)
+                            if (name_buf[k] == '.') { short_name = name_buf + k + 1; break; }
+                        for (int32_t pi = 0; pi < provider_count; pi++) {
+                            for (int32_t ni = 0; ni < prov_nc[pi]; ni++) {
+                                if (strcmp(name_buf, prov_names[pi][ni]) == 0 ||
+                                    strcmp(short_name, prov_names[pi][ni]) == 0) {
+                                    provider_target[ri] = pi;
+                                    goto next_reloc;
+                                }
+                            }
+                        }
+                        stub_count++;
+                        next_reloc:;
+                    }
+
+                    int32_t stub_words = stub_count * 2 + 8;
+                    int32_t total_prov_words = 0;
+                    for (int32_t pi = 0; pi < provider_count; pi++)
+                        total_prov_words += prov_code_words[pi];
+
+                    Code *linked = code_new(arena, shared->count + stub_words + total_prov_words);
+                    memcpy(linked->words, shared->words, (size_t)shared->count * sizeof(uint32_t));
+                    linked->count = shared->count;
+
+                    /* Emit stubs for unresolved relocations */
+                    int32_t *stub_pos = arena_alloc(arena, (size_t)reloc_count * sizeof(int32_t));
+                    for (int32_t ri = 0; ri < reloc_count; ri++) {
+                        if (provider_target[ri] >= 0) {
+                            stub_pos[ri] = -1; /* set after provider code placed */
+                        } else {
+                            stub_pos[ri] = linked->count;
+                            if (is_rv) {
+                                code_emit(linked, rv_addi(RV_A0, RV_ZERO, 0));
+                                code_emit(linked, rv_jalr(RV_ZERO, RV_RA, 0));
+                            } else {
+                                code_emit(linked, 0xD2800000u); /* mov x0, #0 */
+                                code_emit(linked, 0xD65F03C0u); /* ret */
+                            }
+                        }
+                    }
+
+                    /* Append provider code after stubs */
+                    int32_t *provider_start = arena_alloc(arena, (size_t)(provider_count > 0 ? provider_count : 1) * sizeof(int32_t));
+                    for (int32_t pi = 0; pi < provider_count; pi++) {
+                        provider_start[pi] = linked->count;
+                        memcpy(linked->words + linked->count,
+                               prov_code[pi],
+                               (size_t)prov_code_words[pi] * sizeof(uint32_t));
+                        linked->count += prov_code_words[pi];
+                    }
+
+                    /* Set stub_pos for provider-resolved relocations */
+                    for (int32_t ri = 0; ri < reloc_count; ri++) {
+                        if (provider_target[ri] < 0) continue;
+                        int32_t pi = provider_target[ri];
+                        int32_t sym_idx = reloc_symbols[ri];
+                        Span nm = symbols->functions[sym_idx].name;
+                        char name_buf[1024];
+                        int32_t nlen = nm.len < 1023 ? nm.len : 1023;
+                        memcpy(name_buf, nm.ptr, (size_t)nlen);
+                        name_buf[nlen] = '\0';
+                        const char *short_name = name_buf;
+                        for (int32_t k = nlen - 1; k > 0; k--)
+                            if (name_buf[k] == '.') { short_name = name_buf + k + 1; break; }
+                        int32_t off = 0;
+                        for (int32_t ni = 0; ni < prov_nc[pi]; ni++) {
+                            if (strcmp(name_buf, prov_names[pi][ni]) == 0 ||
+                                strcmp(short_name, prov_names[pi][ni]) == 0) {
+                                off = prov_offsets[pi][ni];
+                                break;
+                            }
+                        }
+                        stub_pos[ri] = provider_start[pi] + off;
+                    }
+
+                    /* Patch each relocation */
                     for (int32_t ri = 0; ri < reloc_count; ri++) {
                         int32_t word_pos = reloc_offsets[ri] / 4;
                         if (word_pos < 0 || word_pos >= linked->count) continue;
@@ -13733,11 +13849,22 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
                     /* Update offsets for linked exec */
                     int32_t *exec_offsets = arena_alloc(arena, (size_t)name_count * sizeof(int32_t));
                     for (int32_t i = 0; i < name_count; i++)
-                        exec_offsets[i] = func_offsets[i] >= 0 ? func_offsets[i] : stub_pos[0];
+                        exec_offsets[i] = func_offsets[i] >= 0 ? func_offsets[i] : (stub_count > 0 ? stub_pos[0] : 0);
 
                     char linked_path[PATH_MAX];
                     snprintf(linked_path, sizeof(linked_path), "%s.linked", out_path);
                     elf_write_exec(linked_path, linked->words, linked->count, em);
+
+                    if (stats) stats->provider_object_count = provider_count;
+
+                    /* Free provider resources */
+                    for (int32_t pi = 0; pi < provider_count; pi++) {
+                        free(prov_code[pi]);
+                        for (int32_t ni = 0; ni < prov_nc[pi]; ni++)
+                            free(prov_names[pi][ni]);
+                        free(prov_names[pi]);
+                        free(prov_offsets[pi]);
+                    }
                 }
             }
 
@@ -14688,7 +14815,6 @@ static bool cold_write_system_link_exec_report(const char *path,
     fprintf(file, "csg_input=%s\n", csg_path ? csg_path : "");
     fprintf(file, "output=%s\n", out_path ? out_path : "");
     fprintf(file, "direct_macho=%d\n", success ? 1 : 0);
-    fprintf(file, "provider_object_count=0\n");
     fprintf(file, "function_task_job_count=%d\n", cold_jobs_from_env());
     fprintf(file, "function_task_schedule=%s\n", cold_jobs_from_env() > 1 ? "ws" : "serial");
     if (stats) {
@@ -14731,10 +14857,16 @@ static bool cold_write_system_link_exec_report(const char *path,
         fprintf(file, "egraph_rewrite_count=%d\n", stats->egraph_rewrite_count);
         fprintf(file, "egraph_dedup_count=%d\n", stats->egraph_dedup_count);
         fprintf(file, "link_object=%d\n", stats->link_object);
+        fprintf(file, "provider_object_count=%d\n", stats->provider_object_count);
+        fprintf(file, "provider_archive=%d\n", stats->provider_archive);
         fprintf(file, "provider_archive_member_count=%d\n", stats->provider_archive_member_count);
         fprintf(file, "provider_archive_hash=%016llx\n",
                 (unsigned long long)stats->provider_archive_hash);
+        fprintf(file, "provider_export_count=%d\n", stats->provider_export_count);
+        fprintf(file, "provider_resolved_symbol_count=%d\n", stats->provider_resolved_symbol_count);
+        fprintf(file, "link_reloc_count=%d\n", stats->link_reloc_count);
         fprintf(file, "unresolved_symbol_count=%d\n", stats->unresolved_symbol_count);
+        fprintf(file, "first_unresolved_symbol=%s\n", stats->first_unresolved_symbol);
         cold_print_elapsed_ms(file, "cold_compile_elapsed_ms", stats->elapsed_us);
     }
     /* 30-80ms cold self-hosting architecture compliance */
@@ -14933,6 +15065,476 @@ static bool cold_link_elf64_object_to_exec(const char *object_path,
 done:
     if (words) free(words);
     if (obj.len > 0) munmap((void *)obj.ptr, (size_t)obj.len);
+    return ok;
+}
+
+#define COLD_PROVIDER_ARCHIVE_MAGIC "CHENGPA1"
+#define COLD_PROVIDER_ARCHIVE_VERSION 1u
+#define COLD_PROVIDER_ARCHIVE_HASH_OFFSET 28u
+#define COLD_PROVIDER_ARCHIVE_HEADER_SIZE 36u
+
+static const char *cold_object_format_for_target_cstr(const char *target) {
+    if (!target) return "";
+    if (strcmp(target, "arm64-apple-darwin") == 0) return "macho";
+    if (strcmp(target, "aarch64-unknown-linux-gnu") == 0 ||
+        strcmp(target, "x86_64-unknown-linux-gnu") == 0 ||
+        strcmp(target, "riscv64-unknown-linux-gnu") == 0) return "elf";
+    if (strcmp(target, "x86_64-pc-windows-msvc") == 0 ||
+        strcmp(target, "aarch64-pc-windows-msvc") == 0) return "coff";
+    return "";
+}
+
+static uint64_t cold_provider_archive_hash_bytes(uint8_t *buf, size_t len) {
+    if (len < COLD_PROVIDER_ARCHIVE_HEADER_SIZE) return 0;
+    uint8_t saved[8];
+    memcpy(saved, buf + COLD_PROVIDER_ARCHIVE_HASH_OFFSET, sizeof(saved));
+    memset(buf + COLD_PROVIDER_ARCHIVE_HASH_OFFSET, 0, sizeof(saved));
+    uint64_t hash = cold_fnv1a64_update_bytes(1469598103934665603ULL, buf, len);
+    memcpy(buf + COLD_PROVIDER_ARCHIVE_HASH_OFFSET, saved, sizeof(saved));
+    return hash;
+}
+
+static bool cold_write_all_fd(int fd, const uint8_t *buf, size_t len) {
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = write(fd, buf + off, len - off);
+        if (n <= 0) return false;
+        off += (size_t)n;
+    }
+    return true;
+}
+
+static bool cold_write_provider_archive(const char *out_path,
+                                        const char *target,
+                                        const char *member_object,
+                                        const char *member_module,
+                                        const char *member_source,
+                                        const char *export_symbol,
+                                        int32_t *member_count_out,
+                                        uint64_t *hash_out) {
+    if (!out_path || out_path[0] == '\0' || !target || target[0] == '\0') return false;
+    const char *format = cold_object_format_for_target_cstr(target);
+    if (format[0] == '\0') return false;
+    bool has_member = member_object && member_object[0] != '\0';
+    Span object = {0};
+    if (has_member) {
+        object = source_open(member_object);
+        if (object.len <= 0) return false;
+        if (object.len > INT32_MAX) {
+            munmap((void *)object.ptr, (size_t)object.len);
+            return false;
+        }
+    }
+    const char *module = member_module && member_module[0] ? member_module : "";
+    const char *source = member_source && member_source[0] ? member_source : "";
+    const char *export_name = export_symbol && export_symbol[0] ? export_symbol : "";
+    uint32_t target_len = (uint32_t)strlen(target);
+    uint32_t format_len = (uint32_t)strlen(format);
+    uint32_t module_len = (uint32_t)strlen(module);
+    uint32_t source_len = (uint32_t)strlen(source);
+    uint32_t export_len = (uint32_t)strlen(export_name);
+    uint32_t member_count = has_member ? 1u : 0u;
+    uint32_t export_count = (has_member && export_len > 0) ? 1u : 0u;
+    uint64_t object_hash = has_member
+        ? cold_fnv1a64_update_bytes(1469598103934665603ULL,
+                                    object.ptr, (size_t)object.len)
+        : 0;
+    size_t total = COLD_PROVIDER_ARCHIVE_HEADER_SIZE +
+                   (size_t)target_len + (size_t)format_len;
+    if (has_member) {
+        total += 28u + (size_t)module_len + (size_t)source_len +
+                 (size_t)export_len + (size_t)object.len;
+    }
+    if (total > INT32_MAX) {
+        if (object.len > 0) munmap((void *)object.ptr, (size_t)object.len);
+        return false;
+    }
+    uint8_t *buf = (uint8_t *)calloc(1, total);
+    if (!buf) {
+        if (object.len > 0) munmap((void *)object.ptr, (size_t)object.len);
+        return false;
+    }
+    size_t pos = 0;
+    memcpy(buf + pos, COLD_PROVIDER_ARCHIVE_MAGIC, 8); pos += 8;
+    cold_put_u32le(buf + pos, COLD_PROVIDER_ARCHIVE_VERSION); pos += 4;
+    cold_put_u32le(buf + pos, target_len); pos += 4;
+    cold_put_u32le(buf + pos, format_len); pos += 4;
+    cold_put_u32le(buf + pos, member_count); pos += 4;
+    cold_put_u32le(buf + pos, export_count); pos += 4;
+    memset(buf + pos, 0, 8); pos += 8;
+    memcpy(buf + pos, target, target_len); pos += target_len;
+    memcpy(buf + pos, format, format_len); pos += format_len;
+    if (has_member) {
+        cold_put_u32le(buf + pos, module_len); pos += 4;
+        cold_put_u32le(buf + pos, source_len); pos += 4;
+        cold_put_u32le(buf + pos, (uint32_t)object.len); pos += 4;
+        cold_put_u32le(buf + pos, export_count); pos += 4;
+        cold_put_u64le(buf + pos, object_hash); pos += 8;
+        cold_put_u32le(buf + pos, export_len); pos += 4;
+        memcpy(buf + pos, module, module_len); pos += module_len;
+        memcpy(buf + pos, source, source_len); pos += source_len;
+        memcpy(buf + pos, export_name, export_len); pos += export_len;
+        memcpy(buf + pos, object.ptr, (size_t)object.len); pos += (size_t)object.len;
+    }
+    if (pos != total) {
+        free(buf);
+        if (object.len > 0) munmap((void *)object.ptr, (size_t)object.len);
+        return false;
+    }
+    uint64_t archive_hash = cold_provider_archive_hash_bytes(buf, total);
+    cold_put_u64le(buf + COLD_PROVIDER_ARCHIVE_HASH_OFFSET, archive_hash);
+    char parent[PATH_MAX];
+    if (cold_parent_dir(out_path, parent, sizeof(parent)) && !cold_mkdir_p(parent)) {
+        free(buf);
+        if (object.len > 0) munmap((void *)object.ptr, (size_t)object.len);
+        return false;
+    }
+    int fd = open(out_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        free(buf);
+        if (object.len > 0) munmap((void *)object.ptr, (size_t)object.len);
+        return false;
+    }
+    bool ok = cold_write_all_fd(fd, buf, total);
+    close(fd);
+    free(buf);
+    if (object.len > 0) munmap((void *)object.ptr, (size_t)object.len);
+    if (!ok) return false;
+    if (member_count_out) *member_count_out = (int32_t)member_count;
+    if (hash_out) *hash_out = archive_hash;
+    return true;
+}
+
+static bool cold_verify_provider_archive(const char *path,
+                                         const char *target,
+                                         int32_t *member_count_out,
+                                         uint64_t *hash_out) {
+    Span archive = source_open(path);
+    if (archive.len < (int32_t)COLD_PROVIDER_ARCHIVE_HEADER_SIZE) return false;
+    const uint8_t *p = archive.ptr;
+    bool ok = false;
+    if (memcmp(p, COLD_PROVIDER_ARCHIVE_MAGIC, 8) != 0) goto done;
+    uint32_t version = cold_u32le(p + 8);
+    uint32_t target_len = cold_u32le(p + 12);
+    uint32_t format_len = cold_u32le(p + 16);
+    uint32_t member_count = cold_u32le(p + 20);
+    uint32_t export_count = cold_u32le(p + 24);
+    uint64_t stored_hash = cold_u64le(p + COLD_PROVIDER_ARCHIVE_HASH_OFFSET);
+    if (version != COLD_PROVIDER_ARCHIVE_VERSION) goto done;
+    if (target_len == 0 || format_len == 0) goto done;
+    uint64_t pos = COLD_PROVIDER_ARCHIVE_HEADER_SIZE;
+    if (!cold_file_range_ok(archive.len, pos, target_len)) goto done;
+    Span target_span = {p + pos, (int32_t)target_len};
+    pos += target_len;
+    if (!cold_file_range_ok(archive.len, pos, format_len)) goto done;
+    Span format_span = {p + pos, (int32_t)format_len};
+    pos += format_len;
+    if (target && target[0] != '\0' && !span_eq(target_span, target)) goto done;
+    const char *expected_format = cold_object_format_for_target_cstr(target);
+    if (expected_format[0] == '\0' || !span_eq(format_span, expected_format)) goto done;
+    uint32_t seen_exports = 0;
+    for (uint32_t mi = 0; mi < member_count; mi++) {
+        if (!cold_file_range_ok(archive.len, pos, 28)) goto done;
+        uint32_t module_len = cold_u32le(p + pos); pos += 4;
+        uint32_t source_len = cold_u32le(p + pos); pos += 4;
+        uint32_t object_size = cold_u32le(p + pos); pos += 4;
+        uint32_t member_exports = cold_u32le(p + pos); pos += 4;
+        uint64_t object_hash = cold_u64le(p + pos); pos += 8;
+        uint32_t export_len = cold_u32le(p + pos); pos += 4;
+        if (!cold_file_range_ok(archive.len, pos,
+                                (uint64_t)module_len + source_len + export_len + object_size)) {
+            goto done;
+        }
+        pos += module_len + source_len + export_len;
+        uint64_t computed_object_hash =
+            cold_fnv1a64_update_bytes(1469598103934665603ULL, p + pos, object_size);
+        if (computed_object_hash != object_hash) goto done;
+        pos += object_size;
+        seen_exports += member_exports;
+    }
+    if (seen_exports != export_count) goto done;
+    if (pos != (uint64_t)archive.len) goto done;
+    {
+        uint8_t *copy = (uint8_t *)malloc((size_t)archive.len);
+        if (!copy) goto done;
+        memcpy(copy, archive.ptr, (size_t)archive.len);
+        uint64_t computed = cold_provider_archive_hash_bytes(copy, (size_t)archive.len);
+        free(copy);
+        if (computed != stored_hash) goto done;
+    }
+    if (member_count_out) *member_count_out = (int32_t)member_count;
+    if (hash_out) *hash_out = stored_hash;
+    ok = true;
+
+done:
+    if (archive.len > 0) munmap((void *)archive.ptr, (size_t)archive.len);
+    return ok;
+}
+
+typedef struct ColdElfObjectView {
+    const uint8_t *data;
+    int32_t len;
+    uint16_t machine;
+    int32_t text_idx;
+    const uint32_t *words;
+    int32_t word_count;
+    const Elf64_Sym *syms;
+    int32_t sym_count;
+    const char *strtab;
+    uint64_t strtab_size;
+    const Elf64_Rela *relas;
+    int32_t reloc_count;
+} ColdElfObjectView;
+
+static bool cold_read_elf64_relocatable_view(const uint8_t *data,
+                                             int32_t len,
+                                             const char *target,
+                                             ColdElfObjectView *out) {
+    if (!data || len < 64 || !out) return false;
+    memset(out, 0, sizeof(*out));
+    uint16_t expected_machine = cold_elf_machine_for_target(target);
+    if (expected_machine == 0) return false;
+    if (memcmp(data, "\x7F""ELF", 4) != 0) return false;
+    if (data[4] != ELFCLASS64 || data[5] != ELFDATA2LSB || data[6] != EV_CURRENT) return false;
+    if (cold_u16le(data + 0x10) != ET_REL) return false;
+    uint16_t machine = cold_u16le(data + 0x12);
+    if (machine != expected_machine) return false;
+    uint64_t shoff = cold_u64le(data + 0x28);
+    uint16_t shentsize = cold_u16le(data + 0x3A);
+    uint16_t shnum = cold_u16le(data + 0x3C);
+    uint16_t shstrndx = cold_u16le(data + 0x3E);
+    if (shentsize != sizeof(Elf64_Shdr) || shnum == 0 || shstrndx >= shnum) return false;
+    if (!cold_file_range_ok(len, shoff, (uint64_t)shentsize * shnum)) return false;
+    const Elf64_Shdr *shdrs = (const Elf64_Shdr *)(data + shoff);
+    const Elf64_Shdr *shstr = &shdrs[shstrndx];
+    if (shstr->sh_type != SHT_STRTAB) return false;
+    if (!cold_file_range_ok(len, shstr->sh_offset, shstr->sh_size)) return false;
+    const char *shstr_data = (const char *)(data + shstr->sh_offset);
+
+    int32_t text_idx = -1;
+    int32_t symtab_idx = -1;
+    int32_t rela_idx = -1;
+    for (int32_t i = 0; i < (int32_t)shnum; i++) {
+        const Elf64_Shdr *sh = &shdrs[i];
+        if (!cold_file_range_ok(len, sh->sh_offset, sh->sh_size)) return false;
+        if (sh->sh_type == SHT_PROGBITS &&
+            (sh->sh_flags & SHF_EXECINSTR) &&
+            cold_elf_section_name_eq(shstr_data, shstr->sh_size, sh->sh_name, ".text")) {
+            text_idx = i;
+        } else if (sh->sh_type == SHT_SYMTAB) {
+            symtab_idx = i;
+        } else if (sh->sh_type == SHT_RELA &&
+                   cold_elf_section_name_eq(shstr_data, shstr->sh_size, sh->sh_name, ".rela.text")) {
+            rela_idx = i;
+        }
+    }
+    if (text_idx <= 0 || symtab_idx <= 0) return false;
+    const Elf64_Shdr *text = &shdrs[text_idx];
+    if ((text->sh_size % 4) != 0 || text->sh_size > (uint64_t)INT32_MAX * 4ULL) return false;
+    const Elf64_Shdr *symtab = &shdrs[symtab_idx];
+    if (symtab->sh_entsize != sizeof(Elf64_Sym) || symtab->sh_link >= shnum) return false;
+    if ((symtab->sh_size % sizeof(Elf64_Sym)) != 0) return false;
+    const Elf64_Shdr *strtab = &shdrs[symtab->sh_link];
+    if (strtab->sh_type != SHT_STRTAB) return false;
+    if (!cold_file_range_ok(len, strtab->sh_offset, strtab->sh_size)) return false;
+    const Elf64_Rela *relas = 0;
+    int32_t reloc_count = 0;
+    if (rela_idx > 0) {
+        const Elf64_Shdr *rela = &shdrs[rela_idx];
+        if (rela->sh_entsize != sizeof(Elf64_Rela) ||
+            rela->sh_link != (uint32_t)symtab_idx ||
+            rela->sh_info != (uint32_t)text_idx ||
+            (rela->sh_size % sizeof(Elf64_Rela)) != 0) {
+            return false;
+        }
+        relas = (const Elf64_Rela *)(data + rela->sh_offset);
+        reloc_count = (int32_t)(rela->sh_size / sizeof(Elf64_Rela));
+    }
+    out->data = data;
+    out->len = len;
+    out->machine = machine;
+    out->text_idx = text_idx;
+    out->words = (const uint32_t *)(data + text->sh_offset);
+    out->word_count = (int32_t)(text->sh_size / 4);
+    out->syms = (const Elf64_Sym *)(data + symtab->sh_offset);
+    out->sym_count = (int32_t)(symtab->sh_size / sizeof(Elf64_Sym));
+    out->strtab = (const char *)(data + strtab->sh_offset);
+    out->strtab_size = strtab->sh_size;
+    out->relas = relas;
+    out->reloc_count = reloc_count;
+    return true;
+}
+
+static const char *cold_elf_symbol_name(ColdElfObjectView *obj, uint32_t sym_index) {
+    if (!obj || sym_index >= (uint32_t)obj->sym_count) return 0;
+    uint32_t off = obj->syms[sym_index].st_name;
+    if ((uint64_t)off >= obj->strtab_size) return 0;
+    return obj->strtab + off;
+}
+
+static int32_t cold_elf_find_defined_symbol(ColdElfObjectView *obj, const char *name) {
+    if (!obj || !name || name[0] == '\0') return -1;
+    for (int32_t i = 1; i < obj->sym_count; i++) {
+        const Elf64_Sym *sym = &obj->syms[i];
+        if (sym->st_shndx != (uint16_t)obj->text_idx) continue;
+        const char *sn = cold_elf_symbol_name(obj, (uint32_t)i);
+        if (sn && strcmp(sn, name) == 0) return i;
+    }
+    return -1;
+}
+
+static bool cold_apply_elf_call_reloc(uint32_t *words,
+                                      int32_t word_count,
+                                      uint16_t machine,
+                                      uint32_t type,
+                                      int32_t word_pos,
+                                      int32_t target_word) {
+    if (!words || word_pos < 0 || word_pos >= word_count ||
+        target_word < 0 || target_word >= word_count) {
+        return false;
+    }
+    int32_t delta = target_word - word_pos;
+    if (machine == EM_AARCH64 && type == R_AARCH64_CALL26) {
+        if (delta < -(1 << 25) || delta >= (1 << 25)) return false;
+        words[word_pos] = (words[word_pos] & 0xFC000000u) |
+                          ((uint32_t)delta & 0x03FFFFFFu);
+        return true;
+    }
+    if (machine == EM_RISCV && (type == R_RISCV_CALL || type == R_RISCV_CALL_PLT)) {
+        if (delta < -(1 << 20) || delta >= (1 << 20)) return false;
+        words[word_pos] = rv_jal(RV_RA, delta);
+        return true;
+    }
+    return false;
+}
+
+static bool cold_link_relocs_for_object(ColdElfObjectView *obj,
+                                        uint32_t *words,
+                                        int32_t total_words,
+                                        int32_t base_word,
+                                        ColdElfObjectView *provider,
+                                        const char *provider_export,
+                                        int32_t provider_base_word,
+                                        ColdCompileStats *stats) {
+    for (int32_t i = 0; i < obj->reloc_count; i++) {
+        const Elf64_Rela *reloc = &obj->relas[i];
+        uint32_t sym_index = (uint32_t)(reloc->r_info >> 32);
+        uint32_t type = (uint32_t)(reloc->r_info & 0xFFFFFFFFu);
+        if (sym_index >= (uint32_t)obj->sym_count ||
+            (reloc->r_offset % 4) != 0 ||
+            reloc->r_offset / 4 >= (uint64_t)obj->word_count) {
+            return false;
+        }
+        const Elf64_Sym *sym = &obj->syms[sym_index];
+        int32_t target_word = -1;
+        const char *sym_name = cold_elf_symbol_name(obj, sym_index);
+        if (sym->st_shndx == (uint16_t)obj->text_idx) {
+            if ((sym->st_value % 4) != 0 || sym->st_value / 4 >= (uint64_t)obj->word_count) return false;
+            target_word = base_word + (int32_t)(sym->st_value / 4) + (int32_t)(reloc->r_addend / 4);
+        } else if (sym->st_shndx == 0 && provider && provider_export &&
+                   sym_name && strcmp(sym_name, provider_export) == 0) {
+            int32_t provider_sym = cold_elf_find_defined_symbol(provider, provider_export);
+            if (provider_sym < 0) return false;
+            const Elf64_Sym *ps = &provider->syms[provider_sym];
+            if ((ps->st_value % 4) != 0 || ps->st_value / 4 >= (uint64_t)provider->word_count) return false;
+            target_word = provider_base_word + (int32_t)(ps->st_value / 4) + (int32_t)(reloc->r_addend / 4);
+            if (stats) stats->provider_resolved_symbol_count++;
+        } else if (sym->st_shndx == 0) {
+            if (stats) {
+                stats->unresolved_symbol_count++;
+                if (stats->first_unresolved_symbol[0] == '\0' && sym_name) {
+                    snprintf(stats->first_unresolved_symbol,
+                             sizeof(stats->first_unresolved_symbol),
+                             "%s", sym_name);
+                }
+            }
+            continue;
+        } else {
+            return false;
+        }
+        int32_t word_pos = base_word + (int32_t)(reloc->r_offset / 4);
+        if (!cold_apply_elf_call_reloc(words, total_words, obj->machine, type, word_pos, target_word)) return false;
+        if (stats) stats->link_reloc_count++;
+    }
+    return true;
+}
+
+static bool cold_link_elf64_object_with_provider_archive(const char *object_path,
+                                                         const char *archive_path,
+                                                         const char *out_path,
+                                                         const char *target,
+                                                         ColdCompileStats *stats) {
+    uint64_t start_us = cold_now_us();
+    Span primary_span = source_open(object_path);
+    Span archive_span = source_open(archive_path);
+    uint32_t *words = 0;
+    bool ok = false;
+    if (primary_span.len <= 0 || archive_span.len <= 0) goto done;
+    ColdElfObjectView primary;
+    if (!cold_read_elf64_relocatable_view(primary_span.ptr, primary_span.len, target, &primary)) goto done;
+    int32_t member_count = 0;
+    uint64_t archive_hash = 0;
+    if (!cold_verify_provider_archive(archive_path, target, &member_count, &archive_hash)) goto done;
+    if (member_count != 1) goto done;
+
+    const uint8_t *p = archive_span.ptr;
+    uint64_t pos = COLD_PROVIDER_ARCHIVE_HEADER_SIZE;
+    uint32_t target_len = cold_u32le(p + 12);
+    uint32_t format_len = cold_u32le(p + 16);
+    uint32_t export_count = cold_u32le(p + 24);
+    pos += target_len + format_len;
+    if (!cold_file_range_ok(archive_span.len, pos, 28)) goto done;
+    uint32_t module_len = cold_u32le(p + pos); pos += 4;
+    uint32_t source_len = cold_u32le(p + pos); pos += 4;
+    uint32_t object_size = cold_u32le(p + pos); pos += 4;
+    uint32_t member_exports = cold_u32le(p + pos); pos += 4;
+    (void)cold_u64le(p + pos); pos += 8;
+    uint32_t export_len = cold_u32le(p + pos); pos += 4;
+    if (export_count != 1 || member_exports != 1 || export_len == 0) goto done;
+    if (!cold_file_range_ok(archive_span.len, pos,
+                            (uint64_t)module_len + source_len + export_len + object_size)) goto done;
+    pos += module_len + source_len;
+    char export_name[COLD_NAME_CAP];
+    if (export_len >= sizeof(export_name)) goto done;
+    memcpy(export_name, p + pos, export_len);
+    export_name[export_len] = '\0';
+    pos += export_len;
+    const uint8_t *provider_obj_data = p + pos;
+    ColdElfObjectView provider;
+    if (!cold_read_elf64_relocatable_view(provider_obj_data, (int32_t)object_size, target, &provider)) goto done;
+    if (cold_elf_find_defined_symbol(&provider, export_name) < 0) goto done;
+    if (cold_elf_find_defined_symbol(&primary, export_name) >= 0) goto done;
+
+    int32_t total_words = primary.word_count + provider.word_count;
+    words = (uint32_t *)calloc(total_words > 0 ? (size_t)total_words : 1, sizeof(uint32_t));
+    if (!words) goto done;
+    memcpy(words, primary.words, (size_t)primary.word_count * sizeof(uint32_t));
+    memcpy(words + primary.word_count, provider.words, (size_t)provider.word_count * sizeof(uint32_t));
+    if (stats) {
+        stats->link_object = 1;
+        stats->provider_archive = 1;
+        stats->provider_object_count = 1;
+        stats->provider_archive_member_count = 1;
+        stats->provider_archive_hash = archive_hash;
+        stats->provider_export_count = 1;
+    }
+    if (!cold_link_relocs_for_object(&primary, words, total_words, 0,
+                                     &provider, export_name, primary.word_count, stats)) goto done;
+    if (!cold_link_relocs_for_object(&provider, words, total_words, primary.word_count,
+                                     0, 0, 0, stats)) goto done;
+    if (stats && stats->unresolved_symbol_count != 0) goto done;
+    if (!elf_write_exec(out_path, words, total_words, primary.machine)) goto done;
+    if (stats) {
+        stats->code_words = total_words;
+        stats->elapsed_us = cold_now_us() - start_us;
+        stats->emit_us = stats->elapsed_us;
+    }
+    ok = true;
+
+done:
+    if (words) free(words);
+    if (primary_span.len > 0) munmap((void *)primary_span.ptr, (size_t)primary_span.len);
+    if (archive_span.len > 0) munmap((void *)archive_span.ptr, (size_t)archive_span.len);
     return ok;
 }
 
