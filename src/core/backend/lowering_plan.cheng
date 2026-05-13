@@ -8,6 +8,11 @@ import cheng/core/lang/intern as langintern
 import cheng/core/lang/parser
 import cheng/core/lang/typed_expr as texpr
 import cheng/core/backend/system_link_plan as slplan
+import std/os
+import std/strutils as strutil
+import std/atomic
+import std/async_rt as async
+import std/thread
 
 type
     PrimaryObjectIrStatement =
@@ -89,6 +94,18 @@ type
         functionResultLayoutKinds: int32[]
         missingReasons: str[]
         pipelineStage: str
+
+var
+    loweringParallelPlan: LoweringPlanStub
+    loweringParallelSourceTexts: texpr.TypedExprSourceText[]
+    loweringParallelLetCallReturnLiteralStart: int32
+    loweringParallelResults: PrimaryObjectIrFunction[]
+    loweringParallelDoneCount: atomic.I32
+
+type
+    LoweringWorkChunk = ref
+        funcIndexStart: int32
+        funcIndexEnd: int32
 
 fn LoweringCallConvInternal(): int32 =
     return 1
@@ -1440,13 +1457,68 @@ fn LoweringBuildOneFunction(plan: LoweringPlanStub,
     fnIr.callTargetCount = fnIr.callTargets.len
     return fnIr
 
+fn LoweringWorkChunkMain(raw: ptr) =
+    if raw == nil:
+        return
+    let chunk: LoweringWorkChunk = LoweringWorkChunk(raw)
+    for i in chunk.funcIndexStart..<chunk.funcIndexEnd:
+        let fnIr = LoweringBuildOneFunction(loweringParallelPlan,
+                                            loweringParallelSourceTexts,
+                                            i,
+                                            loweringParallelLetCallReturnLiteralStart)
+        loweringParallelResults[i] = fnIr
+    let _ = atomic.AddI32(loweringParallelDoneCount, 1)
+    memRelease(chunk)
+
 fn LoweringBuildPrimaryObjectIr(plan: LoweringPlanStub,
                                  sourceTexts: texpr.TypedExprSourceText[]): PrimaryObjectIr =
     var ir: PrimaryObjectIr
     let letCallReturnLiteralStart = texpr.BodyKindLetCallReturnI32ConstPrefixLen
-    for i in 0..<plan.functionNames.len:
-        let fnIr = LoweringBuildOneFunction(plan, sourceTexts, i, letCallReturnLiteralStart)
+    let functionCount = plan.functionNames.len
+    if functionCount <= 0:
+        return ir
+    var jobCount: int32 = 1
+    let backendJobsRaw = os.GetEnv("BACKEND_JOBS")
+    if len(backendJobsRaw) > 0:
+        let parsed = int32(strutil.ParseInt(backendJobsRaw))
+        if parsed > 0:
+            jobCount = parsed
+    loweringParallelPlan = plan
+    loweringParallelSourceTexts = sourceTexts
+    loweringParallelLetCallReturnLiteralStart = letCallReturnLiteralStart
+    loweringParallelResults = []
+    for i in 0..<functionCount:
+        var empty: PrimaryObjectIrFunction
+        add(loweringParallelResults, empty)
+    if jobCount <= 1:
+        for i in 0..<functionCount:
+            let fnIr = LoweringBuildOneFunction(plan, sourceTexts, i, letCallReturnLiteralStart)
+            add(ir.functions, fnIr)
+        loweringParallelResults = []
+        return ir
+    var actualWorkerCount = jobCount
+    if actualWorkerCount > functionCount:
+        actualWorkerCount = functionCount
+    loweringParallelDoneCount = atomic.NewI32(0)
+    for workerId in 0..<actualWorkerCount:
+        let start = (functionCount * workerId) / jobCount
+        let finish = (functionCount * (workerId + 1)) / jobCount
+        if start >= finish:
+            let _ = atomic.AddI32(loweringParallelDoneCount, 1)
+            continue
+        var chunk = new(LoweringWorkChunk)
+        if chunk == nil:
+            continue
+        chunk.funcIndexStart = start
+        chunk.funcIndexEnd = finish
+        memRetain(chunk)
+        async.spawnPtr(LoweringWorkChunkMain, chunk)
+    while atomic.LoadI32(loweringParallelDoneCount) < actualWorkerCount:
+        thread.Yield()
+    for i in 0..<functionCount:
+        let fnIr = loweringParallelResults[i]
         add(ir.functions, fnIr)
+    loweringParallelResults = []
     return ir
 fn LoweringIsImportcAnnotation(lineRaw: str): bool =
     let line = chengpath.PathTrim(lineRaw)
