@@ -177,6 +177,34 @@ else
   fail=$((fail + 1))
 fi
 
+
+# Built-in linker determinism: two runs produce bit-identical linked executables
+echo "  - builtin_linker_determinism"
+rm -f "$WORK/ordinary_link_d1.o" "$WORK/ordinary_link_d1.o.linked"
+rm -f "$WORK/ordinary_link_d2.o" "$WORK/ordinary_link_d2.o.linked"
+"$COLD" system-link-exec \
+  --csg-in:"$WORK/ordinary.facts" \
+  --emit:obj --target:riscv64-unknown-linux-gnu \
+  --out:"$WORK/ordinary_link_d1.o" \
+  > "$WORK/ordinary_link_d1.report.txt" 2>&1 || true
+"$COLD" system-link-exec \
+  --csg-in:"$WORK/ordinary.facts" \
+  --emit:obj --target:riscv64-unknown-linux-gnu \
+  --out:"$WORK/ordinary_link_d2.o" \
+  > "$WORK/ordinary_link_d2.report.txt" 2>&1 || true
+if [ -f "$WORK/ordinary_link_d1.o.linked" ] && [ -f "$WORK/ordinary_link_d2.o.linked" ]; then
+  if cmp -s "$WORK/ordinary_link_d1.o.linked" "$WORK/ordinary_link_d2.o.linked"; then
+    echo "PASS builtin_linker_determinism"
+    pass=$((pass + 1))
+  else
+    echo "FAIL builtin_linker_determinism (linked exes differ)"
+    fail=$((fail + 1))
+  fi
+else
+  echo "FAIL builtin_linker_determinism (missing linked files)"
+  fail=$((fail + 1))
+fi
+
 echo "=== $pass passed, $fail failed ==="
 if [ "$fail" -ne 0 ]; then
     exit 1
