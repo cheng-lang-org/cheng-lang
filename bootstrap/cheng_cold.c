@@ -3677,6 +3677,109 @@ static uint64_t cold_body_ir_canonical_hash(BodyIR *body) {
     return h;
 }
 
+/* Compute a normalized hash of a BodyIR function with basic arithmetic
+   rewrite rules:
+   1. I32_CONST values are hashed directly (op_a is the constant value)
+   2. Commutative ops (ADD, MUL, AND, OR, XOR) sort operands before hashing
+   3. Associative ops (ADD, MUL) flatten nested same-kind ops into one level */
+static uint64_t cold_body_ir_canonical_hash_normalized(BodyIR *body) {
+    if (!body) return 0;
+    uint64_t h = 0x9ae16a3b2f90405full;
+
+    /* Build slot -> defining-op-index mapping for associative flattening */
+    int32_t *slot_def = 0;
+    if (body->slot_count > 0) {
+        slot_def = (int32_t *)calloc((size_t)body->slot_count, sizeof(int32_t));
+        if (slot_def) {
+            for (int32_t i = 0; i < body->slot_count; i++) slot_def[i] = -1;
+            for (int32_t i = 0; i < body->op_count; i++) {
+                int32_t dst = body->op_dst[i];
+                if (dst >= 0 && dst < body->slot_count) slot_def[dst] = i;
+            }
+        }
+    }
+
+    for (int32_t i = 0; i < body->op_count; i++) {
+        int32_t kind = body->op_kind[i];
+        int32_t a = body->op_a[i], b = body->op_b[i];
+
+        /* I32_CONST: hash the constant value (op_a) directly */
+        if (kind == BODY_OP_I32_CONST) {
+            h ^= ((uint64_t)kind * 0xc6a4a7935bd1e995ull);
+            h = (h << 7) | (h >> 57);
+            h ^= ((uint64_t)a * 0xc6a4a7935bd1e995ull);
+            h = (h << 7) | (h >> 57);
+            continue;
+        }
+
+        /* Associative flattening for ADD and MUL */
+        if ((kind == BODY_OP_I32_ADD || kind == BODY_OP_I32_MUL) && slot_def) {
+            int32_t flat[64];
+            int32_t fc = 0;
+            int32_t stk[64];
+            int32_t sc = 0;
+            stk[sc++] = b; stk[sc++] = a;
+            while (sc > 0 && fc < 60) {
+                int32_t s = stk[--sc];
+                if (s < 0 || s >= body->slot_count) {
+                    flat[fc++] = s;
+                } else {
+                    int32_t def = slot_def[s];
+                    if (def >= 0 && def < body->op_count &&
+                        body->op_kind[def] == kind) {
+                        stk[sc++] = body->op_b[def];
+                        stk[sc++] = body->op_a[def];
+                    } else {
+                        flat[fc++] = s;
+                    }
+                }
+            }
+            if (sc > 0) { flat[fc++] = a; flat[fc++] = b; }
+            /* Sort flattened operands (commutative) */
+            for (int32_t si = 0; si < fc - 1; si++) {
+                for (int32_t sj = si + 1; sj < fc; sj++) {
+                    if (flat[si] > flat[sj]) {
+                        int32_t t = flat[si]; flat[si] = flat[sj]; flat[sj] = t;
+                    }
+                }
+            }
+            h ^= ((uint64_t)kind * 0xc6a4a7935bd1e995ull);
+            h = (h << 7) | (h >> 57);
+            for (int32_t fi = 0; fi < fc; fi++) {
+                h ^= ((uint64_t)flat[fi] * 0xc6a4a7935bd1e995ull);
+                h = (h << 7) | (h >> 57);
+            }
+            continue;
+        }
+
+        /* Commutative normalization for ADD, MUL, AND, OR, XOR */
+        if (kind == BODY_OP_I32_ADD || kind == BODY_OP_I32_MUL ||
+            kind == BODY_OP_I32_AND || kind == BODY_OP_I32_OR ||
+            kind == BODY_OP_I32_XOR) {
+            if (a > b) { int32_t t = a; a = b; b = t; }
+        }
+
+        h ^= ((uint64_t)kind * 0xc6a4a7935bd1e995ull);
+        h = (h << 7) | (h >> 57);
+        h ^= ((uint64_t)a * 0xc6a4a7935bd1e995ull);
+        h = (h << 7) | (h >> 57);
+        h ^= ((uint64_t)b * 0xc6a4a7935bd1e995ull);
+        h = (h << 7) | (h >> 57);
+    }
+
+    free(slot_def);
+
+    /* Hash term kinds */
+    for (int32_t i = 0; i < body->term_count; i++) {
+        h ^= ((uint64_t)body->term_kind[i] * 0xc6a4a7935bd1e995ull);
+        h = (h << 7) | (h >> 57);
+    }
+    /* Hash block structure */
+    h ^= ((uint64_t)body->block_count * 0xc6a4a7935bd1e995ull);
+    h ^= ((uint64_t)body->slot_count * 0xc6a4a7935bd1e995ull);
+    return h;
+}
+
 /* ================================================================
  * Symbol table and local table
  * ================================================================ */
@@ -11878,6 +11981,7 @@ typedef struct ColdCompileStats {
     int32_t facts_word_count;
     int32_t facts_reloc_count;
     int32_t canonical_hash_count;
+    int32_t canonical_normalized_count;
     int32_t total_function_count;
 } ColdCompileStats;
 
@@ -11941,6 +12045,32 @@ static void cold_collect_body_stats(Symbols *symbols, BodyIR **function_bodies, 
     }
     stats->canonical_hash_count = canonical_count;
     free(canonical_hashes);
+
+    /* Compute normalized hash count (with rewrite rules) */
+    uint64_t *norm_hashes = 0;
+    int32_t norm_cap = 0;
+    int32_t norm_count = 0;
+    for (int32_t i = 0; i < function_count; i++) {
+        BodyIR *body = function_bodies[i];
+        if (!body || body->has_fallback) continue;
+        uint64_t h = cold_body_ir_canonical_hash_normalized(body);
+        bool seen = false;
+        for (int32_t j = 0; j < norm_count; j++) {
+            if (norm_hashes[j] == h) { seen = true; break; }
+        }
+        if (!seen) {
+            if (norm_count >= norm_cap) {
+                int32_t new_cap = norm_cap == 0 ? 64 : norm_cap * 2;
+                uint64_t *new_h = realloc(norm_hashes, (size_t)new_cap * sizeof(uint64_t));
+                if (!new_h) { free(norm_hashes); norm_count = 0; break; }
+                norm_hashes = new_h;
+                norm_cap = new_cap;
+            }
+            norm_hashes[norm_count++] = h;
+        }
+    }
+    stats->canonical_normalized_count = norm_count;
+    free(norm_hashes);
 
     for (int32_t i = 0; i < function_count; i++) {
         BodyIR *body = function_bodies[i];
@@ -14488,6 +14618,7 @@ static bool cold_write_system_link_exec_report(const char *path,
         fprintf(file, "facts_word_count=%d\n", stats->facts_word_count);
         fprintf(file, "facts_reloc_count=%d\n", stats->facts_reloc_count);
         fprintf(file, "canonical_hash_count=%d\n", stats->canonical_hash_count);
+        fprintf(file, "canonical_normalized_count=%d\n", stats->canonical_normalized_count);
         fprintf(file, "total_function_count=%d\n", stats->total_function_count);
         cold_print_elapsed_ms(file, "cold_compile_elapsed_ms", stats->elapsed_us);
     }
