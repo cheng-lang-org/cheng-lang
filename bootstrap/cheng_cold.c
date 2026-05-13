@@ -2064,7 +2064,6 @@ static void cold_write_span_csg(FILE *file, Span span) {
 }
 
 static char cold_field_kind_code_from_type(Span type);
-static char cold_param_kind_code_from_type(Span type);
 static Span cold_type_strip_var(Span type, bool *is_var);
 static bool cold_parse_i32_array_type(Span type, int32_t *len_out);
 static bool cold_parse_i32_seq_type(Span type);
@@ -2093,80 +2092,10 @@ static char cold_field_kind_code_from_type(Span type) {
 }
 
 
-static bool cold_skip_balanced_span(Span span, int32_t *pos, char open, char close) {
-    if (*pos >= span.len || span.ptr[*pos] != (uint8_t)open) return false;
-    int32_t depth = 1;
-    (*pos)++;
-    while (*pos < span.len && depth > 0) {
-        uint8_t c = span.ptr[*pos];
-        if (c == (uint8_t)open) depth++;
-        else if (c == (uint8_t)close) depth--;
-        (*pos)++;
-    }
-    return depth == 0;
-}
-
-static void cold_skip_type_ws(Span span, int32_t *pos) {
-    while (*pos < span.len) {
-        uint8_t c = span.ptr[*pos];
-        if (c != ' ' && c != '\t' && c != '\r' && c != '\n') break;
-        (*pos)++;
-    }
-}
 
 
-static bool cold_write_object_field_spec(FILE *file, Span type) {
-    type = span_trim(type);
-    int32_t array_len = 0;
-    if (cold_parse_i32_array_type(type, &array_len)) {
-        fprintf(file, "a%d", array_len);
-        return true;
-    }
-    if (cold_parse_str_seq_type(type)) {
-        fputc('t', file);
-        return true;
-    }
-    if (cold_parse_i32_seq_type(type)) {
-        fputc('q', file);
-        return true;
-    }
-    /* qualified type sequence like coreir.BodyIR[] -> o:TypeName (opaque seq) */
-    if (type.len > 2 && type.ptr[type.len - 2] == '[' && type.ptr[type.len - 1] == ']') {
-        Span inner = span_trim(span_sub(type, 0, type.len - 2));
-        if (inner.len > 0 && (cold_type_has_qualified_name(inner) ||
-            (inner.ptr[0] >= 'A' && inner.ptr[0] <= 'Z'))) {
-            fputs("o:", file);
-            cold_write_span(file, inner);
-            return true;
-        }
-    }
-    char kind = cold_field_kind_code_from_type(type);
-    fputc(kind, file);
-    /* for user-type fields (v=variant/o=opaque), append :typeName so loader can resolve */
-    if (kind == 'v' || kind == 'o') {
-        fputc(':', file);
-        cold_write_span(file, type);
-    }
-    return true;
-}
 
-static bool cold_emit_csg_field_decl_spec(FILE *file, Span decl, int32_t *emitted) {
-    decl = span_trim(decl);
-    if (decl.len <= 0) return true;
-    int32_t colon = cold_span_find_top_level_char(decl, ':');
-    if (colon <= 0) return false;
-    Span name = span_trim(span_sub(decl, 0, colon));
-    Span type = span_trim(span_sub(decl, colon + 1, decl.len));
-    int32_t eq = cold_span_find_char(type, '=');
-    if (eq >= 0) type = span_trim(span_sub(type, 0, eq));
-    if (name.len <= 0 || type.len <= 0) return false;
-    if (*emitted > 0) fputc(',', file);
-    cold_write_span(file, name);
-    fputc(':', file);
-    if (!cold_write_object_field_spec(file, type)) return false;
-    (*emitted)++;
-    return true;
-}
+
 
 static bool cold_type_block_looks_like_object(Span fields) {
     int32_t pos = 0;
@@ -2204,15 +2133,6 @@ static bool cold_type_block_looks_like_object(Span fields) {
 /* ---- scanner helpers for cold_emit_csg_type_rows ---- */
 
 /* Advance cursor past current line, return line span. New pos is start of next line. */
-static int32_t scan_next_line(Span source, int32_t pos, Span *line) {
-    if (pos >= source.len) { *line = (Span){0}; return pos; }
-    int32_t start = pos;
-    while (pos < source.len && source.ptr[pos] != '\n') pos++;
-    int32_t end = pos;
-    if (pos < source.len) pos++;
-    *line = span_sub(source, start, end);
-    return pos;
-}
 
 /* Collect indented body lines starting at pos. Stops when a line is top-level or has indent
    <= base_indent. Returns the body text (subspan of source, may be empty). *next_pos is set to
