@@ -57,3 +57,44 @@ jobs:
           file /tmp/rv_test /tmp/x64_test
           echo "RISC-V ELF: $(file /tmp/rv_test)"
           echo "x86_64 ELF: $(file /tmp/x64_test)"
+
+  linux-qemu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install QEMU user-mode
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-user
+
+      - name: Build cold compiler
+        run: |
+          cc -std=c11 -Wall -Wextra -pedantic -O2 -o /tmp/cheng_cold bootstrap/cheng_cold.c
+
+      - name: Generate facts + cross-compile ELF exes
+        run: |
+          /tmp/cheng_cold emit-cold-csg-v2 \
+            --root:${{ github.workspace }} \
+            --in:src/tests/ordinary_zero_exit_fixture.cheng \
+            --out:/tmp/cross.facts \
+            --target:arm64-apple-darwin
+          /tmp/cheng_cold system-link-exec \
+            --csg-in:/tmp/cross.facts \
+            --emit:exe --target:riscv64-unknown-linux-gnu \
+            --out:/tmp/rv_test
+          /tmp/cheng_cold system-link-exec \
+            --csg-in:/tmp/cross.facts \
+            --emit:exe --target:x86_64-unknown-linux-gnu \
+            --out:/tmp/x64_test
+
+      - name: Run RISC-V ELF with QEMU
+        run: |
+          qemu-riscv64 /tmp/rv_test
+          echo "RISC-V QEMU exit: $?"
+
+      - name: Run x86_64 ELF with QEMU
+        run: |
+          qemu-x86_64 /tmp/x64_test
+          echo "x86_64 QEMU exit: $?"
