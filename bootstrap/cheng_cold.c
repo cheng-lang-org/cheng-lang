@@ -22657,7 +22657,20 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
         function_bodies = arena_alloc(arena, (size_t)body_cap * sizeof(BodyIR *));
         memset(function_bodies, 0, (size_t)body_cap * sizeof(BodyIR *));
 
-        /* Import body compilation */
+        /* Collect transitive import function signatures */
+        cold_collect_all_transitive_imports(symbols, mapped_source);
+
+        /* Grow function_bodies if needed after transitive collection */
+        if (symbols->function_cap > body_cap) {
+            int32_t old_cap = body_cap;
+            body_cap = symbols->function_cap;
+            BodyIR **grown = arena_alloc(arena, (size_t)body_cap * sizeof(BodyIR *));
+            memset(grown, 0, (size_t)body_cap * sizeof(BodyIR *));
+            if (old_cap > 0) memcpy(grown, function_bodies, (size_t)old_cap * sizeof(BodyIR *));
+            function_bodies = grown;
+        }
+
+        /* Compile direct import bodies */
         if (symbols->function_count < 4096) {
             ColdErrorRecoveryEnabled = true;
             if (setjmp(ColdErrorJumpBuf) == 0) {
@@ -22665,6 +22678,49 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
                                                         function_bodies, body_cap);
             }
             ColdErrorRecoveryEnabled = false;
+        }
+
+        /* Compile transitive import bodies: recursively process each import file */
+        {
+            char visited_paths[64][PATH_MAX];
+            int32_t visited_count = 0;
+            for (int32_t ii = 0; ii < import_source_count && ii < 64; ii++) {
+                snprintf(visited_paths[visited_count++], PATH_MAX, "%s", import_sources[ii].path);
+            }
+            for (int32_t vi = 0; vi < visited_count && vi < 64; vi++) {
+                Span src = source_open(visited_paths[vi]);
+                if (src.len <= 0) continue;
+                ColdErrorRecoveryEnabled = true;
+                if (setjmp(ColdErrorJumpBuf) == 0) {
+                    cold_compile_imported_bodies_no_recurse(symbols, src,
+                                                            function_bodies, body_cap);
+                }
+                ColdErrorRecoveryEnabled = false;
+                /* Also find this import's own imports and add to visited list */
+                int32_t pos = 0;
+                while (pos < src.len && visited_count < 64) {
+                    while (pos < src.len && src.ptr[pos] != 'i') pos++;
+                    if (pos >= src.len) break;
+                    if (strncmp((const char *)(src.ptr + pos), "import ", 7) == 0) {
+                        pos += 7;
+                        int32_t start = pos;
+                        while (pos < src.len && src.ptr[pos] != '\n' && src.ptr[pos] != ';') pos++;
+                        Span mod = span_sub(src, start, pos);
+                        mod = span_trim(mod);
+                        Span alias = {0};
+                        char resolved[PATH_MAX];
+                        if (cold_import_source_path(mod, resolved, sizeof(resolved))) {
+                            bool already = false;
+                            for (int32_t ci = 0; ci < visited_count; ci++)
+                                if (strcmp(visited_paths[ci], resolved) == 0) { already = true; break; }
+                            if (!already)
+                                snprintf(visited_paths[visited_count++], PATH_MAX, "%s", resolved);
+                        }
+                    }
+                    pos++;
+                }
+                munmap((void *)src.ptr, (size_t)src.len);
+            }
         }
 
         /* Parse functions from source */
