@@ -22180,10 +22180,14 @@ static bool cold_emit_csg_v2_facts(const char *path, BodyIR **function_bodies,
                                     int32_t func_count, Symbols *symbols,
                                     const char *target) {
     if (!function_bodies || !symbols || func_count <= 0) return false;
+    /* Count functions to serialize: those with valid bodies AND external declarations */
+    int32_t valid_count = 0;
     for (int32_t i = 0; i < func_count; i++) {
         BodyIR *b = function_bodies[i];
-        if (!b || b->has_fallback) return false;
+        if (b && !b->has_fallback) valid_count++;
+        else if (symbols->functions[i].name.len > 0) valid_count++; /* external declaration */
     }
+    if (valid_count <= 0) return false;
 
     FILE *f = fopen(path, "wb");
     if (!f) return false;
@@ -22222,7 +22226,9 @@ static bool cold_emit_csg_v2_facts(const char *path, BodyIR **function_bodies,
     int32_t total_str_slots = 0;
     for (int32_t i = 0; i < func_count; i++) {
         BodyIR *b = function_bodies[i];
-        total_str_slots += b->string_literal_count;
+        if (!b || b->has_fallback) continue;
+        if (b->string_literal_count > 0 && b->string_literal_count < 65536)
+            total_str_slots += b->string_literal_count;
     }
 
     Span *unique_strs = NULL;
@@ -22238,8 +22244,12 @@ static bool cold_emit_csg_v2_facts(const char *path, BodyIR **function_bodies,
         int32_t map_idx = 0;
         for (int32_t fi = 0; fi < func_count; fi++) {
             BodyIR *b = function_bodies[fi];
+            if (!b || b->has_fallback) continue;
+            if (b->string_literal_count < 0 || b->string_literal_count > 65536 ||
+                !b->string_literal) continue;
             for (int32_t si = 0; si < b->string_literal_count; si++) {
                 Span s = b->string_literal[si];
+                if (s.ptr == NULL || s.len <= 0) continue;
                 int32_t id = -1;
                 for (int32_t ui = 0; ui < unique_str_count; ui++) {
                     if (unique_strs[ui].len == s.len &&
@@ -22259,15 +22269,33 @@ static bool cold_emit_csg_v2_facts(const char *path, BodyIR **function_bodies,
 
     /* ---- FUNCTION SECTION ---- */
     long func_section_start = ftell(f);
-    cold_emit_csg_v2_u32(f, (uint32_t)func_count);
+    cold_emit_csg_v2_u32(f, (uint32_t)valid_count);
 
     {
         int32_t map_idx = 0;
         for (int32_t fi = 0; fi < func_count; fi++) {
             BodyIR *b = function_bodies[fi];
+            /* Skip null/fallback functions with no symbol entry (gaps) */
+            if ((!b || b->has_fallback) && symbols->functions[fi].name.len <= 0) continue;
 
             /* name: u32 len + utf8 bytes */
             cold_emit_csg_v2_str(f, symbols->functions[fi].name);
+            if (!b || b->has_fallback) {
+                /* External declaration: no params, no ops, no slots */
+                cold_emit_csg_v2_u32(f, 0); /* param_count */
+                cold_emit_csg_v2_u32(f, SLOT_I32); /* return_kind */
+                cold_emit_csg_v2_u32(f, 0); /* frame_size */
+                cold_emit_csg_v2_u32(f, 0); /* op_count */
+                cold_emit_csg_v2_u32(f, 0); /* slot_count */
+                cold_emit_csg_v2_u32(f, 0); /* block_count */
+                cold_emit_csg_v2_u32(f, 0); /* term_count */
+                cold_emit_csg_v2_u32(f, 0); /* switch_count */
+                cold_emit_csg_v2_u32(f, 0); /* call_count */
+                cold_emit_csg_v2_u32(f, 0); /* call_arg_count */
+                cold_emit_csg_v2_u32(f, 0); /* str_lit_count */
+                continue;
+            }
+
             /* param_count + per-param ABI triple: slot_kind, slot_size, param_slot */
             cold_emit_csg_v2_u32(f, (uint32_t)b->param_count);
             for (int32_t pi = 0; pi < b->param_count; pi++) {
