@@ -21112,6 +21112,7 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
                 stats->emit_us = stats->facts_total_us;
                 stats->elapsed_us = stats->facts_total_us;
             }
+            ColdErrorRecoveryEnabled = false;
             sigaction(SIGSEGV, &sa_segv_old, 0);
             sigaction(SIGBUS,  &sa_bus_old, 0);
             munmap((void *)csg_text.ptr, (size_t)csg_text.len);
@@ -22260,7 +22261,7 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
             if (patch.target_function < 0 || patch.target_function >= func_count) continue;
             if (symbol_offset[patch.target_function] >= 0) continue; /* already resolved */
             if (reloc_count >= reloc_cap) die("cold object relocation overflow");
-            reloc_offsets[reloc_count] = (int32_t)patch.pos; /* byte offset */
+            reloc_offsets[reloc_count] = (int32_t)patch.pos * 4; /* byte offset */ /* byte offset */
             reloc_symbols[reloc_count] = patch.target_function;
             reloc_count++;
         }
@@ -22281,7 +22282,7 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
             int32_t target_off = symbol_offset[patch.target_function];
             if (target_off < 0) {
                 if (reloc_count >= reloc_cap) die("cold object relocation overflow");
-                reloc_offsets[reloc_count] = (int32_t)patch.pos;
+                reloc_offsets[reloc_count] = (int32_t)patch.pos * 4; /* byte offset */
                 reloc_symbols[reloc_count] = patch.target_function;
                 reloc_count++;
                 continue;
