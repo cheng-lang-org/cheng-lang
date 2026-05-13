@@ -13693,7 +13693,8 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
             code->count = x64_pack_words(&x64, code->words, code->cap);
             uint16_t em = EM_X86_64;
             if (!elf_write_exec(out_path, code->words, code->count, em)) return false;
-            if (stats) { stats->code_words = code->count; stats->csg_lowering = 1; }
+            if (stats) { stats->code_words = code->count; stats->csg_lowering = 1;
+                cold_collect_body_stats(symbols, function_bodies, symbols->function_count, stats); }
         } else {
             Code *code = code_new(arena, 256);
             codegen_program(code, function_bodies, symbols->function_count, entry_function, symbols, target);
@@ -13715,6 +13716,7 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
             }
             if (stats) {
                 stats->code_words = code->count;
+                cold_collect_body_stats(symbols, function_bodies, symbols->function_count, stats);
             }
         }
 
