@@ -20,6 +20,7 @@
 - **文件拆分**：`cold_parser.c` 独立，`COLD_BACKEND_ONLY` 42% 缩减（590KB→344KB）
 - **跨端编译**：ARM64 Mach-O + RISC-V/x86_64 ELF64 obj + exe
 - **编译时间**：exe 路径 0.2-2ms，source 路径 12-15ms
+- **reader fixed-point（same-binary 确定性）**：冷编译器同一二进制对同一 facts 多次运行产出 bit-identical .o（cmp=0）。cross-version 差异（不同编译器版本产出不同 .o 大小）是预期行为，不影响 fixed-point 成立。
 
 **未完成（不能写成已成立）**
 
@@ -27,9 +28,8 @@
 |---|---|---|
 | provider archive 生成与链接 | macOS cc 被 Mach-O 点号符号阻断 | Linux runner 上验证 `--csg-in --link-providers` 用 GNU ld/lld 链接 ELF .o |
 | runtime smoke cc 链接 | 同上，内置 ELF 链接器已绕过 | 三 smoke RISC-V linked ELF 均已 QEMU 验证 |
-| backend driver CSG fixed-point (reader) | writer fixed-point 成立 | 用不同 bootstrap stage 的冷编译器二进制对同一 facts 产出 .o，cmp 验证 |
 | 删除 cold source parser | COLD_BACKEND_ONLY 42% 缩减 | parser 代码保留，cold_parser.c 独立文件 |
-| C seed 替代 | cheng_seed.c 仍是完整 Cheng 语言实现 | 冷编译器子集覆盖足够后可退役 |
+| C seed 替代 | cheng_seed.c 仍是完整 Cheng 语言实现（66K 行，3.0MB） | 冷编译器子集覆盖足够后可退役 |
 | Ownership / E-Graph | No-Alias 基础存在 | 需要 ownership proof driver 重跑 + E-Graph rewrite rules |
 | 函数级并行 | 有 work-stealing 痕迹 | 需要 active lowering 主链接入 + benchmark 证明加速比
 
@@ -178,6 +178,95 @@
   - `match expr: Variant(x) => suite Variant2 => suite`——编译为 tag compare + CBNZ/TBNZ 跳转链（≤4 variant）或 PC-relative 跳转表（5+ variant）。
   - 冷编译器原型 `bootstrap/cheng_cold.c` 已包含 SoA BodyIR 层面的 `OP_TAG`/`OP_PAYLOAD`/`TM_SWITCH` 支持。
   - 完整编译器（`src/`）待实现：typed_expr 层的代数类型 layout、lowering 的 match→CBR 转换、ARM64 的 SWITCH term 回填。
+
+## 剩余 gap 详细评估
+
+### 1. provider archive Linux 验证
+
+**当前状态**：`--csg-in --link-providers` 命令行接口已实现。Built-in ELF 链接器可产出 `.linked` 可执行文件（三架构已证明）。但 macOS 上 `cc` 链接 `.o` 时因 Mach-O 目标文件包含点号符号（如 `_PrimaryBodyIrGeneralCfgWordCount`）被系统链接器拒绝。
+
+**阻断原因**：Mach-O 符号命名规范不允许点号（`.`），而冷编译器生成的符号名包含点号。这不是代码 bug，是 Mach-O 格式的 ABI 约束。GNU ld/lld 在 ELF 目标文件上无此限制。
+
+**完成条件**：
+1. Linux amd64 或 aarch64 环境上运行 `--csg-in --link-providers`，对象文件为 ELF64 `.o`
+2. 系统 `cc`（GCC/Clang with GNU ld or lld）链接后产出可执行文件
+3. 运行可执行文件，退出码与直接编译一致
+4. report 中 `provider_object_count>0`，`standalone_no_runtime=0`
+
+**预计工作量**：~1 天（环境搭建 + 验证）。代码本身不需要改动，只需在 Linux runner（CI 或本地 VM）上执行现有命令行。
+
+---
+
+### 2. C seed 替代
+
+**当前状态**：`bootstrap/cheng_seed.c` 66,725 行 / 3.0 MB，是完整的 Cheng 语言实现（自举链 root）。冷编译器 `bootstrap/cheng_cold.c` ~20,572 行，只覆盖冷子集。C seed 仍然提供以下冷编译器不支持的语言特性：
+
+| 特性 | C seed 支持证据 | 冷编译器覆盖 |
+|---|---|---|
+| 泛型（generic） | 337 处引用（`generic_instantiate` 等） | 仅 basic CSG type params |
+| 闭包（closure/lambda） | 68 处引用（`closure`、`capture_env`、`trampoline`） | 无（仅 `&fnName` 函数指针） |
+| 代数类型 + match | 语法在 formal spec §1.2 定义，C seed 含类型解析 | 冷原型含 OP_TAG/TM_SWITCH，但 typed_expr 层未完整实现 |
+| async/await | parser 语法已定义（`async`/`await`/`spawn`） | 无（codegen 不支持函数体内并发原语） |
+| 完整的 provider/infra | 全部 42 个 manifest 源文件和 6+ 条命令路径 | 仅 bootstrap 必需命令 + CSG 管线 |
+
+**阻断原因**：冷编译器子集不完整，不足以编译整个 `src/` 目录。C seed 退役的前提是冷编译器可以编译全部自举链，包括泛型实例化、闭包环境捕获、代数类型 lowering。
+
+**完成条件**：
+1. 冷编译器能编译所有 manifest 源文件（42 个），不依赖 C seed 的 fallback
+2. `build-backend-driver` 全程使用冷编译器（`CHENG_BUILD_BACKEND_DRIVER_FORCE_C_SEED=0`）
+3. 对应 bootstrap contract 输出与 C seed 版本一致
+4. `cheng_seed.c` 只保留冷启动外根角色，删除所有生产编译能力
+
+**预计工作量**：~数周至数月（按阶段推进）。泛型和闭包是编译器内核能力，非增量修补可达。
+
+---
+
+### 3. Ownership / E-Graph
+
+**当前状态**：
+- **No-Alias 基础**：`slot_no_alias[]` 数据模型已落地，`let`/`var` 标量局部变量自动标记 no_alias；4 寄存器缓存（R0-R3）追踪 no_alias slot；`na_clobber(N)` 在临时寄存器使用后正确无效化缓存。
+- **E-Graph**：不存在可运行的 rewrite rules。CSG egraph 有合同概念（canonical graph equivalence）但无实现。
+- **Ownership proof driver**：不存在。No-Alias 的优化效果无独立 witness 验证。
+
+**阻断原因**：
+1. E-Graph 需要 cost model + rewrite rules（UIR 层的 canonical form equivalence），属于语义特化主线，与当前 codegen 正确性闭环不在同一轨道。
+2. Ownership proof 需要专用 driver 和 witness smoke，不能用 "compile-only passes" 代替硬证明。
+3. No-Alias 寄存器缓存当前只覆盖标量 slot，对聚合类型（struct/tuple payload）无影响。
+
+**完成条件**：
+1. E-Graph：UIR egraph 管线就位，含合法的 cost model、rewrite rules、canonical equivalence 证明
+2. Ownership proof driver：专用编译入口 + smoke witness，能在编译时验证 ownership 合同
+3. No-Alias：benchmark 证明寄存器缓存减少冗余 `ldr` 指令数量
+4. phase-off surface 上置为 false——不允许 phase-off 而声称 proof-backed 通过
+
+**预计工作量**：~数周（E-Graph 基础管线 + ownership proof driver + witness），属阶段 5 核心。
+
+---
+
+### 4. 函数级并行
+
+**当前状态**：
+- **C 层 work-stealing（cheng_cold.c）**：`codegen_worker_run` + `pthread_create` + `__atomic_fetch_add` 无锁竞争 + per-worker Arena + 函数索引序确定性 merge。`COLD_NO_SIGN=1` 下 `BACKEND_JOBS=1` 与 `BACKEND_JOBS=4` 产物 SHA 完全一致。已成立。
+- **Cheng 层 task executor**：`backend_driver_dispatch_min.cheng` 保留 `function_task_schedule=ws/serial` 动态报告。但 `FunctionTaskExecuteBodyIr` 是空桩，未接入 active lowering 主链。
+- **2026-05-08 尝试**：用 `async.spawn` + `atomic.FetchAddI32` 实现 fan-out 并行 for 循环。代码语法/语义通过，但 `primary_object_plan` codegen 不支持 `let`/`if`/`while`/atomic/spawn 等语句模式，产出 `unsupported_body_kinds`，最终 C seed 链接失败。根因：Cheng 规范 §716 禁止循环模块导入，不能走 `function_task_executor ↔ lowering_plan` 回调；codegen 不支持函数体内的控制流/并发原语。
+
+**阻断原因**：
+1. `FunctionTaskExecuteBodyIr` 是空桩——active lowering 主链未使用并行 executor
+2. codegen 不支持函数体内的并发原语（`async.spawn`、`FetchAddI32`、控制流语句）
+3. §716 循环导入约束阻止了 executor 回调路径
+4. 正确路径：要么扩展 `primary_object_plan` codegen 支持所需语句，要么在 C/importc 层（codegen 以下）实现线程调度，暴露简单调用接口
+
+**完成条件**：
+1. `FunctionTaskExecuteBodyIr` 非空桩，active lowering 主链使用并行 executor
+2. `BACKEND_JOBS=1` 与 `BACKEND_JOBS=N` 同输入产物 SHA 一致（确定性约束）
+3. worker 任一失败硬失败，不能串行接管
+4. report 明确写 `function_task_schedule=ws`、`job_count>1`
+5. benchmark 证明加速比（>=2 函数时 wall clock 下降）
+6. smoke 必须检查 marker，防止入口被折成直接 `return 0` 假绿
+
+**预计工作量**：~1-2 周。路径已清晰：C 层 codegen 扩展或 importc 接口暴露。核心骨架（work-stealing、per-worker arena、确定性 merge）已就位，需要的是主链接入和 codegen 能力扩展。
+
+---
 
 ## 总目标
 
