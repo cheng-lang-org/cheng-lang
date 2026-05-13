@@ -179,6 +179,10 @@ static uint32_t rv_slt(int rd, int rs1, int rs2) {
 static uint32_t rv_slti(int rd, int rs1, int16_t imm) {
     return RV_I(rd, rs1, (uint32_t)(imm & 0xFFF), F3_SLT, RV_OP_IMM);
 }
+/* SLTIU rd, rs1, imm12 (set less than immediate unsigned) */
+static uint32_t rv_sltiu(int rd, int rs1, int16_t imm) {
+    return RV_I(rd, rs1, (uint32_t)(imm & 0xFFF), F3_SLTU, RV_OP_IMM);
+}
 /* LD rd, imm12(rs1) -- 64-bit load */
 static uint32_t rv_ld(int rd, int rs1, int16_t imm) {
     return RV_I(rd, rs1, (uint32_t)(imm & 0xFFF), F3_DWORD, RV_LOAD);
@@ -243,4 +247,237 @@ static void rv_li(uint32_t *code, int *pos, int rd, int32_t imm) {
         if (lower != 0)
             code[(*pos)++] = rv_addiw(rd, rd, lower);
     }
+}
+
+/* Load 64-bit immediate (multi-instruction sequence) */
+static void rv_li64(uint32_t *code, int *pos, int rd, uint64_t imm) {
+    int32_t lo = (int32_t)(imm & 0xFFFFFFFFu);
+    int32_t hi = (int32_t)((imm >> 32) & 0xFFFFFFFFu);
+    rv_li(code, pos, rd, lo);
+    if (hi != 0) {
+        /* Use SLLI + ADDI + SLLI + ADDI to construct upper 32 bits */
+        code[(*pos)++] = rv_slli(rd, rd, 32);
+    }
+}
+
+/* REMW rd, rs1, rs2 (signed 32-bit remainder) */
+static uint32_t rv_remw(int rd, int rs1, int rs2) {
+    return RV_R(rd, rs1, rs2, F3_SR, 0x07, RV_OP32);
+}
+/* DIV rd, rs1, rs2 (signed 64-bit) */
+static uint32_t rv_div(int rd, int rs1, int rs2) {
+    return RV_R(rd, rs1, rs2, F3_SR, 0x01, RV_OP);
+}
+/* REM rd, rs1, rs2 (signed 64-bit remainder) */
+static uint32_t rv_rem(int rd, int rs1, int rs2) {
+    return RV_R(rd, rs1, rs2, F3_SR, 0x07, RV_OP);
+}
+/* SRLI rd, rs1, shamt (shift right logical immediate) */
+static uint32_t rv_srli(int rd, int rs1, int shamt) {
+    return RV_I(rd, rs1, (uint32_t)(shamt & 0x3F), F3_SR, RV_OP_IMM);
+}
+/* SLLIW rd, rs1, shamt (32-bit shift left logical immediate) */
+static uint32_t rv_slliw(int rd, int rs1, int shamt) {
+    return RV_I(rd, rs1, (uint32_t)(shamt & 0x1F), F3_SLL, RV_OP_IMM32);
+}
+/* SRLIW rd, rs1, shamt (32-bit shift right logical immediate) */
+static uint32_t rv_srliw(int rd, int rs1, int shamt) {
+    return RV_I(rd, rs1, (uint32_t)(shamt & 0x1F), F3_SR, RV_OP_IMM32);
+}
+/* SRAIW rd, rs1, shamt (32-bit shift right arithmetic immediate) */
+static uint32_t rv_sraiw(int rd, int rs1, int shamt) {
+    return RV_I(rd, rs1, (uint32_t)((shamt & 0x1F) | 0x400), F3_SR, RV_OP_IMM32);
+}
+/* SLLW rd, rs1, rs2 (32-bit shift left logical) */
+static uint32_t rv_sllw(int rd, int rs1, int rs2) {
+    return RV_R(rd, rs1, rs2, F3_SLL, 0, RV_OP32);
+}
+/* SRLW rd, rs1, rs2 (32-bit shift right logical) */
+static uint32_t rv_srlw(int rd, int rs1, int rs2) {
+    return RV_R(rd, rs1, rs2, F3_SR, 0, RV_OP32);
+}
+/* SRAW rd, rs1, rs2 (32-bit shift right arithmetic) */
+static uint32_t rv_sraw(int rd, int rs1, int rs2) {
+    return RV_R(rd, rs1, rs2, F3_SR, 0x20, RV_OP32);
+}
+/* SLL rd, rs1, rs2 (64-bit shift left logical) */
+static uint32_t rv_sll(int rd, int rs1, int rs2) {
+    return RV_R(rd, rs1, rs2, F3_SLL, 0, RV_OP);
+}
+/* SRL rd, rs1, rs2 (64-bit shift right logical) */
+static uint32_t rv_srl(int rd, int rs1, int rs2) {
+    return RV_R(rd, rs1, rs2, F3_SR, 0, RV_OP);
+}
+/* SRA rd, rs1, rs2 (64-bit shift right arithmetic) */
+static uint32_t rv_sra(int rd, int rs1, int rs2) {
+    return RV_R(rd, rs1, rs2, F3_SR, 0x20, RV_OP);
+}
+/* ANDI rd, rs1, imm12 */
+static uint32_t rv_andi(int rd, int rs1, int16_t imm) {
+    return RV_I(rd, rs1, (uint32_t)(imm & 0xFFF), F3_AND, RV_OP_IMM);
+}
+/* ORI rd, rs1, imm12 */
+static uint32_t rv_ori(int rd, int rs1, int16_t imm) {
+    return RV_I(rd, rs1, (uint32_t)(imm & 0xFFF), F3_OR, RV_OP_IMM);
+}
+/* XORI rd, rs1, imm12 */
+static uint32_t rv_xori(int rd, int rs1, int16_t imm) {
+    return RV_I(rd, rs1, (uint32_t)(imm & 0xFFF), F3_XOR, RV_OP_IMM);
+}
+/* SLTU rd, rs1, rs2 (set less than unsigned) */
+static uint32_t rv_sltu(int rd, int rs1, int rs2) {
+    return RV_R(rd, rs1, rs2, F3_SLTU, 0, RV_OP);
+}
+/* BGEU rs1, rs2, offset */
+static uint32_t rv_bgeu(int rs1, int rs2, int16_t offset) {
+    return RV_B(rs1, rs2, (uint32_t)(offset & 0x1FFF), F3_BGEU, RV_BRANCH);
+}
+/* BLTU rs1, rs2, offset */
+static uint32_t rv_bltu(int rs1, int rs2, int16_t offset) {
+    return RV_B(rs1, rs2, (uint32_t)(offset & 0x1FFF), F3_BLTU, RV_BRANCH);
+}
+/* BLT rs1, rs2, offset (exists in original but may differ) */
+/* EBREAK */
+static uint32_t rv_ebreak(void) { return 0x00100073u; }
+/* ECALL */
+static uint32_t rv_ecall(void) { return 0x00000073u; }
+/* FENCE */
+static uint32_t rv_fence(void) { return 0x0FF0000Fu; }
+/* LWU rd, imm12(rs1) -- 32-bit unsigned load (exists in original) */
+/* LBU rd, imm12(rs1) -- load byte unsigned */
+static uint32_t rv_lbu(int rd, int rs1, int16_t imm) {
+    return RV_I(rd, rs1, (uint32_t)(imm & 0xFFF), 4, RV_LOAD);
+}
+/* SB rs2, imm12(rs1) -- store byte */
+static uint32_t rv_sb(int rs2, int rs1, int16_t imm) {
+    return RV_S(rs2, rs1, (uint32_t)(imm & 0xFFF), 0, RV_STORE);
+}
+/* MULW rd, rs1, rs2 (exists in original) */
+/* DIVUW rd, rs1, rs2 (unsigned 32-bit) */
+static uint32_t rv_divuw(int rd, int rs1, int rs2) {
+    return RV_R(rd, rs1, rs2, F3_SR, 0x05, RV_OP32);
+}
+/* LR.W rd, (rs1) -- load reserved 32-bit */
+static uint32_t rv_lr_w(int rd, int rs1) {
+    return 0x1000202Fu | (((uint32_t)rd & 0x1F) << 7) | (((uint32_t)rs1 & 0x1F) << 15);
+}
+/* SC.W rd, rs2, (rs1) -- store conditional 32-bit */
+static uint32_t rv_sc_w(int rd, int rs1, int rs2) {
+    return 0x1800202Fu | (((uint32_t)rd & 0x1F) << 7) | (((uint32_t)rs1 & 0x1F) << 15) | (((uint32_t)rs2 & 0x1F) << 20);
+}
+/* AMOSWAP.W rd, rs2, (rs1) */
+static uint32_t rv_amoswap_w(int rd, int rs1, int rs2) {
+    return 0x0800202Fu | (((uint32_t)rd & 0x1F) << 7) | (((uint32_t)rs1 & 0x1F) << 15) | (((uint32_t)rs2 & 0x1F) << 20);
+}
+/* CSRRW rd, csr, rs1 -- CSR read/write */
+static uint32_t rv_csrrw(int rd, int csr, int rs1) {
+    return 0x00000073u | (((uint32_t)csr & 0xFFF) << 20) | (((uint32_t)rs1 & 0x1F) << 15) | (0x1 << 12) | (((uint32_t)rd & 0x1F) << 7);
+}
+/* CSRRWI rd, csr, uimm5 -- CSR read/write immediate */
+static uint32_t rv_csrrwi(int rd, int csr, int uimm) {
+    return 0x00000073u | (((uint32_t)csr & 0xFFF) << 20) | (((uint32_t)uimm & 0x1F) << 15) | (0x5 << 12) | (((uint32_t)rd & 0x1F) << 7);
+}
+/* Float: FADD.S rd, rs1, rs2 */
+static uint32_t rv_fadd_s(int rd, int rs1, int rs2) {
+    return 0x00000053u | (((uint32_t)rd & 0x1F) << 7) | (((uint32_t)rs1 & 0x1F) << 15) | (((uint32_t)rs2 & 0x1F) << 20) | (0x00u << 25);
+}
+/* FSUB.S rd, rs1, rs2 */
+static uint32_t rv_fsub_s(int rd, int rs1, int rs2) {
+    return 0x08000053u | (((uint32_t)rd & 0x1F) << 7) | (((uint32_t)rs1 & 0x1F) << 15) | (((uint32_t)rs2 & 0x1F) << 20);
+}
+/* FMUL.S rd, rs1, rs2 */
+static uint32_t rv_fmul_s(int rd, int rs1, int rs2) {
+    return 0x10000053u | (((uint32_t)rd & 0x1F) << 7) | (((uint32_t)rs1 & 0x1F) << 15) | (((uint32_t)rs2 & 0x1F) << 20);
+}
+/* FDIV.S rd, rs1, rs2 */
+static uint32_t rv_fdiv_s(int rd, int rs1, int rs2) {
+    return 0x18000053u | (((uint32_t)rd & 0x1F) << 7) | (((uint32_t)rs1 & 0x1F) << 15) | (((uint32_t)rs2 & 0x1F) << 20);
+}
+/* FSGNJN.S rd, rs1, rs2 (negate) */
+static uint32_t rv_fsgnjn_s(int rd, int rs1, int rs2) {
+    return 0x20000053u | (((uint32_t)rd & 0x1F) << 7) | (((uint32_t)rs1 & 0x1F) << 15) | (((uint32_t)rs2 & 0x1F) << 20) | (0x01u << 25);
+}
+/* FEQ.S rd, rs1, rs2 */
+static uint32_t rv_feq_s(int rd, int rs1, int rs2) {
+    return 0xA0000053u | (((uint32_t)rd & 0x1F) << 7) | (((uint32_t)rs1 & 0x1F) << 15) | (((uint32_t)rs2 & 0x1F) << 20) | (0x02u << 25);
+}
+/* FLT.S rd, rs1, rs2 */
+static uint32_t rv_flt_s(int rd, int rs1, int rs2) {
+    return 0xA0000053u | (((uint32_t)rd & 0x1F) << 7) | (((uint32_t)rs1 & 0x1F) << 15) | (((uint32_t)rs2 & 0x1F) << 20) | (0x01u << 25);
+}
+/* FCVT.S.W rd, rs1 (int32→float32) */
+static uint32_t rv_fcvt_s_w(int rd, int rs1) {
+    return 0xD2000053u | (((uint32_t)rd & 0x1F) << 7) | (((uint32_t)rs1 & 0x1F) << 15);
+}
+/* FCVT.W.S rd, rs1 (float32→int32, truncate) */
+static uint32_t rv_fcvt_w_s(int rd, int rs1) {
+    return 0xC2000053u | (((uint32_t)rd & 0x1F) << 7) | (((uint32_t)rs1 & 0x1F) << 15) | (0x03u << 20);
+}
+/* FLW rd, imm12(rs1) -- load float */
+static uint32_t rv_flw(int rd, int rs1, int16_t imm) {
+    return RV_I(rd, rs1, (uint32_t)(imm & 0xFFF), F3_WORD, 0x07);
+}
+/* FSW rs2, imm12(rs1) -- store float */
+static uint32_t rv_fsw(int rs2, int rs1, int16_t imm) {
+    return RV_S(rs2, rs1, (uint32_t)(imm & 0xFFF), F3_WORD, 0x27);
+}
+/* FADD.D rd, rs1, rs2 */
+static uint32_t rv_fadd_d(int rd, int rs1, int rs2) {
+    return 0x02000053u | (((uint32_t)rd & 0x1F) << 7) | (((uint32_t)rs1 & 0x1F) << 15) | (((uint32_t)rs2 & 0x1F) << 20);
+}
+/* FSUB.D rd, rs1, rs2 */
+static uint32_t rv_fsub_d(int rd, int rs1, int rs2) {
+    return 0x0A000053u | (((uint32_t)rd & 0x1F) << 7) | (((uint32_t)rs1 & 0x1F) << 15) | (((uint32_t)rs2 & 0x1F) << 20);
+}
+/* FMUL.D rd, rs1, rs2 */
+static uint32_t rv_fmul_d(int rd, int rs1, int rs2) {
+    return 0x12000053u | (((uint32_t)rd & 0x1F) << 7) | (((uint32_t)rs1 & 0x1F) << 15) | (((uint32_t)rs2 & 0x1F) << 20);
+}
+/* FDIV.D rd, rs1, rs2 */
+static uint32_t rv_fdiv_d(int rd, int rs1, int rs2) {
+    return 0x1A000053u | (((uint32_t)rd & 0x1F) << 7) | (((uint32_t)rs1 & 0x1F) << 15) | (((uint32_t)rs2 & 0x1F) << 20);
+}
+/* FSGNJN.D rd, rs1, rs2 (negate) */
+static uint32_t rv_fsgnjn_d(int rd, int rs1, int rs2) {
+    return 0x22000053u | (((uint32_t)rd & 0x1F) << 7) | (((uint32_t)rs1 & 0x1F) << 15) | (((uint32_t)rs2 & 0x1F) << 20) | (0x01u << 25);
+}
+/* FEQ.D rd, rs1, rs2 */
+static uint32_t rv_feq_d(int rd, int rs1, int rs2) {
+    return 0xA2000053u | (((uint32_t)rd & 0x1F) << 7) | (((uint32_t)rs1 & 0x1F) << 15) | (((uint32_t)rs2 & 0x1F) << 20) | (0x02u << 25);
+}
+/* FLT.D rd, rs1, rs2 */
+static uint32_t rv_flt_d(int rd, int rs1, int rs2) {
+    return 0xA2000053u | (((uint32_t)rd & 0x1F) << 7) | (((uint32_t)rs1 & 0x1F) << 15) | (((uint32_t)rs2 & 0x1F) << 20) | (0x01u << 25);
+}
+/* FCVT.D.W rd, rs1 (int32→float64) */
+static uint32_t rv_fcvt_d_w(int rd, int rs1) {
+    return 0xD2200053u | (((uint32_t)rd & 0x1F) << 7) | (((uint32_t)rs1 & 0x1F) << 15);
+}
+/* FCVT.W.D rd, rs1 (float64→int32, truncate) */
+static uint32_t rv_fcvt_w_d(int rd, int rs1) {
+    return 0xC2200053u | (((uint32_t)rd & 0x1F) << 7) | (((uint32_t)rs1 & 0x1F) << 15) | (0x03u << 20);
+}
+/* FLD rd, imm12(rs1) -- load double */
+static uint32_t rv_fld(int rd, int rs1, int16_t imm) {
+    return RV_I(rd, rs1, (uint32_t)(imm & 0xFFF), F3_DWORD, 0x07);
+}
+/* FSD rs2, imm12(rs1) -- store double */
+static uint32_t rv_fsd(int rs2, int rs1, int16_t imm) {
+    return RV_S(rs2, rs1, (uint32_t)(imm & 0xFFF), F3_DWORD, 0x27);
+}
+/* FMV.W.X rd, rs1 (move int32 to float reg) */
+static uint32_t rv_fmv_w_x(int rd, int rs1) {
+    return 0xF2000053u | (((uint32_t)rd & 0x1F) << 7) | (((uint32_t)rs1 & 0x1F) << 15);
+}
+/* FMV.X.W rd, rs1 (move float reg to int32) */
+static uint32_t rv_fmv_x_w(int rd, int rs1) {
+    return 0xE2000053u | (((uint32_t)rd & 0x1F) << 7) | (((uint32_t)rs1 & 0x1F) << 15);
+}
+/* FMV.D.X rd, rs1 (move int64 to float reg) */
+static uint32_t rv_fmv_d_x(int rd, int rs1) {
+    return 0xF2200053u | (((uint32_t)rd & 0x1F) << 7) | (((uint32_t)rs1 & 0x1F) << 15);
+}
+/* FMV.X.D rd, rs1 (move float reg to int64) */
+static uint32_t rv_fmv_x_d(int rd, int rs1) {
+    return 0xE2200053u | (((uint32_t)rd & 0x1F) << 7) | (((uint32_t)rs1 & 0x1F) << 15);
 }

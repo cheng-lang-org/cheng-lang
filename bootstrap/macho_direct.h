@@ -170,7 +170,7 @@ static bool macho_finalize(MachOWriter *mw, const char *path) {
     
     /* Adhoc sign (skip if COLD_NO_SIGN=1 for deterministic builds) */
     if (!getenv("COLD_NO_SIGN")) {
-        char cmd[256]; snprintf(cmd, sizeof(cmd), "codesign --force -s - %s 2>/dev/null", path);
+        char cmd[256]; snprintf(cmd, sizeof(cmd), "codesign --force -s - -i cheng.cold.direct %s 2>/dev/null", path);
         system(cmd);
     }
     return true;

@@ -588,7 +588,7 @@ fn BackendDriverDispatchMinPrintBuildPlanCommandFromCmdline(): int32 =
 
 fn BackendDriverDispatchMinHelp(): int32 =
     BackendDriverDispatchMinPrintLine("usage: cheng <command> [args]")
-    BackendDriverDispatchMinPrintLine("core commands: status, print-build-plan, system-link-exec, run-host-smokes cold_csg_sidecar_smoke")
+    BackendDriverDispatchMinPrintLine("core commands: status, print-build-plan, system-link-exec, emit-cold-csg-v2, run-host-smokes cold_csg_sidecar_smoke")
     return 0
 
 fn BackendDriverDispatchMinCurrentCompiler(rootDir: str): str =
@@ -673,7 +673,17 @@ fn BackendDriverDispatchMinProviderModuleSafeName(modulePath: str): str =
         return "runtime_program_support_get_env_bridge"
     if modulePath == "runtime/program_support_host_runtime":
         return "runtime_program_support_host_runtime"
-    return "runtime_unknown"
+    var out = "module"
+    for i in 0..<modulePath.len:
+        let c = modulePath[i]
+        if (c >= 'a' && c <= 'z') ||
+           (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') ||
+           c == '_':
+            out = Fmt"{out}{strings.CharToStr(c)}"
+        else:
+            out = Fmt"{out}_"
+    return out
 
 fn BackendDriverDispatchMinProviderSourcePath(rootDir: str,
                                                linkPlan: slplan.SystemLinkPlanStub,
@@ -778,8 +788,11 @@ fn BackendDriverDispatchMinProviderExportRoots(modulePath: str,
             BackendDriverDispatchMinAddRootIfReferenced(roots, seen, symbol, "cheng_thread_spawn_i32")
             BackendDriverDispatchMinAddRootIfReferenced(roots, seen, symbol, "cheng_thread_parallelism")
             BackendDriverDispatchMinAddRootIfReferenced(roots, seen, symbol, "cheng_thread_yield")
+            BackendDriverDispatchMinAddRootIfReferenced(roots, seen, symbol, "cheng_bounds_check")
             if BackendDriverDispatchMinProgramSupportRootCandidate(symbol):
                 BackendDriverDispatchMinAddRootUnique(roots, seen, symbol)
+        if roots.len > 0:
+            BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_bounds_check")
         return BackendDriverDispatchMinCsv(roots)
     if modulePath == "runtime/core_runtime":
         for i in 0..<primaryPlan.relocTargetSymbols.len:
@@ -1500,6 +1513,7 @@ fn BackendDriverDispatchMinRunSystemLinkExecEmitExeProviders(driverRoot: str, re
     var providerExportRootTexts: str[]
     var providerCompileReportPaths: str[]
     var providerCompileLogPaths: str[]
+    var providerCompileRequestCount: int32
     phaseProfile.providerObjectNs = BackendDriverDispatchMinNowNs()
     BackendDriverDispatchMinProgress("provider_object", "begin")
     for i in 0..<linkPlan.providerModules.len:
@@ -1514,15 +1528,16 @@ fn BackendDriverDispatchMinRunSystemLinkExecEmitExeProviders(driverRoot: str, re
         add(providerCompileLogPaths, Fmt"{providerObjectPath}.compile.log")
         add(providerExportRootTexts, providerExportRoots)
         let isRuntime = modulePath == "runtime/compiler_runtime" || modulePath == "runtime/core_runtime" || modulePath == "runtime/debug_runtime" || modulePath == "runtime/program_support" || modulePath == "runtime/program_support_get_env_bridge" || modulePath == "runtime/program_support_host_runtime"
-        if len(providerExportRoots) <= 0 && isRuntime:
+        if len(providerExportRoots) <= 0:
             continue
+        providerCompileRequestCount = providerCompileRequestCount + 1
         let moduleCompilerPath = providerCompilerPath
         if !BackendDriverDispatchMinCompileProviderObject(driverRoot, moduleCompilerPath, linkPlan, primaryPlan, modulePath, providerSourcePath, providerObjectPath, providerExportRoots):
             let reason = Fmt"backend driver direct system-link-exec: provider object failed: {modulePath}"
             let _ = BackendDriverDispatchMinWriteErrorReportBridge(driverRoot, reportPath, reason)
             return BackendDriverDispatchMinUnsupported(reason)
         add(providerObjectPaths, providerObjectPath)
-    if providerObjectPaths.len <= 0 && linkPlan.providerModules.len > 0:
+    if providerObjectPaths.len <= 0 && providerCompileRequestCount > 0:
         let reason = Fmt"backend driver direct system-link-exec: no provider objects compiled (modules={linkPlan.providerModules.len})"
         let _ = BackendDriverDispatchMinWriteErrorReportBridge(driverRoot, reportPath, reason)
         return BackendDriverDispatchMinUnsupported(reason)
@@ -1740,6 +1755,110 @@ fn BackendDriverDispatchMinRunSystemLinkExecFromCmdline(): int32 =
 
 fn BackendDriverDispatchMinRunSystemLinkExecCommandFromCmdline(): int32 =
     return BackendDriverDispatchMinRunSystemLinkExecFromCmdline()
+
+fn BackendDriverDispatchMinWriteColdCsgV2Report(rootDir: str,
+                                                 reportPath: str,
+                                                 status: str,
+                                                 factsBytes: int32,
+                                                 reason: str): bool =
+    var report = ""
+    BackendDriverDispatchMinAppendLine(report, Fmt"cold_csg_v2_writer_status={status}")
+    BackendDriverDispatchMinAppendLine(report, Fmt"facts_bytes={factsBytes}")
+    if len(reason) > 0:
+        BackendDriverDispatchMinAppendLine(report, Fmt"error={reason}")
+    return BackendDriverDispatchMinWriteReport(rootDir, reportPath, report)
+
+fn BackendDriverDispatchMinEmitColdCsgV2Fail(rootDir: str,
+                                              reportPath: str,
+                                              reason: str): int32 =
+    let _ = BackendDriverDispatchMinWriteColdCsgV2Report(rootDir,
+                                                          reportPath,
+                                                          "fail",
+                                                          0,
+                                                          reason)
+    BackendDriverDispatchMinPrintErr(reason)
+    return 2
+
+fn BackendDriverBuildCsgV2BinaryFactsInto(plan: pobj.PrimaryObjectPlan,
+                                           targetTriple: str): uint8[] =
+    return pobj.PrimaryObjectPlanEmitCsgV2BinaryFacts(plan, targetTriple)
+
+fn BackendDriverDispatchMinRunEmitColdCsgV2FromCmdline(): int32 =
+    let packageRoot = BackendDriverDispatchMinReadFlagOrDefault("--root", ".")
+    let sourcePath = BackendDriverDispatchMinReadFlagOrDefault("--in", "")
+    let outputPath = BackendDriverDispatchMinReadFlagOrDefault("--out", "")
+    let reportPath = BackendDriverDispatchMinReadFlagOrDefault("--report-out", "")
+    let targetTriple = BackendDriverDispatchMinReadFlagOrDefault("--target", "arm64-apple-darwin")
+    let csgV2Binary = BackendDriverDispatchMinReadFlagOrDefault("--csg-v2-binary", "")
+    if len(sourcePath) <= 0:
+        return BackendDriverDispatchMinEmitColdCsgV2Fail(packageRoot, reportPath, "emit-cold-csg-v2: missing --in")
+    if len(outputPath) <= 0:
+        return BackendDriverDispatchMinEmitColdCsgV2Fail(packageRoot, reportPath, "emit-cold-csg-v2: missing --out")
+    let objectFormat = tmat.TargetPrimaryObjectFormat(targetTriple)
+    if objectFormat == "unknown":
+        return BackendDriverDispatchMinEmitColdCsgV2Fail(packageRoot, reportPath, Fmt"emit-cold-csg-v2: unsupported target: {targetTriple}")
+    var linkPlan: slplan.SystemLinkPlanStub
+    var err: str
+    if !slplan.BuildSystemLinkPlanStubWithFields(packageRoot,
+                                                  packageRoot,
+                                                  sourcePath,
+                                                  outputPath,
+                                                  targetTriple,
+                                                  creq.EmitObj,
+                                                  "public",
+                                                  "",
+                                                  linkPlan,
+                                                  err):
+        return BackendDriverDispatchMinEmitColdCsgV2Fail(packageRoot, reportPath, err)
+    if linkPlan.missingReasons.len > 0:
+        let missingText = strutil.Join(linkPlan.missingReasons, ",")
+        return BackendDriverDispatchMinEmitColdCsgV2Fail(packageRoot,
+                                                         reportPath,
+                                                         Fmt"emit-cold-csg-v2: system link plan not ready: {missingText}")
+    let sourceBundleCid = slplan.SystemLinkPlanSourceBundleCidValue(linkPlan)
+    var csg: ccsg.CompilerCsg
+    var csgErr: str
+    if !ccsg.BuildCompilerCsgInto(linkPlan, sourceBundleCid, csg, csgErr):
+        return BackendDriverDispatchMinEmitColdCsgV2Fail(packageRoot, reportPath, csgErr)
+    var loweringPlan: lower.LoweringPlanStub
+    if !lower.BuildLoweringPlanStubFromCompilerCsg(linkPlan, csg, loweringPlan, err):
+        return BackendDriverDispatchMinEmitColdCsgV2Fail(packageRoot, reportPath, err)
+    if loweringPlan.missingReasons.len > 0:
+        let missingText = strutil.Join(loweringPlan.missingReasons, ",")
+        return BackendDriverDispatchMinEmitColdCsgV2Fail(packageRoot,
+                                                         reportPath,
+                                                         Fmt"emit-cold-csg-v2: lowering plan not ready: {missingText}")
+    let primaryPlan = pobj.BuildPrimaryObjectPlan(linkPlan, loweringPlan)
+    if primaryPlan.missingReasons.len > 0:
+        let missingText = strutil.Join(primaryPlan.missingReasons, ",")
+        return BackendDriverDispatchMinEmitColdCsgV2Fail(packageRoot,
+                                                         reportPath,
+                                                         Fmt"emit-cold-csg-v2: primary object plan not ready: {missingText}")
+    if csgV2Binary != "":
+        # Binary facts path
+        let factsBytes = BackendDriverBuildCsgV2BinaryFactsInto(primaryPlan, targetTriple)
+        if !BackendDriverDispatchMinEnsureParentDir(packageRoot, outputPath):
+            return BackendDriverDispatchMinEmitColdCsgV2Fail(packageRoot, reportPath, Fmt"emit-cold-csg-v2: failed to create output parent: {outputPath}")
+        os.WriteFileBytes(chengpath.PathAbsolute(packageRoot, outputPath), factsBytes)
+        if !BackendDriverDispatchMinWriteColdCsgV2Report(packageRoot, reportPath, "ok", factsBytes.len, ""):
+            return BackendDriverDispatchMinUnsupported(Fmt"emit-cold-csg-v2: failed to write report: {reportPath}")
+        return 0
+    # Hex-text facts path
+    var facts: str
+    var factsErr: str
+    if !pobj.PrimaryObjectPlanColdCsgV2FactsInto(primaryPlan,
+                                                  targetTriple,
+                                                  objectFormat,
+                                                  facts,
+                                                  factsErr):
+        return BackendDriverDispatchMinEmitColdCsgV2Fail(packageRoot, reportPath, factsErr)
+    if !BackendDriverDispatchMinEnsureParentDir(packageRoot, outputPath):
+        return BackendDriverDispatchMinEmitColdCsgV2Fail(packageRoot, reportPath, Fmt"emit-cold-csg-v2: failed to create output parent: {outputPath}")
+    if !chengpath.WriteTextFile(packageRoot, outputPath, facts):
+        return BackendDriverDispatchMinEmitColdCsgV2Fail(packageRoot, reportPath, Fmt"emit-cold-csg-v2: failed to write facts: {outputPath}")
+    if !BackendDriverDispatchMinWriteColdCsgV2Report(packageRoot, reportPath, "ok", len(facts), ""):
+        return BackendDriverDispatchMinUnsupported(Fmt"emit-cold-csg-v2: failed to write report: {reportPath}")
+    return 0
 
 fn BackendDriverDispatchMinElapsedMsText(startNs: int64): str =
     let elapsedNs = BackendDriverDispatchMinNowNs() - startNs
@@ -2153,6 +2272,24 @@ fn BackendDriverDispatchMinCommandCode(cmd: str): int32 =
        cmd[14] == 'e' &&
        cmd[15] == 'c':
         return int32(5)
+    if n == 16 &&
+       cmd[0] == 'e' &&
+       cmd[1] == 'm' &&
+       cmd[2] == 'i' &&
+       cmd[3] == 't' &&
+       cmd[4] == '-' &&
+       cmd[5] == 'c' &&
+       cmd[6] == 'o' &&
+       cmd[7] == 'l' &&
+       cmd[8] == 'd' &&
+       cmd[9] == '-' &&
+       cmd[10] == 'c' &&
+       cmd[11] == 's' &&
+       cmd[12] == 'g' &&
+       cmd[13] == '-' &&
+       cmd[14] == 'v' &&
+       cmd[15] == '2':
+        return int32(7)
     if n == 15 &&
        cmd[0] == 'r' &&
        cmd[1] == 'u' &&
@@ -2188,6 +2325,8 @@ fn BackendDriverDispatchMinRunCommandWithCmd(cmd: str): int32 =
         return BackendDriverDispatchMinRunSystemLinkExecFromCmdline()
     if code == 6:
         return BackendDriverDispatchMinRunHostSmokesFromCmdline()
+    if code == 7:
+        return BackendDriverDispatchMinRunEmitColdCsgV2FromCmdline()
     return 2
 
 fn ParamStr(index: int32): str =

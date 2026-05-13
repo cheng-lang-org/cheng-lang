@@ -79,6 +79,16 @@
 - cold bootstrap seed 只承诺浅导入；深层导入闭包走 Cheng 工具链。import body 内调用必须严格裸名精确查找，禁止自动加 `import_alias.` 前缀，也禁止 bare-name fallback。
 - provider 编译器选择必须先尊重 `CHENG_NO_BACKEND_DRIVER_HANDOFF`，runtime provider 必须显式走 stage3/stage0；不能先取 argv0，否则生成候选会递归调用自身编译 runtime provider 并 hang。
 - provider export roots 必须按模块所有权和 primary undefined symbols 精确选择；线程 root 只在真实引用时加入，CPU bridge 属于 `runtime/core_runtime`，provider 自身生成代码引用的 `cheng_bounds_check` 必须由 `runtime/program_support` 导出。
+- cold CSG v2 路线只维护 `docs/cold_csg_v2_plan.md` 一个方案文档；必须先写 Phase 0 最小 facts 往返、facts 大小/load 时间预算和 provider archive/facts 策略，禁止拆成多份重复计划。
+- cold CSG v2 Phase 0 不能要求 Cheng direct `.o` 与 cold `.o` bit-identical；两边 ARM64 编码器独立。正确卡口是同一 facts 经 cold reader/codegen 两次产出 `.o` bit-identical，并链接同一 provider archive 后运行 exit/marker 一致。
+- 当前没有 provider archive、`--link-object`、`--provider-archive` 主线；Phase 0 只能验 facts->cold `.o` 确定性，运行验证必须等显式 archive/linkerless 命令落地，禁止借 `cc` 或 `--link-providers` 代替。
+- `CHENGCSG` 二进制 BodyIR 快照只是 cold 内部 fast path 自检；canonical CSG v2 facts 必须用 `CHENG_CSG_V2` record 格式从 `PrimaryObjectPlan` 导出。刷新 `emit-cold-csg-v2` 前若旧 backend driver 重编超时，先取样 type layout 热点，不把它算成 cold reader 失败。
+- `CHENGCSG` BodyIR reader 必须读 writer 保存的参数 ABI 三元组 `slot_kind/slot_size/param_slot`；禁止用 `param_slot[i]=i` 或缺省参数 kind 重建参数槽，否则 cold_subset_coverage 这类 slot 顺序变化会让 CSG 路径和 direct 路径代码漂移。
+- `CHENGCSG` BodyIR reader 必须读 writer 保存的 `block_term`；禁止用 `block i -> term i` 猜 CFG，否则多 block 函数会生成错误分支并 hang。
+- `CHENGCSG` BodyIR reader 要保留 `return_kind=0` 的 void/no-return-value 形态，并把 `return_size` 设为 0；禁止强行拿 0 查 slot size。
+- `CHENGCSG` BodyIR reader 批量读 blocks/terms/switches/call args/string literals 时必须每次追加前 ensure；只在循环前 ensure 一次会在 main 这类 60+ block 函数上踩内存。
+- cold direct Mach-O 确定性对拍必须固定 codesign identifier；默认 ad-hoc signing 会把输出 basename 写入 CodeDirectory，导致同一 code bytes 不同路径 `cmp` 失败。
+- cold `build-backend-driver` 的 entry semantics 合同必须随 `backend_driver_dispatch_min.cheng` 命令面同步更新；新增命令要同步 dispatch case 数、command string table 和生成版 status marker。
 
 ## Resolved
 

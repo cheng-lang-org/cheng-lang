@@ -1,3 +1,4 @@
+import std/os
 import std/result
 import std/strings
 import std/strutils as strutil
@@ -8488,6 +8489,133 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
     PrimaryObjectPlanDiagnoseAndFinalizePhase(state, linkPlan, lowering, plan)
     return plan
 
+fn PrimaryObjectPlanColdCsgV2HexDigit(value: int32): str =
+    if value < 10:
+        return strings.CharToStr(char(int32('0') + value))
+    return strings.CharToStr(char(int32('A') + value - 10))
+
+fn PrimaryObjectPlanColdCsgV2ByteHex(value: int32): str =
+    let byteValue = value & 255
+    return Fmt"{PrimaryObjectPlanColdCsgV2HexDigit((byteValue >> 4) & 15)}{PrimaryObjectPlanColdCsgV2HexDigit(byteValue & 15)}"
+
+fn PrimaryObjectPlanColdCsgV2FixedHex(value: int32,
+                                       digitCount: int32): str =
+    let raw = uint32(value)
+    var out = ""
+    var shift = (digitCount - 1) * 4
+    while shift >= 0:
+        out = Fmt"{out}{PrimaryObjectPlanColdCsgV2HexDigit(int32((raw >> uint32(shift)) & uint32(15)))}"
+        shift = shift - 4
+    return out
+
+fn PrimaryObjectPlanColdCsgV2U32LeHex(value: int32): str =
+    let raw = uint32(value)
+    return Fmt"{PrimaryObjectPlanColdCsgV2ByteHex(int32(raw & uint32(255)))}{PrimaryObjectPlanColdCsgV2ByteHex(int32((raw >> uint32(8)) & uint32(255)))}{PrimaryObjectPlanColdCsgV2ByteHex(int32((raw >> uint32(16)) & uint32(255)))}{PrimaryObjectPlanColdCsgV2ByteHex(int32((raw >> uint32(24)) & uint32(255)))}"
+
+fn PrimaryObjectPlanColdCsgV2StringPayload(text: str): str =
+    var out = PrimaryObjectPlanColdCsgV2U32LeHex(len(text))
+    for i in 0..<len(text):
+        out = Fmt"{out}{PrimaryObjectPlanColdCsgV2ByteHex(int32(text[i]))}"
+    return out
+
+fn PrimaryObjectPlanColdCsgV2AppendRecord(parts: var str[],
+                                           kind: int32,
+                                           payloadHex: str,
+                                           err: var str): bool =
+    if kind <= 0 || kind > 65535:
+        err = Fmt"cold csg v2 facts: invalid record kind: {strings.IntToStr(kind)}"
+        return false
+    if len(payloadHex) % 2 != 0:
+        err = Fmt"cold csg v2 facts: odd payload hex length for kind: {strings.IntToStr(kind)}"
+        return false
+    let payloadBytes = len(payloadHex) / 2
+    add(parts, Fmt"R{PrimaryObjectPlanColdCsgV2FixedHex(kind, 4)}{PrimaryObjectPlanColdCsgV2FixedHex(payloadBytes, 8)}{payloadHex}\n")
+    return true
+
+fn PrimaryObjectPlanColdCsgV2Validate(plan: PrimaryObjectPlan,
+                                       targetTriple: str,
+                                       objectFormat: str,
+                                       err: var str): bool =
+    if targetTriple == "":
+        err = "cold csg v2 facts: missing target triple"
+        return false
+    if objectFormat == "" || objectFormat == "unknown":
+        err = Fmt"cold csg v2 facts: unsupported object format: {objectFormat}"
+        return false
+    if plan.targetTriple != "" && plan.targetTriple != targetTriple:
+        err = Fmt"cold csg v2 facts: target triple mismatch plan={plan.targetTriple} requested={targetTriple}"
+        return false
+    if plan.objectFormat != "" && plan.objectFormat != objectFormat:
+        err = Fmt"cold csg v2 facts: object format mismatch plan={plan.objectFormat} requested={objectFormat}"
+        return false
+    if plan.missingReasons.len > 0:
+        let missingText = strutil.Join(plan.missingReasons, ",")
+        err = Fmt"cold csg v2 facts: primary object plan not ready: {missingText}"
+        return false
+    let functionCount = plan.itemIds.len
+    if plan.symbolNames.len != functionCount ||
+       plan.functionWordOffsets.len != functionCount ||
+       plan.functionWordCounts.len != functionCount ||
+       plan.functionBodyKinds.len != functionCount:
+        err = "cold csg v2 facts: primary object function arrays length mismatch"
+        return false
+    if plan.relocSourceItemIds.len != plan.relocWordOffsets.len ||
+       plan.relocSourceItemIds.len != plan.relocTargetSymbols.len:
+        err = "cold csg v2 facts: primary object reloc arrays length mismatch"
+        return false
+    for i in 0..<functionCount:
+        let wordOffset = plan.functionWordOffsets[i]
+        let wordCount = plan.functionWordCounts[i]
+        if plan.itemIds[i] < 0:
+            err = Fmt"cold csg v2 facts: negative item id at function index {strings.IntToStr(i)}"
+            return false
+        if wordOffset < 0 || wordCount < 0:
+            err = Fmt"cold csg v2 facts: negative word range at function index {strings.IntToStr(i)}"
+            return false
+        if wordOffset + wordCount > plan.instructionWords.len:
+            err = Fmt"cold csg v2 facts: function word range exceeds instruction words at function index {strings.IntToStr(i)}"
+            return false
+    for i in 0..<plan.relocSourceItemIds.len:
+        if plan.relocSourceItemIds[i] < 0:
+            err = Fmt"cold csg v2 facts: negative reloc source item id at reloc index {strings.IntToStr(i)}"
+            return false
+        if plan.relocWordOffsets[i] < 0 || plan.relocWordOffsets[i] >= plan.instructionWords.len:
+            err = Fmt"cold csg v2 facts: reloc word offset outside instruction words at reloc index {strings.IntToStr(i)}"
+            return false
+        if plan.relocTargetSymbols[i] == "":
+            err = Fmt"cold csg v2 facts: empty reloc target symbol at reloc index {strings.IntToStr(i)}"
+            return false
+    return true
+
+fn PrimaryObjectPlanColdCsgV2FactsInto(plan: PrimaryObjectPlan,
+                                        targetTriple: str,
+                                        objectFormat: str,
+                                        out: var str,
+                                        err: var str): bool =
+    if !PrimaryObjectPlanColdCsgV2Validate(plan, targetTriple, objectFormat, err):
+        return false
+    var parts: str[]
+    add(parts, "CHENG_CSG_V2\n")
+    if !PrimaryObjectPlanColdCsgV2AppendRecord(parts, 1, PrimaryObjectPlanColdCsgV2StringPayload(targetTriple), err):
+        return false
+    if !PrimaryObjectPlanColdCsgV2AppendRecord(parts, 2, PrimaryObjectPlanColdCsgV2StringPayload(objectFormat), err):
+        return false
+    if !PrimaryObjectPlanColdCsgV2AppendRecord(parts, 3, PrimaryObjectPlanColdCsgV2StringPayload(plan.entrySymbol), err):
+        return false
+    for i in 0..<plan.itemIds.len:
+        let payload = Fmt"{PrimaryObjectPlanColdCsgV2U32LeHex(plan.itemIds[i])}{PrimaryObjectPlanColdCsgV2U32LeHex(plan.functionWordOffsets[i])}{PrimaryObjectPlanColdCsgV2U32LeHex(plan.functionWordCounts[i])}{PrimaryObjectPlanColdCsgV2StringPayload(plan.symbolNames[i])}{PrimaryObjectPlanColdCsgV2StringPayload(plan.functionBodyKinds[i])}"
+        if !PrimaryObjectPlanColdCsgV2AppendRecord(parts, 4, payload, err):
+            return false
+    for i in 0..<plan.instructionWords.len:
+        if !PrimaryObjectPlanColdCsgV2AppendRecord(parts, 5, PrimaryObjectPlanColdCsgV2U32LeHex(plan.instructionWords[i]), err):
+            return false
+    for i in 0..<plan.relocSourceItemIds.len:
+        let payload = Fmt"{PrimaryObjectPlanColdCsgV2U32LeHex(plan.relocSourceItemIds[i])}{PrimaryObjectPlanColdCsgV2U32LeHex(plan.relocWordOffsets[i])}{PrimaryObjectPlanColdCsgV2StringPayload(plan.relocTargetSymbols[i])}"
+        if !PrimaryObjectPlanColdCsgV2AppendRecord(parts, 6, payload, err):
+            return false
+    out = strutil.Join(parts, "")
+    return true
+
 fn PrimaryObjectPlanIntListText(items: int32[]): str =
     if items.len <= 0:
         return "-"
@@ -8571,3 +8699,357 @@ fn PrimaryObjectPlanReport(plan: PrimaryObjectPlan): str =
     PrimaryObjectPlanAppendLine(out, "primary_object_missing_reasons", slplan.SystemLinkPlanListText(plan.missingReasons))
     out = Fmt"{out}primary_object_pipeline_stage={plan.pipelineStage}"
     return out
+
+fn PrimaryObjectPlanEmitCsgV2BinaryU16(out: var uint8[], v: int32) =
+    add(out, uint8(v & 0xFF))
+    add(out, uint8((v >> 8) & 0xFF))
+
+fn PrimaryObjectPlanEmitCsgV2BinaryU32(out: var uint8[], v: int32) =
+    add(out, uint8(v & 0xFF))
+    add(out, uint8((v >> 8) & 0xFF))
+    add(out, uint8((v >> 16) & 0xFF))
+    add(out, uint8((v >> 24) & 0xFF))
+
+fn PrimaryObjectPlanEmitCsgV2BinaryString(out: var uint8[], text: str) =
+    PrimaryObjectPlanEmitCsgV2BinaryU32(out, len(text))
+    for i in 0..<len(text):
+        add(out, uint8(int32(text[i])))
+
+fn PrimaryObjectPlanEmitCsgV2BinaryFacts(plan: PrimaryObjectPlan,
+                                          targetTriple: str): uint8[] =
+    var buf: uint8[]
+    # Magic: "CHENGCSG" (8 bytes)
+    add(buf, uint8(0x43))
+    add(buf, uint8(0x48))
+    add(buf, uint8(0x45))
+    add(buf, uint8(0x4E))
+    add(buf, uint8(0x47))
+    add(buf, uint8(0x43))
+    add(buf, uint8(0x53))
+    add(buf, uint8(0x47))
+    # Record kind 1: target triple
+    PrimaryObjectPlanEmitCsgV2BinaryU16(buf, 1)
+    PrimaryObjectPlanEmitCsgV2BinaryU32(buf, 4 + len(targetTriple))
+    PrimaryObjectPlanEmitCsgV2BinaryString(buf, targetTriple)
+    # Record kind 2: object format
+    PrimaryObjectPlanEmitCsgV2BinaryU16(buf, 2)
+    PrimaryObjectPlanEmitCsgV2BinaryU32(buf, 4 + len(plan.objectFormat))
+    PrimaryObjectPlanEmitCsgV2BinaryString(buf, plan.objectFormat)
+    # Record kind 3: entry symbol
+    PrimaryObjectPlanEmitCsgV2BinaryU16(buf, 3)
+    PrimaryObjectPlanEmitCsgV2BinaryU32(buf, 4 + len(plan.entrySymbol))
+    PrimaryObjectPlanEmitCsgV2BinaryString(buf, plan.entrySymbol)
+    # Record kind 4: functions
+    for i in 0..<plan.itemIds.len:
+        let funcPayloadSize = 12 + 4 + len(plan.symbolNames[i]) + 4 + len(plan.functionBodyKinds[i])
+        PrimaryObjectPlanEmitCsgV2BinaryU16(buf, 4)
+        PrimaryObjectPlanEmitCsgV2BinaryU32(buf, funcPayloadSize)
+        PrimaryObjectPlanEmitCsgV2BinaryU32(buf, plan.itemIds[i])
+        PrimaryObjectPlanEmitCsgV2BinaryU32(buf, plan.functionWordOffsets[i])
+        PrimaryObjectPlanEmitCsgV2BinaryU32(buf, plan.functionWordCounts[i])
+        PrimaryObjectPlanEmitCsgV2BinaryString(buf, plan.symbolNames[i])
+        PrimaryObjectPlanEmitCsgV2BinaryString(buf, plan.functionBodyKinds[i])
+    # Record kind 5: instruction words (batched)
+    if plan.instructionWords.len > 0:
+        PrimaryObjectPlanEmitCsgV2BinaryU16(buf, 5)
+        PrimaryObjectPlanEmitCsgV2BinaryU32(buf, plan.instructionWords.len * 4)
+        for i in 0..<plan.instructionWords.len:
+            PrimaryObjectPlanEmitCsgV2BinaryU32(buf, plan.instructionWords[i])
+    # Record kind 6: relocs
+    for i in 0..<plan.relocSourceItemIds.len:
+        let relPayloadSize = 8 + 4 + len(plan.relocTargetSymbols[i])
+        PrimaryObjectPlanEmitCsgV2BinaryU16(buf, 6)
+        PrimaryObjectPlanEmitCsgV2BinaryU32(buf, relPayloadSize)
+        PrimaryObjectPlanEmitCsgV2BinaryU32(buf, plan.relocSourceItemIds[i])
+        PrimaryObjectPlanEmitCsgV2BinaryU32(buf, plan.relocWordOffsets[i])
+        PrimaryObjectPlanEmitCsgV2BinaryString(buf, plan.relocTargetSymbols[i])
+    return buf
+
+# ============================================================
+# BodyIR-based section-binary CSG v2 writer
+# Matches cold_csg_v2_format.h exactly: HEADER + SECTION INDEX
+# + FUNCTION section + STRING section + TRAILER
+# ============================================================
+
+fn PrimaryBodyIrEmitCsgV2BinaryWord(buf: var uint8[], v: int32) =
+    PrimaryObjectPlanEmitCsgV2BinaryU32(buf, v)
+
+fn PrimaryBodyIrEmitCsgV2BinaryU32(buf: var uint8[], v: int32) =
+    PrimaryObjectPlanEmitCsgV2BinaryU32(buf, v)
+
+fn PrimaryBodyIrEmitCsgV2BinaryStr(buf: var uint8[], s: str) =
+    PrimaryObjectPlanEmitCsgV2BinaryString(buf, s)
+
+fn PrimaryBodyIrEmitCsgV2BinaryFindStringId(
+    symbols: str[],
+    baseId: int32,
+    target: str,
+): int32 =
+    for j in 0..<symbols.len:
+        if symbols[j] == target:
+            return baseId + j
+    return 0
+
+fn PrimaryBodyIrEmitCsgV2BinaryFacts(
+    bodyIR: coreir.BodyIR,
+    functionName: str,
+    targetTriple: str,
+): uint8[] =
+    var buf: uint8[]
+
+    # Phase 1: collect unique call target symbols (dedup)
+    var callTargetSymbols: str[]
+    for ci in 0..<bodyIR.callSequence.len:
+        let sym = bodyIR.callSequence[ci].targetSymbol
+        var found = false
+        for si in 0..<callTargetSymbols.len:
+            if callTargetSymbols[si] == sym:
+                found = true
+                break
+        if !found:
+            add(callTargetSymbols, sym)
+
+    let cstrCount = bodyIR.cstringLiterals.len
+
+    # ------- HEADER (64 bytes) -------
+    let magic = "CHENGCSG"
+    for i in 0..<8:
+        add(buf, uint8(int32(magic[i])))
+    # version = 2 (u32 LE)
+    PrimaryBodyIrEmitCsgV2BinaryU32(buf, 2)
+    # target_triple: 32 bytes, null-padded
+    let ttl = len(targetTriple)
+    for i in 0..<32:
+        add(buf, if i < ttl: uint8(int32(targetTriple[i])) else: uint8(0))
+    # abi = 0 (u32 LE)
+    PrimaryBodyIrEmitCsgV2BinaryU32(buf, 0)
+    # pointer_width = 8 (u8)
+    add(buf, uint8(8))
+    # endianness = 0 LE (u8)
+    add(buf, uint8(0))
+    # reserved (14 bytes, total header = 64)
+    for i in 0..<14:
+        add(buf, uint8(0))
+
+    # ------- SECTION INDEX placeholder -------
+    # section_count(u32) + N * (kind(u32)+offset(u64)+size(u32))
+    let sectionIndexStart = int32(buf.len)
+    PrimaryBodyIrEmitCsgV2BinaryU32(buf, 2)  # 2 sections: function + string
+
+    # Section index entry 0: function section (kind=1)
+    let entry0KindPos = int32(buf.len)
+    PrimaryBodyIrEmitCsgV2BinaryU32(buf, 1)
+    let entry0OffPos = int32(buf.len)
+    for i in 0..<8:
+        add(buf, uint8(0))
+    let entry0SizePos = int32(buf.len)
+    PrimaryBodyIrEmitCsgV2BinaryU32(buf, 0)
+
+    # Section index entry 1: string section (kind=5)
+    let entry1KindPos = int32(buf.len)
+    PrimaryBodyIrEmitCsgV2BinaryU32(buf, 5)
+    let entry1OffPos = int32(buf.len)
+    for i in 0..<8:
+        add(buf, uint8(0))
+    let entry1SizePos = int32(buf.len)
+    PrimaryBodyIrEmitCsgV2BinaryU32(buf, 0)
+
+    # ------- FUNCTION SECTION (kind=1) -------
+    let functionSectionStart = int32(buf.len)
+
+    # fn_count = 1
+    PrimaryBodyIrEmitCsgV2BinaryU32(buf, 1)
+
+    # Function name
+    PrimaryBodyIrEmitCsgV2BinaryStr(buf, functionName)
+
+    # param_count
+    var paramCount: int32
+    for li in 0..<bodyIR.localSlots.len:
+        if bodyIR.localSlots[li].placeKind == coreir.BodyPlaceParamAddressTag:
+            paramCount = paramCount + 1
+    PrimaryBodyIrEmitCsgV2BinaryU32(buf, paramCount)
+
+    # params: each = kind(u32) size(u32) slot_index(u32) = 12 bytes
+    for li in 0..<bodyIR.localSlots.len:
+        if bodyIR.localSlots[li].placeKind == coreir.BodyPlaceParamAddressTag:
+            let slot = bodyIR.localSlots[li]
+            PrimaryBodyIrEmitCsgV2BinaryU32(buf, slot.typeKind)
+            PrimaryBodyIrEmitCsgV2BinaryU32(buf, slot.sizeBytes)
+            PrimaryBodyIrEmitCsgV2BinaryU32(buf, slot.id)
+
+    # return_kind: type of the return term's result slot
+    var returnKind: int32
+    for ti in 0..<bodyIR.terms.len:
+        if bodyIR.terms[ti].kind == coreir.BodyTermReturnTag:
+            let retSlot = bodyIR.terms[ti].resultSlot
+            if retSlot >= 0 && retSlot < bodyIR.localSlots.len:
+                returnKind = bodyIR.localSlots[retSlot].typeKind
+            break
+    PrimaryBodyIrEmitCsgV2BinaryU32(buf, returnKind)
+
+    # frame_size = max(stackOffset + sizeBytes) across all locals
+    var maxFrameOffset: int32
+    for li in 0..<bodyIR.localSlots.len:
+        let slotEnd = bodyIR.localSlots[li].stackOffset + bodyIR.localSlots[li].sizeBytes
+        if slotEnd > maxFrameOffset:
+            maxFrameOffset = slotEnd
+    PrimaryBodyIrEmitCsgV2BinaryU32(buf, maxFrameOffset)
+
+    # op_count + ops
+    PrimaryBodyIrEmitCsgV2BinaryU32(buf, bodyIR.ops.len)
+    for oi in 0..<bodyIR.ops.len:
+        let op = bodyIR.ops[oi]
+        PrimaryBodyIrEmitCsgV2BinaryU32(buf, op.kind)
+        PrimaryBodyIrEmitCsgV2BinaryU32(buf, op.target)
+        let opA = if op.operands.len > 0: op.operands[0] else: 0
+        let opB = if op.operands.len > 1: op.operands[1] else: 0
+        let opC = if op.operands.len > 2: op.operands[2] else: 0
+        PrimaryBodyIrEmitCsgV2BinaryU32(buf, opA)
+        PrimaryBodyIrEmitCsgV2BinaryU32(buf, opB)
+        PrimaryBodyIrEmitCsgV2BinaryU32(buf, opC)
+
+    # slot_count + slots
+    PrimaryBodyIrEmitCsgV2BinaryU32(buf, bodyIR.localSlots.len)
+    for li in 0..<bodyIR.localSlots.len:
+        let slot = bodyIR.localSlots[li]
+        PrimaryBodyIrEmitCsgV2BinaryU32(buf, slot.typeKind)
+        PrimaryBodyIrEmitCsgV2BinaryU32(buf, slot.stackOffset)
+        PrimaryBodyIrEmitCsgV2BinaryU32(buf, slot.sizeBytes)
+
+    # block_count + blocks
+    PrimaryBodyIrEmitCsgV2BinaryU32(buf, bodyIR.blocks.len)
+    for bi in 0..<bodyIR.blocks.len:
+        let block = bodyIR.blocks[bi]
+        PrimaryBodyIrEmitCsgV2BinaryU32(buf, block.opStart)
+        PrimaryBodyIrEmitCsgV2BinaryU32(buf, block.opCount)
+        PrimaryBodyIrEmitCsgV2BinaryU32(buf, block.termIndex)
+
+    # term_count + terms
+    PrimaryBodyIrEmitCsgV2BinaryU32(buf, bodyIR.terms.len)
+    for ti in 0..<bodyIR.terms.len:
+        let term = bodyIR.terms[ti]
+        PrimaryBodyIrEmitCsgV2BinaryU32(buf, term.kind)
+        # value: Return -> resultSlot, else first operand
+        let termValue = if term.kind == coreir.BodyTermReturnTag: term.resultSlot
+                        else if term.operands.len > 0: term.operands[0]
+                        else: 0
+        PrimaryBodyIrEmitCsgV2BinaryU32(buf, termValue)
+        PrimaryBodyIrEmitCsgV2BinaryU32(buf, 0)   # case_start
+        PrimaryBodyIrEmitCsgV2BinaryU32(buf, 0)   # case_count
+        PrimaryBodyIrEmitCsgV2BinaryU32(buf, term.trueBlock)
+        PrimaryBodyIrEmitCsgV2BinaryU32(buf, term.falseBlock)
+
+    # switch_count = 0 (no switch support yet)
+    PrimaryBodyIrEmitCsgV2BinaryU32(buf, 0)
+
+    # call_count
+    let callCount = bodyIR.callSequence.len
+    PrimaryBodyIrEmitCsgV2BinaryU32(buf, callCount)
+
+    # Pre-count flat call args
+    var flatCallArgCount: int32
+    for ci in 0..<callCount:
+        flatCallArgCount = flatCallArgCount + bodyIR.callSequence[ci].argSlots.len
+
+    # calls
+    var argStart: int32
+    for ci in 0..<callCount:
+        let call = bodyIR.callSequence[ci]
+        let targetId = PrimaryBodyIrEmitCsgV2BinaryFindStringId(
+            callTargetSymbols, cstrCount, call.targetSymbol)
+        PrimaryBodyIrEmitCsgV2BinaryU32(buf, targetId)
+        PrimaryBodyIrEmitCsgV2BinaryU32(buf, argStart)
+        PrimaryBodyIrEmitCsgV2BinaryU32(buf, call.argSlots.len)
+        PrimaryBodyIrEmitCsgV2BinaryU32(buf, call.resultSlot)
+        argStart = argStart + call.argSlots.len
+
+    # call_arg_count + call_args
+    PrimaryBodyIrEmitCsgV2BinaryU32(buf, flatCallArgCount)
+    for ci in 0..<callCount:
+        let call = bodyIR.callSequence[ci]
+        for ai in 0..<call.argSlots.len:
+            let argSlotIdx = call.argSlots[ai]
+            let argOffset = if argSlotIdx >= 0 && argSlotIdx < bodyIR.localSlots.len:
+                               bodyIR.localSlots[argSlotIdx].stackOffset
+                            else: 0
+            PrimaryBodyIrEmitCsgV2BinaryU32(buf, argSlotIdx)
+            PrimaryBodyIrEmitCsgV2BinaryU32(buf, argOffset)
+
+    # str_lit_count + str_lits
+    PrimaryBodyIrEmitCsgV2BinaryU32(buf, cstrCount)
+    for li in 0..<cstrCount:
+        PrimaryBodyIrEmitCsgV2BinaryU32(buf, bodyIR.cstringLiterals[li].id)
+
+    let functionSectionEnd = int32(buf.len)
+    let functionSectionSize = functionSectionEnd - functionSectionStart
+
+    # ------- STRING SECTION (kind=5) -------
+    let stringSectionStart = int32(buf.len)
+    let stringCount = cstrCount + callTargetSymbols.len
+    PrimaryBodyIrEmitCsgV2BinaryU32(buf, stringCount)
+
+    # CStringLiteralEntry texts: each = id(u32) len(u32) + utf8
+    for li in 0..<cstrCount:
+        let literal = bodyIR.cstringLiterals[li]
+        PrimaryBodyIrEmitCsgV2BinaryU32(buf, literal.id)
+        PrimaryBodyIrEmitCsgV2BinaryStr(buf, literal.text)
+
+    # Call target symbol names: each = id(u32) len(u32) + utf8
+    for si in 0..<callTargetSymbols.len:
+        PrimaryBodyIrEmitCsgV2BinaryU32(buf, cstrCount + si)
+        PrimaryBodyIrEmitCsgV2BinaryStr(buf, callTargetSymbols[si])
+
+    let stringSectionEnd = int32(buf.len)
+    let stringSectionSize = stringSectionEnd - stringSectionStart
+
+    # ------- Patch SECTION INDEX with real offsets -------
+    # Entry 0 (function): offset(u64) at entry0OffPos
+    let funcOff = functionSectionStart
+    buf[entry0OffPos]     = uint8(funcOff & 0xFF)
+    buf[entry0OffPos + 1] = uint8((funcOff >> 8) & 0xFF)
+    buf[entry0OffPos + 2] = uint8((funcOff >> 16) & 0xFF)
+    buf[entry0OffPos + 3] = uint8((funcOff >> 24) & 0xFF)
+    buf[entry0OffPos + 4] = uint8(0)
+    buf[entry0OffPos + 5] = uint8(0)
+    buf[entry0OffPos + 6] = uint8(0)
+    buf[entry0OffPos + 7] = uint8(0)
+    # Entry 0: size(u32) at entry0SizePos
+    let funcSz = functionSectionSize
+    buf[entry0SizePos]     = uint8(funcSz & 0xFF)
+    buf[entry0SizePos + 1] = uint8((funcSz >> 8) & 0xFF)
+    buf[entry0SizePos + 2] = uint8((funcSz >> 16) & 0xFF)
+    buf[entry0SizePos + 3] = uint8((funcSz >> 24) & 0xFF)
+
+    # Entry 1 (string): offset(u64) at entry1OffPos
+    let strOff = stringSectionStart
+    buf[entry1OffPos]     = uint8(strOff & 0xFF)
+    buf[entry1OffPos + 1] = uint8((strOff >> 8) & 0xFF)
+    buf[entry1OffPos + 2] = uint8((strOff >> 16) & 0xFF)
+    buf[entry1OffPos + 3] = uint8((strOff >> 24) & 0xFF)
+    buf[entry1OffPos + 4] = uint8(0)
+    buf[entry1OffPos + 5] = uint8(0)
+    buf[entry1OffPos + 6] = uint8(0)
+    buf[entry1OffPos + 7] = uint8(0)
+    # Entry 1: size(u32) at entry1SizePos
+    let strSz = stringSectionSize
+    buf[entry1SizePos]     = uint8(strSz & 0xFF)
+    buf[entry1SizePos + 1] = uint8((strSz >> 8) & 0xFF)
+    buf[entry1SizePos + 2] = uint8((strSz >> 16) & 0xFF)
+    buf[entry1SizePos + 3] = uint8((strSz >> 24) & 0xFF)
+
+    # ------- TRAILER (32 bytes) -------
+    # section_count = 2 (u32) + hash 28 zero bytes
+    PrimaryBodyIrEmitCsgV2BinaryU32(buf, 2)
+    for i in 0..<28:
+        add(buf, uint8(0))
+
+    return buf
+
+fn PrimaryObjectPlanWriteCsgV2BinaryFacts(path: str, plan: PrimaryObjectPlan, target: str) =
+    if plan.functionBodyIRs.len <= 0:
+        return
+    let functionName = if plan.symbolNames.len > 0: plan.symbolNames[0] else: ""
+    let facts = PrimaryBodyIrEmitCsgV2BinaryFacts(
+        plan.functionBodyIRs[0], functionName, target)
+    os.WriteFileBytes(path, facts)

@@ -42,6 +42,7 @@ static bool cold_diag_dump_slots = false;
 #include "coff_direct.h"
 #include "x64_emit.h"
 #include "rv64_emit.h"
+#include "cold_csg_v2_format.h"
 
 #ifndef MAP_ANON
 #define MAP_ANON MAP_ANONYMOUS
@@ -1562,7 +1563,7 @@ static bool cold_recognize_dispatch_chain(Span body, ColdManifestStats *stats,
 
     int32_t default_value = 0;
     if (line_index != count - 1 || !cold_parse_return_i32_line(lines[line_index], &default_value)) return false;
-    if (case_count != 7 || default_value != 2) return false;
+    if (case_count != 8 || default_value != 2) return false;
     for (int32_t i = 0; i < case_count; i++) {
         if (stats->entry_dispatch_cases[i].code != i) return false;
     }
@@ -1617,7 +1618,7 @@ static bool cold_recognize_command_code_table(Span body, ColdManifestStats *stat
 
     int32_t default_value = 0;
     if (line_index != count - 1 || !cold_parse_return_i32_line(lines[line_index], &default_value)) return false;
-    if (case_count != 9 || default_value != -1) return false;
+    if (case_count != 10 || default_value != -1) return false;
     static const char *expected_texts[] = {
         "help",
         "-h",
@@ -1627,9 +1628,10 @@ static bool cold_recognize_command_code_table(Span body, ColdManifestStats *stat
         "verify-export-visibility",
         "verify-export-visibility-parallel",
         "system-link-exec",
+        "emit-cold-csg-v2",
         "run-host-smokes",
     };
-    static const int32_t expected_codes[] = {0, 0, 0, 1, 2, 3, 4, 5, 6};
+    static const int32_t expected_codes[] = {0, 0, 0, 1, 2, 3, 4, 5, 7, 6};
     for (int32_t i = 0; i < case_count; i++) {
         if (strcmp(stats->entry_command_cases[i].text, expected_texts[i]) != 0 ||
             stats->entry_command_cases[i].code != expected_codes[i]) return false;
@@ -17713,165 +17715,494 @@ static void x64_codegen_op(X64Code *x, BodyIR *body, Symbols *symbols,
     int32_t b = body->op_b[op];
     int32_t c = body->op_c[op];
     int32_t off_dst = body->slot_offset[dst];
+    /* I32 arithmetic */
     if (kind == BODY_OP_I32_CONST) {
-        x64_mov_r32_imm32(x, 0, a); /* mov $a, %eax */
-        x64_mov_mr32_r32_store(x, 4, off_dst, 0); /* mov %eax, [rsp+off] */
+        x64_mov_r32_imm32(x, 0, (int32_t)a);
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
     } else if (kind == BODY_OP_COPY_I32) {
         x64_mov_r32_mr32(x, 0, 4, body->slot_offset[a]);
-        x64_mov_mr32_r32_store(x, 4, off_dst, 0);
-    } else if (kind == BODY_OP_LOAD_I32) {
-        /* a = global index, load via RIP-relative */
-        x64_mov_r32_imm32(x, 0, 0);
-        x64_mov_mr32_r32_store(x, 4, off_dst, 0);
-    } else if (kind == BODY_OP_CALL_I32) {
-        if (a >= 0 && a < symbols->function_count) {
-            int32_t call_pos = x->len + 1; /* after E8 opcode */
-            x64_call_rel32(x, 0);
-            function_patches_add(patches, call_pos, a);
-        }
-        x64_mov_mr32_r32_store(x, 4, off_dst, 0); /* store return value */
-    } else if (kind == BODY_OP_STR_LITERAL) {
-        x64_mov_r64_imm64(x, 0, 0); /* placeholder, patched later */
-        x64_mov_mr64_r64_store(x, 4, off_dst, 0);
-    } else if (kind == BODY_OP_I32_ADD) {
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_I32_ADD || kind == BODY_OP_I32_SUB) {
         int32_t oa = body->slot_offset[a], ob = body->slot_offset[b];
         x64_mov_r32_mr32(x, 0, 4, oa);
         x64_mov_r32_mr32(x, 1, 4, ob);
-        x64_add_r32_r32(x, 0, 1); /* add %ecx, %eax */
-        x64_mov_mr32_r32_store(x, 4, off_dst, 0);
-    } else if (kind == BODY_OP_I32_SUB) {
-        int32_t oa = body->slot_offset[a], ob = body->slot_offset[b];
-        x64_mov_r32_mr32(x, 0, 4, oa);
-        x64_mov_r32_mr32(x, 1, 4, ob);
-        x64_sub_r32_r32(x, 0, 1);
-        x64_mov_mr32_r32_store(x, 4, off_dst, 0);
+        if (kind == BODY_OP_I32_ADD) x64_add_r32_r32(x, 0, 1);
+        else x64_sub_r32_r32(x, 0, 1);
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
     } else if (kind == BODY_OP_I32_MUL) {
-        int32_t oa = body->slot_offset[a], ob = body->slot_offset[b];
-        x64_mov_r32_mr32(x, 0, 4, oa);
-        x64_mov_r32_mr32(x, 1, 4, ob);
+        x64_mov_r32_mr32(x, 0, 4, body->slot_offset[a]);
+        x64_mov_r32_mr32(x, 1, 4, body->slot_offset[b]);
         x64_imul_r32_r32(x, 0, 1);
-        x64_mov_mr32_r32_store(x, 4, off_dst, 0);
-    } else if (kind == BODY_OP_I32_CMP) {
-        int32_t oa = body->slot_offset[a], ob = body->slot_offset[b];
-        x64_mov_r32_mr32(x, 0, 4, oa);
-        x64_mov_r32_mr32(x, 1, 4, ob);
-        x64_cmp_r32_r32(x, 0, 1);
-        /* result already in flags, store 0 for now */
-        x64_mov_r32_imm32(x, 0, 0);
-        x64_mov_mr32_r32_store(x, 4, off_dst, 0);
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
     } else if (kind == BODY_OP_I32_DIV) {
-        int32_t oa = body->slot_offset[a], ob = body->slot_offset[b];
-        x64_mov_r32_mr32(x, 0, 4, oa);
-        x64_mov_r32_mr32(x, 1, 4, ob);
-        /* CDQ + IDIV: eax = edx:eax / ecx */
-        x64_emit1(x, 0x99); /* CDQ */
-        x64_emit1(x, 0xF7); x64_emit1(x, MODRM(3, 7, 1)); /* IDIV %ecx */
-        x64_mov_mr32_r32_store(x, 4, off_dst, 0);
+        x64_mov_r32_mr32(x, 0, 4, body->slot_offset[a]);
+        x64_mov_r32_mr32(x, 1, 4, body->slot_offset[b]);
+        x64_cdq(x); x64_idiv_r32(x, 1);
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_I32_MOD) {
+        x64_mov_r32_mr32(x, 0, 4, body->slot_offset[a]);
+        x64_mov_r32_mr32(x, 1, 4, body->slot_offset[b]);
+        x64_cdq(x); x64_idiv_r32(x, 1);
+        x64_mov_r32_r32(x, 0, 2); /* remainder in EDX */
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
     } else if (kind == BODY_OP_I32_AND) {
-        int32_t oa = body->slot_offset[a], ob = body->slot_offset[b];
-        x64_mov_r32_mr32(x, 0, 4, oa);
-        x64_mov_r32_mr32(x, 1, 4, ob);
-        x64_emit1(x, 0x21); x64_emit1(x, MODRM(3, 1, 0)); /* AND %ecx, %eax */
-        x64_mov_mr32_r32_store(x, 4, off_dst, 0);
+        x64_mov_r32_mr32(x, 0, 4, body->slot_offset[a]);
+        x64_mov_r32_mr32(x, 1, 4, body->slot_offset[b]);
+        x64_emit1(x, 0x21); x64_emit1(x, MODRM(3, 1, 0)); /* AND %ecx,%eax */
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
     } else if (kind == BODY_OP_I32_OR) {
-        int32_t oa = body->slot_offset[a], ob = body->slot_offset[b];
-        x64_mov_r32_mr32(x, 0, 4, oa);
-        x64_mov_r32_mr32(x, 1, 4, ob);
-        x64_emit1(x, 0x09); x64_emit1(x, MODRM(3, 1, 0)); /* OR %ecx, %eax */
-        x64_mov_mr32_r32_store(x, 4, off_dst, 0);
-    } else if (kind == BODY_OP_STR_LEN) {
-        x64_mov_r32_mr32(x, 0, 4, body->slot_offset[a] + 8);
-        x64_mov_mr32_r32_store(x, 4, off_dst, 0);
+        x64_mov_r32_mr32(x, 0, 4, body->slot_offset[a]);
+        x64_mov_r32_mr32(x, 1, 4, body->slot_offset[b]);
+        x64_emit1(x, 0x09); x64_emit1(x, MODRM(3, 1, 0)); /* OR %ecx,%eax */
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_I32_XOR) {
+        x64_mov_r32_mr32(x, 0, 4, body->slot_offset[a]);
+        x64_mov_r32_mr32(x, 1, 4, body->slot_offset[b]);
+        x64_xor_r32_r32(x, 0, 1);
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_I32_SHL) {
+        x64_mov_r32_mr32(x, 1, 4, body->slot_offset[b]);
+        x64_mov_r32_r32(x, 1, 1); /* shift count to ECX */
+        x64_mov_r32_mr32(x, 0, 4, body->slot_offset[a]);
+        x64_shl_r32_cl(x, 0);
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_I32_ASR) {
+        x64_mov_r32_mr32(x, 1, 4, body->slot_offset[b]);
+        x64_mov_r32_r32(x, 1, 1);
+        x64_mov_r32_mr32(x, 0, 4, body->slot_offset[a]);
+        x64_sar_r32_cl(x, 0);
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_I32_CMP) {
+        x64_mov_r32_mr32(x, 0, 4, body->slot_offset[a]);
+        x64_mov_r32_mr32(x, 1, 4, body->slot_offset[b]);
+        x64_cmp_r32_r32(x, 0, 1);
+        x64_setcc_r8(x, c, 0);
+        x64_movzb_r8_r32(x, 0, 0);
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
+    /* I64 arithmetic */
     } else if (kind == BODY_OP_I64_CONST) {
         uint64_t bits = (uint32_t)a | ((uint64_t)(uint32_t)b << 32);
         x64_mov_r64_imm64(x, 0, bits);
-        x64_mov_mr64_r64_store(x, 4, off_dst, 0);
-    } else if (kind == BODY_OP_COPY_I64 || kind == BODY_OP_COPY_COMPOSITE) {
-        int32_t sz = body->slot_size[dst];
-        int32_t os = body->slot_offset[a];
-        for (int32_t off = 0; off < sz; off += 8) {
-            x64_mov_r64_mr64(x, 0, 4, os + off);
-            x64_mov_mr64_r64_store(x, 4, off_dst + off, 0);
-        }
-    } else if (kind == BODY_OP_PAYLOAD_LOAD) {
-        int32_t base = body->slot_offset[a];
-        x64_mov_r64_mr64(x, 0, 4, base + b);
-        x64_mov_mr64_r64_store(x, 4, off_dst, 0);
-    } else if (kind == BODY_OP_PAYLOAD_STORE) {
-        int32_t base = body->slot_offset[dst];
+        x64_mov_mr64_r64(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_COPY_I64) {
         x64_mov_r64_mr64(x, 0, 4, body->slot_offset[a]);
-        x64_mov_mr64_r64_store(x, 4, base + b, 0);
-    } else if (kind == BODY_OP_FN_ADDR) {
-        x64_mov_r64_imm64(x, 0, 0); /* placeholder for ADR */
-        x64_mov_mr64_r64_store(x, 4, off_dst, 0);
-    } else if (kind == BODY_OP_CALL_PTR) {
-        int32_t fn_slot = a;
-        x64_mov_r64_mr64(x, 0, 4, body->slot_offset[fn_slot]);
-        x64_call_reg(x, 0);
-        x64_mov_mr32_r32_store(x, 4, off_dst, 0);
+        x64_mov_mr64_r64(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_I64_FROM_I32) {
+        x64_movsxd_r64_r32(x, 0, 0);
+        x64_mov_mr64_r64(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_I32_FROM_I64) {
+        x64_mov_r32_mr32(x, 0, 4, body->slot_offset[a]);
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_I64_ADD || kind == BODY_OP_I64_SUB ||
+               kind == BODY_OP_I64_MUL) {
+        x64_mov_r64_mr64(x, 0, 4, body->slot_offset[a]);
+        x64_mov_r64_mr64(x, 1, 4, body->slot_offset[b]);
+        if (kind == BODY_OP_I64_ADD) x64_add_r64_r64(x, 0, 1);
+        else if (kind == BODY_OP_I64_SUB) x64_sub_r64_r64(x, 0, 1);
+        else x64_imul_r64_r64(x, 0, 1);
+        x64_mov_mr64_r64(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_I64_DIV) {
+        x64_mov_r64_mr64(x, 0, 4, body->slot_offset[a]);
+        x64_mov_r64_mr64(x, 1, 4, body->slot_offset[b]);
+        x64_cqo(x); x64_idiv_r64(x, 1);
+        x64_mov_mr64_r64(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_I64_AND || kind == BODY_OP_I64_OR ||
+               kind == BODY_OP_I64_XOR) {
+        x64_mov_r64_mr64(x, 0, 4, body->slot_offset[a]);
+        x64_mov_r64_mr64(x, 1, 4, body->slot_offset[b]);
+        if (kind == BODY_OP_I64_AND) x64_and_r64_r64(x, 0, 1);
+        else if (kind == BODY_OP_I64_OR) x64_or_r64_r64(x, 0, 1);
+        else x64_xor_r64_r64(x, 0, 1);
+        x64_mov_mr64_r64(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_I64_SHL || kind == BODY_OP_I64_ASR) {
+        x64_mov_r32_mr32(x, 1, 4, body->slot_offset[b]);
+        x64_mov_r32_r32(x, 1, 1);
+        x64_mov_r64_mr64(x, 0, 4, body->slot_offset[a]);
+        if (kind == BODY_OP_I64_SHL) x64_shl_r64_cl(x, 0);
+        else x64_sar_r64_cl(x, 0);
+        x64_mov_mr64_r64(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_I64_CMP) {
+        x64_mov_r64_mr64(x, 0, 4, body->slot_offset[a]);
+        x64_mov_r64_mr64(x, 1, 4, body->slot_offset[b]);
+        x64_cmp_r64_r64(x, 0, 1);
+        x64_setcc_r8(x, c, 0);
+        x64_movzb_r8_r32(x, 0, 0);
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
+    /* Float: F32 */
+    } else if (kind == BODY_OP_F32_CONST) {
+        float val; memcpy(&val, &a, 4);
+        int32_t bits; memcpy(&bits, &val, 4);
+        x64_mov_r32_imm32(x, 0, bits);
+        x64_movd_xmm_r32(x, 0, 0);
+        x64_movss_mr_xmm(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_F32_ADD || kind == BODY_OP_F32_SUB ||
+               kind == BODY_OP_F32_MUL || kind == BODY_OP_F32_DIV) {
+        x64_movss_xmm_mr(x, 0, 4, body->slot_offset[a]);
+        x64_movss_xmm_mr(x, 1, 4, body->slot_offset[b]);
+        if (kind == BODY_OP_F32_ADD) x64_addss(x, 0, 1);
+        else if (kind == BODY_OP_F32_SUB) x64_subss(x, 0, 1);
+        else if (kind == BODY_OP_F32_MUL) x64_mulss(x, 0, 1);
+        else x64_divss(x, 0, 1);
+        x64_movss_mr_xmm(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_F32_NEG) {
+        x64_movss_xmm_mr(x, 0, 4, body->slot_offset[a]);
+        /* XOR sign bit: xmm1 = -0.0f, xorpd xmm0, xmm1 */
+        x64_mov_r32_imm32(x, 0, 0x80000000);
+        x64_movd_xmm_r32(x, 1, 0);
+        x64_xorps(x, 0, 1);
+        x64_movss_mr_xmm(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_F32_CMP) {
+        x64_movss_xmm_mr(x, 0, 4, body->slot_offset[a]);
+        x64_movss_xmm_mr(x, 1, 4, body->slot_offset[b]);
+        x64_ucomiss(x, 0, 1);
+        x64_setcc_r8(x, c, 0);
+        x64_movzb_r8_r32(x, 0, 0);
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_F32_FROM_I32) {
+        x64_mov_r32_mr32(x, 0, 4, body->slot_offset[a]);
+        x64_cvtsi2ss(x, 0, 0);
+        x64_movss_mr_xmm(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_I32_FROM_F32) {
+        x64_movss_xmm_mr(x, 0, 4, body->slot_offset[a]);
+        x64_cvttss2si(x, 0, 0);
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
+    /* Float: F64 */
+    } else if (kind == BODY_OP_F64_CONST) {
+        uint64_t bits = (uint32_t)a | ((uint64_t)(uint32_t)b << 32);
+        x64_mov_r64_imm64(x, 0, bits);
+        x64_movd_xmm_r32(x, 0, 0);
+        x64_movsd_mr_xmm(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_F64_ADD || kind == BODY_OP_F64_SUB ||
+               kind == BODY_OP_F64_MUL || kind == BODY_OP_F64_DIV) {
+        x64_movsd_xmm_mr(x, 0, 4, body->slot_offset[a]);
+        x64_movsd_xmm_mr(x, 1, 4, body->slot_offset[b]);
+        if (kind == BODY_OP_F64_ADD) x64_addsd(x, 0, 1);
+        else if (kind == BODY_OP_F64_SUB) x64_subsd(x, 0, 1);
+        else if (kind == BODY_OP_F64_MUL) x64_mulsd(x, 0, 1);
+        else x64_divsd(x, 0, 1);
+        x64_movsd_mr_xmm(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_F64_NEG) {
+        x64_movsd_xmm_mr(x, 0, 4, body->slot_offset[a]);
+        x64_mov_r64_imm64(x, 0, 0x8000000000000000ULL);
+        x64_movd_xmm_r32(x, 1, 0);
+        x64_xorps(x, 0, 1);
+        x64_movsd_mr_xmm(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_F64_CMP) {
+        x64_movsd_xmm_mr(x, 0, 4, body->slot_offset[a]);
+        x64_movsd_xmm_mr(x, 1, 4, body->slot_offset[b]);
+        x64_ucomisd(x, 0, 1);
+        x64_setcc_r8(x, c, 0);
+        x64_movzb_r8_r32(x, 0, 0);
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_F64_FROM_I32) {
+        x64_mov_r32_mr32(x, 0, 4, body->slot_offset[a]);
+        x64_cvtsi2sd(x, 0, 0);
+        x64_movsd_mr_xmm(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_I32_FROM_F64) {
+        x64_movsd_xmm_mr(x, 0, 4, body->slot_offset[a]);
+        x64_cvttsd2si(x, 0, 0);
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
+    /* String ops */
+    } else if (kind == BODY_OP_STR_LITERAL) {
+        if (a >= 0 && a < body->string_literal_count) {
+            Span literal = body->string_literal[a];
+            x64_lea_r64_mr(x, 0, 4, 0); /* placeholder, patched later with data offset */
+            x64_mov_mr64_r64(x, 4, off_dst, 0);
+            x64_mov_r32_imm32(x, 0, (int32_t)literal.len);
+            x64_mov_mr32_r32(x, 4, off_dst + 8, 0);
+        }
+    } else if (kind == BODY_OP_STR_LEN) {
+        x64_mov_r32_mr32(x, 0, 4, body->slot_offset[a] + 8);
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_STR_EQ) {
+        /* str_eq via memcmp: compare ptr+len */
+        x64_mov_r64_mr64(x, 0, 4, body->slot_offset[a]);
+        x64_mov_r64_mr64(x, 1, 4, body->slot_offset[a] + 8);
+        x64_mov_r64_mr64(x, 2, 4, body->slot_offset[b]);
+        x64_mov_r64_mr64(x, 3, 4, body->slot_offset[b] + 8);
+        /* compare lengths */
+        x64_cmp_r64_r64(x, 1, 3);
+        int32_t len_ne = x->len + 2;
+        x64_jcc_rel8(x, CC_NE, 0);
+        /* compare bytes - simplified: just check if lengths equal for now */
+        x64_mov_r32_imm32(x, 0, 0); /* result */
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_STR_CONCAT) {
+        /* str_concat: simplified - store empty string */
+        x64_mov_r32_imm32(x, 0, 0);
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_I32_TO_STR || kind == BODY_OP_I64_TO_STR ||
+               kind == BODY_OP_STR_INDEX || kind == BODY_OP_STR_JOIN ||
+               kind == BODY_OP_STR_SPLIT_CHAR || kind == BODY_OP_STR_STRIP ||
+               kind == BODY_OP_STR_SLICE || kind == BODY_OP_SHELL_QUOTE) {
+        /* Complex string ops: emit stub returning empty string */
+        x64_mov_r32_imm32(x, 0, 0);
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
+    /* Load/Store */
+    } else if (kind == BODY_OP_LOAD_I32) {
+        x64_mov_r32_imm32(x, 0, 0);
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_PAYLOAD_LOAD) {
+        x64_mov_r64_mr64(x, 0, 4, body->slot_offset[a] + b);
+        x64_mov_mr64_r64(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_PAYLOAD_STORE) {
+        x64_mov_r64_mr64(x, 0, 4, body->slot_offset[a]);
+        x64_mov_mr64_r64(x, 4, body->slot_offset[dst] + b, 0);
+    } else if (kind == BODY_OP_TAG_LOAD) {
+        x64_mov_r32_mr32(x, 0, 4, body->slot_offset[a]);
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_I32_REF_LOAD) {
+        x64_mov_r64_mr64(x, 0, 4, body->slot_offset[a]);
+        x64_mov_r32_mr32_base(x, 0, 0);
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_I32_REF_STORE) {
+        x64_mov_r64_mr64(x, 0, 4, body->slot_offset[dst]);
+        x64_mov_r32_mr32(x, 1, 4, body->slot_offset[a]);
+        x64_mov_mr32_base_r32(x, 0, 1);
+    } else if (kind == BODY_OP_FIELD_REF) {
+        x64_lea_r64_mr(x, 0, 4, body->slot_offset[a] + b);
+        x64_mov_mr64_r64(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_STR_REF_STORE) {
+        x64_mov_r64_mr64(x, 0, 4, body->slot_offset[dst]);
+        x64_mov_r64_mr64(x, 1, 4, body->slot_offset[a]);
+        x64_mov_mr64_base_r64(x, 0, 1);
+        x64_mov_r64_mr64(x, 1, 4, body->slot_offset[a] + 8);
+        x64_emit1(x, REX_W | REX_R); x64_emit1(x, 0x89); x64_emit1(x, MODRM(1, 1 & 7, 0));
+        x64_emit1(x, 8);
+    /* Copy */
+    } else if (kind == BODY_OP_COPY_COMPOSITE) {
+        int32_t sz = body->slot_size[dst];
+        for (int32_t off = 0; off < sz; off += 8) {
+            x64_mov_r64_mr64(x, 0, 4, body->slot_offset[a] + off);
+            x64_mov_mr64_r64(x, 4, off_dst + off, 0);
+        }
+    /* Calls */
+    } else if (kind == BODY_OP_CALL_I32) {
+        if (a >= 0 && a < symbols->function_count) {
+            int32_t call_pos = x->len + 1;
+            x64_call_rel32(x, 0);
+            function_patches_add(patches, call_pos, a);
+        }
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
     } else if (kind == BODY_OP_CALL_COMPOSITE) {
         if (a >= 0 && a < symbols->function_count) {
             int32_t call_pos = x->len + 1;
             x64_call_rel32(x, 0);
             function_patches_add(patches, call_pos, a);
         }
-    } else if (kind == BODY_OP_TAG_LOAD) {
-        x64_mov_r32_mr32(x, 0, 4, body->slot_offset[a]);
-        x64_mov_mr32_r32_store(x, 4, off_dst, 0);
-    } else if (kind == BODY_OP_I32_SHL) {
-        x64_mov_r32_mr32(x, 0, 4, body->slot_offset[b]); /* shift count */
-        x64_emit1(x, 0x89); x64_emit1(x, MODRM(3, 1, 0)); /* mov %eax, %ecx */
-        x64_mov_r32_mr32(x, 0, 4, body->slot_offset[a]); /* value */
-        x64_emit1(x, 0xD3); x64_emit1(x, MODRM(3, 4, 0)); /* SHL %cl, %eax */
-        x64_mov_mr32_r32_store(x, 4, off_dst, 0);
-    } else if (kind == BODY_OP_I32_ASR) {
-        x64_mov_r32_mr32(x, 0, 4, body->slot_offset[b]);
-        x64_emit1(x, 0x89); x64_emit1(x, MODRM(3, 1, 0));
-        x64_mov_r32_mr32(x, 0, 4, body->slot_offset[a]);
-        x64_emit1(x, 0xD3); x64_emit1(x, MODRM(3, 7, 0)); /* SAR %cl, %eax */
-        x64_mov_mr32_r32_store(x, 4, off_dst, 0);
-    } else if (kind == BODY_OP_I32_MOD) {
-        x64_mov_r32_mr32(x, 0, 4, body->slot_offset[a]);
-        x64_mov_r32_mr32(x, 1, 4, body->slot_offset[b]);
-        x64_emit1(x, 0x99); /* CDQ */
-        x64_emit1(x, 0xF7); x64_emit1(x, MODRM(3, 7, 1)); /* IDIV %ecx */
-        x64_mov_r32_r32(x, 0, 2); /* mov %edx, %eax (remainder) */
-        x64_mov_mr32_r32_store(x, 4, off_dst, 0);
-    } else if (kind == BODY_OP_I64_ADD) {
-        int32_t oa = body->slot_offset[a], ob = body->slot_offset[b];
-        x64_mov_r64_mr64(x, 0, 4, oa);
-        x64_mov_r64_mr64(x, 1, 4, ob);
-        x64_emit1(x, REX_W); x64_emit1(x, 0x01); x64_emit1(x, MODRM(3, 1, 0));
-        x64_mov_mr64_r64_store(x, 4, off_dst, 0);
-    } else if (kind == BODY_OP_I64_SUB) {
-        int32_t oa = body->slot_offset[a], ob = body->slot_offset[b];
-        x64_mov_r64_mr64(x, 0, 4, oa);
-        x64_mov_r64_mr64(x, 1, 4, ob);
-        x64_emit1(x, REX_W); x64_emit1(x, 0x29); x64_emit1(x, MODRM(3, 1, 0));
-        x64_mov_mr64_r64_store(x, 4, off_dst, 0);
-    } else if (kind == BODY_OP_I32_REF_LOAD) {
+    } else if (kind == BODY_OP_CALL_PTR) {
         x64_mov_r64_mr64(x, 0, 4, body->slot_offset[a]);
-        x64_mov_r32_mr32(x, 0, 0, 0);
-        x64_mov_mr32_r32_store(x, 4, off_dst, 0);
-    } else if (kind == BODY_OP_ARGC_LOAD) {
-        x64_mov_r32_imm32(x, 0, 0);
-        x64_mov_mr32_r32_store(x, 4, off_dst, 0);
-    } else if (kind == BODY_OP_BRK) {
-        x64_emit1(x, 0xCC); /* INT3 / debug break */
-    } else if (kind == BODY_OP_EXIT) {
-        x64_mov_r32_imm32(x, 0, 0x2000001); /* sys_exit */
-        x64_emit1(x, 0x0F); x64_emit1(x, 0x05); /* SYSCALL */
+        x64_call_reg(x, 0);
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
     } else if (kind == BODY_OP_FN_ADDR) {
         int32_t fn_idx = a;
-        x64_mov_r64_imm64(x, 0, 0); /* placeholder: patched via relocation */
-        x64_mov_mr64_r64_store(x, 4, off_dst, 0);
+        int32_t imm_pos = x->len + 2; /* after REX.W + B8 opcode */
+        x64_mov_r64_imm64(x, 0, 0);
+        x64_mov_mr64_r64(x, 4, off_dst, 0);
         if (fn_idx >= 0 && fn_idx < symbols->function_count)
-            function_patches_add(patches, x->len - 8, fn_idx);
+            function_patches_add(patches, imm_pos, fn_idx);
+    /* Pointer ops */
+    } else if (kind == BODY_OP_PTR_CONST) {
+        x64_mov_r64_imm64(x, 0, (uint64_t)(int32_t)a);
+        x64_mov_mr64_r64(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_PTR_LOAD_I32) {
+        x64_mov_r64_mr64(x, 0, 4, body->slot_offset[a]);
+        x64_mov_r32_mr32_base(x, 0, 0);
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_PTR_STORE_I32) {
+        x64_mov_r64_mr64(x, 0, 4, body->slot_offset[dst]);
+        x64_mov_r32_mr32(x, 1, 4, body->slot_offset[a]);
+        x64_mov_mr32_base_r32(x, 0, 1);
+    } else if (kind == BODY_OP_PTR_LOAD_I64) {
+        x64_mov_r64_mr64(x, 0, 4, body->slot_offset[a]);
+        x64_mov_r64_mr64_base(x, 0, 0);
+        x64_mov_mr64_r64(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_PTR_STORE_I64) {
+        x64_mov_r64_mr64(x, 0, 4, body->slot_offset[dst]);
+        x64_mov_r64_mr64(x, 1, 4, body->slot_offset[a]);
+        x64_mov_mr64_base_r64(x, 0, 1);
+    /* Slot store */
+    } else if (kind == BODY_OP_SLOT_STORE_I32) {
+        x64_mov_r32_mr32(x, 0, 4, body->slot_offset[a]);
+        x64_mov_mr32_r32(x, 4, off_dst + c, 0);
+    } else if (kind == BODY_OP_SLOT_STORE_I64) {
+        x64_mov_r64_mr64(x, 0, 4, body->slot_offset[a]);
+        x64_mov_mr64_r64(x, 4, off_dst + c, 0);
+    /* Seq/Array ops */
+    } else if (kind == BODY_OP_SEQ_I32_INDEX_DYNAMIC) {
+        /* idx in slot b, base in slot a, store result in dst */
+        x64_mov_r64_mr64(x, 0, 4, body->slot_offset[a] + 8); /* data ptr */
+        x64_mov_r32_mr32(x, 1, 4, body->slot_offset[b]);    /* index */
+        x64_mov_r32_mr32_base_index4(x, 0, 0, 1);
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_SEQ_I32_ADD) {
+        /* Append I32 to seq */
+        x64_mov_r32_imm32(x, 0, 0);
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_SEQ_STR_ADD) {
+        x64_mov_r32_imm32(x, 0, 0);
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_SEQ_STR_INDEX_DYNAMIC) {
+        x64_mov_r32_imm32(x, 0, 0);
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_SEQ_OPAQUE_INDEX_DYNAMIC) {
+        x64_mov_r32_imm32(x, 0, 0);
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_SEQ_OPAQUE_ADD) {
+        x64_mov_r32_imm32(x, 0, 0);
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_SEQ_OPAQUE_INDEX_STORE) {
+        x64_mov_r32_imm32(x, 0, 0);
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_SEQ_OPAQUE_REMOVE) {
+        x64_mov_r32_imm32(x, 0, 0);
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_ARRAY_I32_INDEX_DYNAMIC) {
+        x64_mov_r32_mr32(x, 1, 4, body->slot_offset[b]);
+        x64_lea_r64_mr(x, 0, 4, body->slot_offset[a]);
+        x64_mov_r32_mr32_base_index4(x, 0, 0, 1);
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_ARRAY_I32_INDEX_STORE) {
+        x64_mov_r32_mr32(x, 1, 4, body->slot_offset[b]);
+        x64_mov_r32_mr32(x, 2, 4, body->slot_offset[dst]);
+        x64_lea_r64_mr(x, 0, 4, body->slot_offset[a]);
+        x64_mov_mr32_base_index4_r32(x, 0, 1, 2);
+    } else if (kind == BODY_OP_SEQ_I32_INDEX_STORE) {
+        x64_mov_r32_mr32(x, 1, 4, body->slot_offset[b]);
+        x64_mov_r32_mr32(x, 2, 4, body->slot_offset[dst]);
+        x64_mov_r64_mr64(x, 0, 4, body->slot_offset[a] + 8);
+        x64_mov_mr32_base_index4_r32(x, 0, 1, 2);
+    /* Variant / Composite */
+    } else if (kind == BODY_OP_MAKE_VARIANT) {
+        /* dst = zero-init, then set tag and copy fields */
+        for (int32_t i = 0; i < body->slot_size[dst]; i += 8) {
+            x64_mov_r64_imm64(x, 0, 0);
+            x64_mov_mr64_r64(x, 4, off_dst + i, 0);
+        }
+        x64_mov_r32_imm32(x, 0, (int32_t)a);
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
+        for (int32_t fi = 0; fi < c; fi++) {
+            int32_t arg_slot = body->call_arg_slot[b + fi];
+            int32_t poff = body->call_arg_offset[b + fi];
+            x64_mov_r64_mr64(x, 0, 4, body->slot_offset[arg_slot]);
+            x64_mov_mr64_r64(x, 4, off_dst + poff, 0);
+        }
+    } else if (kind == BODY_OP_MAKE_COMPOSITE) {
+        for (int32_t i = 0; i < body->slot_size[dst]; i += 8) {
+            x64_mov_r64_imm64(x, 0, 0);
+            x64_mov_mr64_r64(x, 4, off_dst + i, 0);
+        }
+        for (int32_t fi = 0; fi < c; fi++) {
+            int32_t src = body->call_arg_slot[b + fi];
+            int32_t poff = body->call_arg_offset[b + fi];
+            x64_mov_r64_mr64(x, 0, 4, body->slot_offset[src]);
+            x64_mov_mr64_r64(x, 4, off_dst + poff, 0);
+        }
+    } else if (kind == BODY_OP_MAKE_SEQ_OPAQUE) {
+        for (int32_t i = 0; i < body->slot_size[dst]; i += 8) {
+            x64_mov_r64_imm64(x, 0, 0);
+            x64_mov_mr64_r64(x, 4, off_dst + i, 0);
+        }
+    /* Closure */
+    } else if (kind == BODY_OP_CLOSURE_NEW) {
+        x64_mov_r64_mr64(x, 0, 4, body->slot_offset[a]);
+        x64_mov_mr64_r64(x, 4, off_dst, 0);
+        x64_mov_r64_mr64(x, 0, 4, body->slot_offset[b]);
+        x64_mov_mr64_r64(x, 4, off_dst + 8, 0);
+    } else if (kind == BODY_OP_CLOSURE_CALL) {
+        x64_mov_r64_mr64(x, 0, 4, body->slot_offset[a]);
+        x64_call_reg(x, 0);
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
+    /* Atomic */
+    } else if (kind == BODY_OP_ATOMIC_LOAD_I32) {
+        x64_mov_r64_mr64(x, 0, 4, body->slot_offset[a]);
+        x64_mov_r32_mr32_base(x, 0, 0);
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_ATOMIC_STORE_I32) {
+        x64_mov_r64_mr64(x, 0, 4, body->slot_offset[dst]);
+        x64_mov_r32_mr32(x, 1, 4, body->slot_offset[a]);
+        x64_mov_mr32_base_r32(x, 0, 1);
+    } else if (kind == BODY_OP_ATOMIC_CAS_I32) {
+        /* cmpxchg: lock cmpxchg %ecx,[%rax]; setz %al */
+        x64_mov_r64_mr64(x, 0, 4, body->slot_offset[a]);   /* ptr */
+        x64_mov_r32_mr32(x, 2, 4, body->slot_offset[c]);  /* expected → EAX */
+        x64_mov_r32_mr32(x, 1, 4, body->slot_offset[b]);  /* desired → ECX */
+        x64_lock_cmpxchg_r32_mr(x, 0, 1);
+        x64_setcc_r8(x, CC_E, 0);
+        x64_movzb_r8_r32(x, 0, 0);
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
+    /* Syscall-based ops (macOS x86_64: syscall in RAX, args RDI/RSI/RDX/R10/R8/R9) */
+    } else if (kind == BODY_OP_EXIT) {
+        x64_mov_r32_mr32(x, 0, 4, body->slot_offset[a]);
+        x64_mov_r32_r32(x, 0, 0); /* ARG1 = exit code */
+        x64_mov_r32_imm32(x, 0, 0x2000001); /* RAX = sys_exit */
+        x64_syscall(x);
     } else if (kind == BODY_OP_WRITE_LINE) {
-        x64_mov_r32_imm32(x, 0, 0x2000004); /* sys_write */
-        x64_emit1(x, 0x0F); x64_emit1(x, 0x05);
+        x64_mov_r32_mr32(x, 0, 4, body->slot_offset[a]);   /* fd */
+        x64_mov_r64_mr64(x, 1, 4, body->slot_offset[b]);    /* buf ptr */
+        x64_mov_r32_mr32(x, 2, 4, body->slot_offset[b] + 8); /* len */
+        x64_mov_r32_imm32(x, 0, 0x2000004); /* RAX = sys_write */
+        x64_syscall(x);
+    } else if (kind == BODY_OP_WRITE_RAW) {
+        x64_mov_r32_mr32(x, 0, 4, body->slot_offset[a]);
+        x64_mov_r64_mr64(x, 1, 4, body->slot_offset[b]);
+        x64_mov_r32_mr32(x, 2, 4, body->slot_offset[c]);
+        x64_mov_r32_imm32(x, 0, 0x2000004);
+        x64_syscall(x);
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_WRITE_BYTES) {
+        x64_mov_r32_mr32(x, 0, 4, body->slot_offset[a]);
+        x64_lea_r64_mr(x, 1, 4, body->slot_offset[b]);
+        x64_mov_r32_mr32(x, 2, 4, body->slot_offset[c]);
+        x64_mov_r32_imm32(x, 0, 0x2000004);
+        x64_syscall(x);
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_OPEN) {
+        x64_mov_r64_mr64(x, 0, 4, body->slot_offset[a]);
+        x64_mov_r32_mr32(x, 1, 4, body->slot_offset[b]);
+        x64_mov_r32_imm32(x, 2, 0644);
+        x64_mov_r32_imm32(x, 0, 0x2000005);
+        x64_syscall(x);
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_READ) {
+        x64_mov_r32_mr32(x, 0, 4, body->slot_offset[a]);
+        x64_lea_r64_mr(x, 1, 4, body->slot_offset[b]);
+        x64_mov_r32_mr32(x, 2, 4, body->slot_offset[c]);
+        x64_mov_r32_imm32(x, 0, 0x2000003);
+        x64_syscall(x);
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_CLOSE) {
+        x64_mov_r32_mr32(x, 0, 4, body->slot_offset[a]);
+        x64_mov_r32_imm32(x, 0, 0x2000006);
+        x64_syscall(x);
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_BRK) {
+        x64_int3(x);
+    } else if (kind == BODY_OP_ARGC_LOAD) {
+        x64_mov_r32_imm32(x, 0, 0);
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_UNWRAP_OR_RETURN) {
+        x64_mov_r32_mr32(x, 0, 4, body->slot_offset[a]);
+        x64_cmp_r32_imm8(x, 0, (int8_t)b);
+        x64_int3(x); /* trap on mismatch */
+    /* Remaining: empty stubs */
+    } else if (kind == BODY_OP_MMAP ||
+               kind == BODY_OP_TIME_NS || kind == BODY_OP_GETRUSAGE ||
+               kind == BODY_OP_GETENV_STR || kind == BODY_OP_READ_FLAG ||
+               kind == BODY_OP_PARSE_INT || kind == BODY_OP_TEXT_SET_INIT ||
+               kind == BODY_OP_TEXT_SET_INSERT || kind == BODY_OP_CWD_STR ||
+               kind == BODY_OP_PATH_JOIN || kind == BODY_OP_PATH_ABSOLUTE ||
+               kind == BODY_OP_PATH_PARENT || kind == BODY_OP_PATH_EXISTS ||
+               kind == BODY_OP_PATH_FILE_SIZE || kind == BODY_OP_PATH_READ_TEXT ||
+               kind == BODY_OP_PATH_WRITE_TEXT || kind == BODY_OP_REMOVE_FILE ||
+               kind == BODY_OP_CHMOD_X || kind == BODY_OP_COLD_SELF_EXEC ||
+               kind == BODY_OP_MKDIR_ONE || kind == BODY_OP_TEXT_CONTAINS ||
+               kind == BODY_OP_EXEC_SHELL || kind == BODY_OP_ARGV_STR ||
+               kind == BODY_OP_STR_SELECT_NONEMPTY || kind == BODY_OP_ASSERT) {
+        /* File/OS/shell ops: emit empty result */
+        x64_mov_r32_imm32(x, 0, 0);
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
     }
-    /* remaining ops: skip silently (float, atomics, complex seq ops) */
 }
 
 /* x86_64 function prologue: push rbp; mov rsp, rbp; sub $frame, rsp */
@@ -17900,58 +18231,238 @@ static int32_t x64_pack_words(X64Code *x, uint32_t *words, int32_t max_words) {
     return wc;
 }
 
+/* x86_64 function compilation wrapper */
+static void x64_codegen_func(X64Code *x, BodyIR *body, Symbols *symbols,
+                              FunctionPatchList *patches) {
+    x64_codegen_prologue(x, body->frame_size);
+    for (int32_t bi = 0; bi < body->block_count; bi++) {
+        int32_t bs = body->block_op_start[bi];
+        int32_t be = bs + body->block_op_count[bi];
+        for (int32_t oi = bs; oi < be; oi++)
+            x64_codegen_op(x, body, symbols, patches, oi);
+    }
+    x64_codegen_epilogue(x);
+}
+
 /* ---- RISC-V 64 codegen (fixed 32-bit words, reuses Code struct) ---- */
 
 static void rv64_codegen_op(Code *code, BodyIR *body, Symbols *symbols,
                             FunctionPatchList *patches, int32_t op) {
     int32_t kind = body->op_kind[op], dst = body->op_dst[op];
-    int32_t a = body->op_a[op], b = body->op_b[op];
+    int32_t a = body->op_a[op], b = body->op_b[op], c = body->op_c[op];
     int32_t off_dst = body->slot_offset[dst];
+    /* I32 ops */
     if (kind == BODY_OP_I32_CONST) {
         rv_li(code->words, &code->count, RV_T0, a);
         code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)off_dst));
     } else if (kind == BODY_OP_COPY_I32) {
         code_emit(code, rv_lw(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
         code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)off_dst));
-    } else if (kind == BODY_OP_I32_ADD) {
+    } else if (kind == BODY_OP_I32_ADD || kind == BODY_OP_I32_SUB) {
         code_emit(code, rv_lw(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
         code_emit(code, rv_lw(RV_T1, RV_SP, (int16_t)body->slot_offset[b]));
-        code_emit(code, rv_addw(RV_T0, RV_T0, RV_T1));
-        code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)off_dst));
-    } else if (kind == BODY_OP_I32_SUB) {
-        code_emit(code, rv_lw(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
-        code_emit(code, rv_lw(RV_T1, RV_SP, (int16_t)body->slot_offset[b]));
-        code_emit(code, rv_subw(RV_T0, RV_T0, RV_T1));
+        code_emit(code, kind == BODY_OP_I32_ADD ? rv_addw(RV_T0, RV_T0, RV_T1) : rv_subw(RV_T0, RV_T0, RV_T1));
         code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)off_dst));
     } else if (kind == BODY_OP_I32_MUL) {
         code_emit(code, rv_lw(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
         code_emit(code, rv_lw(RV_T1, RV_SP, (int16_t)body->slot_offset[b]));
         code_emit(code, rv_mulw(RV_T0, RV_T0, RV_T1));
         code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)off_dst));
-    } else if (kind == BODY_OP_CALL_I32) {
-        int32_t call_pos = code->count;
-        code_emit(code, rv_jal(RV_RA, 0));
-        function_patches_add(patches, call_pos, a);
-        code_emit(code, rv_sw(RV_A0, RV_SP, (int16_t)off_dst));
-    } else if (kind == BODY_OP_STR_LITERAL) {
-        rv_li(code->words, &code->count, RV_T0, 0);
-        code_emit(code, rv_sd(RV_T0, RV_SP, (int16_t)off_dst));
-    } else if (kind == BODY_OP_STR_LEN) {
-        code_emit(code, rv_lw(RV_T0, RV_SP, (int16_t)(body->slot_offset[a] + 8)));
+    } else if (kind == BODY_OP_I32_DIV) {
+        code_emit(code, rv_lw(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_lw(RV_T1, RV_SP, (int16_t)body->slot_offset[b]));
+        code_emit(code, rv_divw(RV_T0, RV_T0, RV_T1));
         code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_I32_MOD) {
+        code_emit(code, rv_lw(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_lw(RV_T1, RV_SP, (int16_t)body->slot_offset[b]));
+        code_emit(code, rv_remw(RV_T0, RV_T0, RV_T1));
+        code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_I32_AND) {
+        code_emit(code, rv_lw(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_lw(RV_T1, RV_SP, (int16_t)body->slot_offset[b]));
+        code_emit(code, rv_and(RV_T0, RV_T0, RV_T1));
+        code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_I32_OR) {
+        code_emit(code, rv_lw(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_lw(RV_T1, RV_SP, (int16_t)body->slot_offset[b]));
+        code_emit(code, rv_or(RV_T0, RV_T0, RV_T1));
+        code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_I32_XOR) {
+        code_emit(code, rv_lw(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_lw(RV_T1, RV_SP, (int16_t)body->slot_offset[b]));
+        code_emit(code, rv_xor(RV_T0, RV_T0, RV_T1));
+        code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_I32_SHL) {
+        code_emit(code, rv_lw(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_lw(RV_T1, RV_SP, (int16_t)body->slot_offset[b]));
+        code_emit(code, rv_sllw(RV_T0, RV_T0, RV_T1));
+        code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_I32_ASR) {
+        code_emit(code, rv_lw(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_lw(RV_T1, RV_SP, (int16_t)body->slot_offset[b]));
+        code_emit(code, rv_sraw(RV_T0, RV_T0, RV_T1));
+        code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_I32_CMP) {
+        code_emit(code, rv_lw(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_lw(RV_T1, RV_SP, (int16_t)body->slot_offset[b]));
+        /* Use SLT/SLTU/EQ based on condition code c */
+        if (c == COND_EQ) {
+            code_emit(code, rv_subw(RV_T0, RV_T0, RV_T1));
+            code_emit(code, rv_sltiu(RV_T0, RV_T0, 1)); /* T0==0 ? 1 : 0 */
+        } else if (c == COND_NE) {
+            code_emit(code, rv_subw(RV_T0, RV_T0, RV_T1));
+            code_emit(code, rv_sltu(RV_T0, RV_ZERO, RV_T0)); /* T0!=0 ? 1 : 0 */
+        } else if (c == COND_LT) {
+            code_emit(code, rv_slt(RV_T0, RV_T0, RV_T1));
+        } else if (c == COND_GE) {
+            code_emit(code, rv_slt(RV_T0, RV_T0, RV_T1));
+            code_emit(code, rv_xori(RV_T0, RV_T0, 1));
+        } else {
+            code_emit(code, rv_slt(RV_T0, RV_T1, RV_T0)); /* default: a < b */
+        }
+        code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)off_dst));
+    /* I64 ops */
     } else if (kind == BODY_OP_I64_CONST) {
         uint64_t bits = (uint32_t)a | ((uint64_t)(uint32_t)b << 32);
         rv_li(code->words, &code->count, RV_T0, (int32_t)bits);
-        rv_li(code->words, &code->count, RV_T1, (int32_t)(bits >> 32));
-        code_emit(code, rv_slli(RV_T1, RV_T1, 32));
-        code_emit(code, rv_or(RV_T0, RV_T0, RV_T1));
-        code_emit(code, rv_sd(RV_T0, RV_SP, (int16_t)off_dst));
-    } else if (kind == BODY_OP_COPY_I64 || kind == BODY_OP_COPY_COMPOSITE) {
-        int32_t sz = body->slot_size[dst], os = body->slot_offset[a];
-        for (int32_t off = 0; off < sz; off += 8) {
-            code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)(os + off)));
-            code_emit(code, rv_sd(RV_T0, RV_SP, (int16_t)(off_dst + off)));
+        if ((bits >> 32) != 0) {
+            rv_li(code->words, &code->count, RV_T1, (int32_t)(bits >> 32));
+            code_emit(code, rv_slli(RV_T1, RV_T1, 32));
+            code_emit(code, rv_or(RV_T0, RV_T0, RV_T1));
         }
+        code_emit(code, rv_sd(RV_T0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_COPY_I64) {
+        code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_sd(RV_T0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_I64_FROM_I32) {
+        code_emit(code, rv_lw(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_sd(RV_T0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_I32_FROM_I64) {
+        code_emit(code, rv_lw(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_I64_ADD || kind == BODY_OP_I64_SUB) {
+        code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_ld(RV_T1, RV_SP, (int16_t)body->slot_offset[b]));
+        code_emit(code, kind == BODY_OP_I64_ADD ? rv_add(RV_T0, RV_T0, RV_T1) : rv_sub(RV_T0, RV_T0, RV_T1));
+        code_emit(code, rv_sd(RV_T0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_I64_MUL) {
+        code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_ld(RV_T1, RV_SP, (int16_t)body->slot_offset[b]));
+        code_emit(code, rv_mul(RV_T0, RV_T0, RV_T1));
+        code_emit(code, rv_sd(RV_T0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_I64_DIV) {
+        code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_ld(RV_T1, RV_SP, (int16_t)body->slot_offset[b]));
+        code_emit(code, rv_div(RV_T0, RV_T0, RV_T1));
+        code_emit(code, rv_sd(RV_T0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_I64_AND || kind == BODY_OP_I64_OR || kind == BODY_OP_I64_XOR) {
+        code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_ld(RV_T1, RV_SP, (int16_t)body->slot_offset[b]));
+        if (kind == BODY_OP_I64_AND) code_emit(code, rv_and(RV_T0, RV_T0, RV_T1));
+        else if (kind == BODY_OP_I64_OR) code_emit(code, rv_or(RV_T0, RV_T0, RV_T1));
+        else code_emit(code, rv_xor(RV_T0, RV_T0, RV_T1));
+        code_emit(code, rv_sd(RV_T0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_I64_SHL || kind == BODY_OP_I64_ASR) {
+        code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_ld(RV_T1, RV_SP, (int16_t)body->slot_offset[b]));
+        if (kind == BODY_OP_I64_SHL) code_emit(code, rv_sll(RV_T0, RV_T0, RV_T1));
+        else code_emit(code, rv_sra(RV_T0, RV_T0, RV_T1));
+        code_emit(code, rv_sd(RV_T0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_I64_CMP) {
+        code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_ld(RV_T1, RV_SP, (int16_t)body->slot_offset[b]));
+        if (c == COND_EQ) {
+            code_emit(code, rv_sub(RV_T0, RV_T0, RV_T1));
+            code_emit(code, rv_sltiu(RV_T0, RV_T0, 1));
+        } else if (c == COND_NE) {
+            code_emit(code, rv_sub(RV_T0, RV_T0, RV_T1));
+            code_emit(code, rv_sltu(RV_T0, RV_ZERO, RV_T0));
+        } else if (c == COND_LT) {
+            code_emit(code, rv_slt(RV_T0, RV_T0, RV_T1));
+        } else {
+            code_emit(code, rv_slt(RV_T0, RV_T1, RV_T0));
+        }
+        code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)off_dst));
+    /* Float F32 */
+    } else if (kind == BODY_OP_F32_CONST) {
+        float val; memcpy(&val, &a, 4);
+        int32_t bits; memcpy(&bits, &val, 4);
+        rv_li(code->words, &code->count, RV_T0, bits);
+        code_emit(code, rv_fmv_w_x(0, RV_T0));
+        code_emit(code, rv_fsw(0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_F32_ADD || kind == BODY_OP_F32_SUB ||
+               kind == BODY_OP_F32_MUL || kind == BODY_OP_F32_DIV) {
+        code_emit(code, rv_flw(0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_flw(1, RV_SP, (int16_t)body->slot_offset[b]));
+        if (kind == BODY_OP_F32_ADD) code_emit(code, rv_fadd_s(0, 0, 1));
+        else if (kind == BODY_OP_F32_SUB) code_emit(code, rv_fsub_s(0, 0, 1));
+        else if (kind == BODY_OP_F32_MUL) code_emit(code, rv_fmul_s(0, 0, 1));
+        else code_emit(code, rv_fdiv_s(0, 0, 1));
+        code_emit(code, rv_fsw(0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_F32_NEG) {
+        code_emit(code, rv_flw(0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_fsgnjn_s(0, 0, 0));
+        code_emit(code, rv_fsw(0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_F32_CMP) {
+        code_emit(code, rv_flw(0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_flw(1, RV_SP, (int16_t)body->slot_offset[b]));
+        code_emit(code, c == COND_EQ ? rv_feq_s(RV_T0, 0, 1) : rv_flt_s(RV_T0, 0, 1));
+        code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_F32_FROM_I32) {
+        code_emit(code, rv_lw(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_fcvt_s_w(0, RV_T0));
+        code_emit(code, rv_fsw(0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_I32_FROM_F32) {
+        code_emit(code, rv_flw(0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_fcvt_w_s(RV_T0, 0));
+        code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)off_dst));
+    /* Float F64 */
+    } else if (kind == BODY_OP_F64_CONST) {
+        uint64_t bits = (uint32_t)a | ((uint64_t)(uint32_t)b << 32);
+        rv_li(code->words, &code->count, RV_T0, (int32_t)bits);
+        if ((bits >> 32) != 0) {
+            rv_li(code->words, &code->count, RV_T1, (int32_t)(bits >> 32));
+            code_emit(code, rv_slli(RV_T1, RV_T1, 32));
+            code_emit(code, rv_or(RV_T0, RV_T0, RV_T1));
+        }
+        code_emit(code, rv_fmv_d_x(0, RV_T0));
+        code_emit(code, rv_fsd(0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_F64_ADD || kind == BODY_OP_F64_SUB ||
+               kind == BODY_OP_F64_MUL || kind == BODY_OP_F64_DIV) {
+        code_emit(code, rv_fld(0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_fld(1, RV_SP, (int16_t)body->slot_offset[b]));
+        if (kind == BODY_OP_F64_ADD) code_emit(code, rv_fadd_d(0, 0, 1));
+        else if (kind == BODY_OP_F64_SUB) code_emit(code, rv_fsub_d(0, 0, 1));
+        else if (kind == BODY_OP_F64_MUL) code_emit(code, rv_fmul_d(0, 0, 1));
+        else code_emit(code, rv_fdiv_d(0, 0, 1));
+        code_emit(code, rv_fsd(0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_F64_NEG) {
+        code_emit(code, rv_fld(0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_fsgnjn_d(0, 0, 0));
+        code_emit(code, rv_fsd(0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_F64_CMP) {
+        code_emit(code, rv_fld(0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_fld(1, RV_SP, (int16_t)body->slot_offset[b]));
+        code_emit(code, c == COND_EQ ? rv_feq_d(RV_T0, 0, 1) : rv_flt_d(RV_T0, 0, 1));
+        code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_F64_FROM_I32) {
+        code_emit(code, rv_lw(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_fcvt_d_w(0, RV_T0));
+        code_emit(code, rv_fsd(0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_I32_FROM_F64) {
+        code_emit(code, rv_fld(0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_fcvt_w_d(RV_T0, 0));
+        code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)off_dst));
+    /* String / Load / Store */
+    } else if (kind == BODY_OP_STR_LITERAL) {
+        rv_li(code->words, &code->count, RV_T0, 0);
+        code_emit(code, rv_sd(RV_T0, RV_SP, (int16_t)off_dst));
+        rv_li(code->words, &code->count, RV_T0, 0);
+        code_emit(code, rv_sd(RV_T0, RV_SP, (int16_t)(off_dst + 8)));
+    } else if (kind == BODY_OP_STR_LEN) {
+        code_emit(code, rv_lw(RV_T0, RV_SP, (int16_t)(body->slot_offset[a] + 8)));
+        code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)off_dst));
     } else if (kind == BODY_OP_PAYLOAD_LOAD) {
         code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)(body->slot_offset[a] + b)));
         code_emit(code, rv_sd(RV_T0, RV_SP, (int16_t)off_dst));
@@ -17961,23 +18472,203 @@ static void rv64_codegen_op(Code *code, BodyIR *body, Symbols *symbols,
     } else if (kind == BODY_OP_TAG_LOAD) {
         code_emit(code, rv_lw(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
         code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)off_dst));
-    } else if (kind == BODY_OP_FN_ADDR) {
-        rv_li(code->words, &code->count, RV_T0, 0);
-        code_emit(code, rv_sd(RV_T0, RV_SP, (int16_t)off_dst));
-    } else if (kind == BODY_OP_CALL_PTR) {
+    } else if (kind == BODY_OP_I32_REF_LOAD) {
         code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
-        code_emit(code, rv_jalr(RV_RA, RV_T0, 0));
+        code_emit(code, rv_lw(RV_T0, RV_T0, 0));
+        code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_I32_REF_STORE) {
+        code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)body->slot_offset[dst]));
+        code_emit(code, rv_lw(RV_T1, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_sw(RV_T1, RV_T0, 0));
+    } else if (kind == BODY_OP_FIELD_REF) {
+        code_emit(code, rv_addi(RV_T0, RV_SP, (int16_t)(body->slot_offset[a] + b)));
+        code_emit(code, rv_sd(RV_T0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_STR_REF_STORE) {
+        code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)body->slot_offset[dst]));
+        code_emit(code, rv_ld(RV_T1, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_sd(RV_T1, RV_T0, 0));
+        code_emit(code, rv_ld(RV_T1, RV_SP, (int16_t)(body->slot_offset[a] + 8)));
+        code_emit(code, rv_sd(RV_T1, RV_T0, 8));
+    } else if (kind == BODY_OP_COPY_COMPOSITE) {
+        int32_t sz = body->slot_size[dst], os = body->slot_offset[a];
+        for (int32_t off = 0; off < sz; off += 8) {
+            code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)(os + off)));
+            code_emit(code, rv_sd(RV_T0, RV_SP, (int16_t)(off_dst + off)));
+        }
+    /* Calls */
+    } else if (kind == BODY_OP_CALL_I32) {
+        int32_t call_pos = code->count;
+        code_emit(code, rv_jal(RV_RA, 0));
+        function_patches_add(patches, call_pos, a);
         code_emit(code, rv_sw(RV_A0, RV_SP, (int16_t)off_dst));
     } else if (kind == BODY_OP_CALL_COMPOSITE) {
         int32_t call_pos = code->count;
         code_emit(code, rv_jal(RV_RA, 0));
         function_patches_add(patches, call_pos, a);
-    } else if (kind == BODY_OP_I32_CMP) {
+    } else if (kind == BODY_OP_CALL_PTR) {
+        code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_jalr(RV_RA, RV_T0, 0));
+        code_emit(code, rv_sw(RV_A0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_FN_ADDR) {
+        int32_t fn_idx = a;
+        int32_t auipc_pos = code->count;
+        code_emit(code, rv_auipc(RV_T0, 0));
+        function_patches_add(patches, auipc_pos, fn_idx);
+        code_emit(code, rv_sd(RV_T0, RV_SP, (int16_t)off_dst));
+    /* Pointer ops */
+    } else if (kind == BODY_OP_PTR_CONST) {
+        rv_li(code->words, &code->count, RV_T0, (int32_t)a);
+        code_emit(code, rv_sd(RV_T0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_PTR_LOAD_I32) {
+        code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_lw(RV_T0, RV_T0, 0));
+        code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_PTR_STORE_I32) {
+        code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)body->slot_offset[dst]));
+        code_emit(code, rv_lw(RV_T1, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_sw(RV_T1, RV_T0, 0));
+    } else if (kind == BODY_OP_PTR_LOAD_I64) {
+        code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_ld(RV_T0, RV_T0, 0));
+        code_emit(code, rv_sd(RV_T0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_PTR_STORE_I64) {
+        code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)body->slot_offset[dst]));
+        code_emit(code, rv_ld(RV_T1, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_sd(RV_T1, RV_T0, 0));
+    } else if (kind == BODY_OP_SLOT_STORE_I32) {
         code_emit(code, rv_lw(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)(off_dst + c)));
+    } else if (kind == BODY_OP_SLOT_STORE_I64) {
+        code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_sd(RV_T0, RV_SP, (int16_t)(off_dst + c)));
+    /* Variant / Composite */
+    } else if (kind == BODY_OP_MAKE_VARIANT) {
+        for (int32_t i = 0; i < body->slot_size[dst]; i += 8) {
+            code_emit(code, rv_sd(RV_ZERO, RV_SP, (int16_t)(off_dst + i)));
+        }
+        rv_li(code->words, &code->count, RV_T0, (int32_t)a);
+        code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)off_dst));
+        for (int32_t fi = 0; fi < c; fi++) {
+            int32_t arg_slot = body->call_arg_slot[b + fi];
+            int32_t poff = body->call_arg_offset[b + fi];
+            code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)body->slot_offset[arg_slot]));
+            code_emit(code, rv_sd(RV_T0, RV_SP, (int16_t)(off_dst + poff)));
+        }
+    } else if (kind == BODY_OP_MAKE_COMPOSITE) {
+        for (int32_t i = 0; i < body->slot_size[dst]; i += 8) {
+            code_emit(code, rv_sd(RV_ZERO, RV_SP, (int16_t)(off_dst + i)));
+        }
+        for (int32_t fi = 0; fi < c; fi++) {
+            int32_t src = body->call_arg_slot[b + fi];
+            int32_t poff = body->call_arg_offset[b + fi];
+            code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)body->slot_offset[src]));
+            code_emit(code, rv_sd(RV_T0, RV_SP, (int16_t)(off_dst + poff)));
+        }
+    /* Seq / Array */
+    } else if (kind == BODY_OP_SEQ_I32_INDEX_DYNAMIC ||
+               kind == BODY_OP_ARRAY_I32_INDEX_DYNAMIC) {
+        code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)(body->slot_offset[a] + 8)));
         code_emit(code, rv_lw(RV_T1, RV_SP, (int16_t)body->slot_offset[b]));
-        code_emit(code, rv_slt(RV_T0, RV_T1, RV_T0));
+        code_emit(code, rv_slliw(RV_T1, RV_T1, 2));
+        code_emit(code, rv_add(RV_T0, RV_T0, RV_T1));
+        code_emit(code, rv_lw(RV_T0, RV_T0, 0));
+        code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_ARRAY_I32_INDEX_STORE) {
+        code_emit(code, rv_lw(RV_T1, RV_SP, (int16_t)body->slot_offset[b]));
+        code_emit(code, rv_slliw(RV_T1, RV_T1, 2));
+        code_emit(code, rv_lw(RV_T2, RV_SP, (int16_t)body->slot_offset[dst]));
+        code_emit(code, rv_addi(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_add(RV_T0, RV_T0, RV_T1));
+        code_emit(code, rv_sw(RV_T2, RV_T0, 0));
+    } else if (kind == BODY_OP_SEQ_I32_INDEX_STORE) {
+        code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)(body->slot_offset[a] + 8)));
+        code_emit(code, rv_lw(RV_T1, RV_SP, (int16_t)body->slot_offset[b]));
+        code_emit(code, rv_slliw(RV_T1, RV_T1, 2));
+        code_emit(code, rv_add(RV_T0, RV_T0, RV_T1));
+        code_emit(code, rv_lw(RV_T1, RV_SP, (int16_t)body->slot_offset[dst]));
+        code_emit(code, rv_sw(RV_T1, RV_T0, 0));
+    /* Closure */
+    } else if (kind == BODY_OP_CLOSURE_NEW) {
+        code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_sd(RV_T0, RV_SP, (int16_t)off_dst));
+        code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)body->slot_offset[b]));
+        code_emit(code, rv_sd(RV_T0, RV_SP, (int16_t)(off_dst + 8)));
+    } else if (kind == BODY_OP_CLOSURE_CALL) {
+        code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_jalr(RV_RA, RV_T0, 0));
+        code_emit(code, rv_sw(RV_A0, RV_SP, (int16_t)off_dst));
+    /* Atomic */
+    } else if (kind == BODY_OP_ATOMIC_LOAD_I32) {
+        code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_lr_w(RV_T0, RV_T0));
+        code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_ATOMIC_STORE_I32) {
+        code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)body->slot_offset[dst]));
+        code_emit(code, rv_lw(RV_T1, RV_SP, (int16_t)body->slot_offset[a]));
+        /* amoswap.w for atomic store */
+        code_emit(code, rv_amoswap_w(RV_ZERO, RV_T0, RV_T1));
+    } else if (kind == BODY_OP_ATOMIC_CAS_I32) {
+        code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_lw(RV_T1, RV_SP, (int16_t)body->slot_offset[c])); /* expected */
+        code_emit(code, rv_lw(RV_T2, RV_SP, (int16_t)body->slot_offset[b])); /* desired */
+        int32_t retry = code->count;
+        code_emit(code, rv_lr_w(RV_T3, RV_T0));
+        code_emit(code, rv_bne(RV_T3, RV_T1, 8)); /* skip if not equal */
+        code_emit(code, rv_sc_w(RV_T3, RV_T0, RV_T2));
+        code_emit(code, rv_bne(RV_T3, RV_ZERO, (int16_t)(retry - code->count)));
+        code_emit(code, rv_sltiu(RV_T0, RV_T3, 1)); /* success=1 if SC succeeded */
+        code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)off_dst));
+    /* Syscall / OS */
+    } else if (kind == BODY_OP_EXIT) {
+        code_emit(code, rv_lw(RV_A0, RV_SP, (int16_t)body->slot_offset[a]));
+        rv_li(code->words, &code->count, RV_A7, 93); /* sys_exit */
+        code_emit(code, rv_ecall());
+    } else if (kind == BODY_OP_WRITE_LINE) {
+        code_emit(code, rv_lw(RV_A0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_ld(RV_A1, RV_SP, (int16_t)body->slot_offset[b]));
+        code_emit(code, rv_lw(RV_A2, RV_SP, (int16_t)(body->slot_offset[b] + 8)));
+        rv_li(code->words, &code->count, RV_A7, 64); /* sys_write */
+        code_emit(code, rv_ecall());
+    } else if (kind == BODY_OP_BRK) {
+        code_emit(code, rv_ebreak());
+    } else if (kind == BODY_OP_ARGC_LOAD ||
+               kind == BODY_OP_LOAD_I32) {
+        code_emit(code, rv_sw(RV_ZERO, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_UNWRAP_OR_RETURN) {
+        code_emit(code, rv_lw(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+        rv_li(code->words, &code->count, RV_T1, (int32_t)b);
+        code_emit(code, rv_bne(RV_T0, RV_T1, 0)); /* patched to after ebreak */
+        code_emit(code, rv_ebreak());
+    /* Remaining complex ops: emit zero/empty result */
+    } else if (kind == BODY_OP_STR_EQ || kind == BODY_OP_STR_CONCAT ||
+               kind == BODY_OP_I32_TO_STR || kind == BODY_OP_I64_TO_STR ||
+               kind == BODY_OP_STR_INDEX || kind == BODY_OP_STR_JOIN ||
+               kind == BODY_OP_STR_SPLIT_CHAR || kind == BODY_OP_STR_STRIP ||
+               kind == BODY_OP_STR_SLICE || kind == BODY_OP_SHELL_QUOTE ||
+               kind == BODY_OP_STR_SELECT_NONEMPTY ||
+               kind == BODY_OP_READ_FLAG || kind == BODY_OP_PARSE_INT ||
+               kind == BODY_OP_TEXT_SET_INIT || kind == BODY_OP_TEXT_SET_INSERT ||
+               kind == BODY_OP_CWD_STR || kind == BODY_OP_PATH_JOIN ||
+               kind == BODY_OP_PATH_ABSOLUTE || kind == BODY_OP_PATH_PARENT ||
+               kind == BODY_OP_PATH_EXISTS || kind == BODY_OP_PATH_FILE_SIZE ||
+               kind == BODY_OP_PATH_READ_TEXT || kind == BODY_OP_PATH_WRITE_TEXT ||
+               kind == BODY_OP_REMOVE_FILE || kind == BODY_OP_CHMOD_X ||
+               kind == BODY_OP_COLD_SELF_EXEC || kind == BODY_OP_MKDIR_ONE ||
+               kind == BODY_OP_TEXT_CONTAINS || kind == BODY_OP_EXEC_SHELL ||
+               kind == BODY_OP_ARGV_STR || kind == BODY_OP_MMAP ||
+               kind == BODY_OP_OPEN || kind == BODY_OP_READ || kind == BODY_OP_CLOSE ||
+               kind == BODY_OP_TIME_NS || kind == BODY_OP_GETRUSAGE ||
+               kind == BODY_OP_GETENV_STR || kind == BODY_OP_ASSERT ||
+               kind == BODY_OP_WRITE_RAW || kind == BODY_OP_WRITE_BYTES ||
+               kind == BODY_OP_MAKE_SEQ_OPAQUE ||
+               kind == BODY_OP_SEQ_I32_ADD || kind == BODY_OP_SEQ_STR_ADD ||
+               kind == BODY_OP_SEQ_STR_INDEX_DYNAMIC ||
+               kind == BODY_OP_SEQ_OPAQUE_INDEX_DYNAMIC ||
+               kind == BODY_OP_SEQ_OPAQUE_ADD ||
+               kind == BODY_OP_SEQ_OPAQUE_INDEX_STORE ||
+               kind == BODY_OP_SEQ_OPAQUE_REMOVE) {
+        code_emit(code, rv_sw(RV_ZERO, RV_SP, (int16_t)off_dst));
     }
-    /* remaining ops: skip silently */
 }
 
 static void rv64_codegen_prologue(Code *code, int32_t frame_size) {
@@ -18495,7 +19186,7 @@ static int32_t cold_entry_dispatch_exit_code(int32_t command_code) {
 static const char *cold_entry_dispatch_output_text(int32_t command_code) {
     if (command_code == 0) {
         return "usage: cheng <command> [args]\n"
-               "core commands: status, print-build-plan, system-link-exec\n";
+               "core commands: status, print-build-plan, system-link-exec, emit-cold-csg-v2, run-host-smokes cold_csg_sidecar_smoke\n";
     }
     if (command_code == 1) {
         return "cheng\n"
@@ -18505,7 +19196,9 @@ static const char *cold_entry_dispatch_output_text(int32_t command_code) {
                "compiler_entry=src/core/tooling/backend_driver_dispatch_min.cheng\n"
                "ordinary_command=system-link-exec\n"
                "ordinary_pipeline=canonical_csg_verified_primary_object_codegen_ready\n"
-               "stage3=artifacts/bootstrap/cheng.stage3\n";
+               "stage3=artifacts/bootstrap/cheng.stage3\n"
+               "linkerless_image=1\n"
+               "system_link=0\n";
     }
     if (command_code == 2) {
         return "target=arm64-apple-darwin\n"
@@ -18830,6 +19523,15 @@ typedef struct {
     uint64_t parse_us;
     uint64_t codegen_us;
     uint64_t emit_us;
+    uint64_t facts_bytes;
+    uint64_t facts_mmap_us;
+    uint64_t facts_verify_us;
+    uint64_t facts_decode_us;
+    uint64_t facts_emit_obj_us;
+    uint64_t facts_total_us;
+    int32_t facts_function_count;
+    int32_t facts_word_count;
+    int32_t facts_reloc_count;
 } ColdCompileStats;
 
 static void cold_print_exec_phase_report(FILE *file, ColdCompileStats *stats) {
@@ -18917,6 +19619,1011 @@ static void cold_collect_body_stats(Symbols *symbols, BodyIR **function_bodies, 
     }
 }
 
+/* ================================================================
+ * CSG v2 canonical primary-object text reader
+ * ================================================================ */
+
+typedef struct {
+    uint32_t item_id;
+    int32_t word_offset;
+    int32_t word_count;
+    Span symbol_name;
+    Span body_kind;
+} ColdCsgV2PrimaryFunction;
+
+typedef struct {
+    uint32_t source_item_id;
+    int32_t word_offset;
+    Span target_symbol;
+} ColdCsgV2PrimaryReloc;
+
+typedef struct {
+    Span target_triple;
+    Span object_format;
+    Span entry_symbol;
+    ColdCsgV2PrimaryFunction *functions;
+    int32_t function_count;
+    uint32_t *words;
+    int32_t word_count;
+    ColdCsgV2PrimaryReloc *relocs;
+    int32_t reloc_count;
+} ColdCsgV2PrimaryObject;
+
+typedef struct {
+    uint16_t kind;
+    int32_t payload_bytes;
+    const uint8_t *payload_hex;
+} ColdCsgV2TextRecord;
+
+static int32_t cold_csg_v2_hex_value(uint8_t ch) {
+    if (ch >= '0' && ch <= '9') return (int32_t)(ch - '0');
+    if (ch >= 'A' && ch <= 'F') return (int32_t)(ch - 'A' + 10);
+    if (ch >= 'a' && ch <= 'f') return (int32_t)(ch - 'a' + 10);
+    return -1;
+}
+
+static bool cold_csg_v2_read_fixed_hex(const uint8_t *ptr, int32_t len, uint32_t *out) {
+    if (!ptr || len <= 0 || len > 8) return false;
+    uint32_t value = 0;
+    for (int32_t i = 0; i < len; i++) {
+        int32_t digit = cold_csg_v2_hex_value(ptr[i]);
+        if (digit < 0) return false;
+        value = (value << 4) | (uint32_t)digit;
+    }
+    *out = value;
+    return true;
+}
+
+static bool cold_csg_v2_hex_byte(const uint8_t *payload_hex,
+                                 int32_t payload_bytes,
+                                 int32_t byte_index,
+                                 uint8_t *out) {
+    if (!payload_hex || byte_index < 0 || byte_index >= payload_bytes) return false;
+    int32_t hi = cold_csg_v2_hex_value(payload_hex[byte_index * 2]);
+    int32_t lo = cold_csg_v2_hex_value(payload_hex[byte_index * 2 + 1]);
+    if (hi < 0 || lo < 0) return false;
+    *out = (uint8_t)((hi << 4) | lo);
+    return true;
+}
+
+static bool cold_csg_v2_read_payload_u32le(const uint8_t *payload_hex,
+                                           int32_t payload_bytes,
+                                           int32_t *pos,
+                                           uint32_t *out) {
+    if (!pos || !out || *pos < 0 || *pos > payload_bytes - 4) return false;
+    uint8_t b0, b1, b2, b3;
+    if (!cold_csg_v2_hex_byte(payload_hex, payload_bytes, *pos + 0, &b0)) return false;
+    if (!cold_csg_v2_hex_byte(payload_hex, payload_bytes, *pos + 1, &b1)) return false;
+    if (!cold_csg_v2_hex_byte(payload_hex, payload_bytes, *pos + 2, &b2)) return false;
+    if (!cold_csg_v2_hex_byte(payload_hex, payload_bytes, *pos + 3, &b3)) return false;
+    *out = (uint32_t)b0 | ((uint32_t)b1 << 8) |
+           ((uint32_t)b2 << 16) | ((uint32_t)b3 << 24);
+    *pos += 4;
+    return true;
+}
+
+static bool cold_csg_v2_read_payload_string(const uint8_t *payload_hex,
+                                            int32_t payload_bytes,
+                                            int32_t *pos,
+                                            Arena *arena,
+                                            Span *out) {
+    uint32_t len_u32;
+    if (!cold_csg_v2_read_payload_u32le(payload_hex, payload_bytes, pos, &len_u32)) return false;
+    if (len_u32 > (uint32_t)INT32_MAX) return false;
+    int32_t len = (int32_t)len_u32;
+    if (*pos < 0 || len < 0 || *pos > payload_bytes - len) return false;
+    char *buf = arena_alloc(arena, (size_t)len + 1);
+    for (int32_t i = 0; i < len; i++) {
+        uint8_t byte;
+        if (!cold_csg_v2_hex_byte(payload_hex, payload_bytes, *pos + i, &byte)) return false;
+        buf[i] = (char)byte;
+    }
+    buf[len] = '\0';
+    *pos += len;
+    *out = (Span){(const uint8_t *)buf, len};
+    return true;
+}
+
+static bool cold_csg_v2_next_text_record(Span text,
+                                         int32_t *pos,
+                                         ColdCsgV2TextRecord *record) {
+    if (!pos || !record || *pos < 0 || *pos >= text.len) return false;
+    int32_t start = *pos;
+    int32_t end = start;
+    while (end < text.len && text.ptr[end] != '\n') end++;
+    int32_t line_len = end - start;
+    *pos = end < text.len ? end + 1 : end;
+    if (line_len < 13) return false;
+    if (text.ptr[start] != 'R') return false;
+    uint32_t kind = 0;
+    uint32_t payload_bytes = 0;
+    if (!cold_csg_v2_read_fixed_hex(text.ptr + start + 1, 4, &kind)) return false;
+    if (!cold_csg_v2_read_fixed_hex(text.ptr + start + 5, 8, &payload_bytes)) return false;
+    if (kind == 0 || kind > UINT16_MAX) return false;
+    if (payload_bytes > (uint32_t)(INT32_MAX / 2)) return false;
+    int32_t payload_len = (int32_t)payload_bytes;
+    if (payload_len > (INT32_MAX - 13) / 2) return false;
+    if (line_len != 13 + payload_len * 2) return false;
+    for (int32_t i = 0; i < payload_len * 2; i++) {
+        if (cold_csg_v2_hex_value(text.ptr[start + 13 + i]) < 0) return false;
+    }
+    record->kind = (uint16_t)kind;
+    record->payload_bytes = payload_len;
+    record->payload_hex = text.ptr + start + 13;
+    return true;
+}
+
+static bool cold_csg_v2_count_primary_records(Span text,
+                                              int32_t *out_functions,
+                                              int32_t *out_words,
+                                              int32_t *out_relocs) {
+    static const char magic[] = "CHENG_CSG_V2\n";
+    int32_t magic_len = (int32_t)sizeof(magic) - 1;
+    if (text.len < magic_len || memcmp(text.ptr, magic, (size_t)magic_len) != 0) return false;
+    bool saw_target = false;
+    bool saw_format = false;
+    bool saw_entry = false;
+    int32_t functions = 0;
+    int32_t words = 0;
+    int32_t relocs = 0;
+    int32_t pos = magic_len;
+    while (pos < text.len) {
+        ColdCsgV2TextRecord record;
+        if (!cold_csg_v2_next_text_record(text, &pos, &record)) return false;
+        switch (record.kind) {
+            case 1:
+                if (saw_target) return false;
+                saw_target = true;
+                break;
+            case 2:
+                if (saw_format) return false;
+                saw_format = true;
+                break;
+            case 3:
+                if (saw_entry) return false;
+                saw_entry = true;
+                break;
+            case 4:
+                if (functions == INT32_MAX) return false;
+                functions++;
+                break;
+            case 5:
+                if (words == INT32_MAX) return false;
+                words++;
+                break;
+            case 6:
+                if (relocs == INT32_MAX) return false;
+                relocs++;
+                break;
+            default:
+                return false;
+        }
+    }
+    if (!saw_target || !saw_format || !saw_entry) return false;
+    if (functions <= 0) return false;
+    *out_functions = functions;
+    *out_words = words;
+    *out_relocs = relocs;
+    return true;
+}
+
+static int32_t cold_csg_v2_find_item(const ColdCsgV2PrimaryObject *facts, uint32_t item_id) {
+    for (int32_t i = 0; i < facts->function_count; i++) {
+        if (facts->functions[i].item_id == item_id) return i;
+    }
+    return -1;
+}
+
+static int32_t cold_csg_v2_find_symbol(const ColdCsgV2PrimaryObject *facts, Span symbol) {
+    for (int32_t i = 0; i < facts->function_count; i++) {
+        if (span_same(facts->functions[i].symbol_name, symbol)) return i;
+    }
+    return -1;
+}
+
+static const char *cold_csg_v2_object_format_for_target(const char *target) {
+    if (!target) return "";
+    if (strcmp(target, "arm64-apple-darwin") == 0) return "macho";
+    if (strcmp(target, "aarch64-unknown-linux-gnu") == 0 ||
+        strcmp(target, "x86_64-unknown-linux-gnu") == 0 ||
+        strcmp(target, "riscv64-unknown-linux-gnu") == 0) return "elf";
+    if (strcmp(target, "x86_64-pc-windows-msvc") == 0 ||
+        strcmp(target, "aarch64-pc-windows-msvc") == 0) return "coff";
+    return "";
+}
+
+static bool cold_csg_v2_validate_primary_object(ColdCsgV2PrimaryObject *facts,
+                                                const char *requested_target) {
+    if (!facts || facts->function_count <= 0) return false;
+    if (facts->target_triple.len <= 0 || facts->object_format.len <= 0) return false;
+    if (requested_target && requested_target[0] != '\0') {
+        if (!span_eq(facts->target_triple, requested_target)) return false;
+        const char *expected_format = cold_csg_v2_object_format_for_target(requested_target);
+        if (expected_format[0] == '\0') return false;
+        if (!span_eq(facts->object_format, expected_format)) return false;
+    }
+    for (int32_t i = 0; i < facts->function_count; i++) {
+        ColdCsgV2PrimaryFunction *fn = &facts->functions[i];
+        if (fn->symbol_name.len <= 0) return false;
+        if (fn->word_offset < 0 || fn->word_count < 0) return false;
+        if (fn->word_offset > facts->word_count) return false;
+        if (fn->word_count > facts->word_count - fn->word_offset) return false;
+        for (int32_t j = i + 1; j < facts->function_count; j++) {
+            if (facts->functions[j].item_id == fn->item_id) return false;
+            if (span_same(facts->functions[j].symbol_name, fn->symbol_name)) return false;
+        }
+    }
+    if (facts->entry_symbol.len > 0 &&
+        cold_csg_v2_find_symbol(facts, facts->entry_symbol) < 0) {
+        return false;
+    }
+    for (int32_t i = 0; i < facts->reloc_count; i++) {
+        ColdCsgV2PrimaryReloc *reloc = &facts->relocs[i];
+        if (reloc->target_symbol.len <= 0) return false;
+        int32_t source_index = cold_csg_v2_find_item(facts, reloc->source_item_id);
+        if (source_index < 0) return false;
+        ColdCsgV2PrimaryFunction *source_fn = &facts->functions[source_index];
+        if (reloc->word_offset < source_fn->word_offset) return false;
+        if (reloc->word_offset >= source_fn->word_offset + source_fn->word_count) return false;
+    }
+    return true;
+}
+
+static bool cold_csg_v2_decode_primary_object(Span text,
+                                              Arena *arena,
+                                              int32_t function_count,
+                                              int32_t word_count,
+                                              int32_t reloc_count,
+                                              const char *target,
+                                              ColdCsgV2PrimaryObject *out) {
+    static const char magic[] = "CHENG_CSG_V2\n";
+    int32_t magic_len = (int32_t)sizeof(magic) - 1;
+    memset(out, 0, sizeof(*out));
+    out->function_count = function_count;
+    out->word_count = word_count;
+    out->reloc_count = reloc_count;
+    out->functions = arena_alloc(arena, (size_t)function_count * sizeof(ColdCsgV2PrimaryFunction));
+    out->words = word_count > 0
+        ? arena_alloc(arena, (size_t)word_count * sizeof(uint32_t))
+        : 0;
+    out->relocs = reloc_count > 0
+        ? arena_alloc(arena, (size_t)reloc_count * sizeof(ColdCsgV2PrimaryReloc))
+        : 0;
+
+    bool saw_target = false;
+    bool saw_format = false;
+    bool saw_entry = false;
+    int32_t fn_index = 0;
+    int32_t word_index = 0;
+    int32_t reloc_index = 0;
+    int32_t pos = magic_len;
+    while (pos < text.len) {
+        ColdCsgV2TextRecord record;
+        if (!cold_csg_v2_next_text_record(text, &pos, &record)) return false;
+        int32_t payload_pos = 0;
+        switch (record.kind) {
+            case 1:
+                if (saw_target) return false;
+                if (!cold_csg_v2_read_payload_string(record.payload_hex, record.payload_bytes,
+                                                     &payload_pos, arena, &out->target_triple)) return false;
+                if (payload_pos != record.payload_bytes) return false;
+                saw_target = true;
+                break;
+            case 2:
+                if (saw_format) return false;
+                if (!cold_csg_v2_read_payload_string(record.payload_hex, record.payload_bytes,
+                                                     &payload_pos, arena, &out->object_format)) return false;
+                if (payload_pos != record.payload_bytes) return false;
+                saw_format = true;
+                break;
+            case 3:
+                if (saw_entry) return false;
+                if (!cold_csg_v2_read_payload_string(record.payload_hex, record.payload_bytes,
+                                                     &payload_pos, arena, &out->entry_symbol)) return false;
+                if (payload_pos != record.payload_bytes) return false;
+                saw_entry = true;
+                break;
+            case 4: {
+                if (fn_index >= function_count) return false;
+                uint32_t item_id, word_offset, fn_word_count;
+                if (!cold_csg_v2_read_payload_u32le(record.payload_hex, record.payload_bytes,
+                                                    &payload_pos, &item_id)) return false;
+                if (!cold_csg_v2_read_payload_u32le(record.payload_hex, record.payload_bytes,
+                                                    &payload_pos, &word_offset)) return false;
+                if (!cold_csg_v2_read_payload_u32le(record.payload_hex, record.payload_bytes,
+                                                    &payload_pos, &fn_word_count)) return false;
+                if (item_id > (uint32_t)INT32_MAX ||
+                    word_offset > (uint32_t)INT32_MAX ||
+                    fn_word_count > (uint32_t)INT32_MAX) return false;
+                ColdCsgV2PrimaryFunction *fn = &out->functions[fn_index++];
+                fn->item_id = item_id;
+                fn->word_offset = (int32_t)word_offset;
+                fn->word_count = (int32_t)fn_word_count;
+                if (!cold_csg_v2_read_payload_string(record.payload_hex, record.payload_bytes,
+                                                     &payload_pos, arena, &fn->symbol_name)) return false;
+                if (!cold_csg_v2_read_payload_string(record.payload_hex, record.payload_bytes,
+                                                     &payload_pos, arena, &fn->body_kind)) return false;
+                if (payload_pos != record.payload_bytes) return false;
+                break;
+            }
+            case 5: {
+                if (word_index >= word_count) return false;
+                uint32_t word;
+                if (!cold_csg_v2_read_payload_u32le(record.payload_hex, record.payload_bytes,
+                                                    &payload_pos, &word)) return false;
+                if (payload_pos != record.payload_bytes) return false;
+                out->words[word_index++] = word;
+                break;
+            }
+            case 6: {
+                if (reloc_index >= reloc_count) return false;
+                uint32_t source_item_id, word_offset;
+                if (!cold_csg_v2_read_payload_u32le(record.payload_hex, record.payload_bytes,
+                                                    &payload_pos, &source_item_id)) return false;
+                if (!cold_csg_v2_read_payload_u32le(record.payload_hex, record.payload_bytes,
+                                                    &payload_pos, &word_offset)) return false;
+                if (source_item_id > (uint32_t)INT32_MAX ||
+                    word_offset > (uint32_t)INT32_MAX) return false;
+                ColdCsgV2PrimaryReloc *reloc = &out->relocs[reloc_index++];
+                reloc->source_item_id = source_item_id;
+                reloc->word_offset = (int32_t)word_offset;
+                if (!cold_csg_v2_read_payload_string(record.payload_hex, record.payload_bytes,
+                                                     &payload_pos, arena, &reloc->target_symbol)) return false;
+                if (payload_pos != record.payload_bytes) return false;
+                break;
+            }
+            default:
+                return false;
+        }
+    }
+    if (!saw_target || !saw_format || !saw_entry) return false;
+    if (fn_index != function_count || word_index != word_count || reloc_index != reloc_count) return false;
+    return cold_csg_v2_validate_primary_object(out, target);
+}
+
+static char *cold_span_to_cstr(Arena *arena, Span span) {
+    char *buf = arena_alloc(arena, (size_t)span.len + 1);
+    if (span.len > 0) memcpy(buf, span.ptr, (size_t)span.len);
+    buf[span.len] = '\0';
+    return buf;
+}
+
+static int32_t cold_csg_v2_symbol_index_for_reloc(ColdCsgV2PrimaryObject *facts,
+                                                  Span target_symbol,
+                                                  const char **names,
+                                                  int32_t *offsets,
+                                                  int32_t *name_count,
+                                                  int32_t max_names,
+                                                  Arena *arena) {
+    int32_t defined = cold_csg_v2_find_symbol(facts, target_symbol);
+    if (defined >= 0) return defined;
+    for (int32_t i = facts->function_count; i < *name_count; i++) {
+        Span existing = {(const uint8_t *)names[i], (int32_t)strlen(names[i])};
+        if (span_same(existing, target_symbol)) return i;
+    }
+    if (*name_count >= max_names) return -1;
+    int32_t index = *name_count;
+    names[index] = cold_span_to_cstr(arena, target_symbol);
+    offsets[index] = -1;
+    *name_count = *name_count + 1;
+    return index;
+}
+
+static bool cold_csg_v2_emit_primary_object(const char *out_path,
+                                            const char *target,
+                                            ColdCsgV2PrimaryObject *facts,
+                                            Arena *arena) {
+    bool is_elf = target && (strcmp(target, "aarch64-unknown-linux-gnu") == 0 ||
+                             strcmp(target, "x86_64-unknown-linux-gnu") == 0 ||
+                             strcmp(target, "riscv64-unknown-linux-gnu") == 0);
+    bool is_coff = target && (strcmp(target, "x86_64-pc-windows-msvc") == 0 ||
+                              strcmp(target, "aarch64-pc-windows-msvc") == 0);
+    bool is_macho = target && strcmp(target, "arm64-apple-darwin") == 0;
+    if (!is_macho && !is_elf && !is_coff) return false;
+
+    uint16_t elf_machine = 0;
+    uint16_t coff_machine = 0;
+    if (is_elf) {
+        if (strstr(target, "aarch64")) elf_machine = EM_AARCH64;
+        else if (strstr(target, "riscv64")) elf_machine = EM_RISCV;
+        else if (strstr(target, "x86_64")) elf_machine = EM_X86_64;
+        else return false;
+    }
+    if (is_coff) {
+        if (strstr(target, "aarch64")) coff_machine = IMAGE_FILE_MACHINE_ARM64;
+        else if (strstr(target, "x86_64")) coff_machine = IMAGE_FILE_MACHINE_AMD64;
+        else return false;
+    }
+
+    int32_t max_names = facts->function_count + facts->reloc_count;
+    if (max_names <= 0) return false;
+    const char **names = arena_alloc(arena, (size_t)max_names * sizeof(const char *));
+    int32_t *offsets = arena_alloc(arena, (size_t)max_names * sizeof(int32_t));
+    int32_t name_count = facts->function_count;
+    for (int32_t i = 0; i < facts->function_count; i++) {
+        names[i] = cold_span_to_cstr(arena, facts->functions[i].symbol_name);
+        offsets[i] = facts->functions[i].word_offset;
+    }
+
+    int32_t *reloc_offsets = facts->reloc_count > 0
+        ? arena_alloc(arena, (size_t)facts->reloc_count * sizeof(int32_t))
+        : 0;
+    int32_t *reloc_symbols = facts->reloc_count > 0
+        ? arena_alloc(arena, (size_t)facts->reloc_count * sizeof(int32_t))
+        : 0;
+    for (int32_t i = 0; i < facts->reloc_count; i++) {
+        if (facts->relocs[i].word_offset > INT32_MAX / 4) return false;
+        int32_t byte_offset = facts->relocs[i].word_offset * 4;
+        int32_t symbol_index = cold_csg_v2_symbol_index_for_reloc(facts,
+                                                                  facts->relocs[i].target_symbol,
+                                                                  names, offsets,
+                                                                  &name_count, max_names,
+                                                                  arena);
+        if (symbol_index < 0) return false;
+        reloc_offsets[i] = byte_offset;
+        reloc_symbols[i] = symbol_index;
+    }
+    int32_t local_count = 0;
+    if (is_elf) {
+        return elf64_write_object(out_path, facts->words, facts->word_count,
+                                  names, offsets, name_count, local_count,
+                                  reloc_offsets, reloc_symbols, facts->reloc_count,
+                                  elf_machine);
+    }
+    if (is_coff) {
+        return coff_write_object(out_path, facts->words, facts->word_count,
+                                 names, offsets, name_count, local_count,
+                                 reloc_offsets, reloc_symbols, facts->reloc_count,
+                                 coff_machine);
+    }
+    return macho_write_object(out_path, facts->words, facts->word_count,
+                              names, offsets, name_count, local_count,
+                              reloc_offsets, reloc_symbols, facts->reloc_count);
+}
+
+static bool cold_compile_canonical_csg_v2_primary_object(const char *out_path,
+                                                         const char *target,
+                                                         Span csg_text,
+                                                         Arena *arena,
+                                                         ColdCompileStats *stats,
+                                                         uint64_t start_us,
+                                                         uint64_t mmap_done_us) {
+    int32_t function_count = 0;
+    int32_t word_count = 0;
+    int32_t reloc_count = 0;
+    uint64_t verify_start_us = cold_now_us();
+    if (!cold_csg_v2_count_primary_records(csg_text, &function_count, &word_count, &reloc_count)) {
+        return false;
+    }
+    uint64_t verify_end_us = cold_now_us();
+    ColdCsgV2PrimaryObject facts;
+    if (!cold_csg_v2_decode_primary_object(csg_text, arena,
+                                           function_count, word_count, reloc_count,
+                                           target, &facts)) {
+        return false;
+    }
+    uint64_t decode_end_us = cold_now_us();
+    bool ok = cold_csg_v2_emit_primary_object(out_path, target, &facts, arena);
+    uint64_t emit_end_us = cold_now_us();
+    if (stats) {
+        stats->function_count = facts.function_count;
+        stats->csg_lowering = 1;
+        stats->code_words = facts.word_count;
+        stats->arena_kb = arena->used / 1024;
+        stats->facts_bytes = (uint64_t)csg_text.len;
+        stats->facts_mmap_us = mmap_done_us >= start_us ? mmap_done_us - start_us : 0;
+        stats->facts_verify_us = verify_end_us >= verify_start_us ? verify_end_us - verify_start_us : 0;
+        stats->facts_decode_us = decode_end_us >= verify_end_us ? decode_end_us - verify_end_us : 0;
+        stats->facts_emit_obj_us = emit_end_us >= decode_end_us ? emit_end_us - decode_end_us : 0;
+        stats->facts_total_us = emit_end_us >= start_us ? emit_end_us - start_us : 0;
+        stats->facts_function_count = facts.function_count;
+        stats->facts_word_count = facts.word_count;
+        stats->facts_reloc_count = facts.reloc_count;
+        stats->parse_us = stats->facts_verify_us + stats->facts_decode_us;
+        stats->emit_us = stats->facts_emit_obj_us;
+        stats->elapsed_us = stats->facts_total_us;
+    }
+    return ok;
+}
+
+/* ================================================================
+ * CSG v2 binary reader
+ * ================================================================ */
+
+static bool cold_read_u32(const uint8_t *data, int32_t data_len, int32_t *pos, uint32_t *out) {
+    if (*pos + 4 > data_len) return false;
+    *out = (uint32_t)data[*pos] | ((uint32_t)data[*pos+1] << 8) |
+           ((uint32_t)data[*pos+2] << 16) | ((uint32_t)data[*pos+3] << 24);
+    *pos += 4;
+    return true;
+}
+
+static bool cold_read_u64(const uint8_t *data, int32_t data_len, int32_t *pos, uint64_t *out) {
+    if (*pos + 8 > data_len) return false;
+    *out = (uint64_t)data[*pos] | ((uint64_t)data[*pos+1] << 8) |
+           ((uint64_t)data[*pos+2] << 16) | ((uint64_t)data[*pos+3] << 24) |
+           ((uint64_t)data[*pos+4] << 32) | ((uint64_t)data[*pos+5] << 40) |
+           ((uint64_t)data[*pos+6] << 48) | ((uint64_t)data[*pos+7] << 56);
+    *pos += 8;
+    return true;
+}
+
+static bool cold_read_str(const uint8_t *data, int32_t data_len, int32_t *pos, Span *out) {
+    uint32_t len;
+    if (!cold_read_u32(data, data_len, pos, &len)) return false;
+    if (*pos + (int32_t)len > data_len) return false;
+    out->ptr = data + *pos;
+    out->len = (int32_t)len;
+    *pos += (int32_t)len;
+    return true;
+}
+
+typedef struct {
+    int32_t facts_bytes;
+    int32_t verify_us;
+    int32_t decode_us;
+    int32_t fn_count;
+    int32_t op_count;
+} ColdCsgV2Timing;
+
+static bool cold_load_csg_v2_facts(
+    const uint8_t *data, int32_t data_len,
+    BodyIR ***out_bodies, int32_t *out_count,
+    Symbols *symbols, Arena *arena,
+    ColdCsgV2Timing *timing
+) {
+    uint64_t t_start = cold_now_us();
+    uint64_t t_verify = 0, t_decode = 0;
+    int32_t total_op_count = 0;
+    int32_t pos = 0;
+
+    /* Budget: total facts size */
+    if (data_len > CSG_V2_BUDGET_MAX_FACTS_BYTES) {
+        fprintf(stderr, "[CSG-V2] budget exceeded: facts_bytes=%d > max=%d\n",
+                data_len, CSG_V2_BUDGET_MAX_FACTS_BYTES);
+        return false;
+    }
+
+    /* 1. Parse header (64 bytes) */
+    if (pos + 64 > data_len) return false;
+    if (memcmp(data + pos, "CHENGCSG", 8) != 0) return false;
+    pos += 8;
+    t_verify = cold_now_us();
+
+    uint32_t version;
+    if (!cold_read_u32(data, data_len, &pos, &version)) return false;
+    if (version != 2) return false;
+
+    /* Skip: target_triple(32) + abi(4) + pointer_width(1) + endianness(1) + reserved(14) */
+    pos += 32 + 4 + 1 + 1 + 14;
+
+    /* 2. Read section index */
+    uint32_t section_count;
+    if (!cold_read_u32(data, data_len, &pos, &section_count)) return false;
+    if (section_count > 10) return false;
+
+    uint32_t sec_kind[10], sec_size[10];
+    uint64_t sec_offset[10];
+    for (uint32_t si = 0; si < section_count; si++) {
+        if (!cold_read_u32(data, data_len, &pos, &sec_kind[si])) return false;
+        if (!cold_read_u64(data, data_len, &pos, &sec_offset[si])) return false;
+        if (!cold_read_u32(data, data_len, &pos, &sec_size[si])) return false;
+    }
+
+    /* 3. Parse string section (kind=5) */
+    Span *str_spans = 0;
+    uint32_t str_count = 0;
+    for (uint32_t si = 0; si < section_count; si++) {
+        if (sec_kind[si] == 5) {
+            int32_t spos = (int32_t)sec_offset[si];
+            if (!cold_read_u32(data, data_len, &spos, &str_count)) return false;
+            if (str_count > 0) {
+                str_spans = arena_alloc(arena, (size_t)str_count * sizeof(Span));
+                memset(str_spans, 0, (size_t)str_count * sizeof(Span));
+                for (uint32_t i = 0; i < str_count; i++) {
+                    uint32_t id, slen;
+                    if (!cold_read_u32(data, data_len, &spos, &id)) return false;
+                    if (!cold_read_u32(data, data_len, &spos, &slen)) return false;
+                    if ((int32_t)(spos + (int32_t)slen) > data_len) return false;
+                    if (id < str_count) {
+                        str_spans[id] = (Span){data + spos, (int32_t)slen};
+                    }
+                    spos += (int32_t)slen;
+                }
+            }
+            break;
+        }
+    }
+
+    /* 4. Parse function section (kind=1) */
+    int32_t sec_pos = 0;
+    bool found_fn_section = false;
+    for (uint32_t si = 0; si < section_count; si++) {
+        if (sec_kind[si] == 1) {
+            sec_pos = (int32_t)sec_offset[si];
+            found_fn_section = true;
+            break;
+        }
+    }
+    if (!found_fn_section) return false;
+
+    uint32_t fn_count;
+    if (!cold_read_u32(data, data_len, &sec_pos, &fn_count)) return false;
+    if (fn_count == 0) return false;
+    if (fn_count > CSG_V2_BUDGET_MAX_FN_COUNT) {
+        fprintf(stderr, "[CSG-V2] budget exceeded: fn_count=%u > max=%d\n",
+                fn_count, CSG_V2_BUDGET_MAX_FN_COUNT);
+        return false;
+    }
+
+    /* Temporary list of (symbol_index, BodyIR*) pairs */
+    typedef struct {
+        int32_t symbol_index;
+        BodyIR *body;
+    } FnBodyPair;
+
+    FnBodyPair *fn_list = arena_alloc(arena, (size_t)fn_count * sizeof(FnBodyPair));
+    memset(fn_list, 0, (size_t)fn_count * sizeof(FnBodyPair));
+
+    for (uint32_t fi = 0; fi < fn_count; fi++) {
+        /* Read function name */
+        Span fn_name;
+        if (!cold_read_str(data, data_len, &sec_pos, &fn_name)) return false;
+
+        uint32_t param_count, return_kind, frame_size, op_count;
+        if (!cold_read_u32(data, data_len, &sec_pos, &param_count)) return false;
+        if (param_count > COLD_MAX_I32_PARAMS) return false;
+        int32_t param_kinds[COLD_MAX_I32_PARAMS];
+        int32_t param_sizes[COLD_MAX_I32_PARAMS];
+        int32_t param_slots[COLD_MAX_I32_PARAMS];
+        for (uint32_t pi = 0; pi < param_count; pi++) {
+            uint32_t pk, pz, ps;
+            if (!cold_read_u32(data, data_len, &sec_pos, &pk)) return false;
+            if (!cold_read_u32(data, data_len, &sec_pos, &pz)) return false;
+            if (!cold_read_u32(data, data_len, &sec_pos, &ps)) return false;
+            if (pk > (uint32_t)INT32_MAX ||
+                pz > (uint32_t)INT32_MAX ||
+                ps > (uint32_t)INT32_MAX) return false;
+            param_kinds[pi] = (int32_t)pk;
+            param_sizes[pi] = (int32_t)pz;
+            param_slots[pi] = (int32_t)ps;
+        }
+        if (!cold_read_u32(data, data_len, &sec_pos, &return_kind)) return false;
+        if (!cold_read_u32(data, data_len, &sec_pos, &frame_size)) return false;
+        if (!cold_read_u32(data, data_len, &sec_pos, &op_count)) return false;
+        if (op_count > CSG_V2_BUDGET_MAX_OP_COUNT) {
+            fprintf(stderr, "[CSG-V2] budget exceeded: op_count=%u > max=%d\n",
+                    op_count, CSG_V2_BUDGET_MAX_OP_COUNT);
+            return false;
+        }
+        total_op_count += (int32_t)op_count;
+
+        /* Register function with symbols */
+        int32_t sym_idx = symbols_add_fn(symbols, fn_name, (int32_t)param_count,
+                                          param_kinds, param_sizes, cold_cstr_span(""));
+
+        /* Create BodyIR */
+        BodyIR *body = body_new(arena);
+        body->frame_size = (int32_t)frame_size;
+        body->return_kind = (int32_t)return_kind;
+        body->return_size = body->return_kind == 0
+            ? 0
+            : cold_slot_size_for_kind(body->return_kind);
+        body->return_type = (Span){0};
+        body->sret_slot = -1;
+        body->has_fallback = false;
+        body->param_count = (int32_t)param_count;
+        for (uint32_t pi = 0; pi < param_count; pi++) {
+            body->param_slot[pi] = param_slots[pi];
+            body->param_name[pi] = (Span){0};
+        }
+
+        /* Read ops (5 u32 per op) */
+        for (uint32_t oi = 0; oi < op_count; oi++) {
+            uint32_t kind, dst, a, b, c;
+            if (!cold_read_u32(data, data_len, &sec_pos, &kind)) return false;
+            if (!cold_read_u32(data, data_len, &sec_pos, &dst)) return false;
+            if (!cold_read_u32(data, data_len, &sec_pos, &a)) return false;
+            if (!cold_read_u32(data, data_len, &sec_pos, &b)) return false;
+            if (!cold_read_u32(data, data_len, &sec_pos, &c)) return false;
+            body_op3(body, (int32_t)kind, (int32_t)dst, (int32_t)a, (int32_t)b, (int32_t)c);
+        }
+
+        /* Read slots (3 u32 per slot) */
+        uint32_t slot_count;
+        if (!cold_read_u32(data, data_len, &sec_pos, &slot_count)) return false;
+        if (slot_count > CSG_V2_BUDGET_MAX_SLOT_COUNT) {
+            fprintf(stderr, "[CSG-V2] budget exceeded: slot_count=%u > max=%d\n",
+                    slot_count, CSG_V2_BUDGET_MAX_SLOT_COUNT);
+            return false;
+        }
+        for (uint32_t si = 0; si < slot_count; si++) {
+            uint32_t skind, soff, ssize;
+            if (!cold_read_u32(data, data_len, &sec_pos, &skind)) return false;
+            if (!cold_read_u32(data, data_len, &sec_pos, &soff)) return false;
+            if (!cold_read_u32(data, data_len, &sec_pos, &ssize)) return false;
+            body_ensure_slots(body);
+            int32_t idx = body->slot_count++;
+            body->slot_kind[idx] = (int32_t)skind;
+            body->slot_offset[idx] = (int32_t)soff;
+            body->slot_size[idx] = (int32_t)ssize;
+            body->slot_aux[idx] = 0;
+            body->slot_type[idx] = (Span){0};
+            body->slot_no_alias[idx] = 0;
+        }
+        for (uint32_t pi = 0; pi < param_count; pi++) {
+            int32_t slot = body->param_slot[pi];
+            if (slot < 0 || slot >= body->slot_count) return false;
+        }
+
+        /* Read blocks (3 u32 per block) */
+        uint32_t block_count;
+        if (!cold_read_u32(data, data_len, &sec_pos, &block_count)) return false;
+        for (uint32_t bi = 0; bi < block_count; bi++) {
+            uint32_t bop_start, bop_cnt, bterm;
+            if (!cold_read_u32(data, data_len, &sec_pos, &bop_start)) return false;
+            if (!cold_read_u32(data, data_len, &sec_pos, &bop_cnt)) return false;
+            if (!cold_read_u32(data, data_len, &sec_pos, &bterm)) return false;
+            body_ensure_blocks(body);
+            int32_t idx = body->block_count++;
+            body->block_op_start[idx] = (int32_t)bop_start;
+            body->block_op_count[idx] = (int32_t)bop_cnt;
+            body->block_term[idx] = (int32_t)bterm;
+        }
+
+        /* Read terms (6 u32 per term) */
+        uint32_t term_count;
+        if (!cold_read_u32(data, data_len, &sec_pos, &term_count)) return false;
+        for (uint32_t ti = 0; ti < term_count; ti++) {
+            uint32_t tkind, tval, tcase_start, tcase_count, ttrue, tfalse;
+            if (!cold_read_u32(data, data_len, &sec_pos, &tkind)) return false;
+            if (!cold_read_u32(data, data_len, &sec_pos, &tval)) return false;
+            if (!cold_read_u32(data, data_len, &sec_pos, &tcase_start)) return false;
+            if (!cold_read_u32(data, data_len, &sec_pos, &tcase_count)) return false;
+            if (!cold_read_u32(data, data_len, &sec_pos, &ttrue)) return false;
+            if (!cold_read_u32(data, data_len, &sec_pos, &tfalse)) return false;
+            body_ensure_terms(body);
+            int32_t idx = body->term_count++;
+            body->term_kind[idx] = (int32_t)tkind;
+            body->term_value[idx] = (int32_t)tval;
+            body->term_case_start[idx] = (int32_t)tcase_start;
+            body->term_case_count[idx] = (int32_t)tcase_count;
+            body->term_true_block[idx] = (int32_t)ttrue;
+            body->term_false_block[idx] = (int32_t)tfalse;
+        }
+
+        for (uint32_t bi = 0; bi < block_count; bi++) {
+            int32_t term = body->block_term[bi];
+            if (term < 0 || term >= (int32_t)term_count) return false;
+        }
+
+        /* Read switch cases (3 u32 per case) */
+        uint32_t switch_count;
+        if (!cold_read_u32(data, data_len, &sec_pos, &switch_count)) return false;
+        for (uint32_t si = 0; si < switch_count; si++) {
+            uint32_t stag, sblock, sterm;
+            if (!cold_read_u32(data, data_len, &sec_pos, &stag)) return false;
+            if (!cold_read_u32(data, data_len, &sec_pos, &sblock)) return false;
+            if (!cold_read_u32(data, data_len, &sec_pos, &sterm)) return false;
+            body_ensure_switches(body);
+            int32_t idx = body->switch_count++;
+            body->switch_tag[idx] = (int32_t)stag;
+            body->switch_block[idx] = (int32_t)sblock;
+            body->switch_term[idx] = (int32_t)sterm;
+        }
+
+        /* Skip call metadata (4 u32 per call) */
+        uint32_t call_count;
+        if (!cold_read_u32(data, data_len, &sec_pos, &call_count)) return false;
+        sec_pos += (int32_t)(call_count * 16);
+        if (sec_pos > data_len) return false;
+
+        /* Read call args (2 u32 per arg) */
+        uint32_t call_arg_count;
+        if (!cold_read_u32(data, data_len, &sec_pos, &call_arg_count)) return false;
+        for (uint32_t cai = 0; cai < call_arg_count; cai++) {
+            uint32_t caslot, caoff;
+            if (!cold_read_u32(data, data_len, &sec_pos, &caslot)) return false;
+            if (!cold_read_u32(data, data_len, &sec_pos, &caoff)) return false;
+            body_ensure_call_args(body);
+            int32_t idx = body->call_arg_count++;
+            body->call_arg_slot[idx] = (int32_t)caslot;
+            body->call_arg_offset[idx] = (int32_t)caoff;
+        }
+
+        /* Read string literal ids */
+        uint32_t str_lit_count;
+        if (!cold_read_u32(data, data_len, &sec_pos, &str_lit_count)) return false;
+        for (uint32_t sli = 0; sli < str_lit_count; sli++) {
+            uint32_t str_id;
+            if (!cold_read_u32(data, data_len, &sec_pos, &str_id)) return false;
+            body_ensure_string_literals(body);
+            int32_t idx = body->string_literal_count++;
+            if (str_id < str_count && str_spans) {
+                body->string_literal[idx] = str_spans[str_id];
+            } else {
+                body->string_literal[idx] = (Span){0};
+            }
+        }
+
+        fn_list[fi].symbol_index = sym_idx;
+        fn_list[fi].body = body;
+    }
+
+    /* 5. Build function_bodies array */
+    {
+        int32_t cap = symbols->function_cap;
+        BodyIR **bodies = arena_alloc(arena, (size_t)cap * sizeof(BodyIR *));
+        memset(bodies, 0, (size_t)cap * sizeof(BodyIR *));
+        for (uint32_t fi = 0; fi < fn_count; fi++) {
+            int32_t si = fn_list[fi].symbol_index;
+            if (si >= 0 && si < cap) {
+                bodies[si] = fn_list[fi].body;
+            }
+        }
+        *out_bodies = bodies;
+    }
+    *out_count = (int32_t)symbols->function_count;
+    t_decode = cold_now_us();
+    if (timing) {
+        timing->facts_bytes = data_len;
+        timing->verify_us = (int32_t)(t_verify - t_start);
+        timing->decode_us = (int32_t)(t_decode - t_verify);
+        timing->fn_count = (int32_t)fn_count;
+        timing->op_count = total_op_count;
+    }
+    return true;
+}
+
+/* ================================================================
+ * CSG v2 record-based binary facts reader (lowered instruction words)
+ * ================================================================ */
+
+static uint32_t cold_read_csg_v2_u32_le(const uint8_t *data, int32_t *pos) {
+    uint32_t v = (uint32_t)data[*pos] | ((uint32_t)data[*pos+1] << 8) |
+                 ((uint32_t)data[*pos+2] << 16) | ((uint32_t)data[*pos+3] << 24);
+    *pos += 4;
+    return v;
+}
+
+static char *cold_read_csg_v2_obj_str(Arena *arena, const uint8_t *data, int32_t *pos) {
+    uint32_t len = cold_read_csg_v2_u32_le(data, pos);
+    char *s = (char *)(data + *pos);
+    *pos += (int32_t)len;
+    if (len == 0) return "";
+    char *copy = arena_alloc(arena, (size_t)len + 1);
+    memcpy(copy, s, (size_t)len);
+    copy[len] = '\0';
+    return copy;
+}
+
+typedef struct {
+    uint32_t item_id;
+    uint32_t word_offset;
+    uint32_t word_count;
+    char *symbol_name;
+    char *body_kind;
+} CsgV2ObjFunction;
+
+typedef struct {
+    CsgV2ObjFunction *functions;
+    int32_t function_count;
+    int32_t function_cap;
+    uint32_t *words;
+    int32_t word_count;
+    uint32_t *reloc_source_item_ids;
+    uint32_t *reloc_word_offsets;
+    char **reloc_target_symbols;
+    int32_t reloc_count;
+    int32_t reloc_cap;
+    char *entry_symbol;
+    char *object_format;
+    char *target_triple;
+    Arena *arena;
+} CsgV2ObjFacts;
+
+static bool cold_load_csg_v2_obj_facts(
+    const uint8_t *data, int32_t data_len,
+    CsgV2ObjFacts *facts, Arena *arena)
+{
+    memset(facts, 0, sizeof(*facts));
+    facts->arena = arena;
+    int32_t pos = 0;
+
+    /* Magic */
+    if (data_len < 8 || memcmp(data, "CHENGCSG", 8) != 0) return false;
+    pos = 8;
+
+    /* Parse records */
+    while (pos + 6 <= data_len) {
+        uint32_t kind = (uint32_t)data[pos] | ((uint32_t)data[pos+1] << 8);
+        pos += 2;
+        uint32_t payload_size = cold_read_csg_v2_u32_le(data, &pos);
+        if (pos + (int32_t)payload_size > data_len) return false;
+        int32_t payload_end = pos + (int32_t)payload_size;
+
+        switch (kind) {
+        case 1: /* target_triple */
+            facts->target_triple = cold_read_csg_v2_obj_str(arena, data, &pos);
+            break;
+        case 2: /* object_format */
+            facts->object_format = cold_read_csg_v2_obj_str(arena, data, &pos);
+            break;
+        case 3: /* entry_symbol */
+            facts->entry_symbol = cold_read_csg_v2_obj_str(arena, data, &pos);
+            break;
+        case 4: { /* function */
+            uint32_t item_id = cold_read_csg_v2_u32_le(data, &pos);
+            uint32_t word_offset = cold_read_csg_v2_u32_le(data, &pos);
+            uint32_t word_count = cold_read_csg_v2_u32_le(data, &pos);
+            char *sym = cold_read_csg_v2_obj_str(arena, data, &pos);
+            char *kind_str = cold_read_csg_v2_obj_str(arena, data, &pos);
+            if (facts->function_count >= facts->function_cap) {
+                int32_t new_cap = facts->function_cap ? facts->function_cap * 2 : 8;
+                CsgV2ObjFunction *new_fns = arena_alloc(arena,
+                    (size_t)new_cap * sizeof(CsgV2ObjFunction));
+                if (facts->function_count > 0)
+                    memcpy(new_fns, facts->functions,
+                           (size_t)facts->function_count * sizeof(CsgV2ObjFunction));
+                facts->functions = new_fns;
+                facts->function_cap = new_cap;
+            }
+            CsgV2ObjFunction *fn = &facts->functions[facts->function_count++];
+            fn->item_id = item_id;
+            fn->word_offset = word_offset;
+            fn->word_count = word_count;
+            fn->symbol_name = sym;
+            fn->body_kind = kind_str;
+            break;
+        }
+        case 5: { /* instruction_words (batched) */
+            int32_t word_count = (int32_t)payload_size / 4;
+            facts->words = arena_alloc(arena, (size_t)word_count * sizeof(uint32_t));
+            for (int32_t i = 0; i < word_count; i++) {
+                facts->words[i] = cold_read_csg_v2_u32_le(data, &pos);
+            }
+            facts->word_count = word_count;
+            break;
+        }
+        case 6: { /* reloc */
+            uint32_t src_id = cold_read_csg_v2_u32_le(data, &pos);
+            uint32_t word_off = cold_read_csg_v2_u32_le(data, &pos);
+            char *target = cold_read_csg_v2_obj_str(arena, data, &pos);
+            if (facts->reloc_count >= facts->reloc_cap) {
+                int32_t new_cap = facts->reloc_cap ? facts->reloc_cap * 2 : 8;
+                uint32_t *new_src = arena_alloc(arena,
+                    (size_t)new_cap * sizeof(uint32_t));
+                uint32_t *new_off = arena_alloc(arena,
+                    (size_t)new_cap * sizeof(uint32_t));
+                char **new_tgt = arena_alloc(arena,
+                    (size_t)new_cap * sizeof(char *));
+                if (facts->reloc_count > 0) {
+                    memcpy(new_src, facts->reloc_source_item_ids,
+                           (size_t)facts->reloc_count * sizeof(uint32_t));
+                    memcpy(new_off, facts->reloc_word_offsets,
+                           (size_t)facts->reloc_count * sizeof(uint32_t));
+                    memcpy(new_tgt, facts->reloc_target_symbols,
+                           (size_t)facts->reloc_count * sizeof(char *));
+                }
+                facts->reloc_source_item_ids = new_src;
+                facts->reloc_word_offsets = new_off;
+                facts->reloc_target_symbols = new_tgt;
+                facts->reloc_cap = new_cap;
+            }
+            facts->reloc_source_item_ids[facts->reloc_count] = src_id;
+            facts->reloc_word_offsets[facts->reloc_count] = word_off;
+            facts->reloc_target_symbols[facts->reloc_count] = target;
+            facts->reloc_count++;
+            break;
+        }
+        default:
+            pos = payload_end; /* skip unknown records */
+            break;
+        }
+    }
+    return true;
+}
+
 static int32_t cold_compile_csg_type_rows_seq = 0;
 
 
@@ -18939,14 +20646,305 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
                                            const char *csg_path,
                                            const char *source_path,
                                            const char *workspace_root,
-                                           ColdCompileStats *stats) {
+                                           const char *target,
+                                           ColdCompileStats *stats,
+                                           bool obj_mode) {
     uint64_t start_us = cold_now_us();
     if (stats) memset(stats, 0, sizeof(*stats));
     Arena *arena = mmap(0, sizeof(Arena), PROT_READ | PROT_WRITE,
                         MAP_PRIVATE | MAP_ANON, -1, 0);
     if (arena == MAP_FAILED) die("arena root mmap failed");
     Span csg_text = source_open(csg_path);
+    uint64_t mmap_done_us = cold_now_us();
     if (csg_text.len <= 0) return false;
+
+    if (cold_span_starts_with(csg_text, "CHENG_CSG_V2\n")) {
+        bool ok = false;
+        if (obj_mode) {
+            ok = cold_compile_canonical_csg_v2_primary_object(out_path, target, csg_text,
+                                                              arena, stats,
+                                                              start_us, mmap_done_us);
+        }
+        munmap((void *)csg_text.ptr, (size_t)csg_text.len);
+        return ok;
+    }
+
+    if (csg_text.len >= 8 && memcmp(csg_text.ptr, "CHENGCSG", 8) == 0) {
+        /* New record-based format: 8-byte magic + records, no 64-byte header */
+        if (csg_text.len < 64) {
+            if (!obj_mode) {
+                munmap((void *)csg_text.ptr, (size_t)csg_text.len);
+                return false;
+            }
+            CsgV2ObjFacts obj_facts;
+            if (!cold_load_csg_v2_obj_facts(csg_text.ptr, csg_text.len,
+                                             &obj_facts, arena)) {
+                munmap((void *)csg_text.ptr, (size_t)csg_text.len);
+                return false;
+            }
+            if (obj_facts.function_count <= 0 || obj_facts.word_count <= 0) {
+                munmap((void *)csg_text.ptr, (size_t)csg_text.len);
+                return false;
+            }
+
+            /* Determine object format from target triple */
+            bool is_elf = target && (strcmp(target, "aarch64-unknown-linux-gnu") == 0 ||
+                                     strcmp(target, "x86_64-unknown-linux-gnu") == 0 ||
+                                     strcmp(target, "riscv64-unknown-linux-gnu") == 0);
+            bool is_coff = target && (strcmp(target, "x86_64-pc-windows-msvc") == 0 ||
+                                      strcmp(target, "aarch64-pc-windows-msvc") == 0);
+            bool is_macho = target && strcmp(target, "arm64-apple-darwin") == 0;
+            if (!is_macho && !is_elf && !is_coff) {
+                munmap((void *)csg_text.ptr, (size_t)csg_text.len);
+                return false;
+            }
+
+            uint16_t elf_machine = 0;
+            uint16_t coff_machine = 0;
+            if (is_elf) {
+                if (strstr(target, "aarch64")) elf_machine = EM_AARCH64;
+                else if (strstr(target, "riscv64")) elf_machine = EM_RISCV;
+                else if (strstr(target, "x86_64")) elf_machine = EM_X86_64;
+                else { munmap((void *)csg_text.ptr, (size_t)csg_text.len); return false; }
+            }
+            if (is_coff) {
+                if (strstr(target, "aarch64")) coff_machine = IMAGE_FILE_MACHINE_ARM64;
+                else if (strstr(target, "x86_64")) coff_machine = IMAGE_FILE_MACHINE_AMD64;
+                else { munmap((void *)csg_text.ptr, (size_t)csg_text.len); return false; }
+            }
+
+            /* Build symbol name/offset arrays from obj_facts */
+            int32_t max_names = obj_facts.function_count + obj_facts.reloc_count;
+            if (max_names <= 0) {
+                munmap((void *)csg_text.ptr, (size_t)csg_text.len);
+                return false;
+            }
+            const char **names = arena_alloc(arena, (size_t)max_names * sizeof(const char *));
+            int32_t *offsets = arena_alloc(arena, (size_t)max_names * sizeof(int32_t));
+            int32_t name_count = obj_facts.function_count;
+            for (int32_t i = 0; i < obj_facts.function_count; i++) {
+                names[i] = obj_facts.functions[i].symbol_name;
+                offsets[i] = (int32_t)obj_facts.functions[i].word_offset;
+            }
+
+            /* Build reloc arrays and add external symbols */
+            int32_t *reloc_offsets = obj_facts.reloc_count > 0
+                ? arena_alloc(arena, (size_t)obj_facts.reloc_count * sizeof(int32_t))
+                : 0;
+            int32_t *reloc_symbols = obj_facts.reloc_count > 0
+                ? arena_alloc(arena, (size_t)obj_facts.reloc_count * sizeof(int32_t))
+                : 0;
+            for (int32_t i = 0; i < obj_facts.reloc_count; i++) {
+                if (obj_facts.reloc_word_offsets[i] > (uint32_t)(INT32_MAX / 4)) {
+                    munmap((void *)csg_text.ptr, (size_t)csg_text.len);
+                    return false;
+                }
+                int32_t byte_offset = (int32_t)obj_facts.reloc_word_offsets[i] * 4;
+                /* Look for target symbol in defined functions */
+                int32_t sym_idx = -1;
+                for (int32_t j = 0; j < obj_facts.function_count; j++) {
+                    if (strcmp(obj_facts.functions[j].symbol_name,
+                               obj_facts.reloc_target_symbols[i]) == 0) {
+                        sym_idx = j;
+                        break;
+                    }
+                }
+                /* Check if already added as external symbol */
+                if (sym_idx < 0) {
+                    for (int32_t j = obj_facts.function_count; j < name_count; j++) {
+                        if (strcmp(names[j], obj_facts.reloc_target_symbols[i]) == 0) {
+                            sym_idx = j;
+                            break;
+                        }
+                    }
+                }
+                /* Add as new external symbol */
+                if (sym_idx < 0) {
+                    if (name_count >= max_names) {
+                        munmap((void *)csg_text.ptr, (size_t)csg_text.len);
+                        return false;
+                    }
+                    sym_idx = name_count;
+                    names[sym_idx] = obj_facts.reloc_target_symbols[i];
+                    offsets[sym_idx] = -1;
+                    name_count++;
+                }
+                reloc_offsets[i] = byte_offset;
+                reloc_symbols[i] = sym_idx;
+            }
+
+            /* Count local symbols (non-"main") */
+            int32_t local_count = 0;
+            for (int32_t i = 0; i < obj_facts.function_count; i++) {
+                if (strcmp(obj_facts.functions[i].symbol_name, "main") != 0)
+                    local_count++;
+            }
+
+            bool ok;
+            if (is_elf) {
+                ok = elf64_write_object(out_path, obj_facts.words, obj_facts.word_count,
+                                        names, offsets, name_count, local_count,
+                                        reloc_offsets, reloc_symbols, obj_facts.reloc_count,
+                                        elf_machine);
+            } else if (is_coff) {
+                ok = coff_write_object(out_path, obj_facts.words, obj_facts.word_count,
+                                       names, offsets, name_count, local_count,
+                                       reloc_offsets, reloc_symbols, obj_facts.reloc_count,
+                                       coff_machine);
+            } else {
+                ok = macho_write_object(out_path, obj_facts.words, obj_facts.word_count,
+                                        names, offsets, name_count, local_count,
+                                        reloc_offsets, reloc_symbols, obj_facts.reloc_count);
+            }
+
+            if (stats) {
+                stats->function_count = obj_facts.function_count;
+                stats->csg_lowering = 1;
+                stats->code_words = obj_facts.word_count;
+                stats->arena_kb = arena->used / 1024;
+                stats->facts_bytes = (uint64_t)csg_text.len;
+                uint64_t end_us = cold_now_us();
+                if (end_us >= start_us) stats->elapsed_us = end_us - start_us;
+            }
+            munmap((void *)csg_text.ptr, (size_t)csg_text.len);
+            return ok;
+        }
+
+        /* Old BodyIR facts format (64-byte header) */
+        Symbols *symbols = symbols_new(arena);
+        BodyIR **function_bodies = 0;
+        int32_t function_count = 0;
+        ColdCsgV2Timing csg_timing = {0};
+
+        if (!cold_load_csg_v2_facts(csg_text.ptr, csg_text.len,
+                                     &function_bodies, &function_count,
+                                     symbols, arena, &csg_timing)) {
+            return false;
+        }
+
+        if (stats) {
+            stats->facts_bytes = (uint64_t)csg_timing.facts_bytes;
+            stats->facts_mmap_us = mmap_done_us - start_us;
+            stats->facts_verify_us = (uint64_t)csg_timing.verify_us;
+            stats->facts_decode_us = (uint64_t)csg_timing.decode_us;
+            stats->facts_function_count = csg_timing.fn_count;
+            stats->facts_total_us = cold_now_us() - start_us;
+        }
+
+        int32_t entry_function = -1;
+        for (int32_t ei = 0; ei < (int32_t)symbols->function_count; ei++) {
+            if (span_eq(symbols->functions[ei].name, "main")) {
+                entry_function = ei;
+                break;
+            }
+        }
+        if (entry_function < 0) return false;
+
+        if (obj_mode) {
+            /* Per-function codegen + object file writer */
+            int32_t func_count = symbols->function_count;
+            Code *shared = code_new(arena, 1024);
+            int32_t *symbol_offset = arena_alloc(arena, (size_t)func_count * sizeof(int32_t));
+            for (int32_t i = 0; i < func_count; i++) symbol_offset[i] = -1;
+            FunctionPatchList function_patches = {0};
+            function_patches.arena = arena;
+
+            for (int32_t i = 0; i < func_count && i < func_count; i++) {
+                if (!function_bodies[i]) continue;
+                BodyIR *body = function_bodies[i];
+                symbol_offset[i] = shared->count;
+                if ((uintptr_t)body < 4096 || body->has_fallback ||
+                    body->block_count == 0) {
+                    /* Emit stub */
+                    code_emit(shared, a64_movz(R0, 0, 0));
+                    code_emit(shared, a64_ret());
+                    continue;
+                }
+                codegen_func(shared, body, symbols, &function_patches);
+            }
+
+            /* Resolve patches and collect relocations */
+            int32_t reloc_cap = function_patches.count > 0 ? function_patches.count : 1;
+            int32_t *reloc_offsets = arena_alloc(arena, (size_t)reloc_cap * sizeof(int32_t));
+            int32_t *reloc_symbols = arena_alloc(arena, (size_t)reloc_cap * sizeof(int32_t));
+            int32_t reloc_count = 0;
+            for (int32_t pi = 0; pi < function_patches.count; pi++) {
+                FunctionPatch patch = function_patches.items[pi];
+                if (patch.target_function < 0 || patch.target_function >= func_count) continue;
+                int32_t target_off = symbol_offset[patch.target_function];
+                if (target_off < 0) {
+                    reloc_offsets[reloc_count] = (int32_t)patch.pos;
+                    reloc_symbols[reloc_count] = patch.target_function;
+                    reloc_count++;
+                    continue;
+                }
+                int32_t delta = target_off - (int32_t)patch.pos;
+                shared->words[patch.pos] = (shared->words[patch.pos] & 0xFC000000u) |
+                                           ((uint32_t)delta & 0x03FFFFFFu);
+            }
+
+            /* Build symbol name/offset arrays */
+            int32_t max_names = func_count + reloc_count + 1;
+            const char **func_names = arena_alloc(arena, (size_t)max_names * sizeof(const char *));
+            int32_t *func_offsets = arena_alloc(arena, (size_t)max_names * sizeof(int32_t));
+            int32_t name_count = 0, local_count = 0;
+            for (int32_t i = 0; i < func_count; i++) {
+                if (symbol_offset[i] < 0) continue;
+                Span nm = symbols->functions[i].name;
+                char *name_buf = arena_alloc(arena, (size_t)(nm.len + 2));
+                memcpy(name_buf, nm.ptr, (size_t)nm.len);
+                name_buf[nm.len] = '\0';
+                func_names[name_count] = name_buf;
+                func_offsets[name_count] = symbol_offset[i];
+                name_count++;
+                if (!span_eq(nm, "main")) local_count++;
+            }
+            for (int32_t ri = 0; ri < reloc_count; ri++) {
+                int32_t sym_idx = reloc_symbols[ri];
+                if (sym_idx < 0 || sym_idx >= func_count) continue;
+                Span nm = symbols->functions[sym_idx].name;
+                char *name_buf = arena_alloc(arena, (size_t)(nm.len + 2));
+                memcpy(name_buf, nm.ptr, (size_t)nm.len);
+                name_buf[nm.len] = '\0';
+                func_names[name_count] = name_buf;
+                func_offsets[name_count] = reloc_offsets[ri];
+                name_count++;
+            }
+
+            bool ok = macho_write_object(out_path, shared->words, shared->count,
+                                          func_names, func_offsets,
+                                          name_count, local_count,
+                                          reloc_offsets, reloc_symbols, reloc_count);
+            if (stats) {
+                stats->function_count = symbols->function_count;
+                stats->csg_lowering = 1;
+                stats->code_words = shared->count;
+                stats->arena_kb = arena->used / 1024;
+            }
+            munmap((void *)csg_text.ptr, (size_t)csg_text.len);
+            return ok;
+        }
+
+        Code *code = code_new(arena, 256);
+        codegen_program(code, function_bodies, symbols->function_count, entry_function, symbols);
+        if (output_direct_macho(out_path, code) != 0) return false;
+
+        if (stats) {
+            stats->function_count = symbols->function_count;
+            stats->csg_lowering = 1;
+            stats->code_words = code->count;
+            stats->arena_kb = arena->used / 1024;
+            uint64_t end_us = cold_now_us();
+            if (start_us > 0 && end_us >= start_us) stats->elapsed_us = end_us - start_us;
+        }
+        munmap((void *)csg_text.ptr, (size_t)csg_text.len);
+        return true;
+    }
+
+    if (!cold_span_starts_with(csg_text, "cold_csg_version=1")) {
+        munmap((void *)csg_text.ptr, (size_t)csg_text.len);
+        return false;
+    }
 
     Symbols *symbols = symbols_new(arena);
     ColdCsg csg;
@@ -19799,6 +21797,20 @@ static bool cold_write_system_link_exec_report(const char *path,
         fprintf(file, "cold_after_csg_frame_size=%d\n", stats->after_csg_frame_size);
         fprintf(file, "cold_codegen_words=%d\n", stats->code_words);
         fprintf(file, "cold_arena_kb=%zu\n", stats->arena_kb);
+        fprintf(file, "facts_bytes=%llu\n", (unsigned long long)stats->facts_bytes);
+        fprintf(file, "facts_mmap_us=%llu\n", (unsigned long long)stats->facts_mmap_us);
+        fprintf(file, "facts_verify_us=%llu\n", (unsigned long long)stats->facts_verify_us);
+        fprintf(file, "facts_decode_us=%llu\n", (unsigned long long)stats->facts_decode_us);
+        fprintf(file, "facts_emit_obj_us=%llu\n", (unsigned long long)stats->facts_emit_obj_us);
+        fprintf(file, "facts_total_us=%llu\n", (unsigned long long)stats->facts_total_us);
+        cold_print_elapsed_ms(file, "facts_mmap_ms", stats->facts_mmap_us);
+        cold_print_elapsed_ms(file, "facts_verify_ms", stats->facts_verify_us);
+        cold_print_elapsed_ms(file, "facts_decode_ms", stats->facts_decode_us);
+        cold_print_elapsed_ms(file, "facts_emit_obj_ms", stats->facts_emit_obj_us);
+        cold_print_elapsed_ms(file, "facts_total_ms", stats->facts_total_us);
+        fprintf(file, "facts_function_count=%d\n", stats->facts_function_count);
+        fprintf(file, "facts_word_count=%d\n", stats->facts_word_count);
+        fprintf(file, "facts_reloc_count=%d\n", stats->facts_reloc_count);
         cold_print_elapsed_ms(file, "cold_compile_elapsed_ms", stats->elapsed_us);
     }
     /* 30-80ms cold self-hosting architecture compliance */
@@ -19938,20 +21950,35 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
     FunctionPatchList function_patches = {0};
     function_patches.arena = arena;
 
-    /* Entry trampoline: save argc/argv in callee-saved registers */
-    int32_t trampoline_bl_pos = shared->count + 4;
-    code_emit(shared, a64_add_imm(19, R0, 0, true));
-    code_emit(shared, a64_add_imm(20, R1, 0, true));
-    code_emit(shared, a64_add_imm(21, LR, 0, true));
-    code_emit(shared, a64_add_imm(22, R2, 0, true));
-    code_emit(shared, a64_bl(0));
-    code_emit(shared, a64_add_imm(LR, 21, 0, true));
-    code_emit(shared, a64_ret());
-
-    /* Detect x86_64 target for codegen dispatch */
+    /* Detect target architecture for codegen dispatch */
     bool use_x64 = (elf_machine == EM_X86_64 || coff_machine == IMAGE_FILE_MACHINE_AMD64);
     bool use_rv64 = (elf_machine == EM_RISCV);
     X64Code x64_buf; if (use_x64) { x64_init(&x64_buf, 65536); }
+
+    /* Entry trampoline: save argc/argv in callee-saved registers */
+    int32_t trampoline_bl_pos = shared->count + 4;
+    if (use_x64) {
+        /* x86_64 entry: argc in %rdi (ARG1), argv in %rsi (ARG2).
+           Save into callee-saved registers r12=argv, r13=argc for ARGC_LOAD/ARGV_STR. */
+        trampoline_bl_pos = x64_buf.len + 1; /* after E8 opcode */
+        x64_push_r64(&x64_buf, 5); /* push %rbp */
+        x64_mov_r64_r64(&x64_buf, 5, 4); /* mov %rsp,%rbp */
+        x64_mov_r64_r64(&x64_buf, 12, 1); /* mov %rdi,%r12 (argv) */
+        x64_mov_r64_r64(&x64_buf, 13, 2); /* mov %rsi,%r13 (argc saved) */
+        x64_mov_r64_r64(&x64_buf, 3, 0); /* mov %rdi,%rbx (argc -> rbx for ARGC_LOAD) */
+        x64_call_rel32(&x64_buf, 0); /* placeholder, patched to main */
+        x64_mov_r64_r64(&x64_buf, 4, 5); /* mov %rbp,%rsp */
+        x64_pop_r64(&x64_buf, 5); /* pop %rbp */
+        x64_ret(&x64_buf);
+    } else {
+        code_emit(shared, a64_add_imm(19, R0, 0, true));
+        code_emit(shared, a64_add_imm(20, R1, 0, true));
+        code_emit(shared, a64_add_imm(21, LR, 0, true));
+        code_emit(shared, a64_add_imm(22, R2, 0, true));
+        code_emit(shared, a64_bl(0));
+        code_emit(shared, a64_add_imm(LR, 21, 0, true));
+        code_emit(shared, a64_ret());
+    }
 
     /* First pass: compile each function body into the shared buffer */
     for (int32_t i = 0; i < func_count && i < body_cap; i++) {
@@ -19963,7 +21990,19 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
             body->block_count == 0 ||
             (body->block_count > 0 && body->block_term[0] < 0)) {
             /* Emit stub that zero-initializes the return slot */
-            symbol_offset[i] = shared->count;
+            if (use_x64) {
+                if (body->return_kind == SLOT_I32) {
+                    x64_mov_r32_imm32(&x64_buf, 0, 0);
+                    x64_ret(&x64_buf);
+                } else if (body->return_kind == SLOT_I64 || body->return_kind == SLOT_PTR) {
+                    x64_mov_r64_imm64(&x64_buf, 0, 0);
+                    x64_ret(&x64_buf);
+                } else {
+                    x64_mov_r32_imm32(&x64_buf, 0, 0);
+                    x64_ret(&x64_buf);
+                }
+                continue;
+            }
             if (use_rv64) {
                 code_emit(shared, rv_addi(RV_A0, RV_ZERO, 0));
                 code_emit(shared, rv_jalr(RV_ZERO, RV_RA, 0));
@@ -19994,44 +22033,87 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
             }
             continue;
         }
-        if (use_rv64)
+        if (use_x64)
+            x64_codegen_func(&x64_buf, body, symbols, &function_patches);
+        else if (use_rv64)
             rv64_codegen_func(shared, body, symbols, &function_patches);
         else
             codegen_func(shared, body, symbols, &function_patches);
     }
 
-    if (use_x64) {
-        shared->count = x64_pack_words(&x64_buf, shared->words, shared->cap);
-        for (int32_t i = 0; i < func_count; i++)
-            if (symbol_offset[i] >= 0) symbol_offset[i] /= 4;
-    }
-
-    /* Resolve inter-function patches; collect relocations for external calls */
+    /* Relocation tracking (shared between all architectures) */
     int32_t reloc_cap = function_patches.count > 0 ? function_patches.count : 1;
     int32_t *reloc_offsets = arena_alloc(arena, (size_t)reloc_cap * sizeof(int32_t));
     int32_t *reloc_symbols = arena_alloc(arena, (size_t)reloc_cap * sizeof(int32_t));
     int32_t reloc_count = 0;
-    for (int32_t pi = 0; pi < function_patches.count; pi++) {
-        FunctionPatch patch = function_patches.items[pi];
-        if (patch.target_function < 0 || patch.target_function >= func_count) {
-            die("cold object function patch target out of range");
+
+    if (use_x64) {
+        /* Resolve x86_64 patches in byte buffer before packing */
+        for (int32_t pi = 0; pi < function_patches.count; pi++) {
+            FunctionPatch patch = function_patches.items[pi];
+            if (patch.target_function < 0 || patch.target_function >= func_count) continue;
+            int32_t target_off = symbol_offset[patch.target_function];
+            if (target_off < 0) continue; /* external: leave as relocation */
+            x64_patch_call_rel32(&x64_buf, (int32_t)patch.pos, target_off);
         }
-        int32_t target_off = symbol_offset[patch.target_function];
-        if (target_off < 0) {
+        /* Re-collect unresolved (external) patches as relocations */
+        for (int32_t pi = 0; pi < function_patches.count; pi++) {
+            FunctionPatch patch = function_patches.items[pi];
+            if (patch.target_function < 0 || patch.target_function >= func_count) continue;
+            if (symbol_offset[patch.target_function] >= 0) continue; /* already resolved */
             if (reloc_count >= reloc_cap) die("cold object relocation overflow");
-            reloc_offsets[reloc_count] = (int32_t)patch.pos * 4;
+            reloc_offsets[reloc_count] = (int32_t)patch.pos; /* byte offset */
             reloc_symbols[reloc_count] = patch.target_function;
             reloc_count++;
-            continue;
         }
-        int32_t delta = target_off - (int32_t)patch.pos;
-        shared->words[patch.pos] = (shared->words[patch.pos] & 0xFC000000u) |
-                                   ((uint32_t)delta & 0x03FFFFFFu);
+        /* Pack bytes into words */
+        shared->count = x64_pack_words(&x64_buf, shared->words, shared->cap);
+        for (int32_t i = 0; i < func_count; i++)
+            if (symbol_offset[i] >= 0) symbol_offset[i] /= 4;
+        /* Convert relocation offsets from bytes to words */
+        for (int32_t ri = 0; ri < reloc_count; ri++)
+            reloc_offsets[ri] /= 4;
+    } else {
+        /* Resolve intra-object patches for ARM64/RISC-V (word-level) */
+        for (int32_t pi = 0; pi < function_patches.count; pi++) {
+            FunctionPatch patch = function_patches.items[pi];
+            if (patch.target_function < 0 || patch.target_function >= func_count) {
+                die("cold object function patch target out of range");
+            }
+            int32_t target_off = symbol_offset[patch.target_function];
+            if (target_off < 0) {
+                if (reloc_count >= reloc_cap) die("cold object relocation overflow");
+                reloc_offsets[reloc_count] = (int32_t)patch.pos;
+                reloc_symbols[reloc_count] = patch.target_function;
+                reloc_count++;
+                continue;
+            }
+            int32_t delta = target_off - (int32_t)patch.pos;
+            if (use_rv64) {
+                /* RISC-V JAL: patch the 20-bit immediate using RV_J encoding */
+                uint32_t w = shared->words[patch.pos];
+                uint32_t imm = (uint32_t)(delta & 0x1FFFFF);
+                shared->words[patch.pos] = (w & 0xFFFu) |
+                    ((imm & 0xFF000u) >> 0) |
+                    ((imm & 0x800u) << 9) |
+                    ((imm & 0x7FEu) << 20) |
+                    ((imm & 0x100000u) << 11);
+            } else {
+                shared->words[patch.pos] = (shared->words[patch.pos] & 0xFC000000u) |
+                                           ((uint32_t)delta & 0x03FFFFFFu);
+            }
+        }
     }
 
     if (main_function >= 0 && symbol_offset[main_function] >= 0) {
         int32_t target = symbol_offset[main_function];
-        shared->words[trampoline_bl_pos] = a64_bl(target - trampoline_bl_pos);
+        if (use_x64) {
+            /* x86_64: trampoline bl placeholder at byte offset trampoline_bl_pos */
+            x64_patch_call_rel32(&x64_buf, trampoline_bl_pos, target * 4);
+            shared->count = x64_pack_words(&x64_buf, shared->words, shared->cap);
+        } else {
+            shared->words[trampoline_bl_pos] = a64_bl(target - trampoline_bl_pos);
+        }
     }
 
     int32_t max_names = func_count + reloc_count + 1;
@@ -20073,6 +22155,261 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
 }
 
 static bool cold_compile_source_to_object(const char *out_path, const char *src_path, const char *target);
+
+/* ================================================================
+ * CSG v2 binary format writer
+ * ================================================================ */
+static void cold_emit_csg_v2_u32(FILE *f, uint32_t v) {
+    fputc((int)(v & 0xFF), f);
+    fputc((int)((v >> 8) & 0xFF), f);
+    fputc((int)((v >> 16) & 0xFF), f);
+    fputc((int)((v >> 24) & 0xFF), f);
+}
+
+static void cold_emit_csg_v2_u64(FILE *f, uint64_t v) {
+    cold_emit_csg_v2_u32(f, (uint32_t)(v & 0xFFFFFFFF));
+    cold_emit_csg_v2_u32(f, (uint32_t)((v >> 32) & 0xFFFFFFFF));
+}
+
+static void cold_emit_csg_v2_str(FILE *f, Span s) {
+    cold_emit_csg_v2_u32(f, (uint32_t)s.len);
+    if (s.len > 0) fwrite(s.ptr, 1, (size_t)s.len, f);
+}
+
+static bool cold_emit_csg_v2_facts(const char *path, BodyIR **function_bodies,
+                                    int32_t func_count, Symbols *symbols,
+                                    const char *target) {
+    if (!function_bodies || !symbols || func_count <= 0) return false;
+    for (int32_t i = 0; i < func_count; i++) {
+        BodyIR *b = function_bodies[i];
+        if (!b || b->has_fallback) return false;
+    }
+
+    FILE *f = fopen(path, "wb");
+    if (!f) return false;
+
+    /* ---- HEADER (64 bytes) ---- */
+    fwrite("CHENGCSG", 1, 8, f);
+    cold_emit_csg_v2_u32(f, 2); /* version */
+    {   /* target_triple (32 bytes, null-padded) */
+        char triple[32];
+        memset(triple, 0, 32);
+        if (target) {
+            size_t tlen = strlen(target);
+            if (tlen > 32) tlen = 32;
+            memcpy(triple, target, tlen);
+        }
+        fwrite(triple, 1, 32, f);
+    }
+    cold_emit_csg_v2_u32(f, 0); /* abi = system */
+    fputc(8, f);                 /* pointer_width = 8 */
+    fputc(0, f);                 /* endianness = LE */
+    {   /* reserved 14 bytes */
+        uint8_t reserved[14];
+        memset(reserved, 0, 14);
+        fwrite(reserved, 1, 14, f);
+    }
+
+    /* ---- SECTION INDEX PLACEHOLDER ---- */
+    /* section_count(4) + 2 sections * (kind(4)+offset(8)+size(4)) = 36 bytes */
+    long section_index_pos = ftell(f);
+    {   uint8_t placeholder[36];
+        memset(placeholder, 0, 36);
+        fwrite(placeholder, 1, 36, f);
+    }
+
+    /* ---- COLLECT UNIQUE STRING LITERALS ---- */
+    int32_t total_str_slots = 0;
+    for (int32_t i = 0; i < func_count; i++) {
+        BodyIR *b = function_bodies[i];
+        total_str_slots += b->string_literal_count;
+    }
+
+    Span *unique_strs = NULL;
+    int32_t *str_id_map = NULL;
+    int32_t unique_str_count = 0;
+
+    if (total_str_slots > 0) {
+        unique_strs = (Span *)malloc((size_t)total_str_slots * sizeof(Span));
+        str_id_map = (int32_t *)malloc((size_t)total_str_slots * sizeof(int32_t));
+    }
+
+    {
+        int32_t map_idx = 0;
+        for (int32_t fi = 0; fi < func_count; fi++) {
+            BodyIR *b = function_bodies[fi];
+            for (int32_t si = 0; si < b->string_literal_count; si++) {
+                Span s = b->string_literal[si];
+                int32_t id = -1;
+                for (int32_t ui = 0; ui < unique_str_count; ui++) {
+                    if (unique_strs[ui].len == s.len &&
+                        (s.len == 0 || memcmp(unique_strs[ui].ptr, s.ptr, (size_t)s.len) == 0)) {
+                        id = ui;
+                        break;
+                    }
+                }
+                if (id < 0) {
+                    id = unique_str_count++;
+                    unique_strs[id] = s;
+                }
+                str_id_map[map_idx++] = id;
+            }
+        }
+    }
+
+    /* ---- FUNCTION SECTION ---- */
+    long func_section_start = ftell(f);
+    cold_emit_csg_v2_u32(f, (uint32_t)func_count);
+
+    {
+        int32_t map_idx = 0;
+        for (int32_t fi = 0; fi < func_count; fi++) {
+            BodyIR *b = function_bodies[fi];
+
+            /* name: u32 len + utf8 bytes */
+            cold_emit_csg_v2_str(f, symbols->functions[fi].name);
+            /* param_count + per-param ABI triple: slot_kind, slot_size, param_slot */
+            cold_emit_csg_v2_u32(f, (uint32_t)b->param_count);
+            for (int32_t pi = 0; pi < b->param_count; pi++) {
+                int32_t ps = b->param_slot[pi];
+                int32_t pk = (ps >= 0 && ps < b->slot_count) ? b->slot_kind[ps] : SLOT_I32;
+                int32_t pz = (ps >= 0 && ps < b->slot_count) ? b->slot_size[ps] : cold_slot_size_for_kind(pk);
+                cold_emit_csg_v2_u32(f, (uint32_t)pk);
+                cold_emit_csg_v2_u32(f, (uint32_t)pz);
+                cold_emit_csg_v2_u32(f, (uint32_t)ps);
+            }
+            /* return_kind */
+            cold_emit_csg_v2_u32(f, (uint32_t)b->return_kind);
+            /* frame_size */
+            cold_emit_csg_v2_u32(f, (uint32_t)b->frame_size);
+            /* op_count + ops (5 x u32 = 20 bytes per op) */
+            cold_emit_csg_v2_u32(f, (uint32_t)b->op_count);
+            for (int32_t oi = 0; oi < b->op_count; oi++) {
+                cold_emit_csg_v2_u32(f, (uint32_t)b->op_kind[oi]);
+                cold_emit_csg_v2_u32(f, (uint32_t)b->op_dst[oi]);
+                cold_emit_csg_v2_u32(f, (uint32_t)b->op_a[oi]);
+                cold_emit_csg_v2_u32(f, (uint32_t)b->op_b[oi]);
+                cold_emit_csg_v2_u32(f, (uint32_t)b->op_c[oi]);
+            }
+            /* slot_count + slots (3 x u32 = 12 bytes per slot) */
+            cold_emit_csg_v2_u32(f, (uint32_t)b->slot_count);
+            for (int32_t si = 0; si < b->slot_count; si++) {
+                cold_emit_csg_v2_u32(f, (uint32_t)b->slot_kind[si]);
+                cold_emit_csg_v2_u32(f, (uint32_t)b->slot_offset[si]);
+                cold_emit_csg_v2_u32(f, (uint32_t)b->slot_size[si]);
+            }
+            /* block_count + blocks (3 x u32 = 12 bytes per block) */
+            cold_emit_csg_v2_u32(f, (uint32_t)b->block_count);
+            for (int32_t bi = 0; bi < b->block_count; bi++) {
+                cold_emit_csg_v2_u32(f, (uint32_t)b->block_op_start[bi]);
+                cold_emit_csg_v2_u32(f, (uint32_t)b->block_op_count[bi]);
+                cold_emit_csg_v2_u32(f, (uint32_t)b->block_term[bi]);
+            }
+            /* term_count + terms (6 x u32 = 24 bytes per term) */
+            cold_emit_csg_v2_u32(f, (uint32_t)b->term_count);
+            for (int32_t ti = 0; ti < b->term_count; ti++) {
+                cold_emit_csg_v2_u32(f, (uint32_t)b->term_kind[ti]);
+                cold_emit_csg_v2_u32(f, (uint32_t)b->term_value[ti]);
+                cold_emit_csg_v2_u32(f, (uint32_t)b->term_case_start[ti]);
+                cold_emit_csg_v2_u32(f, (uint32_t)b->term_case_count[ti]);
+                cold_emit_csg_v2_u32(f, (uint32_t)b->term_true_block[ti]);
+                cold_emit_csg_v2_u32(f, (uint32_t)b->term_false_block[ti]);
+            }
+            /* switch_case_count + switch entries (3 x u32 = 12 bytes each) */
+            cold_emit_csg_v2_u32(f, (uint32_t)b->switch_count);
+            for (int32_t si = 0; si < b->switch_count; si++) {
+                cold_emit_csg_v2_u32(f, (uint32_t)b->switch_tag[si]);
+                cold_emit_csg_v2_u32(f, (uint32_t)b->switch_block[si]);
+                cold_emit_csg_v2_u32(f, (uint32_t)b->switch_term[si]);
+            }
+            /* call_count + call entries (4 x u32 = 16 bytes each) */
+            {
+                int32_t call_count = 0;
+                for (int32_t oi = 0; oi < b->op_count; oi++) {
+                    int32_t ok = b->op_kind[oi];
+                    if (ok == BODY_OP_CALL_I32 || ok == BODY_OP_CALL_COMPOSITE)
+                        call_count++;
+                }
+                cold_emit_csg_v2_u32(f, (uint32_t)call_count);
+                for (int32_t oi = 0; oi < b->op_count; oi++) {
+                    int32_t ok = b->op_kind[oi];
+                    if (ok != BODY_OP_CALL_I32 && ok != BODY_OP_CALL_COMPOSITE)
+                        continue;
+                    int32_t target_fn = b->op_a[oi];
+                    int32_t arg_start  = b->op_b[oi];
+                    int32_t arg_count;
+                    if (ok == BODY_OP_CALL_I32) {
+                        if (target_fn >= 0 && target_fn < symbols->function_count)
+                            arg_count = symbols->functions[target_fn].arity;
+                        else
+                            arg_count = 0;
+                    } else {
+                        arg_count = b->op_c[oi];
+                    }
+                    int32_t result_slot = b->op_dst[oi];
+                    cold_emit_csg_v2_u32(f, (uint32_t)target_fn);
+                    cold_emit_csg_v2_u32(f, (uint32_t)arg_start);
+                    cold_emit_csg_v2_u32(f, (uint32_t)arg_count);
+                    cold_emit_csg_v2_u32(f, (uint32_t)result_slot);
+                }
+            }
+            /* call_arg_count + call args (2 x u32 = 8 bytes each) */
+            {
+                int32_t cac = b->call_arg_count;
+                if (cac < 0 || cac > 65536) cac = 0;
+                cold_emit_csg_v2_u32(f, (uint32_t)cac);
+                for (int32_t cai = 0; cai < cac; cai++) {
+                cold_emit_csg_v2_u32(f, (uint32_t)b->call_arg_slot[cai]);
+                cold_emit_csg_v2_u32(f, (uint32_t)b->call_arg_offset[cai]);
+                }
+            }
+            /* string_literal_count + string literal IDs */
+            cold_emit_csg_v2_u32(f, (uint32_t)b->string_literal_count);
+            for (int32_t si = 0; si < b->string_literal_count; si++) {
+                cold_emit_csg_v2_u32(f, (uint32_t)str_id_map[map_idx++]);
+            }
+        }
+    }
+
+    long str_section_start = ftell(f);
+
+    /* ---- STRING SECTION ---- */
+    cold_emit_csg_v2_u32(f, (uint32_t)unique_str_count);
+    for (int32_t ui = 0; ui < unique_str_count; ui++) {
+        cold_emit_csg_v2_u32(f, (uint32_t)ui); /* id */
+        cold_emit_csg_v2_str(f, unique_strs[ui]);
+    }
+
+    long trailer_start = ftell(f);
+
+    /* ---- REWRITE SECTION INDEX ---- */
+    fseek(f, section_index_pos, SEEK_SET);
+    cold_emit_csg_v2_u32(f, 2); /* section_count = 2 */
+    /* Section 0: function (kind=1) */
+    cold_emit_csg_v2_u32(f, 1); /* section_kind = function */
+    cold_emit_csg_v2_u64(f, (uint64_t)func_section_start);
+    cold_emit_csg_v2_u32(f, (uint32_t)(str_section_start - func_section_start));
+    /* Section 1: string_literal (kind=5) */
+    cold_emit_csg_v2_u32(f, 5); /* section_kind = string_literal */
+    cold_emit_csg_v2_u64(f, (uint64_t)str_section_start);
+    cold_emit_csg_v2_u32(f, (uint32_t)(trailer_start - str_section_start));
+
+    /* Seek to trailer position */
+    fseek(f, trailer_start, SEEK_SET);
+
+    /* ---- TRAILER (32 bytes) ---- */
+    cold_emit_csg_v2_u32(f, 2); /* section_count (redundant) */
+    {   /* content_hash (28 bytes, zero for Phase 0) */
+        uint8_t hash[28];
+        memset(hash, 0, 28);
+        fwrite(hash, 1, 28, f);
+    }
+
+    fclose(f);
+    free(unique_strs);
+    free(str_id_map);
+    return true;
+}
 
 static int cold_cmd_system_link_exec(int argc, char **argv) {
     const char *source_path = cold_flag_value(argc, argv, "--in");
@@ -20116,6 +22453,20 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
         fprintf(stderr, "[cheng_cold] missing --in:<source> or --csg-in:<facts>\n");
         return 2;
     }
+#ifdef COLD_BACKEND_ONLY
+    if (source_path && source_path[0] && (!csg_in_path || csg_in_path[0] == '\0')) {
+        cold_write_system_link_exec_report(report_path, false, source_path, 0, out_path,
+                                           target, emit, 0, "source compile disabled in backend-only mode");
+        fprintf(stderr, "[cheng_cold] backend-only: --in:<source> disabled, use --csg-in:<facts>\n");
+        return 2;
+    }
+    if (csg_out_path && csg_out_path[0] != '\0') {
+        cold_write_system_link_exec_report(report_path, false, source_path, csg_out_path, out_path,
+                                           target, emit, 0, "--csg-out requires source parser (disabled in backend-only)");
+        fprintf(stderr, "[cheng_cold] backend-only: --csg-out disabled\n");
+        return 2;
+    }
+#endif
     if (csg_out_path && csg_out_path[0] != '\0') {
         if (!source_path || source_path[0] == '\0') {
             cold_write_system_link_exec_report(report_path, false, source_path, csg_out_path, out_path,
@@ -20143,7 +22494,7 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
         fprintf(stderr, "[cheng_cold] unsupported target: %s\n", target);
         return 2;
     }
-    if (strcmp(emit, "exe") != 0 && strcmp(emit, "obj") != 0 && strcmp(emit, "csg") != 0) {
+    if (strcmp(emit, "exe") != 0 && strcmp(emit, "obj") != 0 && strcmp(emit, "csg") != 0 && strcmp(emit, "csg-v2") != 0) {
         cold_write_system_link_exec_report(report_path, false, source_path, effective_csg_path, out_path,
                                            target, emit, 0, "unsupported emit");
         fprintf(stderr, "[cheng_cold] unsupported emit: %s\n", emit);
@@ -20151,6 +22502,18 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
     }
     /* --emit:obj = emit real Mach-O object file (.o) with symbols */
     if (strcmp(emit, "obj") == 0) {
+        if (csg_in_path && csg_in_path[0] != '\0') {
+            ColdCompileStats stats = {0};
+            if (!cold_compile_csg_path_to_macho(out_path, csg_in_path, 0, 0,
+                                                target, &stats, true)) {
+                cold_write_system_link_exec_report(report_path, false, source_path, csg_in_path, out_path,
+                                                   target, emit, &stats, "cold csg v2 object emit failed");
+                return 2;
+            }
+            cold_write_system_link_exec_report(report_path, true, source_path, csg_in_path, out_path,
+                                               target, emit, &stats, "");
+            return 0;
+        }
         if (!source_path || source_path[0] == '\0') {
             cold_write_system_link_exec_report(report_path, false, source_path, out_path, out_path,
                                                target, emit, 0, "missing --in for emit:obj");
@@ -20161,6 +22524,101 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
                                                target, emit, 0, "cold object emit failed");
             return 2;
         }
+        cold_write_system_link_exec_report(report_path, true, source_path, out_path, out_path,
+                                           target, emit, 0, "");
+        return 0;
+    }
+    /* --emit:csg-v2 = emit binary CSG v2 facts file */
+    if (strcmp(emit, "csg-v2") == 0) {
+        if (!source_path || source_path[0] == '\0') {
+            cold_write_system_link_exec_report(report_path, false, source_path, out_path, out_path,
+                                               target, emit, 0, "missing --in for emit:csg-v2");
+            fprintf(stderr, "[cheng_cold] --emit:csg-v2 requires --in:<source>\n");
+            return 2;
+        }
+        /* Parse source into BodyIR, then serialize as CSG v2 */
+        Arena *arena = mmap(0, sizeof(Arena), PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (arena == MAP_FAILED) {
+            cold_write_system_link_exec_report(report_path, false, source_path, out_path, out_path,
+                                               target, emit, 0, "arena allocation failed");
+            return 2;
+        }
+        Symbols *symbols = symbols_new(arena);
+        BodyIR **function_bodies = NULL;
+        int32_t body_cap = 0;
+
+        Span mapped_source = source_open(source_path);
+        if (mapped_source.len <= 0) {
+            cold_write_system_link_exec_report(report_path, false, source_path, out_path, out_path,
+                                               target, emit, 0, "source_open failed");
+            return 2;
+        }
+
+        cold_collect_imported_function_signatures(symbols, mapped_source);
+        cold_collect_function_signatures(symbols, mapped_source);
+        ColdImportSource import_sources[64];
+        int32_t import_source_count = cold_collect_direct_import_sources(mapped_source,
+                                                                         import_sources, 64);
+
+        body_cap = symbols->function_cap;
+        if (body_cap < 256) body_cap = 256;
+        function_bodies = arena_alloc(arena, (size_t)body_cap * sizeof(BodyIR *));
+        memset(function_bodies, 0, (size_t)body_cap * sizeof(BodyIR *));
+
+        /* Import body compilation */
+        if (symbols->function_count < 4096) {
+            ColdErrorRecoveryEnabled = true;
+            if (setjmp(ColdErrorJumpBuf) == 0) {
+                cold_compile_imported_bodies_no_recurse(symbols, mapped_source,
+                                                        function_bodies, body_cap);
+            }
+            ColdErrorRecoveryEnabled = false;
+        }
+
+        /* Parse functions from source */
+        Parser parser = {mapped_source, 0, arena, symbols};
+        parser.import_sources = import_sources;
+        parser.import_source_count = import_source_count;
+        while (parser.pos < mapped_source.len) {
+            parser_ws(&parser);
+            if (parser.pos >= mapped_source.len) break;
+            Span next = parser_peek(&parser);
+            if (span_eq(next, "type")) {
+                parse_type(&parser);
+            } else if (span_eq(next, "const")) {
+                parse_const(&parser);
+            } else if (span_eq(next, "fn")) {
+                int32_t symbol_index = -1;
+                BodyIR *body = parse_fn(&parser, &symbol_index);
+                if (symbol_index >= 0 && symbol_index < body_cap) {
+                    function_bodies[symbol_index] = body;
+                }
+            } else {
+                parser_line(&parser);
+            }
+        }
+
+        /* Grow function_bodies if parse added more functions */
+        if (symbols->function_cap > body_cap) {
+            int32_t old_cap = body_cap;
+            body_cap = symbols->function_cap;
+            BodyIR **grown = arena_alloc(arena, (size_t)body_cap * sizeof(BodyIR *));
+            memset(grown, 0, (size_t)body_cap * sizeof(BodyIR *));
+            memcpy(grown, function_bodies, (size_t)old_cap * sizeof(BodyIR *));
+            function_bodies = grown;
+        }
+
+        if (!cold_emit_csg_v2_facts(out_path, function_bodies, symbols->function_count,
+                                     symbols, target)) {
+            cold_write_system_link_exec_report(report_path, false, source_path, out_path, out_path,
+                                               target, emit, 0, "csg-v2 emit failed");
+            fprintf(stderr, "[cheng_cold] csg-v2 emit failed\n");
+            munmap((void *)mapped_source.ptr, (size_t)mapped_source.len);
+            return 2;
+        }
+
+        munmap((void *)mapped_source.ptr, (size_t)mapped_source.len);
         cold_write_system_link_exec_report(report_path, true, source_path, out_path, out_path,
                                            target, emit, 0, "");
         return 0;
@@ -20201,17 +22659,26 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
 
     ColdCompileStats stats = {0};
     int compiled = 0;
-    if (link_providers && source_path && source_path[0] && strcmp(emit, "exe") == 0) {
+    if (link_providers && strcmp(emit, "exe") == 0 &&
+        ((source_path && source_path[0]) || (effective_csg_path && effective_csg_path[0]))) {
         char primary_o[PATH_MAX], host_stubs_o[PATH_MAX];
         snprintf(primary_o, sizeof(primary_o), "%s.primary.o", out_path);
         snprintf(host_stubs_o, sizeof(host_stubs_o), "%s.host_stubs.o", out_path);
 
-        setenv("CHENG_NO_IMPORT_BODIES", "1", 1);
-        if (!cold_compile_source_to_object(primary_o, source_path, target)) {
-            fprintf(stderr, "[cheng_cold] --link-providers: primary compile failed\n");
-            return 2;
+        if (effective_csg_path && effective_csg_path[0]) {
+            /* CSG path: compile facts → primary .o */
+            if (!cold_compile_csg_path_to_macho(primary_o, effective_csg_path, 0, 0, target, &stats, true)) {
+                fprintf(stderr, "[cheng_cold] --link-providers: csg primary compile failed\n");
+                return 2;
+            }
+        } else {
+            setenv("CHENG_NO_IMPORT_BODIES", "1", 1);
+            if (!cold_compile_source_to_object(primary_o, source_path, target)) {
+                fprintf(stderr, "[cheng_cold] --link-providers: primary compile failed\n");
+                return 2;
+            }
+            unsetenv("CHENG_NO_IMPORT_BODIES");
         }
-        unsetenv("CHENG_NO_IMPORT_BODIES");
 
         { char cmd[PATH_MAX * 2];
           snprintf(cmd, sizeof(cmd),
@@ -20221,7 +22688,7 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
           (void)rc;
         }
 
-        Span source = source_open(source_path);
+        Span source = source_path ? source_open(source_path) : (Span){0};
         char import_paths[32][PATH_MAX];
         int import_count = 0;
         if (source.len > 0) {
@@ -20248,6 +22715,8 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
             }
             munmap((void *)source.ptr, (size_t)source.len);
         }
+        /* For CSG path: facts already contain all needed code; skip import scanning.
+           Only link with pre-compiled provider .o files if --provider-objects is specified. */
 
         char provider_o[32][PATH_MAX];
         int provider_count = 0;
@@ -20283,7 +22752,8 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
         }
     } else if (effective_csg_path && effective_csg_path[0]) {
         compiled = cold_compile_csg_path_to_macho(out_path, effective_csg_path, source_path,
-                                                  workspace_root[0] ? workspace_root : 0, &stats);
+                                                  workspace_root[0] ? workspace_root : 0,
+                                                  target, &stats, false);
     } else {
         compiled = cold_compile_source_path_to_macho(out_path, source_path, false, &stats);
     }
@@ -20383,6 +22853,7 @@ int main(int argc, char **argv) {
     if (argc >= 2 && strcmp(argv[1], "self-check") == 0) {
         return cold_cmd_self_check(argc, argv);
     }
+#ifndef COLD_BACKEND_ONLY
     if (argc >= 2 && strcmp(argv[1], "compile-bootstrap") == 0) {
         return cold_cmd_compile_bootstrap(argc, argv, argv[0]);
     }
@@ -20392,12 +22863,32 @@ int main(int argc, char **argv) {
     if (argc >= 2 && strcmp(argv[1], "build-backend-driver") == 0) {
         return cold_cmd_build_backend_driver(argc, argv, argv[0]);
     }
+#endif
     if (argc >= 2 && strcmp(argv[1], "status") == 0) {
         return cold_cmd_status(argc, argv);
     }
-    if (argc >= 2 && strcmp(argv[1], "system-link-exec") == 0) {
+    if (argc >= 2 && (strcmp(argv[1], "system-link-exec") == 0 ||
+                      strcmp(argv[1], "--system-link-exec") == 0)) {
         return cold_cmd_system_link_exec(argc, argv);
     }
+    if (argc >= 2 && strcmp(argv[1], "emit-cold-csg-v2") == 0) {
+        /* Route to system-link-exec with --emit:csg-v2 */
+        int32_t new_argc = argc + 1;
+        const char **new_argv = (const char **)malloc((size_t)(new_argc + 1) * sizeof(char *));
+        new_argv[0] = argv[0];
+        new_argv[1] = "system-link-exec";
+        new_argv[2] = "--emit:csg-v2";
+        for (int32_t i = 2; i < argc; i++) new_argv[i + 1] = argv[i];
+        new_argv[new_argc] = 0;
+        int32_t rc = cold_cmd_system_link_exec(new_argc, (char **)new_argv);
+        free(new_argv);
+        return rc;
+    }
+#ifdef COLD_BACKEND_ONLY
+    fprintf(stderr, "cheng_cold (backend-only): unknown command '%s'\n", argv[1] ? argv[1] : "(none)");
+    fprintf(stderr, "Available: help, print-contract, self-check, system-link-exec, emit-cold-csg-v2\n");
+    return 1;
+#else
     const char *out_path = argc > 1 ? argv[1] : "/tmp/cheng_cold_out";
     const char *src_path = argc > 2 ? argv[2] : 0;
 
@@ -20416,4 +22907,5 @@ int main(int argc, char **argv) {
            stats.arena_kb);
     cold_print_elapsed_ms(stdout, "cold_compile_elapsed_ms", stats.elapsed_us);
     return rc;
+#endif
 }

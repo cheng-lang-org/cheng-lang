@@ -116,7 +116,8 @@ type
         surfaceLen: int32
         surfaceFirstCode: int32
         surfaceLastCode: int32
-        items: int32[]
+        head: int32
+        pad: int32
 
     NormalizedExprLookupKey =
         sourcePathLen: int32
@@ -137,6 +138,7 @@ type
     NormalizedExprLayer =
         sourceCount: int32
         exprs: NormalizedExpr[]
+        exprNext: int32[]
         questionResidualCount: int32
         exprLookup: NormalizedExprLookup
 
@@ -366,7 +368,7 @@ fn ParserCallReasonText(reason: NormalizedExprCallReason): str =
         return "unknown_call_target"
     return ""
 
-fn NormalizedExprClone(expr: NormalizedExpr): NormalizedExpr =
+fn NormalizedExprClone(expr: var NormalizedExpr): NormalizedExpr =
     var out: NormalizedExpr
     out.exprId = expr.exprId
     out.sourcePath = expr.sourcePath
@@ -602,7 +604,7 @@ fn NormalizedExprLookupEnsureBucket(lookup: var NormalizedExprLookup,
     bucket.surfaceLen = key.surfaceLen
     bucket.surfaceFirstCode = key.surfaceFirstCode
     bucket.surfaceLastCode = key.surfaceLastCode
-    bucket.items = []
+    bucket.head = -1
     add(lookup.buckets, bucket)
     lookup.slots[slot] = lookup.buckets.len
     return lookup.buckets.len - 1
@@ -630,8 +632,8 @@ fn NormalizedExprLookupBucketIndexExact(lookup: NormalizedExprLookup,
         return bucketIndexPlus1 - 1
     return -1
 
-fn NormalizedExprMatchesExact(expr: NormalizedExpr,
-                                expected: NormalizedExpr): bool =
+fn NormalizedExprMatchesExact(expr: var NormalizedExpr,
+                                expected: var NormalizedExpr): bool =
     if expr.sourcePath != expected.sourcePath:
         return false
     if expr.lineNumber != expected.lineNumber:
@@ -668,8 +670,8 @@ fn NormalizedExprMatchesExact(expr: NormalizedExpr,
         return false
     return true
 
-fn NormalizedExprLayerContainsExpr(layer: NormalizedExprLayer,
-                                     expr: NormalizedExpr): bool =
+fn NormalizedExprLayerContainsExpr(layer: var NormalizedExprLayer,
+                                     expr: var NormalizedExpr): bool =
     let bucketIndex = NormalizedExprLookupBucketIndexExact(layer.exprLookup,
                                                              expr.sourcePath,
                                                              expr.lineNumber,
@@ -679,42 +681,70 @@ fn NormalizedExprLayerContainsExpr(layer: NormalizedExprLayer,
                                                              expr.surfaceText)
     if bucketIndex < 0 || bucketIndex >= layer.exprLookup.buckets.len:
         return false
-    let bucket = layer.exprLookup.buckets[bucketIndex]
-    for i in 0..<bucket.items.len:
-        let exprIndex = bucket.items[i]
+    var exprIndex = layer.exprLookup.buckets[bucketIndex].head
+    var guard: int32
+    while exprIndex >= 0 && guard <= layer.exprs.len:
         if exprIndex < 0 || exprIndex >= layer.exprs.len:
-            continue
-        if NormalizedExprMatchesExact(layer.exprs[exprIndex], expr):
+            return false
+        if layer.exprs[exprIndex].sourcePath == expr.sourcePath &&
+           layer.exprs[exprIndex].lineNumber == expr.lineNumber &&
+           layer.exprs[exprIndex].columnNumber == expr.columnNumber &&
+           layer.exprs[exprIndex].kind == expr.kind &&
+           layer.exprs[exprIndex].detailKind == expr.detailKind &&
+           layer.exprs[exprIndex].surfaceText == expr.surfaceText &&
+           layer.exprs[exprIndex].callSurfaceKind == expr.callSurfaceKind &&
+           layer.exprs[exprIndex].callResolved == expr.callResolved &&
+           layer.exprs[exprIndex].callReason == expr.callReason &&
+           layer.exprs[exprIndex].callQualifier == expr.callQualifier &&
+           layer.exprs[exprIndex].callCallee == expr.callCallee &&
+           layer.exprs[exprIndex].callTarget == expr.callTarget &&
+           layer.exprs[exprIndex].callTargetSourcePath == expr.callTargetSourcePath &&
+           layer.exprs[exprIndex].callTargetImportc == expr.callTargetImportc &&
+           layer.exprs[exprIndex].callPrefixStyle == expr.callPrefixStyle &&
+           layer.exprs[exprIndex].callArgCount == expr.callArgCount &&
+           layer.exprs[exprIndex].callArgsText == expr.callArgsText:
             return true
+        if exprIndex >= layer.exprNext.len:
+            return false
+        exprIndex = layer.exprNext[exprIndex]
+        guard = guard + 1
     return false
 
 fn NormalizedExprLayerRememberExpr(layer: var NormalizedExprLayer,
                                      exprIndex: int32) =
     if exprIndex < 0 || exprIndex >= layer.exprs.len:
         return
-    let expr = layer.exprs[exprIndex]
     let bucketIndex = NormalizedExprLookupEnsureBucket(layer.exprLookup,
-                                                         expr.sourcePath,
-                                                         expr.lineNumber,
-                                                         expr.columnNumber,
-                                                         expr.kind,
-                                                         expr.detailKind,
-                                                         expr.surfaceText)
+                                                         layer.exprs[exprIndex].sourcePath,
+                                                         layer.exprs[exprIndex].lineNumber,
+                                                         layer.exprs[exprIndex].columnNumber,
+                                                         layer.exprs[exprIndex].kind,
+                                                         layer.exprs[exprIndex].detailKind,
+                                                         layer.exprs[exprIndex].surfaceText)
     if bucketIndex < 0:
         return
     var bucket = layer.exprLookup.buckets[bucketIndex]
-    for i in 0..<bucket.items.len:
-        if bucket.items[i] == exprIndex:
-            layer.exprLookup.buckets[bucketIndex] = bucket
+    var current = bucket.head
+    var guard: int32
+    while current >= 0 && guard <= layer.exprs.len:
+        if current == exprIndex:
             return
-    add(bucket.items, exprIndex)
+        if current >= layer.exprNext.len:
+            return
+        current = layer.exprNext[current]
+        guard = guard + 1
+    while layer.exprNext.len <= exprIndex:
+        add(layer.exprNext, -1)
+    layer.exprNext[exprIndex] = bucket.head
+    bucket.head = exprIndex
     layer.exprLookup.buckets[bucketIndex] = bucket
 
 fn NormalizedExprLayerAppendExisting(layer: var NormalizedExprLayer,
-                                       expr: NormalizedExpr) =
+                                       expr: var NormalizedExpr) =
     if NormalizedExprLayerContainsExpr(layer, expr):
         return
     add(layer.exprs, expr)
+    add(layer.exprNext, -1)
     NormalizedExprLayerRememberExpr(layer, layer.exprs.len - 1)
 
 fn ParserConcat2(a: str, b: str): str =
@@ -973,7 +1003,7 @@ fn ParserSourceHasMultilineString(textRaw: str): bool =
 fn ParserWriteTextFast(outPtr: ptr,
                          writePos: var int32,
                          text: str) =
-    let textLen = StrLenFast(text)
+    let textLen = text.len
     if textLen <= 0:
         return
     rawmem_support.RawmemCopy(rawmem_support.RawmemPtrAdd(outPtr, writePos),
@@ -1094,7 +1124,7 @@ fn NormalizedExprMakeCallLikeId(sourcePath: str,
     ParserWriteTextFast(outPtr, writePos, callArgsText)
     return out
 
-fn NormalizedExprLayerClone(layer: NormalizedExprLayer): NormalizedExprLayer =
+fn NormalizedExprLayerClone(layer: var NormalizedExprLayer): NormalizedExprLayer =
     return layer
 
 fn NormalizedExprLayerAppend(layer: var NormalizedExprLayer,
@@ -1147,6 +1177,7 @@ fn NormalizedExprLayerAppendSpan(layer: var NormalizedExprLayer,
     if NormalizedExprLayerContainsExpr(layer, expr):
         return
     add(layer.exprs, expr)
+    add(layer.exprNext, -1)
     NormalizedExprLayerRememberExpr(layer, layer.exprs.len - 1)
 
 fn NormalizedExprLayerAppendCall(layer: var NormalizedExprLayer,
@@ -1207,6 +1238,7 @@ fn NormalizedExprLayerAppendCall(layer: var NormalizedExprLayer,
     if NormalizedExprLayerContainsExpr(layer, expr):
         return
     add(layer.exprs, expr)
+    add(layer.exprNext, -1)
     NormalizedExprLayerRememberExpr(layer, layer.exprs.len - 1)
 
 fn NormalizedExprLayerAppendConstructor(layer: var NormalizedExprLayer,
@@ -1258,6 +1290,7 @@ fn NormalizedExprLayerAppendConstructor(layer: var NormalizedExprLayer,
     if NormalizedExprLayerContainsExpr(layer, expr):
         return
     add(layer.exprs, expr)
+    add(layer.exprNext, -1)
     NormalizedExprLayerRememberExpr(layer, layer.exprs.len - 1)
 
 fn NormalizedExprLayerAppendAssign(layer: var NormalizedExprLayer,
@@ -1307,14 +1340,15 @@ fn NormalizedExprLayerAppendAssign(layer: var NormalizedExprLayer,
     if NormalizedExprLayerContainsExpr(layer, expr):
         return
     add(layer.exprs, expr)
+    add(layer.exprNext, -1)
     NormalizedExprLayerRememberExpr(layer, layer.exprs.len - 1)
 
 fn NormalizedExprLayerAdd(total: var NormalizedExprLayer,
-                            delta: NormalizedExprLayer) =
+                            delta: var NormalizedExprLayer) =
     total.sourceCount = total.sourceCount + delta.sourceCount
     total.questionResidualCount = total.questionResidualCount + delta.questionResidualCount
     for i in 0..<delta.exprs.len:
-        NormalizedExprLayerAppendExisting(total, NormalizedExprClone(delta.exprs[i]))
+        NormalizedExprLayerAppendExisting(total, delta.exprs[i])
 
 fn NormalizedExprLayerExprCount(layer: NormalizedExprLayer): int32 =
     return layer.exprs.len

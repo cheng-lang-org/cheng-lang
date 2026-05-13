@@ -10177,6 +10177,9 @@ static int32_t cheng_seed_find_type_def_index_by_symbol(const ChengSeedLoweringP
     char lookup_args[CHENG_MAX_TYPE_PARAMS][256];
     size_t lookup_arg_count = 0U;
     size_t i;
+    if (lowering == NULL || owner_module_path == NULL || type_name == NULL) {
+        return -1;
+    }
     if (!cheng_seed_parse_type_instance_text(type_name,
                                      lookup_base,
                                      sizeof(lookup_base),
@@ -10186,16 +10189,16 @@ static int32_t cheng_seed_find_type_def_index_by_symbol(const ChengSeedLoweringP
         return -1;
     }
     for (i = 0; i < lowering->type_def_count; ++i) {
-        if (cheng_seed_module_paths_equivalent(lowering->type_defs[i].owner_module_path, owner_module_path) &&
-            lowering->type_defs[i].generic_param_count == lookup_arg_count &&
-            strcmp(lowering->type_defs[i].type_name, lookup_base) == 0) {
+        if (lowering->type_defs[i].generic_param_count == lookup_arg_count &&
+            strcmp(lowering->type_defs[i].type_name, lookup_base) == 0 &&
+            cheng_seed_module_paths_equivalent(lowering->type_defs[i].owner_module_path, owner_module_path)) {
             return (int32_t)i;
         }
     }
     for (i = 0; i < lowering->type_def_count; ++i) {
-        if (cheng_seed_module_paths_equivalent(lowering->type_defs[i].owner_module_path, owner_module_path) &&
-            lowering->type_defs[i].generic_param_count == lookup_arg_count &&
-            cheng_seed_text_case_equal(lowering->type_defs[i].type_name, lookup_base)) {
+        if (lowering->type_defs[i].generic_param_count == lookup_arg_count &&
+            cheng_seed_text_case_equal(lowering->type_defs[i].type_name, lookup_base) &&
+            cheng_seed_module_paths_equivalent(lowering->type_defs[i].owner_module_path, owner_module_path)) {
             return (int32_t)i;
         }
     }
@@ -16403,6 +16406,13 @@ static bool cheng_seed_module_paths_equivalent(const char *left_module_path,
                                        const char *right_module_path) {
     char left_norm[PATH_MAX];
     char right_norm[PATH_MAX];
+    if (!left_module_path || !right_module_path ||
+        left_module_path[0] == '\0' || right_module_path[0] == '\0') {
+        return false;
+    }
+    if (strcmp(left_module_path, right_module_path) == 0) {
+        return true;
+    }
     cheng_seed_canonical_module_path_identity(left_module_path, left_norm, sizeof(left_norm));
     cheng_seed_canonical_module_path_identity(right_module_path, right_norm, sizeof(right_norm));
     if (left_norm[0] == '\0' || right_norm[0] == '\0') {
@@ -16869,8 +16879,8 @@ static void cheng_seed_lowered_function_add_all_callees_by_module_and_name(const
         return;
     }
     for (i = 0; i < lowering->function_count; ++i) {
-        if (cheng_seed_module_paths_equivalent(lowering->functions[i].owner_module_path, module_path) &&
-            strcmp(lowering->functions[i].function_name, function_name) == 0) {
+        if (strcmp(lowering->functions[i].function_name, function_name) == 0 &&
+            cheng_seed_module_paths_equivalent(lowering->functions[i].owner_module_path, module_path)) {
             cheng_seed_lowered_function_add_callee(function, lowering->functions[i].symbol_text);
         }
     }
@@ -19425,10 +19435,14 @@ static bool cheng_seed_statement_find_removed_default_error(const ChengSeedLower
                                                    alias_count,
                                                    type_text,
                                                    expr)) {
-            cheng_seed_format_redundant_explicit_default_init_error(type_text,
-                                                            expr,
-                                                            message_out,
-                                                            message_cap);
+            if (message_out && message_cap > 0U) {
+                snprintf(message_out,
+                         message_cap,
+                         "[cheng_seed] redundant explicit default init; omit initializer type=%s expr=%s statement=%s\n",
+                         type_text,
+                         expr,
+                         statement);
+            }
             return true;
         }
         return cheng_seed_expr_find_removed_default_error_recursive(lowering,
@@ -26401,6 +26415,9 @@ static bool cheng_seed_select_visible_overloaded_function_symbol(const ChengSeed
         int32_t score = 0;
         int32_t exact_score = 0;
         size_t arg_index;
+        if (strcmp(candidate->function_name, function_name) != 0) {
+            continue;
+        }
         trace_candidate = trace_overload &&
                           trace_overload[0] != '\0' &&
                           (strcmp(trace_overload, "1") == 0 ||
@@ -26424,9 +26441,7 @@ static bool cheng_seed_select_visible_overloaded_function_symbol(const ChengSeed
                     arg_count,
                     visible ? 1 : 0);
         }
-        if (strcmp(candidate->function_name, function_name) != 0 ||
-            candidate->param_count != arg_count ||
-            !visible) {
+        if (candidate->param_count != arg_count || !visible) {
             continue;
         }
         memset(generic_names, 0, sizeof(generic_names));
