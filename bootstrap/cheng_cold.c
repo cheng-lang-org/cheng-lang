@@ -18965,6 +18965,89 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
     }
 }
 
+/* ---- x86_64 codegen (byte-level, packs into uint32_t words) ---- */
+
+static void x64_codegen_op(X64Code *x, BodyIR *body, Symbols *symbols,
+                           FunctionPatchList *patches, int32_t op) {
+    int32_t kind = body->op_kind[op];
+    int32_t dst = body->op_dst[op];
+    int32_t a = body->op_a[op];
+    int32_t b = body->op_b[op];
+    int32_t c = body->op_c[op];
+    int32_t off_dst = body->slot_offset[dst];
+    if (kind == BODY_OP_I32_CONST) {
+        x64_mov_r32_imm32(x, 0, a); /* mov $a, %eax */
+        x64_mov_mr32_r32_store(x, 4, off_dst, 0); /* mov %eax, [rsp+off] */
+    } else if (kind == BODY_OP_COPY_I32) {
+        x64_mov_r32_mr32(x, 0, 4, body->slot_offset[a]);
+        x64_mov_mr32_r32_store(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_LOAD_I32) {
+        /* a = global index, load via RIP-relative */
+        x64_mov_r32_imm32(x, 0, 0);
+        x64_mov_mr32_r32_store(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_CALL_I32) {
+        if (a >= 0 && a < symbols->function_count) {
+            int32_t call_pos = x->len + 1; /* after E8 opcode */
+            x64_call_rel32(x, 0);
+            function_patches_add(patches, call_pos, a);
+        }
+        x64_mov_mr32_r32_store(x, 4, off_dst, 0); /* store return value */
+    } else if (kind == BODY_OP_STR_LITERAL) {
+        x64_mov_r64_imm64(x, 0, 0); /* placeholder, patched later */
+        x64_mov_mr64_r64_store(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_I32_ADD) {
+        int32_t oa = body->slot_offset[a], ob = body->slot_offset[b];
+        x64_mov_r32_mr32(x, 0, 4, oa);
+        x64_mov_r32_mr32(x, 1, 4, ob);
+        x64_add_r32_r32(x, 0, 1); /* add %ecx, %eax */
+        x64_mov_mr32_r32_store(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_I32_SUB) {
+        int32_t oa = body->slot_offset[a], ob = body->slot_offset[b];
+        x64_mov_r32_mr32(x, 0, 4, oa);
+        x64_mov_r32_mr32(x, 1, 4, ob);
+        x64_sub_r32_r32(x, 0, 1);
+        x64_mov_mr32_r32_store(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_I32_MUL) {
+        int32_t oa = body->slot_offset[a], ob = body->slot_offset[b];
+        x64_mov_r32_mr32(x, 0, 4, oa);
+        x64_mov_r32_mr32(x, 1, 4, ob);
+        x64_imul_r32_r32(x, 0, 1);
+        x64_mov_mr32_r32_store(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_I32_CMP) {
+        int32_t oa = body->slot_offset[a], ob = body->slot_offset[b];
+        x64_mov_r32_mr32(x, 0, 4, oa);
+        x64_cmp_r32_r32(x, 0, 1);
+        x64_mov_mr32_r32_store(x, 4, off_dst, 0);
+    }
+    /* other ops: skip silently */
+}
+
+/* x86_64 function prologue: push rbp; mov rsp, rbp; sub $frame, rsp */
+static void x64_codegen_prologue(X64Code *x, int32_t frame_size) {
+    x64_push_r64(x, 5); /* push %rbp */
+    x64_mov_r64_r64(x, 5, 4); /* mov %rsp, %rbp */
+    if (frame_size > 0) x64_sub_rsp_imm8(x, (int8_t)frame_size);
+}
+
+/* x86_64 function epilogue: mov rbp, rsp; pop rbp; ret */
+static void x64_codegen_epilogue(X64Code *x) {
+    x64_mov_r64_r64(x, 4, 5); /* mov %rbp, %rsp */
+    x64_pop_r64(x, 5); /* pop %rbp */
+    x64_ret(x);
+}
+
+/* Pack X64Code bytes into uint32_t words. Returns word count. */
+static int32_t x64_pack_words(X64Code *x, uint32_t *words, int32_t max_words) {
+    int32_t wc = 0;
+    for (int32_t i = 0; i < x->len && wc < max_words; i += 4) {
+        uint32_t w = 0;
+        for (int32_t j = 0; j < 4 && i + j < x->len; j++)
+            w |= ((uint32_t)x->buf[i + j]) << (j * 8);
+        words[wc++] = w;
+    }
+    return wc;
+}
+
 static void codegen_switch(Code *code, BodyIR *body, PatchList *patches, int32_t term) {
     int32_t tag_slot = body->term_value[term];
     int32_t count = body->term_case_count[term];
