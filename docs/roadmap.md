@@ -30,8 +30,14 @@
 | runtime smoke cc 链接 | 同上，内置 ELF 链接器已绕过 | 三 smoke RISC-V linked ELF 均已 QEMU 验证 |
 | 删除 cold source parser | COLD_BACKEND_ONLY 42% 缩减 | parser 代码保留，cold_parser.c 独立文件 |
 | C seed 替代 | cheng_seed.c 仍是完整 Cheng 语言实现（66K 行，3.0MB） | 冷编译器子集覆盖足够后可退役 |
-| Ownership / E-Graph | No-Alias 基础存在 | 需要 ownership proof driver 重跑 + E-Graph rewrite rules |
-| 函数级并行 | 有 work-stealing 痕迹 | 需要 active lowering 主链接入 + benchmark 证明加速比
+| Ownership / E-Graph | No-Alias 数据模型活跃（寄存器缓存禁用）；Ownership proof 可编译运行（exit 0）；E-Graph 无实现 | 激活寄存器缓存（CFG-aware 后）、规范 witness 入口、E-Graph 从头实现 |
+| 函数级并行 | C 层 codegen 并行已激活（work-stealing + pthread + 确定性合并），Cheng 层 FunctionTaskExecuteBodyIr 是空桩，未接入 active lowering 主链 | 需要 lowering 主链接入 FunctionTaskExecuteAuto + benchmark 证明加速比
+
+### 本次会话新增（2026-05-14）：Ownership/No-Alias/E-Graph 全面评估
+
+- **No-Alias 标注逻辑活跃，寄存器缓存明确禁用**：`cold_parser.c:6054/6143` 对 `SLOT_I32/I64/F32/F64` 的 `let`/`var` 自动标记 `slot_no_alias[slot]=1`。但 `cheng_cold.c:8620` 显式注释 "Disabled no-alias register cache"，`na_find()` 始终返回 -1（stale miss），`na_set/na_clobber` 空桩。codegen 侧检查 `body->slot_no_alias[dst]` 后调用空桩——数据模型正确但优化无效。
+- **Ownership proof driver + witness 可编译运行**：`ownership_proof_driver.cheng`（13 函数/324 ops）经 stage3 编译 exit 0，运行输出 `"ownership_proof_driver ok"`。`ownership_proof_witness.cheng`（5 函数/89 ops）经 backend_driver 编译 exit 0，运行输出 `" ownership_proof_witness ok"`。`ownership_proof_driver_cold.cheng` 为自包含（无 import）cold-subset 版本。
+- **E-Graph 无实现**：`compiler_csg_egraph_contract.cheng` 仅返回 `uir_egraph_status=unavailable` + `uir_egraph_available=0` 的合同报告壳。无 rewrite rule / cost model / canonical equivalence。
 
 ### 本次会话新增（2026-05-12）
 
@@ -44,6 +50,15 @@
 - **I64_REF 识别**：`parse_arith_expr` 和 `parse_term` 的 I64 分支同步检查 `SLOT_I64_REF`，`let x: uint64 = ...` 的位运算不再掉进零值 fallback。
 - **Combined kernel 全路径通过**：`cold_bootstrap_kernel_combined.cheng` (2035 行) source-direct 路径 exit 42。`cold_bootstrap_kernel_aarch64_encode.cheng` source-direct 路径 exit 42。`cold_bootstrap_kernel_frontend_scan.cheng` exit 42。
 - **回归矩阵**：28/28 冷编译器回归 PASS，13/13 bootstrap slice PASS，3/3 kernel PASS。
+
+### 本次会话新增（2026-05-14）
+
+- **并行状态审计与 roadmap 更新**：审计了 C 层和 Cheng 层两套并行框架的实际状态。
+  - **C 层 codegen 并行**（`bootstrap/cheng_cold.c`）：Chase-Lev 无锁 work-stealing deque（行 6070-6103）、`codegen_worker_run` 线程函数（行 6128-6158）、per-worker Arena 缓存（行 11249-11271）、确定性函数索引序合并（行 11306-11319）均已激活且在 production 中工作。`COLD_NO_SIGN=1` 下 `BACKEND_JOBS=1` 与 `BACKEND_JOBS=4` 产物 SHA 一致已验证。
+  - **Cheng 层 lowering 并行**（`src/core/ir/function_task_executor.cheng`）：`FunctionTaskExecuteBodyIr`（行 27-80）仍是 word-count-only 空桩，不做实际 lowering。`LoweringBuildPrimaryObjectIr`（`lowering_plan.cheng:1443-1450`）使用纯串行 `for` 循环，未调用 `FunctionTaskExecuteAuto`。
+  - **关键文件行号**：`cheng_cold.c` 并行代码 == 行 6070-6172（deque + worker + env）、行 11214-11319（codegen_program 并行分支）；`function_task_executor.cheng` 全文件 258 行；`lowering_plan.cheng:1443-1450` 串行循环。
+  - **最小接入路径**：`FunctionTaskExecuteBodyIr` 从 word-count 桩升级为调用 `LoweringBuildOneFunction`，然后 `LoweringBuildPrimaryObjectIr` 切换到 `FunctionTaskExecuteAuto` 调度。
+  - 详情已更新到阶段 3 和 4 号 gap 章节。
 
 ### 已成立（2026-05-10）
 
@@ -224,47 +239,71 @@
 ### 3. Ownership / E-Graph
 
 **当前状态**：
-- **No-Alias 基础**：`slot_no_alias[]` 数据模型已落地，`let`/`var` 标量局部变量自动标记 no_alias；4 寄存器缓存（R0-R3）追踪 no_alias slot；`na_clobber(N)` 在临时寄存器使用后正确无效化缓存。
-- **E-Graph**：不存在可运行的 rewrite rules。CSG egraph 有合同概念（canonical graph equivalence）但无实现。
-- **Ownership proof driver**：不存在。No-Alias 的优化效果无独立 witness 验证。
+- **No-Alias 数据模型活跃，寄存器缓存禁用**：`slot_no_alias[]` 数组随 slot 分配（`cheng_cold.c:3422`），`cold_parser.c:6054/6143` 对 `SLOT_I32/I64/F32/F64` 的 `let`/`var` 局部变量自动标记 `slot_no_alias[slot]=1`，默认初始化为 `0`（`cheng_cold.c:3559`）。**但寄存器缓存优化被明确禁用**（`cheng_cold.c:8620` 注释 `"Disabled no-alias register cache: correctness first until it is CFG-aware."`），`na_find()/na_set()/na_clobber()` 都是空桩（`cheng_cold.c:8620-8624`），`na_find()` 始终返回 -1（缓存未命中）。codegen 侧 `slot_no_alias[dst]` 检查存在但调用空桩 `na_set()`，无实际优化效果。标记逻辑健全但优化无效。
+- **Ownership proof driver 可编译运行**：共 3 个文件：
+  - `src/tests/ownership_proof_driver.cheng`：完整 Cheng 版，import `ownership.cheng` 模块。编译命令 `artifacts/bootstrap/cheng.stage3 system-link-exec --root:... --in:src/tests/ownership_proof_driver.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/ownership_proof_driver`。13 函数/324 ops/86 blocks，runs with `EXIT=0`，输出 `"ownership_proof_driver ok"`。
+  - `src/tests/ownership_proof_driver_cold.cheng`：独立实现（无 import），自包含 OwnershipCtx + transfer/borrow/release。含 `OwnershipError（Ok/DoubleMove/MoveAfterBorrow）`、transfer state machine、shared borrow with refcount。
+  - `src/tests/ownership_proof_witness.cheng`：最小冷子集 witness。5 函数/89 ops/41 blocks，runs with `EXIT=0`，输出 `" ownership_proof_witness ok"`。编译命令：`artifacts/backend_driver/cheng system-link-exec --root:. --in:src/tests/ownership_proof_witness.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/ownership_witness`。
+- **E-Graph**：仅 contract 报告壳 `src/core/tooling/compiler_csg_egraph_contract.cheng`，返回 `uir_egraph_status=unavailable` + `uir_egraph_available=0`。**无任何 rewrite rule、cost model、canonical equivalence 的实现。**
 
 **阻断原因**：
-1. E-Graph 需要 cost model + rewrite rules（UIR 层的 canonical form equivalence），属于语义特化主线，与当前 codegen 正确性闭环不在同一轨道。
-2. Ownership proof 需要专用 driver 和 witness smoke，不能用 "compile-only passes" 代替硬证明。
-3. No-Alias 寄存器缓存当前只覆盖标量 slot，对聚合类型（struct/tuple payload）无影响。
+1. E-Graph 需要从零实现：cost model + rewrite rules（UIR 层的 canonical form equivalence），属于语义特化主线，与当前 codegen 正确性闭环不在同一轨道。CSG egraph 合同壳只是报告字段占位。
+2. Ownership proof 已有可运行的 driver + witness，但未规范化：没有专用编译入口（`--ownership-on` flag）、没有 CI 集成、没有 phase-off 证明、没有编译时验证（当前在 runtime 验证）。
+3. No-Alias 寄存器缓存禁用是因为 CFG-aware 不完整：`na_find()` 是单值追踪，不支持 CFG block 间的值传播，可能产生 stale 或漏优化。标记逻辑健全（标量 slot），聚合类型（struct/tuple payload）无影响。
 
 **完成条件**：
-1. E-Graph：UIR egraph 管线就位，含合法的 cost model、rewrite rules、canonical equivalence 证明
-2. Ownership proof driver：专用编译入口 + smoke witness，能在编译时验证 ownership 合同
-3. No-Alias：benchmark 证明寄存器缓存减少冗余 `ldr` 指令数量
-4. phase-off surface 上置为 false——不允许 phase-off 而声称 proof-backed 通过
+1. **No-Alias 寄存器缓存激活**：使 `na_find()/na_set()/na_clobber()` 实现 CFG-aware 的值追踪，benchmark 证明减少冗余 `ldr` 指令。
+2. **Ownership proof 规范化**：`--ownership-on` 编译入口 + 编译时验证（非 runtime）+ CI smoke + phase-off 证明。
+3. **E-Graph**：UIR egraph 管线从零实现，含合法的 cost model、rewrite rules、canonical equivalence 证明。
+4. **phase-off surface** 上置为 false——不允许 phase-off 而声称 proof-backed 通过。
 
-**预计工作量**：~数周（E-Graph 基础管线 + ownership proof driver + witness），属阶段 5 核心。
+**预计工作量**：
+- No-Alias 缓存修复（CFG-aware）：~1-2 周（数据模型已就位，需要重写追踪逻辑）
+- Ownership proof 规范化：~2-3 天（现有 runtime driver 加编译时入口）
+- E-Graph 从头实现：~数周（已有 CSG canonical graph CID 概念但无实现）
 
 ---
 
 ### 4. 函数级并行
 
 **当前状态**：
-- **C 层 work-stealing（cheng_cold.c）**：`codegen_worker_run` + `pthread_create` + `__atomic_fetch_add` 无锁竞争 + per-worker Arena + 函数索引序确定性 merge。`COLD_NO_SIGN=1` 下 `BACKEND_JOBS=1` 与 `BACKEND_JOBS=4` 产物 SHA 完全一致。已成立。
-- **Cheng 层 task executor**：`backend_driver_dispatch_min.cheng` 保留 `function_task_schedule=ws/serial` 动态报告。但 `FunctionTaskExecuteBodyIr` 是空桩，未接入 active lowering 主链。
+
+有两层并行：C 层（codegen 阶段，已激活）和 Cheng 层（lowering 阶段，空桩）。
+
+**C 层 codegen 并行（已激活）**：
+- `cheng_cold.c` 中 `codegen_worker_run`（行 6128）+ Chase-Lev 无锁 work-stealing deque（`cold_wsdeque_push/pop/steal`，行 6070-6103）
+- `cold_jobs_from_env()` 读取 `BACKEND_JOBS` 环境变量（行 6161）
+- per-worker Arena 缓存（mmap 独立页，跨编译重用，行 11249-11271）
+- `codegen_program` 中并行分支（行 11221-11319）：入口函数串行编译后，其余函数均分到 worker 线程，`pthread_join` 后确定性按函数索引序合并 code words、patches、positions
+- 确定性验证：`COLD_NO_SIGN=1` 下 `BACKEND_JOBS=1` 与 `BACKEND_JOBS=4` 产物 SHA 完全一致（行 124）
+- report 输出 `function_task_job_count=N`、`function_task_schedule=ws|serial`（行 14333-14334）
+- **已成立**——该路径已在 production 中工作，不是实验性痕迹
+
+**Cheng 层 lowering 并行（空桩）**：
+- `src/core/ir/function_task_executor.cheng`：完整的 work-stealing 框架（`FunctionTaskExecuteBodyIr`、`FunctionTaskExecuteAuto`、`FunctionTaskExecuteWorkStealing`、`FunctionTaskExecuteSerial`、`FunctionTaskMergeResults`、`FunctionTaskWorkStealingLastWorkerCount`）
+- 但 `FunctionTaskExecuteBodyIr`（行 27-80）**只做 word count 统计**——遍历 ops 累加 word count，不做实际 lowering
+- **`LoweringBuildPrimaryObjectIr` 在 `lowering_plan.cheng`（行 1443-1450）使用纯串行 `for` 循环，从不调用 `FunctionTaskExecuteAuto`**
+- `backend_driver_dispatch_min.cheng` 保留 `function_task_schedule=ws/serial` 动态报告，但该报告只反映 `cold_jobs_from_env()` 的值，与 lowering 并行无关
+- 唯一客户端：`function_task_executor_contract_smoke.cheng` 测试（`src/tests/`），该测试构造纯 `FunctionTask` 调用 executor，不经过实际 lowering 管线
 - **2026-05-08 尝试**：用 `async.spawn` + `atomic.FetchAddI32` 实现 fan-out 并行 for 循环。代码语法/语义通过，但 `primary_object_plan` codegen 不支持 `let`/`if`/`while`/atomic/spawn 等语句模式，产出 `unsupported_body_kinds`，最终 C seed 链接失败。根因：Cheng 规范 §716 禁止循环模块导入，不能走 `function_task_executor ↔ lowering_plan` 回调；codegen 不支持函数体内的控制流/并发原语。
 
 **阻断原因**：
-1. `FunctionTaskExecuteBodyIr` 是空桩——active lowering 主链未使用并行 executor
-2. codegen 不支持函数体内的并发原语（`async.spawn`、`FetchAddI32`、控制流语句）
-3. §716 循环导入约束阻止了 executor 回调路径
-4. 正确路径：要么扩展 `primary_object_plan` codegen 支持所需语句，要么在 C/importc 层（codegen 以下）实现线程调度，暴露简单调用接口
+1. `LoweringBuildPrimaryObjectIr`（`lowering_plan.cheng:1443`）是纯串行 `for` 循环，未使用 `FunctionTaskExecuteAuto`
+2. `FunctionTaskExecuteBodyIr` 只做 word count，不做实际 lowering——其类型输出是 `FunctionTaskResult`（含 `wordCount`），不是 lowering 管线需要的 `PrimaryObjectIrFunction`
+3. 即使替换为实际 lowering，`LoweringBuildOneFunction` 依赖 `LoweringPlanStub` 的共享可变状态（`plan.typedIr`、`plan.functionNames` 等），当前 API 设计需要先确认每函数独立是否线程安全
+4. §716 循环导入约束阻止了 `function_task_executor ↔ lowering_plan` 直接回调
+5. 正确路径：在 C/importc 层（codegen 以下）实现线程调度并暴露简单调用接口——这正是 cold C 编译器已经做到的
 
 **完成条件**：
-1. `FunctionTaskExecuteBodyIr` 非空桩，active lowering 主链使用并行 executor
-2. `BACKEND_JOBS=1` 与 `BACKEND_JOBS=N` 同输入产物 SHA 一致（确定性约束）
-3. worker 任一失败硬失败，不能串行接管
-4. report 明确写 `function_task_schedule=ws`、`job_count>1`
-5. benchmark 证明加速比（>=2 函数时 wall clock 下降）
-6. smoke 必须检查 marker，防止入口被折成直接 `return 0` 假绿
+1. `LoweringBuildPrimaryObjectIr` 使用 `FunctionTaskExecuteAuto` 或等价并行调度
+2. `FunctionTaskExecuteBodyIr` 做实际 lowering（调用 `LoweringBuildOneFunction`），而非只算 word count
+3. `BACKEND_JOBS=1` 与 `BACKEND_JOBS=N` 同输入产物 SHA 一致（确定性约束）
+4. worker 任一失败硬失败，不能串行接管
+5. report 明确写 `function_task_schedule=ws`、`job_count>1`
+6. benchmark 证明加速比（>=2 函数时 wall clock 下降）
+7. smoke 必须检查 marker，防止入口被折成直接 `return 0` 假绿
 
-**预计工作量**：~1-2 周。路径已清晰：C 层 codegen 扩展或 importc 接口暴露。核心骨架（work-stealing、per-worker arena、确定性 merge）已就位，需要的是主链接入和 codegen 能力扩展。
+**预计工作量**：~1-2 周。核心骨架（C 层 work-stealing、per-worker arena、确定性 merge）已就位。Cheng 层 executor 的 work-stealing 框架也已就位。关键缺口是 `FunctionTaskExecuteBodyIr` 从 word-count 桩升级为真实 lowering 调用，以及 `LoweringBuildPrimaryObjectIr` 切换到 executor 调度。
 
 ---
 
@@ -357,15 +396,55 @@ Cheng 的工业路线不是和 LLVM/mold 在传统资源赛道硬拼，而是用
 
 ## 阶段 3：函数级并行
 
+Stage 3 涵盖两层并行。C 层 codegen 并行已激活（可视为阶段 3 目标的前半段完成）。Cheng 层 lowering 并行是当前剩余缺口。
+
+### C 层 codegen 并行（已激活，2026-05-11）
+
+| 切片 | 状态 | 证据 |
+|---|---|---|
+| Chase-Lev 无锁 work-stealing deque | **已完成** | `cold_wsdeque_push/pop/steal`（`cheng_cold.c:6070-6103`） |
+| `codegen_worker_run` 线程函数 | **已完成** | `cheng_cold.c:6128-6158`，per-worker Code buffer + PatchList + Arena |
+| `cold_jobs_from_env()` + `BACKEND_JOBS` | **已完成** | `cheng_cold.c:6161-6172`，1-16 范围 |
+| Per-worker Arena 缓存 | **已完成** | `cheng_cold.c:11249-11271`，mmap 独立页，跨编译重用 |
+| 确定性合并（函数索引序） | **已完成** | `cheng_cold.c:11306-11319`，`COLD_NO_SIGN=1` 下任意 `BACKEND_JOBS` 值产物 SHA 一致 |
+| report: `function_task_job_count` + `ws/serial` | **已完成** | `cheng_cold.c:14333-14334` |
+| 入口函数串行 + 其余并行 | **已完成** | `cheng_cold.c:11214-11319` |
+
+### Cheng 层 lowering 并行（空桩）
+
 | 切片 | 状态 | 下一步 |
 |---|---|---|
-| `UirFnTask/UirFnTaskResult` | 最小纯数据模型已落地 | 保持 task/result 不携带 AST、源码全文、完整 BodyIR |
-| `LoweringBuildOneFunction` per-function 提取 | **已完成** | 可独立调用，无共享可变状态，线程安全 |
-| `BACKEND_JOBS` env→CompilerRequest→report | **已完成** | `function_task_job_count=N` + `function_task_schedule=serial` 已写入报告 |
-| serial oracle | 必须保留 | `BACKEND_JOBS=1` 产物作为确定性基准 |
-| work-stealing executor | 库级 executor 可见，但未接入 active lowering 主链 | 待接入 lowering callback（`FunctionTaskExecuteBodyIr` 是空桩）；接入前不得宣称主链并行完成 |
-| 实际并行执行 | **2026-05-08 尝试受阻** | `async.spawn` + `FetchAddI32` 方案通过语法/语义检查，但 codegen 不支持函数体内的并发原语；循环导入约束（§716）阻止了 executor 回调路径 |
-| dispatch report | **已完成** | `function_task_schedule` 动态报告 `ws`/`serial`，`function_task_job_count=N` |
+| `FunctionTask` / `FunctionTaskResult` / `FunctionTaskPlan` 数据模型 | **已完成** | `src/core/ir/function_task.cheng`，含 `funcIndex`、`declOrdinal`、`bodyIR`、`outputKind`、`wordCount` |
+| `FunctionTaskExecuteSerial` 串行 oracle | **已完成** | `src/core/ir/function_task_executor.cheng:85-90` |
+| `FunctionTaskExecuteWorkStealing` 框架 | **已完成** | `src/core/ir/function_task_executor.cheng:182-229`：`async.spawnPtr` + `atomic.CasI32` + Chase-Lev pop/steal |
+| `FunctionTaskExecuteAuto` 自动调度 | **已完成** | `src/core/ir/function_task_executor.cheng:231-234`：依据 `jobCount > 1 && schedule == ws` |
+| `FunctionTaskMergeResults` + report | **已完成** | `src/core/ir/function_task_executor.cheng:236-257` |
+| `FunctionTaskExecuteBodyIr` 实际 lowering | **空桩（关键缺口）** | 当前仅算 word count（遍历 ops/terms 累加），不产生产出。需要改为调用 `LoweringBuildOneFunction` 或等价实际 lowering |
+| `LoweringBuildPrimaryObjectIr` 接入 executor | **未接入** | `lowering_plan.cheng:1443-1450` 使用纯串行 `for` 循环，未调用 `FunctionTaskExecuteAuto` |
+| `function_task_executor_contract_smoke` | **通过** | `src/tests/function_task_executor_contract_smoke.cheng`：验证 serial + ws 两种调度路径，结果 funcIndex/wordCount/diags 正确 |
+
+### 最小接入路径
+
+```c
+// lowering_plan.cheng:1443 — 当前串行
+fn LoweringBuildPrimaryObjectIr(...): PrimaryObjectIr =
+    var ir: PrimaryObjectIr
+    for i in 0..<plan.functionNames.len:
+        let fnIr = LoweringBuildOneFunction(plan, sourceTexts, i, letCallReturnLiteralStart)
+        add(ir.functions, fnIr)
+    return ir
+
+// 改为调用 executor：
+fn LoweringBuildPrimaryObjectIr(...): PrimaryObjectIr =
+    var taskPlan = ftask.FunctionTaskPlanNew()
+    taskPlan.jobCount = cold_jobs_from_env()  // 需暴露给 Cheng 层
+    for i in 0..<plan.functionNames.len:
+        var task = ftask.FunctionTaskNew(i, plan, sourceTexts)
+        ftask.FunctionTaskPlanAppend(taskPlan, task)
+    let results = fexec.FunctionTaskExecuteAuto(taskPlan)
+    // merges results → PrimaryObjectIr
+    return BuildPrimaryObjectIrFromResults(results)
+```
 
 切默认条件：
 1. `BACKEND_JOBS=1` 与 `BACKEND_JOBS=N` 同输入产物 SHA 一致。
@@ -397,7 +476,7 @@ Cheng 的工业路线不是和 LLVM/mold 在传统资源赛道硬拼，而是用
 |---|---|---|
 | no-pointer ABI | 公开表面默认不暴露裸指针 | `Slice/Handle/Borrow/Tuple out-param` 都要有 compile-fail 和 runtime smoke |
 | BodyIR DoD/SoA | 有合同 smoke | 继续锁定 flat arrays、local noalias flags、cstring side table |
-| Ownership/No-Alias | proof phase 需要专用 driver/witness | 不允许 phase-off surface 误报 proof-backed 通过 |
+| Ownership/No-Alias | No-Alias 数据模型活跃（`cold_parser.c:6054/6143` 标量 slot 标记）；寄存器缓存禁用（`na_find/set/clobber` 空桩，`cheng_cold.c:8620`）；Ownership proof driver + witness 可编译运行（`EXIT=0`） | 激活 CFG-aware 寄存器缓存；`--ownership-on` 编译入口 + 编译时验证；E-Graph 从零实现 |
 | CSG egraph | canonical graph equivalence 合同可见 | UIR egraph 当前不可用，后续接 cost model 和 rewrite rules |
 | SIMD | 当前闭环未要求 | 先完成 UIR 向量类型、合法性分析、寄存器映射 |
 
@@ -435,7 +514,7 @@ Cheng 的工业路线不是和 LLVM/mold 在传统资源赛道硬拼，而是用
 1. ✅ **`atomic_i32_runtime_smoke` 已通过**（exit 0）。Call ABI、原子指令、`?` 操作符均已完成。
 2. ✅ **`build-backend-driver` 自检通过**。冷编译器直接 Mach-O 路径：ordinary_zero_exit_fixture exit 0。
 3. ✅ **冷自举 A/B 证明**：bootstrap-bridge 全链条 fixed_point。
-4. ✅ **Stage 5 No-Alias**：数据模型 + 寄存器缓存 + clobber 无效化。
+4. ⚠️ **Stage 5 No-Alias 部分就位**：数据模型活跃（标量 slot 标记），寄存器缓存禁用（CFG-aware 不完整，`na_find/set/clobber` 空桩）；Ownership proof driver + witness 可编译运行 exit 0；E-Graph 无实现。
 5. ✅ **函数级并行 + lock-free work-stealing**：pthread + `__atomic_fetch_add` + 确定性 merge。`COLD_NO_SIGN=1` 下任意 `BACKEND_JOBS` 值产物 SHA 一致。
 6. ✅ **30-80ms 架构合规**：6 个 report 字段全部输出，冷进程内微秒级计时。实测 135 函数/5293 ops 编译 total=22.5ms。
 7. ✅ **回归测试**：34/35 cold_* 测试通过（仅 cold_csg_facts_exporter_smoke SIGSEGV，os.GetEnvDefault 不在冷子集），5/5 roadmap 验证 fixture 通过。
