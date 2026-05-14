@@ -134,8 +134,43 @@ roundtrip_fixture() {
 }
 
 echo "=== CSG v2 Roundtrip ==="
+
+# Baseline: minimal smoke tests
 roundtrip_fixture ordinary src/tests/ordinary_zero_exit_fixture.cheng 32768
 roundtrip_fixture return_let tests/cheng/backend/fixtures/return_let.cheng 32768
+
+# Object types with field access and constructors
+roundtrip_fixture return_object_fields tests/cheng/backend/fixtures/return_object_fields.cheng 4096
+roundtrip_fixture object_str_i32_local_ctor tests/cheng/backend/fixtures/object_str_i32_local_ctor.cheng 4096
+roundtrip_fixture return_object_copy_assign tests/cheng/backend/fixtures/return_object_copy_assign.cheng 4096
+roundtrip_fixture object_scalar_control_probe tests/cheng/backend/fixtures/object_scalar_control_probe.cheng 8192
+
+# Multi-function: calls, forward declarations, void returns
+roundtrip_fixture return_call tests/cheng/backend/fixtures/return_call.cheng 4096
+roundtrip_fixture return_forward_decl_call tests/cheng/backend/fixtures/return_forward_decl_call.cheng 4096
+roundtrip_fixture void_fn_return tests/cheng/backend/fixtures/void_fn_return.cheng 4096
+
+# Global variables
+roundtrip_fixture return_global_add tests/cheng/backend/fixtures/return_global_add.cheng 4096
+
+# Control flow: if/elif/else, while loops, for loops
+roundtrip_fixture return_if_elif tests/cheng/backend/fixtures/return_if_elif.cheng 4096
+roundtrip_fixture return_while_sum tests/cheng/backend/fixtures/return_while_sum.cheng 4096
+roundtrip_fixture return_for_sum tests/cheng/backend/fixtures/return_for_sum.cheng 4096
+
+# Error handling with Result type
+roundtrip_fixture return_result_hidden_ret_probe tests/cheng/backend/fixtures/return_result_hidden_ret_probe.cheng 16384
+
+# Expression forms: nested ternary
+roundtrip_fixture return_ternary_nested tests/cheng/backend/fixtures/return_ternary_nested.cheng 4096
+
+# Loop control flow: break and continue
+roundtrip_fixture return_while_break tests/cheng/backend/fixtures/return_while_break.cheng 4096
+roundtrip_fixture return_while_continue tests/cheng/backend/fixtures/return_while_continue.cheng 4096
+
+# Files with imports: object-by-value and object-var-assign (pull in external types)
+roundtrip_fixture ptr_object_by_value_probe tests/cheng/backend/fixtures/ptr_object_by_value_probe.cheng 131072
+roundtrip_fixture ptr_object_var_assign_probe tests/cheng/backend/fixtures/ptr_object_var_assign_probe.cheng 131072
 
 bad_facts="$WORK/ordinary.unknown-record.facts"
 cp "$WORK/ordinary.facts" "$bad_facts"
@@ -734,6 +769,146 @@ if "$DRIVER" emit-cold-csg-v2 \
   fi
 else
   echo "FAIL csg_v2_fixedpoint_unused_binding (roundtrip command failed)"
+  fail=$((fail + 1))
+fi
+
+# CSG v2 fixed-point: object types with field access
+echo "  - csg_v2_fixedpoint_object_fields"
+csg_fp_a="$WORK/fixedpoint.object_fields.a.facts"
+csg_fp_b="$WORK/fixedpoint.object_fields.b.facts"
+if "$COLD" system-link-exec \
+    --csg-in:"$WORK/return_object_fields.facts" \
+    --emit:csg-v2 \
+    --target:"$TARGET" \
+    --out:"$csg_fp_a" \
+    --report-out:"$WORK/fixedpoint.object_fields.a.report.txt" >/dev/null 2>&1 &&
+   "$COLD" system-link-exec \
+    --csg-in:"$csg_fp_a" \
+    --emit:csg-v2 \
+    --target:"$TARGET" \
+    --out:"$csg_fp_b" \
+    --report-out:"$WORK/fixedpoint.object_fields.b.report.txt" >/dev/null 2>&1; then
+  if cmp -s "$csg_fp_a" "$csg_fp_b" 2>/dev/null; then
+    echo "PASS csg_v2_fixedpoint_object_fields"
+    pass=$((pass + 1))
+  else
+    echo "FAIL csg_v2_fixedpoint_object_fields (iterations differ)"
+    fail=$((fail + 1))
+  fi
+else
+  echo "FAIL csg_v2_fixedpoint_object_fields (roundtrip command failed)"
+  fail=$((fail + 1))
+fi
+
+# CSG v2 fixed-point: if/elif/else branching
+echo "  - csg_v2_fixedpoint_if_elif"
+csg_fp_a="$WORK/fixedpoint.if_elif.a.facts"
+csg_fp_b="$WORK/fixedpoint.if_elif.b.facts"
+if "$COLD" system-link-exec \
+    --csg-in:"$WORK/return_if_elif.facts" \
+    --emit:csg-v2 \
+    --target:"$TARGET" \
+    --out:"$csg_fp_a" \
+    --report-out:"$WORK/fixedpoint.if_elif.a.report.txt" >/dev/null 2>&1 &&
+   "$COLD" system-link-exec \
+    --csg-in:"$csg_fp_a" \
+    --emit:csg-v2 \
+    --target:"$TARGET" \
+    --out:"$csg_fp_b" \
+    --report-out:"$WORK/fixedpoint.if_elif.b.report.txt" >/dev/null 2>&1; then
+  if cmp -s "$csg_fp_a" "$csg_fp_b" 2>/dev/null; then
+    echo "PASS csg_v2_fixedpoint_if_elif"
+    pass=$((pass + 1))
+  else
+    echo "FAIL csg_v2_fixedpoint_if_elif (iterations differ)"
+    fail=$((fail + 1))
+  fi
+else
+  echo "FAIL csg_v2_fixedpoint_if_elif (roundtrip command failed)"
+  fail=$((fail + 1))
+fi
+
+# CSG v2 fixed-point: while loop
+echo "  - csg_v2_fixedpoint_while_sum"
+csg_fp_a="$WORK/fixedpoint.while_sum.a.facts"
+csg_fp_b="$WORK/fixedpoint.while_sum.b.facts"
+if "$COLD" system-link-exec \
+    --csg-in:"$WORK/return_while_sum.facts" \
+    --emit:csg-v2 \
+    --target:"$TARGET" \
+    --out:"$csg_fp_a" \
+    --report-out:"$WORK/fixedpoint.while_sum.a.report.txt" >/dev/null 2>&1 &&
+   "$COLD" system-link-exec \
+    --csg-in:"$csg_fp_a" \
+    --emit:csg-v2 \
+    --target:"$TARGET" \
+    --out:"$csg_fp_b" \
+    --report-out:"$WORK/fixedpoint.while_sum.b.report.txt" >/dev/null 2>&1; then
+  if cmp -s "$csg_fp_a" "$csg_fp_b" 2>/dev/null; then
+    echo "PASS csg_v2_fixedpoint_while_sum"
+    pass=$((pass + 1))
+  else
+    echo "FAIL csg_v2_fixedpoint_while_sum (iterations differ)"
+    fail=$((fail + 1))
+  fi
+else
+  echo "FAIL csg_v2_fixedpoint_while_sum (roundtrip command failed)"
+  fail=$((fail + 1))
+fi
+
+# CSG v2 fixed-point: multi-function call
+echo "  - csg_v2_fixedpoint_call"
+csg_fp_a="$WORK/fixedpoint.call.a.facts"
+csg_fp_b="$WORK/fixedpoint.call.b.facts"
+if "$COLD" system-link-exec \
+    --csg-in:"$WORK/return_call.facts" \
+    --emit:csg-v2 \
+    --target:"$TARGET" \
+    --out:"$csg_fp_a" \
+    --report-out:"$WORK/fixedpoint.call.a.report.txt" >/dev/null 2>&1 &&
+   "$COLD" system-link-exec \
+    --csg-in:"$csg_fp_a" \
+    --emit:csg-v2 \
+    --target:"$TARGET" \
+    --out:"$csg_fp_b" \
+    --report-out:"$WORK/fixedpoint.call.b.report.txt" >/dev/null 2>&1; then
+  if cmp -s "$csg_fp_a" "$csg_fp_b" 2>/dev/null; then
+    echo "PASS csg_v2_fixedpoint_call"
+    pass=$((pass + 1))
+  else
+    echo "FAIL csg_v2_fixedpoint_call (iterations differ)"
+    fail=$((fail + 1))
+  fi
+else
+  echo "FAIL csg_v2_fixedpoint_call (roundtrip command failed)"
+  fail=$((fail + 1))
+fi
+
+# CSG v2 fixed-point: error handling with Result type
+echo "  - csg_v2_fixedpoint_result_probe"
+csg_fp_a="$WORK/fixedpoint.result_probe.a.facts"
+csg_fp_b="$WORK/fixedpoint.result_probe.b.facts"
+if "$COLD" system-link-exec \
+    --csg-in:"$WORK/return_result_hidden_ret_probe.facts" \
+    --emit:csg-v2 \
+    --target:"$TARGET" \
+    --out:"$csg_fp_a" \
+    --report-out:"$WORK/fixedpoint.result_probe.a.report.txt" >/dev/null 2>&1 &&
+   "$COLD" system-link-exec \
+    --csg-in:"$csg_fp_a" \
+    --emit:csg-v2 \
+    --target:"$TARGET" \
+    --out:"$csg_fp_b" \
+    --report-out:"$WORK/fixedpoint.result_probe.b.report.txt" >/dev/null 2>&1; then
+  if cmp -s "$csg_fp_a" "$csg_fp_b" 2>/dev/null; then
+    echo "PASS csg_v2_fixedpoint_result_probe"
+    pass=$((pass + 1))
+  else
+    echo "FAIL csg_v2_fixedpoint_result_probe (iterations differ)"
+    fail=$((fail + 1))
+  fi
+else
+  echo "FAIL csg_v2_fixedpoint_result_probe (roundtrip command failed)"
   fail=$((fail + 1))
 fi
 
