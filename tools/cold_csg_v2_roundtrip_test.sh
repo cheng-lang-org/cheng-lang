@@ -173,8 +173,13 @@ echo "  - builtin_linker_elf"
   --out:"$WORK/ordinary_link.o" \
   > "$WORK/ordinary_link.report.txt" 2>&1 || true
 if [ -f "$WORK/ordinary_link.o.linked" ]; then
-  file "$WORK/ordinary_link.o.linked" | grep -q "ELF.*executable" && echo "PASS builtin_linker_elf" || echo "FAIL builtin_linker_elf"
-  pass=$((pass + 1))
+  if file "$WORK/ordinary_link.o.linked" | grep -q "ELF.*executable"; then
+    echo "PASS builtin_linker_elf"
+    pass=$((pass + 1))
+  else
+    echo "FAIL builtin_linker_elf"
+    fail=$((fail + 1))
+  fi
 else
   echo "FAIL builtin_linker_elf (no .linked file)"
   fail=$((fail + 1))
@@ -232,19 +237,116 @@ else
   fail=$((fail + 1))
 fi
 
-# Provider archives must not be silently accepted until the archive reader exists.
-echo "  - provider_archive_hard_fail"
+# Provider archive forward/reverse gate: provider object -> archive -> primary link.
+provider_source="$WORK/provider_fixture.cheng"
+primary_source="$WORK/provider_primary.cheng"
+provider_obj="$WORK/provider_fixture.o"
+primary_obj="$WORK/provider_primary.o"
+provider_archive="$WORK/provider_fixture.chenga"
+provider_exe="$WORK/provider_archive_link"
+provider_obj_report="$WORK/provider_fixture.obj.report.txt"
+primary_obj_report="$WORK/provider_primary.obj.report.txt"
+provider_pack_report="$WORK/provider_fixture.pack.report.txt"
+provider_link_report="$WORK/provider_archive_link.report.txt"
+
+cat > "$provider_source" <<'CHENG'
+@exportc("provider_fixture_value")
+fn provider_fixture_value(): int32 = return 7
+CHENG
+
+cat > "$primary_source" <<'CHENG'
+@importc("provider_fixture_value")
+fn provider_fixture_value(): int32
+
+fn main(): int32 = return provider_fixture_value()
+CHENG
+
+echo "  - provider_archive_forward"
 if "$COLD" system-link-exec \
-  --link-object:"$WORK/ordinary_link_d1.o" \
-  --provider-archive:"$WORK/missing-provider.chenga" \
+  --in:"$provider_source" \
+  --emit:obj --target:riscv64-unknown-linux-gnu \
+  --out:"$provider_obj" \
+  --report-out:"$provider_obj_report" \
+  > "$WORK/provider_fixture.obj.stdout" 2>&1 &&
+   "$COLD" system-link-exec \
+  --in:"$primary_source" \
+  --emit:obj --target:riscv64-unknown-linux-gnu \
+  --out:"$primary_obj" \
+  --report-out:"$primary_obj_report" \
+  > "$WORK/provider_primary.obj.stdout" 2>&1 &&
+   "$COLD" provider-archive-pack \
+  --target:riscv64-unknown-linux-gnu \
+  --object:"$provider_obj" \
+  --export:provider_fixture_value \
+  --module:provider_fixture \
+  --source:"$provider_source" \
+  --out:"$provider_archive" \
+  --report-out:"$provider_pack_report" \
+  > "$WORK/provider_fixture.pack.stdout" 2>&1 &&
+   "$COLD" system-link-exec \
+  --link-object:"$primary_obj" \
+  --provider-archive:"$provider_archive" \
   --emit:exe --target:riscv64-unknown-linux-gnu \
-  --out:"$WORK/provider_archive_should_not_exist" \
-  --report-out:"$WORK/provider_archive_hard_fail.report.txt" \
-  > "$WORK/provider_archive_hard_fail.stdout" 2>&1; then
-  echo "FAIL provider_archive_hard_fail"
+  --out:"$provider_exe" \
+  --report-out:"$provider_link_report" \
+  > "$WORK/provider_archive_link.stdout" 2>&1 &&
+   [ -f "$provider_exe" ] &&
+   grep -q '^provider_archive=1$' "$provider_link_report" &&
+   grep -q '^provider_archive_member_count=1$' "$provider_link_report" &&
+   grep -q '^provider_object_count=1$' "$provider_link_report" &&
+   grep -q '^provider_export_count=1$' "$provider_link_report" &&
+   grep -q '^provider_resolved_symbol_count=1$' "$provider_link_report" &&
+   grep -q '^unresolved_symbol_count=0$' "$provider_link_report" &&
+   grep -q '^system_link=0$' "$provider_link_report" &&
+   grep -q '^linkerless_image=1$' "$provider_link_report" &&
+   grep -q '^link_object=1$' "$provider_link_report"; then
+  echo "PASS provider_archive_forward"
+  pass=$((pass + 1))
+else
+  echo "FAIL provider_archive_forward"
+  fail=$((fail + 1))
+fi
+
+echo "  - provider_archive_corrupt_magic_hard_fail"
+corrupt_archive="$WORK/provider_fixture.corrupt_magic.chenga"
+if [ ! -s "$provider_archive" ] || [ ! -s "$primary_obj" ]; then
+  echo "FAIL provider_archive_corrupt_magic_hard_fail (missing forward artifacts)"
+  fail=$((fail + 1))
+elif ! cp "$provider_archive" "$corrupt_archive" 2>/dev/null ||
+     ! printf 'BADMAGIC' | dd of="$corrupt_archive" bs=1 count=8 conv=notrunc >/dev/null 2>&1; then
+  echo "FAIL provider_archive_corrupt_magic_hard_fail (corrupt setup failed)"
+  fail=$((fail + 1))
+elif "$COLD" system-link-exec \
+  --link-object:"$primary_obj" \
+  --provider-archive:"$corrupt_archive" \
+  --emit:exe --target:riscv64-unknown-linux-gnu \
+  --out:"$WORK/provider_archive_corrupt_magic_should_not_exist" \
+  --report-out:"$WORK/provider_archive_corrupt_magic.report.txt" \
+  > "$WORK/provider_archive_corrupt_magic.stdout" 2>&1; then
+  echo "FAIL provider_archive_corrupt_magic_hard_fail"
   fail=$((fail + 1))
 else
-  echo "PASS provider_archive_hard_fail"
+  echo "PASS provider_archive_corrupt_magic_hard_fail"
+  pass=$((pass + 1))
+fi
+
+echo "  - provider_archive_missing_export_pack_fail"
+if [ ! -s "$provider_archive" ] || [ ! -s "$provider_obj" ]; then
+  echo "FAIL provider_archive_missing_export_pack_fail (missing forward artifacts)"
+  fail=$((fail + 1))
+elif "$COLD" provider-archive-pack \
+  --target:riscv64-unknown-linux-gnu \
+  --object:"$provider_obj" \
+  --export:provider_fixture_missing \
+  --module:provider_fixture \
+  --source:"$provider_source" \
+  --out:"$WORK/provider_fixture_missing_export.chenga" \
+  --report-out:"$WORK/provider_fixture_missing_export.pack.report.txt" \
+  > "$WORK/provider_fixture_missing_export.pack.stdout" 2>&1; then
+  echo "FAIL provider_archive_missing_export_pack_fail"
+  fail=$((fail + 1))
+else
+  echo "PASS provider_archive_missing_export_pack_fail"
   pass=$((pass + 1))
 fi
 

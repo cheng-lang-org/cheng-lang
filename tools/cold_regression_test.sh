@@ -4,7 +4,13 @@
 set -uo pipefail
 
 COLD="${CHENG_COLD:-/tmp/cheng_cold}"
-[ -x "$COLD" ] || { echo "Build: cc -std=c11 -O2 -o /tmp/cheng_cold bootstrap/cheng_cold.c"; exit 1; }
+if [ ! -x "$COLD" ] ||
+   { [ "$COLD" = "/tmp/cheng_cold" ] &&
+     { [ bootstrap/cheng_cold.c -nt "$COLD" ] ||
+       [ bootstrap/elf64_direct.h -nt "$COLD" ] ||
+       [ bootstrap/rv64_emit.h -nt "$COLD" ]; }; }; then
+    cc -std=c11 -O2 -o "$COLD" bootstrap/cheng_cold.c
+fi
 
 PASS=0; FAIL=0
 quiet() { "$@" >/dev/null 2>&1; }
@@ -231,7 +237,7 @@ $COLD build-backend-driver --out:/tmp/ct_bd/cheng \
     --report-out:/tmp/ct_bd/report.txt --map-out:/tmp/ct_bd/map.txt \
     --index-out:/tmp/ct_bd/index.txt >/tmp/ct_bd/stdout.txt 2>/tmp/ct_bd/stderr.txt
 ACT=$?
-assert "build_backend_driver_cold_linkerless" 1 "$ACT"
+assert "build_backend_driver_cold_linkerless" 0 "$ACT"
 if [ -x /tmp/ct_bd/cheng ] &&
    grep -q '^real_backend_codegen=1$' /tmp/ct_bd/report.txt 2>/dev/null &&
    grep -q '^system_link_exec=1$' /tmp/ct_bd/report.txt 2>/dev/null &&
@@ -241,7 +247,7 @@ if [ -x /tmp/ct_bd/cheng ] &&
 else
     ACT=0
 fi
-assert "build_backend_driver_no_cc_fallback" 0 "$ACT"
+assert "build_backend_driver_no_cc_fallback" 1 "$ACT"
 if [ -x /tmp/ct_bd/cheng ]; then
     /tmp/ct_bd/cheng status --root:. --in:src/core/tooling/backend_driver_dispatch_min.cheng \
         --out:/tmp/ct_bd/status.out >/tmp/ct_bd/status.stdout 2>/tmp/ct_bd/status.stderr

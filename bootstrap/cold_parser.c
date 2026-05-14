@@ -6634,11 +6634,56 @@ int32_t cold_match_eval_target(Parser *parser, BodyIR *body, Locals *locals,
     return kind;
 }
 
+/* Parse a guard condition after 'if' in a match arm, up to '=>'.
+   Returns the guard condition Span. The parser position is left at '=>'. */
+static Span parser_take_guard_span(Parser *parser) {
+    parser_inline_ws(parser);
+    int32_t start = parser->pos;
+    int32_t depth = 0;
+    bool in_string = false;
+    bool in_char = false;
+    while (parser->pos < parser->source.len) {
+        uint8_t c = parser->source.ptr[parser->pos];
+        if (in_string) {
+            if (c == '\\' && parser->pos + 1 < parser->source.len) { parser->pos += 2; continue; }
+            if (c == '"') in_string = false;
+            parser->pos++;
+            continue;
+        }
+        if (in_char) {
+            if (c == '\\' && parser->pos + 1 < parser->source.len) { parser->pos += 2; continue; }
+            if (c == '\'') in_char = false;
+            parser->pos++;
+            continue;
+        }
+        if (c == '"') { in_string = true; parser->pos++; continue; }
+        if (c == '\'') { in_char = true; parser->pos++; continue; }
+        if (c == '(' || c == '[') { depth++; parser->pos++; continue; }
+        if (c == ')' || c == ']') {
+            depth--;
+            if (depth < 0) die("unbalanced guard expression");
+            parser->pos++;
+            continue;
+        }
+        if (depth == 0 && c == '=' && parser->pos + 1 < parser->source.len &&
+            parser->source.ptr[parser->pos + 1] == '>') {
+            Span guard = span_trim(span_sub(parser->source, start, parser->pos));
+            if (guard.len <= 0) die("empty guard condition");
+            return guard;
+        }
+        parser->pos++;
+    }
+    die("expected => after guard condition");
+    return (Span){0};
+}
+
 int32_t parse_match_arm(Parser *parser, BodyIR *body, Locals *locals,
                                int32_t matched_slot, int32_t switch_term,
                                int32_t arm_indent,
                                TypeDef *match_type, LoopCtx *loop,
-                               bool *is_complete) {
+                               bool *is_complete,
+                               int32_t entry_block,
+                               bool *out_has_guard) {
     *is_complete = false;
     Span variant_name = parser_token(parser);
     Variant *variant = match_type ? type_find_variant(match_type, variant_name)
@@ -6653,12 +6698,26 @@ int32_t parse_match_arm(Parser *parser, BodyIR *body, Locals *locals,
     if (bind_count != variant->field_count) {
         die("match arm payload binding count mismatch");
     }
+    /* Check for guard condition */
+    bool has_guard = false;
+    Span guard_span = {0};
+    if (span_eq(parser_peek(parser), "if")) {
+        has_guard = true;
+        (void)parser_token(parser);
+        guard_span = parser_take_guard_span(parser);
+    }
     if (!parser_take(parser, "=>")) {
         die("expected => in match arm");
     }
 
-    int32_t arm_block = body_block(body);
-    body_switch_case(body, switch_term, variant->tag, arm_block);
+    int32_t arm_block;
+    if (entry_block >= 0) {
+        arm_block = entry_block;
+        body_reopen_block(body, arm_block);
+    } else {
+        arm_block = body_block(body);
+        body_switch_case(body, switch_term, variant->tag, arm_block);
+    }
     int32_t saved_local_count = locals->count;
     for (int32_t field_index = 0; field_index < bind_count; field_index++) {
         int32_t field_kind = variant->field_kind[field_index];
@@ -6667,6 +6726,27 @@ int32_t parse_match_arm(Parser *parser, BodyIR *body, Locals *locals,
         body_op(body, BODY_OP_PAYLOAD_LOAD, payload_slot, matched_slot,
                 variant->field_offset[field_index]);
         locals_add(locals, bind_names[field_index], payload_slot, field_kind);
+    }
+
+    /* Guard check: if guard present, evaluate and CBR to body or fallthrough */
+    int32_t guard_ft_block = -1;
+    if (has_guard) {
+        Parser guard_parser = parser_child(parser, guard_span);
+        int32_t guard_kind = SLOT_I32;
+        int32_t guard_val = parse_expr(&guard_parser, body, locals, &guard_kind);
+        parser_ws(&guard_parser);
+        if (guard_parser.pos != guard_parser.source.len) {
+            die("unsupported match guard expression");
+        }
+        int32_t body_blk = body_block(body);
+        guard_ft_block = body_block(body);
+        int32_t zero = body_slot(body, SLOT_I32, 4);
+        body_op(body, BODY_OP_I32_CONST, zero, 0, 0);
+        int32_t cbr = body_term(body, BODY_TERM_CBR, guard_val, COND_NE, zero,
+                                body_blk, guard_ft_block);
+        body_end_block(body, arm_block, cbr);
+        body_reopen_block(body, body_blk);
+        arm_block = body_blk;
     }
 
     parser_inline_ws(parser);
@@ -6691,6 +6771,15 @@ int32_t parse_match_arm(Parser *parser, BodyIR *body, Locals *locals,
         if (arm_parser.pos != arm_parser.source.len) die("unsupported inline match arm body");
         parser->pos = end;
         locals->count = saved_local_count;
+        if (has_guard) {
+            if (body->block_term[arm_end] < 0) {
+                body_branch_to(body, arm_end, guard_ft_block);
+            }
+            if (out_has_guard) *out_has_guard = true;
+            *is_complete = true;
+            return guard_ft_block;
+        }
+        if (out_has_guard) *out_has_guard = false;
         *is_complete = true;
         return arm_end;
     }
@@ -6715,6 +6804,15 @@ int32_t parse_match_arm(Parser *parser, BodyIR *body, Locals *locals,
         arm_end = parse_statement(parser, body, locals, arm_end, loop);
     }
     locals->count = saved_local_count;
+    if (has_guard) {
+        if (body->block_term[arm_end] < 0) {
+            body_branch_to(body, arm_end, guard_ft_block);
+        }
+        if (out_has_guard) *out_has_guard = true;
+        *is_complete = true;
+        return guard_ft_block;
+    }
+    if (out_has_guard) *out_has_guard = false;
     *is_complete = true;
     return arm_end;
 }
@@ -6761,6 +6859,8 @@ int32_t parse_match(Parser *parser, BodyIR *body, Locals *locals,
                         parser->source.ptr[parser->pos] != '\n');
 
     if (single_line) {
+        Variant *prev_variant = 0;
+        int32_t prev_guard_ft = -1;
         while (parser->pos < parser->source.len && parser->source.ptr[parser->pos] != '\n') {
             Span next = parser_peek(parser);
             Variant *variant = match_type ? type_find_variant(match_type, next)
@@ -6768,18 +6868,39 @@ int32_t parse_match(Parser *parser, BodyIR *body, Locals *locals,
             if (!variant) break;
             if (match_type && symbols_find_variant_type(parser->symbols, variant) != match_type) break;
             if (!match_type) match_type = symbols_find_variant_type(parser->symbols, variant);
-            if (seen_tags[variant->tag]) die("duplicate match arm");
-            seen_tags[variant->tag] = true;
-            case_count++;
+            bool is_same_variant = (prev_variant && variant->tag == prev_variant->tag);
+            if (seen_tags[variant->tag] && !is_same_variant) die("duplicate match arm");
+            if (!is_same_variant) {
+                seen_tags[variant->tag] = true;
+                case_count++;
+            }
             (void)parser_token(parser);
 
             Span bind_names[COLD_MAX_VARIANT_FIELDS];
             int32_t bind_count = parse_match_bindings(parser, bind_names, COLD_MAX_VARIANT_FIELDS);
             if (bind_count != variant->field_count) die("match arm payload binding count mismatch");
+
+            /* Check for guard */
+            bool has_guard = false;
+            Span guard_span = {0};
+            if (span_eq(parser_peek(parser), "if")) {
+                has_guard = true;
+                (void)parser_token(parser);
+                guard_span = parser_take_guard_span(parser);
+            }
             if (!parser_take(parser, "=>")) die("expected => in match arm");
 
-            int32_t arm_block = body_block(body);
-            body_switch_case(body, switch_term, variant->tag, arm_block);
+            /* Set up arm block */
+            int32_t arm_block;
+            if (is_same_variant && prev_guard_ft >= 0) {
+                /* Same variant: reuse previous guard fallthrough block as entry */
+                arm_block = prev_guard_ft;
+                body_reopen_block(body, arm_block);
+            } else {
+                arm_block = body_block(body);
+                body_switch_case(body, switch_term, variant->tag, arm_block);
+            }
+
             int32_t saved_local_count = locals->count;
             for (int32_t fi = 0; fi < bind_count; fi++) {
                 int32_t fk = variant->field_kind[fi];
@@ -6787,6 +6908,27 @@ int32_t parse_match(Parser *parser, BodyIR *body, Locals *locals,
                 body_slot_set_type(body, ps, variant->field_type[fi]);
                 body_op(body, BODY_OP_PAYLOAD_LOAD, ps, matched_slot, variant->field_offset[fi]);
                 locals_add(locals, bind_names[fi], ps, fk);
+            }
+
+            /* Guard check */
+            int32_t guard_ft_block = -1;
+            if (has_guard) {
+                Parser guard_parser = parser_child(parser, guard_span);
+                int32_t guard_kind = SLOT_I32;
+                int32_t guard_val = parse_expr(&guard_parser, body, locals, &guard_kind);
+                parser_ws(&guard_parser);
+                if (guard_parser.pos != guard_parser.source.len) {
+                    die("unsupported match guard expression");
+                }
+                int32_t body_blk = body_block(body);
+                guard_ft_block = body_block(body);
+                int32_t zero = body_slot(body, SLOT_I32, 4);
+                body_op(body, BODY_OP_I32_CONST, zero, 0, 0);
+                int32_t cbr = body_term(body, BODY_TERM_CBR, guard_val, COND_NE, zero,
+                                        body_blk, guard_ft_block);
+                body_end_block(body, arm_block, cbr);
+                body_reopen_block(body, body_blk);
+                arm_block = body_blk;
             }
 
             Span rest = (Span){parser->source.ptr + parser->pos,
@@ -6800,17 +6942,35 @@ int32_t parse_match(Parser *parser, BodyIR *body, Locals *locals,
                    body->block_term[end_block] < 0) {
                 end_block = parse_statement(&arm_parser, body, locals, end_block, loop);
             }
-            if (body->block_term[end_block] < 0) {
-                if (fallthrough_count >= COLD_MATCH_FALLTHROUGH_CAP) die("too many fallthrough");
-                fallthrough_terms[fallthrough_count++] = body_branch_to(body, end_block, -1);
+
+            /* Handle fallthrough */
+            if (has_guard) {
+                if (body->block_term[end_block] < 0) {
+                    body_branch_to(body, end_block, guard_ft_block);
+                }
+                if (body->block_term[guard_ft_block] < 0) {
+                    if (fallthrough_count >= COLD_MATCH_FALLTHROUGH_CAP) die("too many fallthrough");
+                    fallthrough_terms[fallthrough_count++] = body_branch_to(body, guard_ft_block, -1);
+                }
+            } else {
+                if (body->block_term[end_block] < 0) {
+                    if (fallthrough_count >= COLD_MATCH_FALLTHROUGH_CAP) die("too many fallthrough");
+                    fallthrough_terms[fallthrough_count++] = body_branch_to(body, end_block, -1);
+                }
             }
+
             parser->pos += nl;
             if (parser->pos < parser->source.len) parser->pos++;
             locals->count = saved_local_count;
+            prev_variant = variant;
+            prev_guard_ft = guard_ft_block;
         }
     } else {
         int32_t arm_indent = stmt_indent;
         if (arm_indent < 0) arm_indent = 4;
+        Variant *prev_variant = 0;
+        bool prev_variant_has_guard = false;
+        int32_t prev_arm_end = -1;
 
         while (parser->pos < parser->source.len) {
             int32_t next_indent = parser_next_indent(parser);
@@ -6877,19 +7037,28 @@ int32_t parse_match(Parser *parser, BodyIR *body, Locals *locals,
             if (!match_type) match_type = symbols_find_variant_type(parser->symbols, variant);
 
             if (variant->tag < 0 || variant->tag >= COLD_MATCH_VARIANT_CAP) die("match tag out of range");
-            if (seen_tags[variant->tag]) die("duplicate match arm");
-            seen_tags[variant->tag] = true;
-            case_count++;
+            bool is_same_variant = (prev_variant && variant->tag == prev_variant->tag);
+            if (seen_tags[variant->tag] && !is_same_variant) die("duplicate match arm");
+            if (!is_same_variant) {
+                seen_tags[variant->tag] = true;
+                case_count++;
+            }
 
+            bool arm_has_guard = false;
+            int32_t entry_block = (is_same_variant && prev_variant_has_guard && prev_arm_end >= 0) ? prev_arm_end : -1;
             bool arm_complete = false;
             int32_t arm_end = parse_match_arm(parser, body, locals, matched_slot,
                                                switch_term, arm_indent, match_type, loop,
-                                               &arm_complete);
+                                               &arm_complete, entry_block,
+                                               &arm_has_guard);
             if (!arm_complete) die("match arm incomplete");
             if (body->block_term[arm_end] < 0) {
                 if (fallthrough_count >= COLD_MATCH_FALLTHROUGH_CAP) die("too many match fallthrough arms");
                 fallthrough_terms[fallthrough_count++] = body_branch_to(body, arm_end, -1);
             }
+            prev_variant = variant;
+            prev_variant_has_guard = arm_has_guard;
+            prev_arm_end = arm_end;
         }
     }
 

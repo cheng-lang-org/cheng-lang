@@ -125,7 +125,7 @@ let d = RunResult { outputText: "ok" }
 - backend driver 的 `system-link-exec` 不支持或 primary/object/native materializer 未就绪时必须硬失败并写报告，不能默认转发到 stage3 掩盖缺口。
 - 纯 Cheng 自举证明只能以 `artifacts/backend_driver/cheng system-link-exec` 的 pure self 结果为准；C seed forced build 只允许人工恢复破损 artifact，不能作为进展、验证或默认刷新路径。
 - 纯 Cheng 自举主线不能继续用源码行字符串扫描扩展 statement 支持；下一步必须消费 parser/typed facts/NormalizedExpr 的结构化 statement/CFG/call sequence IR。
-- `primary_object_emit` 的 `.s` 文本路径只保留为 fallback/debug 对拍；Darwin arm64 主线优先使用 direct object writer，真正生产缺口必须在 Mach-O/ELF/COFF object writer 或 direct-exe 主线补齐，不能用 `.s` fallback 冒充完成。
+- `primary_object_emit` 的 `.s` 文本路径只保留为 debug 对拍；Darwin arm64 主线优先使用 direct object writer，真正生产缺口必须在 Mach-O/ELF/COFF object writer 或 direct-exe 主线补齐，不能用 `.s` 路径冒充完成。
 - CSG v2 主线由 Cheng backend driver 产 `PrimaryObjectPlan/BodyIR` facts，cold reader 只做 `--csg-in` 加载校验与 object/direct-exe emit；确定性门禁固定用 `tools/cold_csg_v2_roundtrip_test.sh`。
 - 顶层 `runtime/` 与旧 `runtime/native` C 源已不属于主线；纯 Cheng runtime 只保留 `src/core/runtime` provider 与 `src/runtime` Cheng 包源码。新增 runtime bridge 必须落到 `src/core/runtime/*provider*.cheng`，同步 provider module/source mapping/export roots/cache freshness，不得恢复顶层 `runtime/` 或扩展 C 源。
 - RSS 守卫必须保持 process-group 语义：子进程组内存按 pgid 求和，不能用单 pid RSS 替代，也不能 shell 出 `/bin/ps` 作为实现口径。

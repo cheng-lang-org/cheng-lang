@@ -11431,89 +11431,8 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
     FunctionPatchList function_patches = {0};
     function_patches.arena = code->arena;
 
-    /* E-Graph rewrite: normalize reachable function bodies.
-       Associative flattening + shift-by-zero elimination. */
-    for (int32_t fn = 0; fn < function_count; fn++) {
-        if (!reachable_functions[fn] || !function_bodies[fn] ||
-            function_bodies[fn]->has_fallback) continue;
-        BodyIR *body = function_bodies[fn];
-        int32_t slot_count = body->slot_count;
-        if (slot_count <= 0) continue;
-
-        /* Build slot_writer: track which op writes each slot */
-        int32_t *slot_writer = (int32_t *)calloc((size_t)slot_count, sizeof(int32_t));
-        if (!slot_writer) continue;
-        for (int32_t i = 0; i < slot_count; i++) slot_writer[i] = -1;
-        for (int32_t oi = 0; oi < body->op_count; oi++) {
-            int32_t dst = body->op_dst[oi];
-            if (dst >= 0 && dst < slot_count) slot_writer[dst] = oi;
-        }
-
-        /* Build use_count for safe reassociation */
-        int32_t *use_count = (int32_t *)calloc((size_t)slot_count, sizeof(int32_t));
-        if (use_count) {
-            for (int32_t oi = 0; oi < body->op_count; oi++) {
-                int32_t a = body->op_a[oi], b = body->op_b[oi];
-                if (a >= 0 && a < slot_count) use_count[a]++;
-                if (b >= 0 && b < slot_count) use_count[b]++;
-            }
-        }
-
-        for (int32_t oi = 0; oi < body->op_count; oi++) {
-            int32_t k = body->op_kind[oi];
-            int32_t a_slot = body->op_a[oi];
-            int32_t b_slot = body->op_b[oi];
-
-            /* Shift/ASR by zero -> COPY */
-            if ((k == BODY_OP_I32_SHL || k == BODY_OP_I32_ASR) &&
-                b_slot >= 0 && b_slot < slot_count) {
-                int32_t b_op = slot_writer[b_slot];
-                if (b_op >= 0 &&
-                    body->op_kind[b_op] == BODY_OP_I32_CONST &&
-                    body->op_a[b_op] == 0) {
-                    body->op_kind[oi] = BODY_OP_COPY_I32;
-                    cold_egraph_rewrite_count++;
-                    continue;
-                }
-            }
-            if ((k == BODY_OP_I64_SHL || k == BODY_OP_I64_ASR) &&
-                b_slot >= 0 && b_slot < slot_count) {
-                int32_t b_op = slot_writer[b_slot];
-                if (b_op >= 0 &&
-                    body->op_kind[b_op] == BODY_OP_I64_CONST &&
-                    body->op_a[b_op] == 0 && body->op_b[b_op] == 0) {
-                    body->op_kind[oi] = BODY_OP_COPY_I64;
-                    cold_egraph_rewrite_count++;
-                    continue;
-                }
-            }
-
-            /* Associative flattening: ADD(a, ADD(x, y)) -> ADD(ADD(a, x), y)
-               Only when inner ADD result is used exactly once. */
-            if (k == BODY_OP_I32_ADD && b_slot >= 0 &&
-                b_slot < slot_count && use_count) {
-                int32_t b_op = slot_writer[b_slot];
-                if (b_op >= 0 && body->op_kind[b_op] == BODY_OP_I32_ADD) {
-                    int32_t inner_dst = body->op_dst[b_op];
-                    if (inner_dst >= 0 && inner_dst < slot_count &&
-                        use_count[inner_dst] == 1) {
-                        int32_t x = body->op_a[b_op];
-                        int32_t y = body->op_b[b_op];
-                        /* Reassociate: inner ADD becomes ADD(a_slot, x);
-                           outer ADD becomes ADD(inner_dst, y). */
-                        body->op_a[b_op] = a_slot;
-                        body->op_b[b_op] = x;
-                        body->op_a[oi] = inner_dst;
-                        body->op_b[oi] = y;
-                        cold_egraph_rewrite_count++;
-                    }
-                }
-            }
-        }
-
-        free(use_count);
-        free(slot_writer);
-    }
+    /* E-Graph mutating rewrites are disabled until they have a proof-backed
+       verifier. Cold codegen must consume BodyIR exactly as produced. */
 
     bool use_rv64 = target && strstr(target, "riscv64") != 0;
 
@@ -11704,34 +11623,13 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
             /* Arena retained in cache for next compilation; skip munmap */
         }
     } else {
-        /* E-Graph DCE: skip codegen for duplicate functions (same normalized hash) */
-        int32_t dedup_count = 0;
-        #define DEDUP_MAP_SIZE 256
-        uint64_t dedup_hash[DEDUP_MAP_SIZE];
-        int32_t dedup_pos[DEDUP_MAP_SIZE];
-        int32_t dedup_n = 0;
-
+        cold_egraph_dedup_count = 0;
         for (int32_t i = 0; i < function_count; i++) {
             if (i == entry_function || !reachable_functions[i] ||
                 !function_bodies[i] ||
                 function_bodies[i]->has_fallback) continue;
             BodyIR *body = function_bodies[i];
-            uint64_t h = cold_body_ir_canonical_hash_normalized(body);
-            int32_t dup_idx = -1;
-            for (int32_t di = 0; di < dedup_n; di++) {
-                if (dedup_hash[di] == h) { dup_idx = di; break; }
-            }
-            if (dup_idx >= 0) {
-                function_pos[i] = dedup_pos[dup_idx];
-                dedup_count++;
-                continue;
-            }
             function_pos[i] = code->count;
-            if (dedup_n < DEDUP_MAP_SIZE) {
-                dedup_hash[dedup_n] = h;
-                dedup_pos[dedup_n] = code->count;
-                dedup_n++;
-            }
             if (!cold_body_codegen_ready(body))
                 die("cold function body is not codegen-ready");
             if (use_rv64)
@@ -11745,7 +11643,6 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
                         fprintf(stderr, "  %08x\n", code->words[w]);
                 }
             }
-            cold_egraph_dedup_count = dedup_count;
         }
     }
 
@@ -15095,6 +14992,16 @@ static bool cold_write_system_link_exec_report(const char *path,
     fprintf(file, "direct_macho=%d\n", success ? 1 : 0);
     fprintf(file, "function_task_job_count=%d\n", cold_jobs_from_env());
     fprintf(file, "function_task_schedule=%s\n", cold_jobs_from_env() > 1 ? "ws" : "serial");
+    int32_t link_object = stats ? stats->link_object : 0;
+    int32_t provider_object_count = stats ? stats->provider_object_count : 0;
+    int32_t provider_archive = stats ? stats->provider_archive : 0;
+    int32_t provider_archive_member_count = stats ? stats->provider_archive_member_count : 0;
+    uint64_t provider_archive_hash = stats ? stats->provider_archive_hash : 0;
+    int32_t provider_export_count = stats ? stats->provider_export_count : 0;
+    int32_t provider_resolved_symbol_count = stats ? stats->provider_resolved_symbol_count : 0;
+    int32_t link_reloc_count = stats ? stats->link_reloc_count : 0;
+    int32_t unresolved_symbol_count = stats ? stats->unresolved_symbol_count : 0;
+    const char *first_unresolved_symbol = stats ? stats->first_unresolved_symbol : "";
     if (stats) {
         fprintf(file, "cold_csg_lowering=%d\n", stats->csg_lowering);
         fprintf(file, "cold_csg_statement_count=%d\n", stats->csg_statement_count);
@@ -15134,19 +15041,19 @@ static bool cold_write_system_link_exec_report(const char *path,
         fprintf(file, "total_function_count=%d\n", stats->total_function_count);
         fprintf(file, "egraph_rewrite_count=%d\n", stats->egraph_rewrite_count);
         fprintf(file, "egraph_dedup_count=%d\n", stats->egraph_dedup_count);
-        fprintf(file, "link_object=%d\n", stats->link_object);
-        fprintf(file, "provider_object_count=%d\n", stats->provider_object_count);
-        fprintf(file, "provider_archive=%d\n", stats->provider_archive);
-        fprintf(file, "provider_archive_member_count=%d\n", stats->provider_archive_member_count);
-        fprintf(file, "provider_archive_hash=%016llx\n",
-                (unsigned long long)stats->provider_archive_hash);
-        fprintf(file, "provider_export_count=%d\n", stats->provider_export_count);
-        fprintf(file, "provider_resolved_symbol_count=%d\n", stats->provider_resolved_symbol_count);
-        fprintf(file, "link_reloc_count=%d\n", stats->link_reloc_count);
-        fprintf(file, "unresolved_symbol_count=%d\n", stats->unresolved_symbol_count);
-        fprintf(file, "first_unresolved_symbol=%s\n", stats->first_unresolved_symbol);
         cold_print_elapsed_ms(file, "cold_compile_elapsed_ms", stats->elapsed_us);
     }
+    fprintf(file, "link_object=%d\n", link_object);
+    fprintf(file, "provider_object_count=%d\n", provider_object_count);
+    fprintf(file, "provider_archive=%d\n", provider_archive);
+    fprintf(file, "provider_archive_member_count=%d\n", provider_archive_member_count);
+    fprintf(file, "provider_archive_hash=%016llx\n",
+            (unsigned long long)provider_archive_hash);
+    fprintf(file, "provider_export_count=%d\n", provider_export_count);
+    fprintf(file, "provider_resolved_symbol_count=%d\n", provider_resolved_symbol_count);
+    fprintf(file, "link_reloc_count=%d\n", link_reloc_count);
+    fprintf(file, "unresolved_symbol_count=%d\n", unresolved_symbol_count);
+    fprintf(file, "first_unresolved_symbol=%s\n", first_unresolved_symbol);
     /* 30-80ms cold self-hosting architecture compliance */
     fputs("source_storage=mmap_span\n", file);
     fputs("allocation=phase_arena\n", file);
@@ -15767,7 +15674,7 @@ static bool cold_link_elf64_object_with_provider_archive(const char *object_path
     int32_t member_count = 0;
     uint64_t archive_hash = 0;
     if (!cold_verify_provider_archive(archive_path, target, &member_count, &archive_hash)) goto done;
-    if (member_count != 1) goto done;
+    if (member_count < 1) goto done;
 
     const uint8_t *p = archive_span.ptr;
     uint64_t pos = COLD_PROVIDER_ARCHIVE_HEADER_SIZE;
@@ -15782,7 +15689,7 @@ static bool cold_link_elf64_object_with_provider_archive(const char *object_path
     uint32_t member_exports = cold_u32le(p + pos); pos += 4;
     (void)cold_u64le(p + pos); pos += 8;
     uint32_t export_len = cold_u32le(p + pos); pos += 4;
-    if (export_count != 1 || member_exports != 1 || export_len == 0) goto done;
+    if (export_count < 1 || member_exports < 1 || export_len == 0) goto done;
     if (!cold_file_range_ok(archive_span.len, pos,
                             (uint64_t)module_len + source_len + export_len + object_size)) goto done;
     pos += module_len + source_len;
@@ -15806,7 +15713,7 @@ static bool cold_link_elf64_object_with_provider_archive(const char *object_path
         stats->link_object = 1;
         stats->provider_archive = 1;
         stats->provider_object_count = 1;
-        stats->provider_archive_member_count = 1;
+        stats->provider_archive_member_count = member_count;
         stats->provider_archive_hash = archive_hash;
         stats->provider_export_count = 1;
     }

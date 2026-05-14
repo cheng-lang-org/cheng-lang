@@ -148,8 +148,8 @@ reloc -> cold linkerless/object linker applies reloc
 | 阶段 2：writer 扩展 | `src/core/backend/primary_object_plan.cheng` | 从 canonical PrimaryObjectPlan 导出 function/slot/block/op/term/call/data/reloc | 同一输入重复导出 hash 一致；record 数与 plan/report 一致 | facts 覆盖 `.o` 所需全部信息 |
 | 阶段 3：reader 结构化 | `bootstrap/cheng_cold.c` | `--csg-in` reader 直接构造 dense sections，不做文本查找 | `facts_mmap_ms/facts_verify_ms/facts_decode_ms` 写 report；预算不过直接失败 | load 成本可见 |
 | 阶段 4：object 合同验证 | `bootstrap/cheng_cold.c`、`src/core/backend/primary_object_plan.cheng` | `--csg-in --emit:obj` 覆盖更多 fixture，验证 cold 自身确定性和运行语义 | 同一 facts 多次生成 `.o` bit-identical；导出符号、未解析外部符号、reloc 目标集合稳定；链接同一 provider archive 后运行 marker 正确 | 不要求 Cheng direct `.o` 与 cold `.o` 字节一致 |
-| 阶段 5：provider archive 生成 | `src/core/tooling/backend_driver_dispatch_min.cheng`、`src/core/runtime/*provider*.cheng` | 新增显式 provider archive 生成命令，预编译 provider `.o` 后写 `.a`、导出表和 hash | archive hash、member count、导出表写 report；不把 primary `.o` 的临时 `.link.a` 当 provider archive | 不现场编译 provider |
-| 阶段 6：provider archive link | `bootstrap/cheng_cold.c` | 新增 `--link-object` 和 `--provider-archive`，cold 内部读取 object/archive 并生成 exe | `system_link=0`、`linkerless_image=1`、`unresolved_symbol_count=0`、archive hash 写 report；缺导出符号 hard-fail | 不调用 `cc` 或 `--link-providers` |
+| 阶段 5：provider archive 生成 | `bootstrap/cheng_cold.c` | 已新增 `provider-archive-pack`，预编译 provider `.o` 后写 `.chenga`、导出表和 hash | archive hash、member count、导出表写 report；缺 export hard-fail | 当前只支持单 ELF member/export |
+| 阶段 6：provider archive link | `bootstrap/cheng_cold.c` | 已新增 `--link-object` 和 `--provider-archive`，cold 内部读取 object/archive 并生成 exe | `system_link=0`、`linkerless_image=1`、`unresolved_symbol_count=0`、`provider_resolved_symbol_count=1`；坏 magic/缺导出 hard-fail | 当前只覆盖 AArch64/RISC-V ELF call reloc，不调用 `cc` 或 `--link-providers` |
 | 阶段 7：linkerless exe | `bootstrap/cheng_cold.c` | `--csg-in --emit:exe` 写 Mach-O/ELF/COFF 可执行布局 | ordinary、import_use、cold_subset、combined kernel 真实运行 marker | 不依赖系统 linker |
 | 阶段 8：backend driver fixed-point | `artifacts/bootstrap/cheng.stage3`、`artifacts/backend_driver/cheng` | A 产 facts，cold 编 B；B 再产 facts，cold 编 C | B/C report 关键字段一致，facts hash 或等价 hash 稳定，smoke 全过 | 可替代对应 seed/link 路径 |
 | 阶段 9：删除 cold 前端 | `bootstrap/cheng_cold.c` | 删除 parser/type/import source-direct 模块 | `--csg-in` fixed-point 和运行回归连续稳定 | 删除后无 source-direct 依赖 |
@@ -195,11 +195,11 @@ cmp /tmp/cheng_csg_v2_zero.cold.1.o /tmp/cheng_csg_v2_zero.cold.2.o
 
 这组命令要求 `artifacts/backend_driver/cheng` 已由包含 `emit-cold-csg-v2` 的源码刷新。刷新前只运行 cold reader/object writer 的最小 facts smoke。
 
-阶段 6 接入后才允许运行验证：
+runtime provider archive 接入后才允许运行验证：
 
 ```sh
-bootstrap/cheng_cold --link-object:/tmp/cheng_csg_v2_zero.cold.1.o --provider-archive:/tmp/cheng_provider_runtime.a --emit:exe --out:/tmp/cheng_csg_v2_zero.1 --target:arm64-apple-darwin
-bootstrap/cheng_cold --link-object:/tmp/cheng_csg_v2_zero.cold.2.o --provider-archive:/tmp/cheng_provider_runtime.a --emit:exe --out:/tmp/cheng_csg_v2_zero.2 --target:arm64-apple-darwin
+bootstrap/cheng_cold --link-object:/tmp/cheng_csg_v2_zero.cold.1.o --provider-archive:/tmp/cheng_provider_runtime.chenga --emit:exe --out:/tmp/cheng_csg_v2_zero.1 --target:arm64-apple-darwin
+bootstrap/cheng_cold --link-object:/tmp/cheng_csg_v2_zero.cold.2.o --provider-archive:/tmp/cheng_provider_runtime.chenga --emit:exe --out:/tmp/cheng_csg_v2_zero.2 --target:arm64-apple-darwin
 /tmp/cheng_csg_v2_zero.1
 /tmp/cheng_csg_v2_zero.2
 ```
@@ -207,7 +207,7 @@ bootstrap/cheng_cold --link-object:/tmp/cheng_csg_v2_zero.cold.2.o --provider-ar
 linkerless 接入后：
 
 ```sh
-bootstrap/cheng_cold --csg-in:/tmp/cheng_csg_v2_zero.facts --emit:exe --out:/tmp/cheng_csg_v2_zero --target:arm64-apple-darwin --provider-archive:/tmp/cheng_provider_runtime.a
+bootstrap/cheng_cold --csg-in:/tmp/cheng_csg_v2_zero.facts --emit:exe --out:/tmp/cheng_csg_v2_zero --target:arm64-apple-darwin --provider-archive:/tmp/cheng_provider_runtime.chenga
 /tmp/cheng_csg_v2_zero
 ```
 
@@ -217,8 +217,8 @@ bootstrap/cheng_cold --csg-in:/tmp/cheng_csg_v2_zero.facts --emit:exe --out:/tmp
 - 阶段 0 的 cold `.o` 重复生成确定性对拍通过。
 - facts 文件大小和 load/verify 时间在 report 中可见。
 - `--csg-in` 不触发源码 parser、typed_expr、semantic lowering。
-- provider/runtime 通过显式 archive 或 provider facts 输入闭合。
-- provider archive/link 命令真实存在后，才允许写运行验证通过。
+- provider/runtime 必须通过显式 archive 或 provider facts 输入闭合；当前只闭合单 member/export ELF fixture。
+- provider archive/link 命令已存在；runtime 多 member/export archive 还未完成。
 - 未解析外部符号直接失败。
 - 真实可执行文件运行通过，不接受 compile-only。
 - fixed-point 通过后才允许删除 cold 前端。
