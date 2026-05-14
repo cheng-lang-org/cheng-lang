@@ -18,6 +18,14 @@ if [ ! -x "$COLD" ] ||
     cc -std=c11 -O2 -o "$COLD" bootstrap/cheng_cold.c
 fi
 
+COLD_O0="${CHENG_COLD_O0:-/tmp/cheng_cold_O0}"
+if [ ! -x "$COLD_O0" ] ||
+   [ bootstrap/cheng_cold.c -nt "$COLD_O0" ] ||
+   [ bootstrap/elf64_direct.h -nt "$COLD_O0" ] ||
+   [ bootstrap/rv64_emit.h -nt "$COLD_O0" ]; then
+    cc -std=c11 -O0 -o "$COLD_O0" bootstrap/cheng_cold.c
+fi
+
 if [ ! -x "$DRIVER" ]; then
     echo "missing backend driver: $DRIVER" >&2
     echo "run: artifacts/bootstrap/cheng.stage3 build-backend-driver" >&2
@@ -133,6 +141,76 @@ roundtrip_fixture() {
     require_grep "$name report_no_system_link" '^system_link=0$' "$reader1"
 }
 
+# Cross-version simulation: same cold compiler built with -O0 and -O2
+# must produce identical obj and csg-v2 output from the same input facts.
+cross_version_opt_test() {
+    local name="$1"
+    local facts="$2"
+
+    local obj_O0="$WORK/$name.xver_O0.o"
+    local obj_O2="$WORK/$name.xver_O2.o"
+    local csg_O0="$WORK/$name.xver_O0.csgv2"
+    local csg_O2="$WORK/$name.xver_O2.csgv2"
+
+    echo "  - ${name}_xver_obj"
+    if "$COLD_O0" system-link-exec \
+        --csg-in:"$facts" --emit:obj --target:"$TARGET" \
+        --out:"$obj_O0" >/dev/null 2>&1 &&
+       "$COLD" system-link-exec \
+        --csg-in:"$facts" --emit:obj --target:"$TARGET" \
+        --out:"$obj_O2" >/dev/null 2>&1; then
+        if cmp -s "$obj_O0" "$obj_O2" 2>/dev/null; then
+            ok "${name}_xver_obj"
+        else
+            bad "${name}_xver_obj (O0 vs O2 .o differ)"
+        fi
+    else
+        bad "${name}_xver_obj (cold run failed)"
+    fi
+
+    echo "  - ${name}_xver_csg"
+    if "$COLD_O0" system-link-exec \
+        --csg-in:"$facts" --emit:csg-v2 --target:"$TARGET" \
+        --out:"$csg_O0" >/dev/null 2>&1 &&
+       "$COLD" system-link-exec \
+        --csg-in:"$facts" --emit:csg-v2 --target:"$TARGET" \
+        --out:"$csg_O2" >/dev/null 2>&1; then
+        if cmp -s "$csg_O0" "$csg_O2" 2>/dev/null; then
+            ok "${name}_xver_csg"
+        else
+            bad "${name}_xver_csg (O0 vs O2 csg-v2 differ)"
+        fi
+    else
+        bad "${name}_xver_csg (cold run failed)"
+    fi
+}
+
+# Roundtrip stability: facts -> csg-v2 (round 1) -> csg-v2 (round 2)
+# must converge in exactly 1 step (r1 and r2 are bit-identical).
+roundtrip_stability_fixture() {
+    local name="$1"
+    local facts="$2"
+
+    local r1="$WORK/$name.stable.r1.csgv2"
+    local r2="$WORK/$name.stable.r2.csgv2"
+
+    echo "  - ${name}_roundtrip_stable"
+    if "$COLD" system-link-exec \
+        --csg-in:"$facts" --emit:csg-v2 --target:"$TARGET" \
+        --out:"$r1" >/dev/null 2>&1 &&
+       "$COLD" system-link-exec \
+        --csg-in:"$r1" --emit:csg-v2 --target:"$TARGET" \
+        --out:"$r2" >/dev/null 2>&1; then
+        if cmp -s "$r1" "$r2" 2>/dev/null; then
+            ok "${name}_roundtrip_stable"
+        else
+            bad "${name}_roundtrip_stable (r1 and r2 csg-v2 differ)"
+        fi
+    else
+        bad "${name}_roundtrip_stable (command failed)"
+    fi
+}
+
 echo "=== CSG v2 Roundtrip ==="
 
 # Baseline: minimal smoke tests
@@ -171,6 +249,13 @@ roundtrip_fixture return_while_continue tests/cheng/backend/fixtures/return_whil
 # Files with imports: object-by-value and object-var-assign (pull in external types)
 roundtrip_fixture ptr_object_by_value_probe tests/cheng/backend/fixtures/ptr_object_by_value_probe.cheng 131072
 roundtrip_fixture ptr_object_var_assign_probe tests/cheng/backend/fixtures/ptr_object_var_assign_probe.cheng 131072
+
+# Roundtrip stability: all fixtures must converge in 1 csg-v2 step
+echo "  - roundtrip_stability"
+for f in "$WORK"/*.facts; do
+    base="$(basename "$f" .facts)"
+    roundtrip_stability_fixture "$base" "$f"
+done
 
 bad_facts="$WORK/ordinary.unknown-record.facts"
 cp "$WORK/ordinary.facts" "$bad_facts"
@@ -219,6 +304,31 @@ else
     bad "darwin_runtime_provider_marker_object"
 fi
 
+darwin_provider_archive_macho_error='Mach-O relocatable provider archive reader/linker unsupported'
+
+darwin_pack_archive="$WORK/core_runtime_provider_darwin.chenga"
+darwin_pack_report="$WORK/core_runtime_provider_darwin.pack.report.txt"
+if "$COLD" provider-archive-pack \
+    --target:arm64-apple-darwin \
+    --object:"$darwin_runtime_provider_obj" \
+    --export:_core_runtime_stub_trace_export \
+    --module:runtime/core_runtime \
+    --source:"$darwin_runtime_provider_source" \
+    --out:"$darwin_pack_archive" \
+    --report-out:"$darwin_pack_report" >/dev/null 2>&1; then
+    bad "darwin_provider_archive_pack_hard_fail_no_fallback"
+elif grep -q '^provider_archive_pack=0$' "$darwin_pack_report" &&
+     grep -q '^provider_archive=0$' "$darwin_pack_report" &&
+     grep -q '^provider_object_count=0$' "$darwin_pack_report" &&
+     grep -q '^system_link=0$' "$darwin_pack_report" &&
+     grep -q '^linkerless_image=1$' "$darwin_pack_report" &&
+     grep -q "^error=$darwin_provider_archive_macho_error$" "$darwin_pack_report" &&
+     [ ! -e "$darwin_pack_archive" ]; then
+    ok "darwin_provider_archive_pack_hard_fail_no_fallback"
+else
+    bad "darwin_provider_archive_pack_hard_fail_no_fallback"
+fi
+
 darwin_archive_report="$WORK/darwin_provider_archive_hard_fail.report.txt"
 if "$COLD" system-link-exec \
     --csg-in:"$WORK/ordinary.facts" \
@@ -231,10 +341,41 @@ if "$COLD" system-link-exec \
 elif grep -q '^provider_archive=1$' "$darwin_archive_report" &&
      grep -q '^provider_object_count=0$' "$darwin_archive_report" &&
      grep -q '^system_link=0$' "$darwin_archive_report" &&
-     grep -q '^error=--provider-archive with --csg-in requires ELF target$' "$darwin_archive_report"; then
+     grep -q "^error=$darwin_provider_archive_macho_error$" "$darwin_archive_report"; then
     ok "darwin_provider_archive_hard_fail_no_fallback"
 else
     bad "darwin_provider_archive_hard_fail_no_fallback"
+fi
+
+darwin_link_object_primary="$WORK/ordinary_darwin_provider_primary.o"
+darwin_link_object_primary_report="$WORK/ordinary_darwin_provider_primary.report.txt"
+darwin_link_object_report="$WORK/darwin_link_object_provider_archive.report.txt"
+darwin_link_object_out="$WORK/darwin_link_object_provider_archive_should_not_exist"
+if "$COLD" system-link-exec \
+    --csg-in:"$WORK/ordinary.facts" \
+    --emit:obj \
+    --target:arm64-apple-darwin \
+    --out:"$darwin_link_object_primary" \
+    --report-out:"$darwin_link_object_primary_report" >/dev/null 2>&1 &&
+   "$COLD" system-link-exec \
+    --link-object:"$darwin_link_object_primary" \
+    --provider-archive:"$WORK/missing_darwin_runtime.chenga" \
+    --emit:exe \
+    --target:arm64-apple-darwin \
+    --out:"$darwin_link_object_out" \
+    --report-out:"$darwin_link_object_report" >/dev/null 2>&1; then
+    bad "darwin_link_object_provider_archive_hard_fail_no_fallback"
+elif [ -s "$darwin_link_object_primary" ] &&
+     grep -q '^direct_macho=1$' "$darwin_link_object_primary_report" &&
+     grep -q '^link_object=1$' "$darwin_link_object_report" &&
+     grep -q '^provider_archive=1$' "$darwin_link_object_report" &&
+     grep -q '^provider_object_count=0$' "$darwin_link_object_report" &&
+     grep -q '^system_link=0$' "$darwin_link_object_report" &&
+     grep -q "^error=$darwin_provider_archive_macho_error$" "$darwin_link_object_report" &&
+     [ ! -e "$darwin_link_object_out" ]; then
+    ok "darwin_link_object_provider_archive_hard_fail_no_fallback"
+else
+    bad "darwin_link_object_provider_archive_hard_fail_no_fallback"
 fi
 
 
@@ -665,6 +806,15 @@ else
     fail=$((fail + 1))
   fi
 fi
+
+# Cross-version optimization-level simulation: O0 and O2 binaries produce identical output
+# Skip intentionally corrupted files created by error-handling tests
+echo "=== Cross-Version Determinism ==="
+for f in "$WORK"/*.facts; do
+    base="$(basename "$f" .facts)"
+    case "$base" in *truncated|*unknown-record) continue ;; esac
+    cross_version_opt_test "$base" "$f"
+done
 
 # CSG v2 fixed-point: read facts, codegen (DSE), re-emit, verify convergence
 echo "  - csg_v2_fixedpoint_ordinary"

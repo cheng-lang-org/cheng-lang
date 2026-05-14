@@ -6191,13 +6191,17 @@ static uint32_t a64_strb_imm(int rt, int rn, int32_t offset) {
     uint32_t imm = (uint32_t)(offset & 0xFFF);
     return 0x39000000u | (imm << 10) | ((uint32_t)rn << 5) | (uint32_t)rt;
 }
-__attribute__((unused))
-static uint32_t a64_ldr_reg_x(int rt, int rn, int rm) {
-    return 0xF8606800u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rt;
+static uint32_t a64_ldr_reg(int rt, int rn, int rm, bool x) {
+    return (x ? 0xF8606800u : 0xB8606800u) | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rt;
 }
-__attribute__((unused))
-static uint32_t a64_str_reg_x(int rt, int rn, int rm) {
-    return 0xF8206800u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rt;
+static uint32_t a64_str_reg(int rt, int rn, int rm, bool x) {
+    return (x ? 0xF8206800u : 0xB8206800u) | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rt;
+}
+static uint32_t a64_ldrb_reg(int rt, int rn, int rm) {
+    return 0x38606800u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rt;
+}
+static uint32_t a64_strb_reg(int rt, int rn, int rm) {
+    return 0x38206800u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rt;
 }
 static uint32_t a64_stp_pre(int a, int b, int n, int32_t offset) {
     uint32_t imm = (uint32_t)((offset >> 3) & 0x7F);
@@ -6626,33 +6630,70 @@ static void a64_emit_add_large(Code *code, int rd, int rn, int32_t value, bool x
         code_emit(code, a64_add_imm(rd, rd, (uint16_t)lo, x64));
 }
 
-/* Emit 16-bit immediate into x16 (single movz for values 0-65535, two for larger). */
-__attribute__((unused))
-static void a64_emit_mov_imm_x16(Code *code, int32_t value) {
-    code_emit(code, a64_movz_x(16, (uint16_t)(value & 0xFFFF), 0));
-    if (value > 0xFFFF)
-        code_emit(code, a64_movk(16, (uint16_t)((value >> 16) & 0xFFFF), 1));
+/* Emit movz/movk sequence to load an arbitrary 64-bit value into rd. */
+static void a64_emit_mov_large(Code *code, int rd, uint64_t value) {
+    int sft = 0;
+    bool first = true;
+    while (value > 0) {
+        uint16_t chunk = (uint16_t)(value & 0xFFFF);
+        if (first) {
+            code_emit(code, a64_movz_x(rd, chunk, sft));
+            first = false;
+        } else {
+            code_emit(code, a64_movk_x(rd, chunk, sft));
+        }
+        value >>= 16;
+        sft++;
+    }
+    if (first) code_emit(code, a64_movz_x(rd, 0, 0));
 }
 
-/* Load from SP with potentially large unsigned offset. */
+/* Load from SP with potentially large unsigned offset.
+   For offsets within scaled 12-bit range (and properly aligned), use
+   immediate encoding.  Otherwise load offset into X9 and use register-offset
+   addressing: ldr rt, [sp, x9]. */
 static void a64_emit_ldr_sp_off(Code *code, int rt, int32_t offset, bool x64) {
     int32_t max_off = x64 ? 32760 : 16380;
-    if (offset <= max_off) {
+    int32_t align  = x64 ? 7 : 3;
+    if (offset >= 0 && offset <= max_off && (offset & align) == 0) {
         code_emit(code, a64_ldr_imm(rt, SP, offset, x64));
     } else {
-        a64_emit_add_large(code, 16, SP, offset, true);
-        code_emit(code, a64_ldr_imm(rt, 16, 0, x64));
+        a64_emit_mov_large(code, 9, (uint64_t)(uint32_t)offset);
+        code_emit(code, a64_ldr_reg(rt, SP, 9, x64));
     }
 }
 
 /* Store to SP with potentially large unsigned offset. */
 static void a64_emit_str_sp_off(Code *code, int rt, int32_t offset, bool x64) {
     int32_t max_off = x64 ? 32760 : 16380;
-    if (offset <= max_off) {
+    int32_t align  = x64 ? 7 : 3;
+    if (offset >= 0 && offset <= max_off && (offset & align) == 0) {
         code_emit(code, a64_str_imm(rt, SP, offset, x64));
     } else {
-        a64_emit_add_large(code, 16, SP, offset, true);
-        code_emit(code, a64_str_imm(rt, 16, 0, x64));
+        int scratch = rt == 9 ? 10 : 9;
+        a64_emit_mov_large(code, scratch, (uint64_t)(uint32_t)offset);
+        code_emit(code, a64_str_reg(rt, SP, scratch, x64));
+    }
+}
+
+/* Byte load from SP with potentially large offset. */
+static void a64_emit_ldrb_sp_off(Code *code, int rt, int32_t offset) {
+    if (offset >= 0 && offset <= 4095) {
+        code_emit(code, a64_ldrb_imm(rt, SP, offset));
+    } else {
+        a64_emit_mov_large(code, 9, (uint64_t)(uint32_t)offset);
+        code_emit(code, a64_ldrb_reg(rt, SP, 9));
+    }
+}
+
+/* Byte store to SP with potentially large offset. */
+static void a64_emit_strb_sp_off(Code *code, int rt, int32_t offset) {
+    if (offset >= 0 && offset <= 4095) {
+        code_emit(code, a64_strb_imm(rt, SP, offset));
+    } else {
+        int scratch = rt == 9 ? 10 : 9;
+        a64_emit_mov_large(code, scratch, (uint64_t)(uint32_t)offset);
+        code_emit(code, a64_strb_reg(rt, SP, scratch));
     }
 }
 
@@ -9146,7 +9187,7 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         code_emit(code, a64_svc(0x80));
         code_emit(code, a64_movz_x(R0, 2, 0));
         code_emit(code, a64_movz(R1, '\n', 0));
-        code_emit(code, a64_strb_imm(R1, SP, body->slot_offset[dst]));
+        a64_emit_strb_sp_off(code, R1, body->slot_offset[dst]);
         a64_emit_add_large(code, R1, SP, body->slot_offset[dst], true);
         code_emit(code, a64_movz_x(R2, 1, 0));
         code_emit(code, a64_movz_x(16, 4, 0));
@@ -9184,7 +9225,7 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
             a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
         }
         code_emit(code, a64_movz(R1, '\n', 0));
-        code_emit(code, a64_strb_imm(R1, SP, body->slot_offset[dst]));
+        a64_emit_strb_sp_off(code, R1, body->slot_offset[dst]);
         a64_emit_add_large(code, R1, SP, body->slot_offset[dst], true);
         code_emit(code, a64_movz_x(R2, 1, 0));
         code_emit(code, a64_movz_x(16, 4, 0));
@@ -15859,6 +15900,7 @@ done:
 #define COLD_PROVIDER_ARCHIVE_VERSION 1u
 #define COLD_PROVIDER_ARCHIVE_HASH_OFFSET 28u
 #define COLD_PROVIDER_ARCHIVE_HEADER_SIZE 36u
+#define COLD_PROVIDER_ARCHIVE_MACHO_ERROR "Mach-O relocatable provider archive reader/linker unsupported"
 
 typedef struct ColdElfObjectView {
     const uint8_t *data;
@@ -16753,6 +16795,13 @@ static int cold_cmd_provider_archive_pack(int argc, char **argv) {
         cold_write_provider_archive_pack_report(report_path, false, target, object_path, out_path,
                                                 export_symbol, 0, 0, 0, "missing --export");
         fprintf(stderr, "[cheng_cold] provider-archive-pack requires --export:<symbol>\n");
+        return 2;
+    }
+    const char *format = cold_object_format_for_target_cstr(target);
+    if (strcmp(format, "macho") == 0) {
+        cold_write_provider_archive_pack_report(report_path, false, target, object_path, out_path,
+                                                export_symbol, 0, 0, 0, COLD_PROVIDER_ARCHIVE_MACHO_ERROR);
+        fprintf(stderr, "[cheng_cold] %s\n", COLD_PROVIDER_ARCHIVE_MACHO_ERROR);
         return 2;
     }
     uint16_t machine = cold_elf_machine_for_target(target);
@@ -17717,6 +17766,7 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
     if (link_object_path && link_object_path[0] != '\0') {
         ColdCompileStats stats = {0};
         stats.link_object = 1;
+        if (provider_archive_path && provider_archive_path[0] != '\0') stats.provider_archive = 1;
         if ((source_path && source_path[0] != '\0') ||
             (csg_in_path && csg_in_path[0] != '\0') ||
             (csg_out_path && csg_out_path[0] != '\0')) {
@@ -17732,9 +17782,12 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
             return 2;
         }
         if (!is_elf) {
+            const char *error = (provider_archive_path && provider_archive_path[0] != '\0' && is_macho)
+                ? COLD_PROVIDER_ARCHIVE_MACHO_ERROR
+                : "--link-object currently requires ELF target";
             cold_write_system_link_exec_report(report_path, false, link_object_path, provider_archive_path, out_path,
-                                               target, emit, &stats, "--link-object currently requires ELF target");
-            fprintf(stderr, "[cheng_cold] --link-object currently requires ELF target\n");
+                                               target, emit, &stats, error);
+            fprintf(stderr, "[cheng_cold] %s\n", error);
             return 2;
         }
         bool linked = false;
@@ -17765,9 +17818,12 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
         ColdCompileStats stats = {0};
         stats.provider_archive = 1;
         if (!is_elf) {
+            const char *error = is_macho
+                ? COLD_PROVIDER_ARCHIVE_MACHO_ERROR
+                : "--provider-archive with --csg-in requires ELF target";
             cold_write_system_link_exec_report(report_path, false, source_path, csg_in_path, out_path,
-                                               target, emit, &stats, "--provider-archive with --csg-in requires ELF target");
-            fprintf(stderr, "[cheng_cold] --provider-archive with --csg-in requires ELF target\n");
+                                               target, emit, &stats, error);
+            fprintf(stderr, "[cheng_cold] %s\n", error);
             return 2;
         }
         char primary_o[PATH_MAX];

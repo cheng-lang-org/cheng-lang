@@ -7,11 +7,11 @@
 | 模块 | 进度 | 判断 |
 |---|---|---|
 | 冷编译器基础 codegen | 86% | 133 BodyIR ops 覆盖，三架构 ARM64/x86_64/RISC-V，direct Mach-O 可运行；DSE 活跃性根已修复 |
-| CSG v2 facts 往返 | 80% | roundtrip 53/53 PASS，object/exe 确定性成立 |
+| CSG v2 facts 往返 | 81% | roundtrip 332/332 PASS，object/exe 确定性成立 |
 | PrimaryObjectPlan → facts | 62% | writer/reader 已闭合到 backend driver CSG 事实，仍需扩大 canonical facts 覆盖 |
 | cold --csg-in --emit:obj | 72% | 最小 fixture、cold subset、provider archive smoke 稳定，完整 runtime provider 仍未闭合 |
 | cold linkerless exe | 68% | provider-free 可行；A/B witness 通过；多 provider archive ELF 链路和 `--csg-in --provider-archive` 已闭环 |
-| provider archive | 62% | `provider-archive-pack` + `--link-object/--csg-in --provider-archive` 已覆盖多 ELF member/export、缺 export hard-fail |
+| provider archive | 63% | `provider-archive-pack` + `--link-object/--csg-in --provider-archive` 已覆盖多 ELF member/export、缺 export hard-fail；Mach-O archive 入口已明确硬失败 |
 | backend driver fixed-point | 35% | A/B witness 通过（产物 SHA 一致，关键报告字段对等）；cross-version 确定性待定 |
 | Ownership / E-Graph | 38% | ownership proof driver 可运行；整数/位运算恒等式只用于严格合同；浮点不做重排；UIR E-Graph unavailable，rewrite=0 |
 | C seed 替代 | 32% | 闭包已在 cold；函数级泛型/完整单态化未闭合，cheng_seed.c 仍在链中 |
@@ -27,7 +27,7 @@
 
 - **冷编译器三架构 codegen**：ARM64/x86_64/RISC-V 全 133 BodyIR ops 覆盖
 - **ordinary provider-free direct Mach-O**：`ordinary_zero_exit_fixture` 直接编译运行 exit 0
-- **CSG v2 facts 往返**：`tools/cold_csg_v2_roundtrip_test.sh` 53/53 PASS
+- **CSG v2 facts 往返**：`tools/cold_csg_v2_roundtrip_test.sh` 332/332 PASS
   - Cheng writer → facts → cold reader → .o → cmp（确定性验证）
   - 错误输入 hard-fail（unknown record、truncated）
   - report 字段全输出（facts_bytes/mmap_ms/verify_ms/decode_ms/total_ms）
@@ -45,7 +45,7 @@
 
 | gap | 状态 | 下一步 |
 |---|---|---|
-| provider archive 生成与链接 | 多 provider ELF member/export 已由 cold linkerless 链路闭合；Darwin runtime marker object 已锁；runtime provider roots 未闭合 | 把 runtime provider 预编译 archive 接入并锁 root 选择 |
+| provider archive 生成与链接 | 多 provider ELF member/export 已由 cold linkerless 链路闭合；Darwin runtime marker object 已锁；Mach-O archive pack/link 三入口已明确硬失败；runtime provider roots 未闭合 | 把 runtime provider 预编译 archive 接入并锁 root 选择 |
 | runtime smoke cc 链接 | 同上，内置 ELF 链接器已绕过 | 三 smoke RISC-V linked ELF 均已 QEMU 验证 |
 | 删除 cold source parser | COLD_BACKEND_ONLY 42% 缩减 | parser 代码保留，cold_parser.c 独立文件 |
 | C seed 替代 | cheng_seed.c 仍是完整 Cheng 语言实现（66K 行，3.0MB） | 冷编译器子集覆盖足够后可退役 |
@@ -55,12 +55,12 @@
 ### 本次会话（2026-05-14）：CSG v2/provider 门禁收敛 + E-Graph 边界锁定
 
 **门禁全通**：
-- 43/43 冷回归 PASS，53/53 CSG v2 roundtrip PASS ✅
+- 45/45 冷回归 PASS，332/332 CSG v2 roundtrip PASS ✅
 - `ordinary_zero_exit_fixture` provider-backed 编译运行 exit 0 ✅
 - `atomic_i32_runtime_smoke` / `compiler_runtime_smoke` 全部通过 ✅
 
 **本轮有效推进**：
-- `tools/cold_regression_test.sh` 43/43 PASS，`tools/cold_csg_v2_roundtrip_test.sh` 53/53 PASS。
+- `tools/cold_regression_test.sh` 45/45 PASS，`tools/cold_csg_v2_roundtrip_test.sh` 332/332 PASS。
 - `compiler_csg_egraph_active_contract_smoke` 已接入 cold `run-host-smokes`，刷新后的 `artifacts/backend_driver/cheng` 可直接运行该 smoke。
 - fake runtime stubs 已删除；原子 provider smoke 只证明 atomic 外部符号解析，不外推成 runtime roots。
 - `host_smoke_gate_contract_smoke` 通过 stage3_new 可运行，但用当前 backend_driver 生成物运行会 hang，原因是 os 文件函数未被 cold linkerless 正确闭合，不能计入完成。
@@ -68,8 +68,8 @@
 ### 历史记录（2026-05-14）：provider archive 最小闭环 + mutable-slot CSE 禁用
 
 - **provider archive 最小闭环已落地**：`provider-archive-pack` 接受 `--target/--object/--export/--module/--source/--out/--report-out`，写 `.chenga` archive、member count、export count、hash 和 report。`system-link-exec --link-object:<primary.o> --provider-archive:<provider.chenga> --emit:exe` 在 cold 内部读取 ELF relocatable object 和 archive，解析 undefined symbol，应用 call relocation，生成 ELF executable。
-- **门禁已更新**：`tools/cold_csg_v2_roundtrip_test.sh` 覆盖正向 provider archive、坏 magic、缺 export、双 provider member/export、`--csg-in --provider-archive`、CSG v2 fixed-point、DSE noop、Darwin runtime marker hard-fail。当前结果为 **53/53 PASS**。
-- **当前边界**：archive 已支持多 ELF member/export，目标限定在当前 cold ELF reloc linker 支持的 AArch64/RISC-V；runtime provider root 精确选择仍未完成，Darwin marker hard-fail 已锁。
+- **门禁已更新**：`tools/cold_csg_v2_roundtrip_test.sh` 覆盖正向 provider archive、坏 magic、缺 export、双 provider member/export、`--csg-in --provider-archive`、CSG v2 fixed-point、DSE noop、Darwin runtime marker object、Mach-O provider archive pack/link 硬失败。当前结果为 **332/332 PASS**。
+- **当前边界**：archive 已支持多 ELF member/export，目标限定在当前 cold ELF reloc linker 支持的 AArch64/RISC-V；runtime provider root 精确选择仍未完成，Darwin Mach-O provider archive reader/linker 不支持并已硬失败锁定。
 - **mutable-slot CSE 与 hash-only dedup 已禁用**：原先的 mutating rewrite 会把 build-backend-driver 的 system-link smoke 编错；hash-only 函数去重会把不同零参函数合并到同一地址，导致 `compiler_runtime_smoke` 读到错误字符串。当前只保留 DSE 和可证明代数恒等式；后续 E-Graph 必须先做只读等价证明和运行门禁，再允许 rewrite。
 - **函数参数 no_alias 标记已撤销**：参数参与跨 block/call 后的值流，直接标记为 no_alias 会污染寄存器缓存假设。No-Alias 当前只对明确局部标量 slot 生效。
 
@@ -584,7 +584,7 @@ fn LoweringBuildPrimaryObjectIr(...): PrimaryObjectIr =
 
 进入默认门槛全部满足：
 - 核心 `build-backend-driver` 和 ordinary `system-link-exec` 稳定 ✅
-- cold source-direct runtime smoke 已运行通过；Darwin runtime marker object 已锁，runtime provider roots 尚未闭合 ⚠️
+- cold source-direct runtime smoke 已运行通过；Darwin runtime marker object 与 Mach-O provider archive 硬失败已锁，runtime provider roots 尚未闭合 ⚠️
 - cross-target smoke 证明 Mach-O/ELF/COFF 产物合法 ✅
 
 ## 当前优先级
@@ -595,7 +595,7 @@ fn LoweringBuildPrimaryObjectIr(...): PrimaryObjectIr =
 4. ✅ **E-Graph 边界已锁**：UIR E-Graph unavailable、rewrite=0 已由 smoke 锁定。CSE 已移除（BodyIR 可变 slot 不安全）。Ownership report 字段已激活。No-Alias 局部标量仍活跃；函数参数 no_alias 已撤销；mutating rewrite 仍禁用。
 5. ✅ **函数级并行 + lock-free work-stealing**：pthread + `__atomic_fetch_add` + 确定性 merge。`COLD_NO_SIGN=1` 下任意 `BACKEND_JOBS` 值产物 SHA 一致。
 6. ✅ **30-80ms 架构合规**：6 个 report 字段全部输出，冷进程内微秒级计时。实测 135 函数/5293 ops 编译 total=22.5ms。
-7. ✅ **回归测试**：`tools/cold_regression_test.sh` 43/43 PASS，`tools/cold_csg_v2_roundtrip_test.sh` 53/53 PASS。
+7. ✅ **回归测试**：`tools/cold_regression_test.sh` 45/45 PASS，`tools/cold_csg_v2_roundtrip_test.sh` 332/332 PASS。
 8. ✅ **cold source-direct runtime smoke 通过**：`atomic_i32_runtime_smoke`、`thread_atomic_orc_runtime_smoke`、`compiler_runtime_smoke`、source-direct `while` 均通过；runtime provider roots 仍是下一步。
 9. 若目标切到 `30-80ms` 冷自举的下一阶段，工作重心转移到 Ownership/E-Graph（阶段 5）、C seed 最小化（阶段 6）、跨端（阶段 7）。
 

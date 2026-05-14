@@ -605,6 +605,142 @@ else
 fi
 assert "ownership_report_off_fields" 1 "$ACT"
 
+# 12: emit:obj with object fields (int32 + str)
+rm -f /tmp/ct_eo_fields.cheng /tmp/ct_eo_fields /tmp/ct_eo_fields.o /tmp/ct_eo_fields_link
+cat > /tmp/ct_eo_fields.cheng << 'EOF'
+type Person =
+    name: str
+    age: int32
+
+fn main(): int32 =
+    let p: Person = Person{
+        name: "Alice",
+        age: 30,
+    }
+    return p.age
+EOF
+ACT=$(compile_run /tmp/ct_eo_fields.cheng /tmp/ct_eo_fields)
+assert "emit_obj_fields_exe" 30 "$ACT"
+quiet $COLD system-link-exec --in:/tmp/ct_eo_fields.cheng --target:arm64-apple-darwin \
+    --emit:obj --out:/tmp/ct_eo_fields.o
+if [ -s /tmp/ct_eo_fields.o ] && file /tmp/ct_eo_fields.o 2>/dev/null | grep -q "Mach-O 64-bit object"; then
+    ACT=1; else ACT=0
+fi
+assert "emit_obj_fields_obj_file" 1 "$ACT"
+if quiet cc -o /tmp/ct_eo_fields_link /tmp/ct_eo_fields.o; then
+    /tmp/ct_eo_fields_link 2>/dev/null; ACT=$?
+else
+    ACT="LINK_FAILED"
+fi
+assert "emit_obj_fields_obj_run" 30 "$ACT"
+rm -f /tmp/ct_eo_fields.cheng /tmp/ct_eo_fields /tmp/ct_eo_fields.o /tmp/ct_eo_fields_link
+
+# 13: emit:obj with match/switch
+rm -f /tmp/ct_eo_match.cheng /tmp/ct_eo_match /tmp/ct_eo_match.o /tmp/ct_eo_match_link
+cat > /tmp/ct_eo_match.cheng << 'EOF'
+type Color = Red | Green | Blue
+
+fn main(): int32 =
+    let c: Color = Color.Blue
+    match c:
+        Red => return 1
+        Green => return 2
+        Blue => return 42
+EOF
+ACT=$(compile_run /tmp/ct_eo_match.cheng /tmp/ct_eo_match)
+assert "emit_obj_match_exe" 42 "$ACT"
+quiet $COLD system-link-exec --in:/tmp/ct_eo_match.cheng --target:arm64-apple-darwin \
+    --emit:obj --out:/tmp/ct_eo_match.o
+if [ -s /tmp/ct_eo_match.o ] && file /tmp/ct_eo_match.o 2>/dev/null | grep -q "Mach-O 64-bit object"; then
+    ACT=1; else ACT=0
+fi
+assert "emit_obj_match_obj_file" 1 "$ACT"
+if quiet cc -o /tmp/ct_eo_match_link /tmp/ct_eo_match.o; then
+    /tmp/ct_eo_match_link 2>/dev/null; ACT=$?
+else
+    ACT="LINK_FAILED"
+fi
+assert "emit_obj_match_obj_run" 42 "$ACT"
+rm -f /tmp/ct_eo_match.cheng /tmp/ct_eo_match /tmp/ct_eo_match.o /tmp/ct_eo_match_link
+
+# 14: emit:obj with Result/? handling
+rm -f /tmp/ct_eo_result.cheng /tmp/ct_eo_result /tmp/ct_eo_result.o /tmp/ct_eo_result_link
+cat > /tmp/ct_eo_result.cheng << 'EOF'
+type Result = Ok(val: int32) | Err(msg: str)
+
+fn main(): int32 =
+    let r: Result = Result.Ok(42)
+    return r?
+EOF
+ACT=$(compile_run /tmp/ct_eo_result.cheng /tmp/ct_eo_result)
+assert "emit_obj_result_exe" 42 "$ACT"
+quiet $COLD system-link-exec --in:/tmp/ct_eo_result.cheng --target:arm64-apple-darwin \
+    --emit:obj --out:/tmp/ct_eo_result.o
+if [ -s /tmp/ct_eo_result.o ] && file /tmp/ct_eo_result.o 2>/dev/null | grep -q "Mach-O 64-bit object"; then
+    ACT=1; else ACT=0
+fi
+assert "emit_obj_result_obj_file" 1 "$ACT"
+if quiet cc -o /tmp/ct_eo_result_link /tmp/ct_eo_result.o; then
+    /tmp/ct_eo_result_link 2>/dev/null; ACT=$?
+else
+    ACT="LINK_FAILED"
+fi
+assert "emit_obj_result_obj_run" 42 "$ACT"
+rm -f /tmp/ct_eo_result.cheng /tmp/ct_eo_result /tmp/ct_eo_result.o /tmp/ct_eo_result_link
+
+# 15: emit:obj with closure
+rm -f /tmp/ct_eo_closure.cheng /tmp/ct_eo_closure /tmp/ct_eo_closure.o /tmp/ct_eo_closure_link
+cat > /tmp/ct_eo_closure.cheng << 'EOF'
+fn main(): int32 =
+    let f: fn(int32): int32 = fn(x: int32): int32 = return x + 1
+    return f(41)
+EOF
+# Direct exe path works for non-capturing closures
+ACT=$(compile_run /tmp/ct_eo_closure.cheng /tmp/ct_eo_closure)
+assert "emit_obj_closure_exe" 42 "$ACT"
+# --emit:obj produces valid .o
+quiet $COLD system-link-exec --in:/tmp/ct_eo_closure.cheng --target:arm64-apple-darwin \
+    --emit:obj --out:/tmp/ct_eo_closure.o
+if [ -s /tmp/ct_eo_closure.o ] && file /tmp/ct_eo_closure.o 2>/dev/null | grep -q "Mach-O 64-bit object"; then
+    ACT=1; else ACT=0
+fi
+assert "emit_obj_closure_obj_file" 1 "$ACT"
+# Linking succeeds (runtime crash is a known cold codegen limitation for closure .o)
+if quiet cc -o /tmp/ct_eo_closure_link /tmp/ct_eo_closure.o; then
+    ACT=1; else ACT=0
+fi
+assert "emit_obj_closure_obj_link" 1 "$ACT"
+rm -f /tmp/ct_eo_closure.cheng /tmp/ct_eo_closure /tmp/ct_eo_closure.o /tmp/ct_eo_closure_link
+
+# 16: emit:obj multi-file (two .cheng -> two .o -> link with cc)
+rm -f /tmp/ct_eo_prov.cheng /tmp/ct_eo_cons.cheng /tmp/ct_eo_prov.o /tmp/ct_eo_cons.o /tmp/ct_eo_multi_link
+cat > /tmp/ct_eo_prov.cheng << 'EOF'
+@exportc("eo_provide_value")
+fn eo_provide_value(): int32 = return 42
+EOF
+cat > /tmp/ct_eo_cons.cheng << 'EOF'
+@importc("eo_provide_value")
+fn eo_provide_value(): int32
+
+fn main(): int32 = return eo_provide_value()
+EOF
+quiet $COLD system-link-exec --in:/tmp/ct_eo_prov.cheng --target:arm64-apple-darwin \
+    --emit:obj --out:/tmp/ct_eo_prov.o
+quiet $COLD system-link-exec --in:/tmp/ct_eo_cons.cheng --target:arm64-apple-darwin \
+    --emit:obj --out:/tmp/ct_eo_cons.o
+if [ -s /tmp/ct_eo_prov.o ] && file /tmp/ct_eo_prov.o 2>/dev/null | grep -q "Mach-O 64-bit object" &&
+   [ -s /tmp/ct_eo_cons.o ] && file /tmp/ct_eo_cons.o 2>/dev/null | grep -q "Mach-O 64-bit object"; then
+    ACT=1; else ACT=0
+fi
+assert "emit_obj_multi_obj_files" 1 "$ACT"
+if quiet cc -o /tmp/ct_eo_multi_link /tmp/ct_eo_cons.o /tmp/ct_eo_prov.o; then
+    /tmp/ct_eo_multi_link 2>/dev/null; ACT=$?
+else
+    ACT="LINK_FAILED"
+fi
+assert "emit_obj_multi_obj_run" 42 "$ACT"
+rm -f /tmp/ct_eo_prov.cheng /tmp/ct_eo_cons.cheng /tmp/ct_eo_prov.o /tmp/ct_eo_cons.o /tmp/ct_eo_multi_link
+
 echo ""
 echo "=== $PASS passed, $FAIL failed ==="
 [ "$FAIL" -eq 0 ]
