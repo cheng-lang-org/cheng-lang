@@ -43,6 +43,7 @@ static bool cold_diag_dump_per_fn = false;
 static bool cold_diag_dump_slots = false;
 static int32_t cold_egraph_rewrite_count = 0;
 static int32_t cold_egraph_dedup_count = 0;
+static int32_t cold_egraph_licm_hoisted = 0;
 
 #include "macho_direct.h"
 #include "elf64_direct.h"
@@ -11995,9 +11996,10 @@ static void cold_apply_identity_rewrites(BodyIR *body) {
     free(writer_count);
 }
 
+static void cold_apply_licm(BodyIR *body);
 /* Optimize a BodyIR function with dead store elimination.
    BodyIR slots are mutable, so CSE belongs after SSA/equivalence proof. */
-static void cold_optimize_body(BodyIR *body) {
+static void cold_optimize_body(BodyIR *body, bool enable_licm) {
     if (!body || body->slot_count <= 0 || body->op_count <= 0) return;
 
     int32_t slot_count = body->slot_count;
@@ -12071,12 +12073,110 @@ static void cold_optimize_body(BodyIR *body) {
        Runs after DSE so slot writer counts reflect only live ops. */
     cold_apply_identity_rewrites(body);
 
+    if (enable_licm) cold_apply_licm(body);
+
+}
+
+/* LICM: Loop Invariant Code Motion for CONST hoisting. */
+static void cold_apply_licm(BodyIR *body) {
+    if (!body || body->block_count <= 2 || body->op_count <= 0) return;
+    int32_t block_count = body->block_count;
+    int32_t slot_count = body->slot_count;
+    int32_t op_count = body->op_count;
+    int32_t *writer_count = (int32_t *)calloc((size_t)(slot_count > 0 ? (size_t)slot_count : 1), sizeof(int32_t));
+    if (!writer_count) return;
+    for (int32_t i = 0; i < op_count; i++) {
+        int32_t k = body->op_kind[i];
+        if (k <= 0) continue;
+        int32_t dst = body->op_dst[i];
+        if (dst >= 0 && dst < slot_count) writer_count[dst]++;
+    }
+    for (int32_t b = 1; b < block_count; b++) {
+        int32_t term = body->block_term[b];
+        if (term < 0 || term >= body->term_count) continue;
+        int32_t tkind = body->term_kind[term];
+        int32_t hdr = -1;
+        if (tkind == BODY_TERM_BR) {
+            hdr = body->term_true_block[term];
+        } else if (tkind == BODY_TERM_CBR) {
+            int32_t tb = body->term_true_block[term];
+            int32_t fb = body->term_false_block[term];
+            if (tb >= 0 && tb < b) hdr = tb;
+            if (fb >= 0 && fb < b && (hdr < 0 || fb < hdr)) hdr = fb;
+        }
+        if (hdr < 0 || hdr >= b) continue;
+        int32_t pre = -1;
+        for (int32_t p = 0; p < hdr; p++) {
+            int32_t pt = body->block_term[p];
+            if (pt < 0) continue;
+            int32_t pk = body->term_kind[pt];
+            if (pk == BODY_TERM_BR && body->term_true_block[pt] == hdr) { pre = p; break; }
+            if (pk == BODY_TERM_CBR &&
+                (body->term_true_block[pt] == hdr || body->term_false_block[pt] == hdr)) {
+                pre = p; break;
+            }
+        }
+        if (pre < 0 || pre >= hdr) continue;
+#define COLD_LICM_MAX 4096
+        int32_t const_pos[COLD_LICM_MAX];
+        int32_t const_kind[COLD_LICM_MAX];
+        int32_t const_dst[COLD_LICM_MAX];
+        int32_t const_a[COLD_LICM_MAX];
+        int32_t const_b[COLD_LICM_MAX];
+        int32_t n_const = 0;
+        for (int32_t sb = hdr; sb <= b && n_const < COLD_LICM_MAX; sb++) {
+            int32_t bs = body->block_op_start[sb];
+            int32_t be = bs + body->block_op_count[sb];
+            for (int32_t i = bs; i < be && n_const < COLD_LICM_MAX; i++) {
+                int32_t kind = body->op_kind[i];
+                if (kind != BODY_OP_I32_CONST && kind != BODY_OP_I64_CONST) continue;
+                int32_t dst = body->op_dst[i];
+                if (dst < 0 || dst >= slot_count || writer_count[dst] != 1) continue;
+                const_pos[n_const] = i;
+                const_kind[n_const] = kind;
+                const_dst[n_const] = dst;
+                const_a[n_const] = body->op_a[i];
+                const_b[n_const] = body->op_b[i];
+                n_const++;
+            }
+        }
+        if (n_const == 0) continue;
+        int32_t insert_pos = body->block_op_start[hdr];
+        for (int32_t ci = 0; ci < n_const; ci++) {
+            size_t sz = (size_t)(body->op_count - insert_pos) * sizeof(int32_t);
+            memmove(&body->op_kind[insert_pos + 1], &body->op_kind[insert_pos], sz);
+            memmove(&body->op_dst[insert_pos + 1],  &body->op_dst[insert_pos],  sz);
+            memmove(&body->op_a[insert_pos + 1],    &body->op_a[insert_pos],    sz);
+            memmove(&body->op_b[insert_pos + 1],    &body->op_b[insert_pos],    sz);
+            memmove(&body->op_c[insert_pos + 1],    &body->op_c[insert_pos],    sz);
+            body->op_kind[insert_pos] = const_kind[ci];
+            body->op_dst[insert_pos]  = const_dst[ci];
+            body->op_a[insert_pos]    = const_a[ci];
+            body->op_b[insert_pos]    = const_b[ci];
+            body->op_c[insert_pos]    = 0;
+            body->op_count++;
+            int32_t orig_pos = const_pos[ci] + ci + 1;
+            if (orig_pos >= 0 && orig_pos < body->op_count &&
+                body->op_kind[orig_pos] == const_kind[ci] &&
+                body->op_dst[orig_pos] == const_dst[ci]) {
+                body->op_kind[orig_pos] = 0;
+            }
+            for (int32_t bi = 0; bi < block_count; bi++) {
+                if (bi != hdr && body->block_op_start[bi] >= insert_pos)
+                    body->block_op_start[bi]++;
+            }
+            body->block_op_count[hdr]++;
+        }
+        __atomic_add_fetch(&cold_egraph_licm_hoisted, n_const, __ATOMIC_RELAXED);
+#undef COLD_LICM_MAX
+    }
+    free(writer_count);
 }
 
 static void codegen_func(Code *code, BodyIR *body, Symbols *symbols,
                          FunctionPatchList *function_patches) {
     na_reset();
-    cold_optimize_body(body);
+    cold_optimize_body(body, true);
     int32_t frame_size = align_i32(body->frame_size, 16);
     code_emit(code, a64_stp_pre(19, 20, SP, -16));
     code_emit(code, a64_stp_pre(FP, LR, SP, -16));
@@ -12381,6 +12481,7 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
                                   entry_function, reachable_functions);
 
     cold_egraph_rewrite_count = 0;
+    cold_egraph_licm_hoisted = 0;
     FunctionPatchList function_patches = {0};
     function_patches.arena = code->arena;
 
@@ -13018,6 +13119,7 @@ typedef struct ColdCompileStats {
     int32_t canonical_hash_count;
     int32_t canonical_normalized_count;
     int32_t egraph_rewrite_count;
+    int32_t egraph_licm_hoisted;
     int32_t egraph_dedup_count;
     int32_t total_function_count;
     int32_t link_object;
@@ -15160,6 +15262,7 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
         if (stats) {
             stats->function_count = symbols->function_count;
             stats->egraph_rewrite_count = cold_egraph_rewrite_count;
+            stats->egraph_licm_hoisted = cold_egraph_licm_hoisted;
             stats->egraph_dedup_count = cold_egraph_dedup_count;
             stats->csg_lowering = 1;
             stats->arena_kb = arena->used / 1024;
@@ -16173,7 +16276,7 @@ static bool cold_write_system_link_exec_report(const char *path,
     fputs("full_backend_codegen=0\n", file);
     fprintf(file, "target=%s\n", target ? target : "");
     fprintf(file, "emit=%s\n", emit ? emit : "");
-    if (emit && strcmp(emit, "csg-v2") == 0) {
+    if (emit && (strcmp(emit, "csg-v2") == 0 || strcmp(emit, "csg-v2-primary") == 0)) {
         fprintf(file, "cold_csg_v2_writer_status=%s\n", success ? "ok" : "fail");
     }
     fprintf(file, "source=%s\n", source_path ? source_path : "");
@@ -16233,6 +16336,7 @@ static bool cold_write_system_link_exec_report(const char *path,
         fprintf(file, "canonical_normalized_count=%d\n", stats->canonical_normalized_count);
         fprintf(file, "total_function_count=%d\n", stats->total_function_count);
         fprintf(file, "egraph_rewrite_count=%d\n", stats->egraph_rewrite_count);
+        fprintf(file, "egraph_licm_hoisted=%d\n", stats->egraph_licm_hoisted);
         fprintf(file, "egraph_dedup_count=%d\n", stats->egraph_dedup_count);
         fprintf(file, "ownership_compile_entry=%d\n", stats->ownership_compile_entry);
         fprintf(file, "ownership_runtime_witness=%d\n", stats->ownership_runtime_witness);
@@ -16457,6 +16561,22 @@ done:
 #define COLD_PROVIDER_ARCHIVE_HASH_OFFSET 28u
 #define COLD_PROVIDER_ARCHIVE_HEADER_SIZE 36u
 #define COLD_PROVIDER_ARCHIVE_MACHO_ERROR "Mach-O relocatable provider archive reader/linker unsupported"
+
+/* Mach-O relocatable object view (MH_OBJECT) */
+typedef struct ColdMachOObjectView {
+const uint8_t *data;
+int32_t len;
+int32_t text_offset;
+int32_t text_size;
+const uint32_t *words;
+int32_t word_count;
+const struct { uint32_t n_strx; uint8_t n_type; uint8_t n_sect; int16_t n_desc; uint64_t n_value; } *syms;
+int32_t sym_count;
+const char *strtab;
+uint64_t strtab_size;
+const struct { int32_t r_address; uint32_t r_symbolnum : 24; uint32_t r_pcrel : 1; uint32_t r_length : 2; uint32_t r_extern : 1; uint32_t r_type : 4; } *relas;
+int32_t reloc_count;
+} ColdMachOObjectView;
 
 typedef struct ColdElfObjectView {
     const uint8_t *data;
@@ -16775,6 +16895,70 @@ static bool cold_verify_provider_archive(const char *path,
 done:
     if (archive.len > 0) munmap((void *)archive.ptr, (size_t)archive.len);
     return ok;
+}
+
+
+/* Mach-O relocatable object reader (MH_OBJECT) */
+static bool cold_read_macho_relocatable_view(const uint8_t *data,
+                                              int32_t len,
+                                              const char *target,
+                                              ColdMachOObjectView *out) {
+    if (!data || len < 32 || !out) return false;
+    if (strcmp(target, "arm64-apple-darwin") != 0) return false;
+    memset(out, 0, sizeof(*out));
+    /* MH_OBJECT header */
+    uint32_t magic = cold_u32le(data);
+    if (magic != 0xfeedfacf) return false; /* MH_MAGIC_64 */
+    uint32_t cputype = cold_u32le(data + 4);
+    if (cputype != 0x0100000c) return false; /* CPU_TYPE_ARM64 */
+    uint32_t filetype = cold_u32le(data + 12);
+    if (filetype != 1) return false; /* MH_OBJECT */
+    uint32_t ncmds = cold_u32le(data + 16);
+    uint32_t sizeofcmds = cold_u32le(data + 20);
+    if (ncmds == 0 || sizeofcmds == 0) return false;
+    if (!cold_file_range_ok(len, 32, sizeofcmds)) return false;
+    
+    const uint8_t *cmds = data + 32;
+    uint32_t cmd_pos = 0;
+    for (uint32_t ci = 0; ci < ncmds; ci++) {
+        if (cmd_pos + 8 > sizeofcmds) return false;
+        uint32_t cmd = cold_u32le(cmds + cmd_pos);
+        uint32_t cmdsize = cold_u32le(cmds + cmd_pos + 4);
+        if (cmdsize < 8 || cmd_pos + cmdsize > sizeofcmds) return false;
+        
+        if (cmd == 0x19) { /* LC_SEGMENT_64 */
+            if (cmdsize < 72) return false;
+            uint64_t fileoff = cold_u64le(cmds + cmd_pos + 48);
+            uint64_t filesize = cold_u64le(cmds + cmd_pos + 56);
+            if (fileoff > (uint64_t)len || filesize > (uint64_t)(len - (int32_t)fileoff)) return false;
+            if (filesize > (uint64_t)INT32_MAX) return false;
+            out->text_offset = (int32_t)fileoff;
+            out->text_size = (int32_t)filesize;
+            out->words = (const uint32_t *)(data + fileoff);
+            out->word_count = (int32_t)(filesize / 4);
+        } else if (cmd == 0x02) { /* LC_SYMTAB */
+            if (cmdsize < 24) return false;
+            uint32_t symoff = cold_u32le(cmds + cmd_pos + 8);
+            uint32_t nsyms = cold_u32le(cmds + cmd_pos + 12);
+            uint32_t stroff = cold_u32le(cmds + cmd_pos + 16);
+            uint32_t strsize = cold_u32le(cmds + cmd_pos + 20);
+            if (symoff > (uint32_t)len || stroff > (uint32_t)len) return false;
+            if (nsyms > 0 && symoff + nsyms * 16 > (uint32_t)len) return false;
+            if (strsize > 0 && stroff + strsize > (uint32_t)len) return false;
+            out->syms = (const void *)(data + symoff);
+            out->sym_count = (int32_t)nsyms;
+            out->strtab = (const char *)(data + stroff);
+            out->strtab_size = strsize;
+        }
+        cmd_pos += cmdsize;
+    }
+    if (out->word_count <= 0 || out->text_size <= 0) return false;
+    out->data = data;
+    out->len = len;
+    /* Mach-O relocations are in section headers; for now mark as 0 */
+    out->relas = 0;
+    out->reloc_count = 0;
+    return true;
 }
 
 static bool cold_read_elf64_relocatable_view(const uint8_t *data,
@@ -17867,6 +18051,191 @@ bool cold_compile_source_to_object(const char *out_path,
     return ok;
 }
 
+static void cold_csg_v2_write_hex_byte(FILE *f, uint8_t byte) {
+    static const char hex[] = "0123456789abcdef";
+    fputc(hex[(byte >> 4) & 0xF], f);
+    fputc(hex[byte & 0xF], f);
+}
+
+static void cold_csg_v2_write_hex_be(FILE *f, uint32_t value, int32_t nybbles) {
+    static const char hex[] = "0123456789abcdef";
+    for (int32_t shift = (nybbles - 1) * 4; shift >= 0; shift -= 4)
+        fputc(hex[(value >> shift) & 0xF], f);
+}
+
+static void cold_csg_v2_write_payload_u32le(FILE *f, uint32_t value) {
+    cold_csg_v2_write_hex_byte(f, (uint8_t)(value & 0xFF));
+    cold_csg_v2_write_hex_byte(f, (uint8_t)((value >> 8) & 0xFF));
+    cold_csg_v2_write_hex_byte(f, (uint8_t)((value >> 16) & 0xFF));
+    cold_csg_v2_write_hex_byte(f, (uint8_t)((value >> 24) & 0xFF));
+}
+
+static void cold_csg_v2_write_payload_span(FILE *f, Span text) {
+    cold_csg_v2_write_payload_u32le(f, (uint32_t)text.len);
+    for (int32_t i = 0; i < text.len; i++)
+        cold_csg_v2_write_hex_byte(f, text.ptr[i]);
+}
+
+static void cold_csg_v2_write_record_header(FILE *f, uint16_t kind, uint32_t payload_bytes) {
+    fputc('R', f);
+    cold_csg_v2_write_hex_be(f, kind, 4);
+    cold_csg_v2_write_hex_be(f, payload_bytes, 8);
+}
+
+static void cold_csg_v2_write_string_record(FILE *f, uint16_t kind, Span text) {
+    cold_csg_v2_write_record_header(f, kind, (uint32_t)(4 + text.len));
+    cold_csg_v2_write_payload_span(f, text);
+    fputc('\n', f);
+}
+
+static void cold_csg_v2_write_word_record(FILE *f, uint32_t word) {
+    cold_csg_v2_write_record_header(f, 5, 4);
+    cold_csg_v2_write_payload_u32le(f, word);
+    fputc('\n', f);
+}
+
+static void cold_csg_v2_write_function_record(FILE *f,
+                                              uint32_t item_id,
+                                              uint32_t word_offset,
+                                              uint32_t word_count,
+                                              Span symbol_name,
+                                              Span body_kind) {
+    uint32_t payload_bytes = 12u + 4u + (uint32_t)symbol_name.len +
+                             4u + (uint32_t)body_kind.len;
+    cold_csg_v2_write_record_header(f, 4, payload_bytes);
+    cold_csg_v2_write_payload_u32le(f, item_id);
+    cold_csg_v2_write_payload_u32le(f, word_offset);
+    cold_csg_v2_write_payload_u32le(f, word_count);
+    cold_csg_v2_write_payload_span(f, symbol_name);
+    cold_csg_v2_write_payload_span(f, body_kind);
+    fputc('\n', f);
+}
+
+static void cold_csg_v2_write_reloc_record(FILE *f,
+                                           uint32_t source_item_id,
+                                           uint32_t word_offset,
+                                           Span target_symbol) {
+    uint32_t payload_bytes = 8u + 4u + (uint32_t)target_symbol.len;
+    cold_csg_v2_write_record_header(f, 6, payload_bytes);
+    cold_csg_v2_write_payload_u32le(f, source_item_id);
+    cold_csg_v2_write_payload_u32le(f, word_offset);
+    cold_csg_v2_write_payload_span(f, target_symbol);
+    fputc('\n', f);
+}
+
+static int32_t cold_csg_v2_source_item_for_word(bool *emit_function,
+                                                int32_t *symbol_offset,
+                                                int32_t *symbol_end,
+                                                int32_t func_count,
+                                                int32_t word_pos) {
+    for (int32_t i = 0; i < func_count; i++)
+        if (emit_function[i] &&
+            symbol_offset[i] <= word_pos &&
+            word_pos < symbol_end[i])
+            return i;
+    return -1;
+}
+
+static bool cold_emit_canonical_csg_v2_facts_from_bodyir(const char *path,
+                                                         BodyIR **function_bodies,
+                                                         int32_t body_cap,
+                                                         Symbols *symbols,
+                                                         const char *target) {
+    if (!path || !function_bodies || !symbols || symbols->function_count <= 0) return false;
+    if (!target ||
+        (strcmp(target, "arm64-apple-darwin") != 0 &&
+         strcmp(target, "aarch64-unknown-linux-gnu") != 0)) return false;
+    const char *object_format = cold_csg_v2_object_format_for_target(target);
+    if (!object_format || object_format[0] == '\0') return false;
+
+    Arena *arena = symbols->arena;
+    int32_t func_count = symbols->function_count;
+    bool *emit_function = arena_alloc(arena, (size_t)func_count * sizeof(bool));
+    int32_t *symbol_offset = arena_alloc(arena, (size_t)func_count * sizeof(int32_t));
+    int32_t *symbol_end = arena_alloc(arena, (size_t)func_count * sizeof(int32_t));
+    int32_t emit_count = 0;
+    for (int32_t i = 0; i < func_count; i++) {
+        emit_function[i] = false;
+        symbol_offset[i] = -1;
+        symbol_end[i] = -1;
+        BodyIR *body = i < body_cap ? function_bodies[i] : 0;
+        if (!body) continue;
+        if (!cold_body_codegen_ready(body)) return false;
+        emit_function[i] = true;
+        emit_count++;
+    }
+    if (emit_count <= 0) return false;
+
+    Code *shared = code_new(arena, 1024);
+    FunctionPatchList function_patches = {0};
+    function_patches.arena = arena;
+    for (int32_t i = 0; i < func_count; i++) {
+        if (!emit_function[i]) continue;
+        symbol_offset[i] = shared->count;
+        codegen_func(shared, function_bodies[i], symbols, &function_patches);
+        symbol_end[i] = shared->count;
+    }
+
+    int32_t reloc_cap = function_patches.count > 0 ? function_patches.count : 1;
+    int32_t *reloc_source = arena_alloc(arena, (size_t)reloc_cap * sizeof(int32_t));
+    int32_t *reloc_word = arena_alloc(arena, (size_t)reloc_cap * sizeof(int32_t));
+    int32_t *reloc_target = arena_alloc(arena, (size_t)reloc_cap * sizeof(int32_t));
+    int32_t reloc_count = 0;
+    for (int32_t pi = 0; pi < function_patches.count; pi++) {
+        FunctionPatch patch = function_patches.items[pi];
+        if (patch.target_function < 0 || patch.target_function >= func_count) return false;
+        int32_t target_off = symbol_offset[patch.target_function];
+        if (target_off >= 0) {
+            int32_t delta = target_off - patch.pos;
+            shared->words[patch.pos] = (shared->words[patch.pos] & 0xFC000000u) |
+                                       ((uint32_t)delta & 0x03FFFFFFu);
+            continue;
+        }
+        if (!symbols->functions[patch.target_function].is_external) return false;
+        int32_t source_item = cold_csg_v2_source_item_for_word(emit_function, symbol_offset,
+                                                               symbol_end, func_count,
+                                                               patch.pos);
+        if (source_item < 0 || reloc_count >= reloc_cap) return false;
+        reloc_source[reloc_count] = source_item;
+        reloc_word[reloc_count] = patch.pos;
+        reloc_target[reloc_count] = patch.target_function;
+        reloc_count++;
+    }
+
+    FILE *f = fopen(path, "wb");
+    if (!f) return false;
+    static const char body_kind_text[] = "cold_body_ir_codegen";
+    Span body_kind = {(const uint8_t *)body_kind_text, (int32_t)strlen(body_kind_text)};
+    Span target_span = {(const uint8_t *)target, (int32_t)strlen(target)};
+    Span format_span = {(const uint8_t *)object_format, (int32_t)strlen(object_format)};
+    Span entry_span = {(const uint8_t *)"main", 4};
+    fwrite("CHENG_CSG_V2\n", 1, 13, f);
+    cold_csg_v2_write_string_record(f, 1, target_span);
+    cold_csg_v2_write_string_record(f, 2, format_span);
+    cold_csg_v2_write_string_record(f, 3, entry_span);
+    for (int32_t i = 0; i < func_count; i++) {
+        if (!emit_function[i]) continue;
+        Span name = cold_fn_object_symbol_span(&symbols->functions[i], false);
+        if (name.len <= 0) { fclose(f); return false; }
+        cold_csg_v2_write_function_record(f, (uint32_t)i,
+                                          (uint32_t)symbol_offset[i],
+                                          (uint32_t)(symbol_end[i] - symbol_offset[i]),
+                                          name, body_kind);
+    }
+    for (int32_t i = 0; i < shared->count; i++)
+        cold_csg_v2_write_word_record(f, shared->words[i]);
+    for (int32_t i = 0; i < reloc_count; i++) {
+        Span target_name = cold_fn_object_symbol_span(&symbols->functions[reloc_target[i]], true);
+        if (target_name.len <= 0) { fclose(f); return false; }
+        cold_csg_v2_write_reloc_record(f, (uint32_t)reloc_source[i],
+                                       (uint32_t)reloc_word[i],
+                                       target_name);
+    }
+    bool ok = ferror(f) == 0;
+    fclose(f);
+    return ok;
+}
+
 /* ================================================================
  * CSG v2 binary format writer
  * ================================================================ */
@@ -18407,7 +18776,9 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
         fprintf(stderr, "[cheng_cold] unsupported target: %s\n", target);
         return 2;
     }
-    if (strcmp(emit, "exe") != 0 && strcmp(emit, "obj") != 0 && strcmp(emit, "csg") != 0 && strcmp(emit, "csg-v2") != 0) {
+    if (strcmp(emit, "exe") != 0 && strcmp(emit, "obj") != 0 &&
+        strcmp(emit, "csg") != 0 && strcmp(emit, "csg-v2") != 0 &&
+        strcmp(emit, "csg-v2-primary") != 0) {
         cold_write_system_link_exec_report(report_path, false, source_path, effective_csg_path, out_path,
                                            target, emit, 0, "unsupported emit");
         fprintf(stderr, "[cheng_cold] unsupported emit: %s\n", emit);
@@ -18558,11 +18929,13 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
         return 0;
 #endif
     }
-    /* --emit:csg-v2 = emit binary CSG v2 facts file */
-    if (strcmp(emit, "csg-v2") == 0) {
+    /* --emit:csg-v2 = emit internal BodyIR facts.
+       --emit:csg-v2-primary = emit canonical primary-object facts. */
+    if (strcmp(emit, "csg-v2") == 0 || strcmp(emit, "csg-v2-primary") == 0) {
+        bool primary_csg_v2_emit = strcmp(emit, "csg-v2-primary") == 0;
         /* CSG v2 fixed-point roundtrip: read facts, codegen (DSE), re-emit.
            This operates on CSG facts directly; no source compilation needed. */
-        if (csg_in_path && csg_in_path[0] != '\0' &&
+        if (!primary_csg_v2_emit && csg_in_path && csg_in_path[0] != '\0' &&
             (!source_path || source_path[0] == '\0')) {
             uint64_t rp_start = cold_now_us();
             Arena *rp_arena = mmap(0, sizeof(Arena), PROT_READ | PROT_WRITE,
@@ -18586,7 +18959,7 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
                 /* Apply dead-store elimination (the primary BodyIR mutation) */
                 for (int32_t i = 0; i < rp_count; i++) {
                     BodyIR *b = rp_bodies[i];
-                    if (b && !b->has_fallback) cold_optimize_body(b);
+                    if (b && !b->has_fallback) cold_optimize_body(b, false);
                 }
                 rp_ok = cold_emit_csg_v2_facts(out_path, rp_bodies, rp_count, rp_sym, target);
             }
@@ -18614,8 +18987,8 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
 #ifndef COLD_BACKEND_ONLY
         if (!source_path || source_path[0] == '\0') {
             cold_write_system_link_exec_report(report_path, false, source_path, out_path, out_path,
-                                               target, emit, 0, "missing --in for emit:csg-v2");
-            fprintf(stderr, "[cheng_cold] --emit:csg-v2 requires --in:<source>\n");
+                                               target, emit, 0, "missing --in for csg-v2 emit");
+            fprintf(stderr, "[cheng_cold] csg-v2 emit requires --in:<source>\n");
             return 2;
         }
         /* Parse source into BodyIR, then serialize as CSG v2 */
@@ -18749,8 +19122,12 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
             function_bodies = grown;
         }
 
-        if (!cold_emit_csg_v2_facts(out_path, function_bodies, symbols->function_count,
-                                     symbols, target)) {
+        bool emit_ok = primary_csg_v2_emit
+            ? cold_emit_canonical_csg_v2_facts_from_bodyir(out_path, function_bodies,
+                                                           body_cap, symbols, target)
+            : cold_emit_csg_v2_facts(out_path, function_bodies, symbols->function_count,
+                                      symbols, target);
+        if (!emit_ok) {
             cold_write_system_link_exec_report(report_path, false, source_path, out_path, out_path,
                                                target, emit, 0, "csg-v2 emit failed");
             fprintf(stderr, "[cheng_cold] csg-v2 emit failed\n");
@@ -19386,12 +19763,12 @@ int main(int argc, char **argv) {
         return cold_cmd_system_link_exec(argc, argv);
     }
     if (argc >= 2 && strcmp(argv[1], "emit-cold-csg-v2") == 0) {
-        /* Route to system-link-exec with --emit:csg-v2 */
+        /* Route public command to canonical primary-object facts. */
         int32_t new_argc = argc + 1;
         const char **new_argv = (const char **)malloc((size_t)(new_argc + 1) * sizeof(char *));
         new_argv[0] = argv[0];
         new_argv[1] = "system-link-exec";
-        new_argv[2] = "--emit:csg-v2";
+        new_argv[2] = "--emit:csg-v2-primary";
         for (int32_t i = 2; i < argc; i++) new_argv[i + 1] = argv[i];
         new_argv[new_argc] = 0;
         int32_t rc = cold_cmd_system_link_exec(new_argc, (char **)new_argv);

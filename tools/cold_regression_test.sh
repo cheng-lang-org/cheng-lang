@@ -68,6 +68,9 @@ compile_run_timed() {
 ACT=$(compile_run src/tests/ordinary_zero_exit_fixture.cheng /tmp/ct_oz)
 assert "ordinary_zero" 0 "$ACT"
 
+ACT=$(compile_run src/tests/cold_var_index_smoke.cheng /tmp/ct_var_index)
+assert "var_index_smoke" 0 "$ACT"
+
 rm -f /tmp/ct_iu /tmp/ct_iu.report
 quiet $COLD system-link-exec --in:src/tests/import_use.cheng \
     --target:arm64-apple-darwin --out:/tmp/ct_iu --report-out:/tmp/ct_iu.report
@@ -1288,6 +1291,17 @@ EOF
 ACT=$(compile_run_timed "$COLD" /tmp/ct_mutual_rec.cheng /tmp/ct_mutual_rec_out 10)
 assert "mutual_recursion" 0 "$ACT"
 rm -f /tmp/ct_mutual_rec.cheng /tmp/ct_mutual_rec_out
+
+# --- i32_mul_large (regression: verify no 8-bit truncation) ---
+cat > /tmp/ct_i32_mul_large.cheng << 'EOF'
+fn main(): int32 =
+    let a: int32 = 100 * 100
+    let b: int32 = 1000 * 1000
+    return (a + b) - 1010000
+EOF
+ACT=$(compile_run_timed "$COLD" /tmp/ct_i32_mul_large.cheng /tmp/ct_i32_mul_large_out 10)
+assert "i32_mul_large" 0 "$ACT"
+rm -f /tmp/ct_i32_mul_large.cheng /tmp/ct_i32_mul_large_out
 
 echo ""
 echo "=== $PASS passed, $FAIL failed ==="
