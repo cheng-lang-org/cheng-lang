@@ -7,9 +7,9 @@
 | 模块 | 进度 | 判断 |
 |---|---|---|
 | 冷编译器基础 codegen | 88% | 133 BodyIR ops 覆盖，三架构 ARM64/x86_64/RISC-V，direct Mach-O 可运行；large frame >32KB 支持，load/store 寄存器偏移路径已覆盖 |
-| CSG v2 facts 往返 | 89% | `tools/cold_csg_v2_roundtrip_test.sh` 本地实跑 724/724 PASS；cross-version 确定性 O0≡O2 已证明；canonical `CHENG_CSG_V2` reader 最小 object/link smoke 已锁；object/exe 确定性成立 |
-| PrimaryObjectPlan → facts | 64% | internal `CHENGCSG` writer/reader 已闭合到 backend driver 事实；canonical `CHENG_CSG_V2` writer 已在源码存在，但 artifact 命令仍未切到 canonical 输出 |
-| cold --csg-in --emit:obj | 82% | 最小 fixture、cold subset、provider archive smoke 稳定；88/88 回归 + 724/724 CSG v2 PASS；runtime provider 纯常量 root 集已接入 root-selective archive 链接报告门禁 |
+| CSG v2 facts 往返 | 90% | `tools/cold_csg_v2_roundtrip_test.sh` 本地实跑 732/732 PASS；cross-version 确定性 O0≡O2 已证明；canonical `CHENG_CSG_V2` writer/reader 最小 object/link smoke 已锁；object/exe 确定性成立 |
+| PrimaryObjectPlan → facts | 66% | public `emit-cold-csg-v2` 已输出 canonical `CHENG_CSG_V2`；internal `CHENGCSG` 只保留给显式 cold self-test；完整 Cheng `PrimaryObjectPlan` writer 刷新仍受 `build-backend-driver` smoke mismatch 阻塞 |
+| cold --csg-in --emit:obj | 83% | 最小 fixture、cold subset、provider archive smoke 稳定；98/98 回归 + 732/732 CSG v2 PASS；runtime provider 纯常量 root 集已接入 root-selective archive 链接报告门禁 |
 | cold linkerless exe | 78% | provider-free 可行；A/B witness 通过；多 provider archive ELF 链路、`--csg-in --provider-archive`、10 个 runtime provider 纯常量 roots 自动归档链接报告已由门禁覆盖；`get_nprocs` 非纯常量 root 已锁 hard-fail |
 | provider archive | 73% | `provider-archive-pack` + `--link-object/--csg-in --provider-archive` 已覆盖多 ELF member/export、缺 export hard-fail；Mach-O archive 入口已明确硬失败；10 个 Linux runtime 纯常量 roots 已走 primary undefined symbol 自动选 root 并锁链接报告；首个非纯常量 root 锁住外部符号未解析 hard-fail |
 | backend driver fixed-point | 55% | A/B witness 通过（产物 SHA 一致，关键报告字段对等）；cross-version 确定性成立（O0/O2 对 19 fixture 产出 bit-identical .o 与 .csgv2）；cross-version proven |
@@ -27,16 +27,16 @@
 
 - **冷编译器三架构 codegen**：ARM64/x86_64/RISC-V 全 133 BodyIR ops 覆盖
 - **ordinary provider-free direct Mach-O**：`ordinary_zero_exit_fixture` 直接编译运行 exit 0
-- **CSG v2 facts 往返**：`tools/cold_csg_v2_roundtrip_test.sh` 724/724 PASS
-  - Cheng writer → facts → cold reader → .o → cmp（确定性验证）
-  - canonical `CHENG_CSG_V2` 最小 reader/object/link smoke 已锁；artifact writer 尚未切到 canonical 输出
+- **CSG v2 facts 往返**：`tools/cold_csg_v2_roundtrip_test.sh` 732/732 PASS
+  - public `emit-cold-csg-v2` → canonical facts → cold reader → .o → link/run
+  - internal `CHENGCSG` fixed-point 仍由显式 `system-link-exec --emit:csg-v2` 锁定
   - 错误输入 hard-fail（unknown record、truncated）
   - report 字段全输出（facts_bytes/mmap_ms/verify_ms/decode_ms/total_ms）
 - **三架构 ELF/Mach-O exe 直出**：ARM64 Mach-O + RISC-V/x86_64 ELF64 executable
 - **内置 ELF 链接器**：obj 路径自动产出 `.linked` 可执行文件，`--link-object` 可显式消费 ELF `.o`
 - **provider archive / runtime link-report smoke**：`provider-archive-pack` 生成 `.chenga`，`system-link-exec --link-object/--csg-in --provider-archive` 解析 primary undefined symbol 并链接 provider ELF member，report 锁 `provider_archive_member_count=2`、`provider_export_count=2`、`provider_resolved_symbol_count=2`、`system_link=0`、`linkerless_image=1`；`--link-providers` 已能从 primary undefined symbols 自动选择 10 个 Linux runtime 纯常量 roots 并链接真实 provider archive；`cheng_native_system_cpu_logical_cores_value_bridge` 会暴露 `get_nprocs` 未解析 hard-fail；该门禁只锁链接报告，不声明目标 ELF 运行语义
 - **E-Graph 合同边界**：CSE 已移除；当前保留 DSE、24+ rewrite rules（整数/位运算恒等式 + 强度缩减，含 EQ(x,x)→CONST 1 identity、double-NEG/NOT 消除）带 intra-block 安全证明、canonical hash 合同；`normalization_coverage=I32_I64_bitwise_integer_only`，浮点不参与 canonical hash 操作数重排。LICM CONST hoisting 已实现但不在 codegen 主线中。没有 UIR E-Graph，没有跨块 rewrite。
-- **fixed-point**：internal `CHENGCSG` writer/reader 对同一输入产出 bit-identical facts；canonical writer 仍等 artifact 接通后再计入
+- **fixed-point**：internal `CHENGCSG` writer/reader 只作为显式 cold self-test 产出 bit-identical facts；public canonical writer 已有 ordinary fixture writer/read/link/run smoke；完整 Cheng `PrimaryObjectPlan` writer 路径仍受 `build-backend-driver` smoke mismatch 阻塞
 - **文件拆分**：`cold_parser.c` 独立，`COLD_BACKEND_ONLY` 42% 缩减（590KB→344KB）
 - **跨端编译**：ARM64 Mach-O + RISC-V/x86_64 ELF64 obj + exe
 - **编译时间**：exe 路径 0.2-2ms，source 路径 12-15ms
@@ -57,17 +57,18 @@
 ### 本次会话（2026-05-14）：回归矩阵扩展 + E-Graph 边界收紧
 
 **本地实跑**：
-- 88/88 冷回归 PASS，724/724 CSG v2 roundtrip PASS ✅
+- 98/98 冷回归 PASS，732/732 CSG v2 roundtrip PASS ✅
 - `ordinary_zero_exit_fixture` provider-backed 编译运行 exit 0 ✅
 - `atomic_i32_runtime_smoke` / `compiler_runtime_smoke` 全部通过 ✅
 
 **本轮有效推进**：
-- `tools/cold_regression_test.sh` 88/88 PASS，`tools/cold_csg_v2_roundtrip_test.sh` 724/724 PASS。
+- `tools/cold_regression_test.sh` 98/98 PASS，`tools/cold_csg_v2_roundtrip_test.sh` 732/732 PASS。
 - **C seed manifest 扩展（6 blockers）**：typed const imports、add() l-value、importc/exportc names、array literal 上限 64→1024、..<= for-loop range、multi-level field assign a.b.c = expr，全部修复；system_link_plan.cheng + compiler_runtime.cheng 可编译；parser.cheng 推进中。
 - **LICM 变换已实现**：不变量 CONST 提升到循环头部的逻辑已编码（commit 9289ef25），但不在当前 codegen 主路径中运行；需收敛证明后再进入 active 变换。
 - **代数恒等式扩展**：新增 EQ(x,x)→CONST 1 identity rewrite rule（commit 05171923）；double-NEG/NOT 消除（commit 86307b6d）。
-- **回归矩阵扩展至 88**：新增 compare_ops（!= >= <= == 短路求值）、type alias、nested if/loop、string cmp、recursion、mutual_recursion、multi_level_field_assign 等测试。
-- **+323 CSG v2 fixtures，回归矩阵继续扩展**：CSG v2 主体 internal 数量跃升至 716；当前总门禁 724 含 canonical reader 最小 smoke，冷回归当前拓展至 88（含 float/recursion/string WIP fixtures，commit 519d8a70、47ce9cf9）。
+- **回归矩阵扩展至 98**：新增 compare_ops（!= >= <= == 短路求值）、type alias、type alias index、nested if/loop、string cmp、recursion、mutual_recursion、multi_level_field_assign、var index 等测试。
+- **CSG v2 fixtures 继续扩展**：当前总门禁 732，含 canonical writer/read/link/run smoke 与 internal fixed-point；冷回归当前拓展至 98。
+- **输出合同硬化**：新增 `build_backend_driver_no_debug_noise`，锁定 `build-backend-driver` stdout/stderr 不允许泄漏无条件 BodyIR/op debug dump。
 - **MAKE_SEQ_I32**：x64/RISC-V codegen 新增序列化立即数编码（commit 519d8a70）。
 - **算术类型检查放宽**：OPAQUE/OPAQUE_REF slots 允许通过算术类型检查（commit 484d75f8）。
 - **Ownership CI gate 已接入**：ownership proof 驱动 CI gate 已接线，fixed-point 提升至 55%（cross-version proven，commit 152398b7）。
@@ -82,7 +83,7 @@
 ### 历史记录（2026-05-14）：provider archive 最小闭环 + mutable-slot CSE 禁用
 
 - **provider archive 最小闭环已落地**：`provider-archive-pack` 接受 `--target/--object/--export/--module/--source/--out/--report-out`，写 `.chenga` archive、member count、export count、hash 和 report。`system-link-exec --link-object:<primary.o> --provider-archive:<provider.chenga> --emit:exe` 在 cold 内部读取 ELF relocatable object 和 archive，解析 undefined symbol，应用 call relocation，生成 ELF executable。
-- **门禁已更新**：`tools/cold_csg_v2_roundtrip_test.sh` 覆盖正向 provider archive、坏 magic、缺 export、双 provider member/export、`--csg-in --provider-archive`、CSG v2 fixed-point、DSE noop、Darwin runtime marker object、Mach-O provider archive pack/link 硬失败，并新增 canonical `CHENG_CSG_V2` reader 最小 object/link smoke。当前结果为 **724/724 PASS**。
+- **门禁已更新**：`tools/cold_csg_v2_roundtrip_test.sh` 覆盖正向 provider archive、坏 magic、缺 export、双 provider member/export、`--csg-in --provider-archive`、CSG v2 fixed-point、DSE noop、Darwin runtime marker object、Mach-O provider archive pack/link 硬失败，并新增 canonical `CHENG_CSG_V2` writer/read/link/run smoke。当前结果为 **732/732 PASS**。
 - **当前边界**：archive 已支持多 ELF member/export，目标限定在当前 cold ELF reloc linker 支持的 AArch64/RISC-V；runtime provider 纯常量 roots 已锁链接报告，首个非纯常量 root 已锁 `get_nprocs` 未解析 hard-fail，目标运行 marker 仍需逐个纳入；Darwin Mach-O provider archive reader/linker 不支持并已硬失败锁定。
 - **mutable-slot CSE 与 hash-only dedup 已禁用**：原先的 mutating rewrite 会把 build-backend-driver 的 system-link smoke 编错；hash-only 函数去重会把不同零参函数合并到同一地址，导致 `compiler_runtime_smoke` 读到错误字符串。当前只保留 DSE 和可证明代数恒等式；后续 E-Graph 必须先做只读等价证明和运行门禁，再允许 rewrite。
 - **函数参数 no_alias 标记已撤销**：参数参与跨 block/call 后的值流，直接标记为 no_alias 会污染寄存器缓存假设。No-Alias 当前只对明确局部标量 slot 生效。
@@ -111,7 +112,7 @@
 - **参数匹配 I32↔I64 互容**：`cold_call_args_match` 与 `cold_validate_call_args` 均增加 int32↔int64 参数互容，`A64EncBImm(int64)` 接受 `2`(int32) 调用不再失败。
 - **I64_REF 识别**：`parse_arith_expr` 和 `parse_term` 的 I64 分支同步检查 `SLOT_I64_REF`，`let x: uint64 = ...` 的位运算不再错误返回零值。
 - **Combined kernel 全路径通过**：`cold_bootstrap_kernel_combined.cheng` (2035 行) source-direct 路径 exit 42。`cold_bootstrap_kernel_aarch64_encode.cheng` source-direct 路径 exit 42。`cold_bootstrap_kernel_frontend_scan.cheng` exit 42。
-- **历史回归矩阵**：28/28 冷编译器回归 PASS，13/13 bootstrap slice PASS，3/3 kernel PASS；当前基线见上方 88/88。
+- **历史回归矩阵**：28/28 冷编译器回归 PASS，13/13 bootstrap slice PASS，3/3 kernel PASS；当前基线见上方 98/98。
 
 ### 本次会话新增（2026-05-14）
 
@@ -623,7 +624,7 @@ fn LoweringBuildPrimaryObjectIr(...): PrimaryObjectIr =
 4. ✅ **E-Graph rewrite rules 活跃**：24+ rewrite rules（整数/位运算恒等式 + 强度缩减，含 EQ(x,x)→CONST 1 identity、double-NEG/NOT 消除）带 intra-block 安全证明；`normalization_coverage=I32_I64_bitwise_integer_only`，浮点不参与 canonical hash 操作数重排。LICM CONST hoisting 已实现但不在 codegen 主线中。CSE 已移除（BodyIR 可变 slot 不安全）。UIR E-Graph 仍 unavailable。Ownership report 字段已激活；No-Alias 局部标量仍活跃；函数参数 no_alias 已撤销。
 5. ✅ **函数级并行 + lock-free work-stealing**：pthread + `__atomic_fetch_add` + 确定性 merge。`COLD_NO_SIGN=1` 下任意 `BACKEND_JOBS` 值产物 SHA 一致。
 6. ✅ **30-80ms 架构合规**：6 个 report 字段全部输出，冷进程内微秒级计时。实测 135 函数/5293 ops 编译 total=22.5ms。
-7. ✅ **回归测试**：`tools/cold_regression_test.sh` 88/88 PASS，`tools/cold_csg_v2_roundtrip_test.sh` 724/724 PASS。
+7. ✅ **回归测试**：`tools/cold_regression_test.sh` 98/98 PASS，`tools/cold_csg_v2_roundtrip_test.sh` 732/732 PASS。
 8. ✅ **cold source-direct runtime smoke 通过**：`atomic_i32_runtime_smoke`、`thread_atomic_orc_runtime_smoke`、`compiler_runtime_smoke`、source-direct `while` 均通过；Linux runtime provider 纯常量 roots 目前只锁 link-report smoke，首个非纯常量 root 已锁 `get_nprocs` hard-fail，目标运行 marker 继续扩展。
 9. 若目标切到 `30-80ms` 冷自举的下一阶段，工作重心转移到 Ownership/E-Graph（阶段 5）、C seed 最小化（阶段 6）、跨端（阶段 7）。
 

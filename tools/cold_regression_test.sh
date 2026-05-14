@@ -356,6 +356,13 @@ else
     ACT=0
 fi
 assert "build_backend_driver_no_cc_fallback" 1 "$ACT"
+if ! grep -E '^(=== (AFTER REWRITE|BODY OPS|BODY TERMS|DEBUG)|  (op|term)\[[0-9]+\]:)' \
+    /tmp/ct_bd/stdout.txt /tmp/ct_bd/stderr.txt 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "build_backend_driver_no_debug_noise" 1 "$ACT"
 if [ -x /tmp/ct_bd/cheng ]; then
     /tmp/ct_bd/cheng status --root:. --in:src/core/tooling/backend_driver_dispatch_min.cheng \
         --out:/tmp/ct_bd/status.out >/tmp/ct_bd/status.stdout 2>/tmp/ct_bd/status.stderr
@@ -1136,6 +1143,19 @@ EOF
 ACT=$(compile_run_timed "$COLD" /tmp/ct_type_alias.cheng /tmp/ct_type_alias_out 10)
 assert "type_alias" 42 "$ACT"
 rm -f /tmp/ct_type_alias.cheng /tmp/ct_type_alias_out
+
+# --- type_alias_index (regression: type alias used as array index) ---
+cat > /tmp/ct_type_alias_idx.cheng << 'EOF'
+type Idx = int32
+
+fn main(): int32 =
+    var a: int32[4] = [10, 20, 30, 40]
+    var i: Idx = 2
+    return a[i]
+EOF
+ACT=$(compile_run_timed "$COLD" /tmp/ct_type_alias_idx.cheng /tmp/ct_type_alias_idx_out 10)
+assert "type_alias_index" 30 "$ACT"
+rm -f /tmp/ct_type_alias_idx.cheng /tmp/ct_type_alias_idx_out
 
 # --- deeply_nested_if (10 levels) ---
 cat > /tmp/ct_deep_if.cheng << 'EOF'

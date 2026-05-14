@@ -4787,7 +4787,13 @@ static int32_t cold_slot_kind_from_type_with_symbols(Symbols *symbols, Span type
         ObjectDef *obj = symbols_resolve_object(symbols, type);
         if (obj) return obj->is_ref ? SLOT_PTR : SLOT_OBJECT;
     }
-    if (known_type) return SLOT_VARIANT;
+    if (known_type) {
+        if (known_type->variant_count == 0 && !known_type->is_enum) {
+            /* Type alias (e.g. `type InternId = int32`): resolve to int32 as default */
+            return is_var ? SLOT_I32_REF : SLOT_I32;
+        }
+        return SLOT_VARIANT;
+    }
     if (cold_type_has_qualified_name(type)) return SLOT_OPAQUE;
     if (type.len > 1 && type.ptr[0] >= 'A' && type.ptr[0] <= 'Z') return SLOT_VARIANT;
     /* Unknown type: treat as opaque */
@@ -5235,10 +5241,6 @@ static void cold_csg_add_type(ColdCsg *csg, Span *fields, int32_t field_count) {
         type->generic_count = cold_split_top_level_commas(fields[3],
                                                           type->generic_names,
                                                           COLD_MAX_VARIANT_FIELDS);
-        fprintf(stderr, "[DBG] type %.*s generic_count=%d names=", fields[1].len, fields[1].ptr, type->generic_count);
-        for (int32_t gi = 0; gi < type->generic_count; gi++)
-            fprintf(stderr, "%.*s,", type->generic_names[gi].len, type->generic_names[gi].ptr);
-        fprintf(stderr, "\n");
     }
     int32_t start = 0;
     int32_t vi = 0;
@@ -11761,14 +11763,14 @@ static void cold_apply_identity_rewrites(BodyIR *body) {
                     /* Double NEG: SUB(0, SUB(0, y)) -> COPY(y) for I32 */
                     if (kind == BODY_OP_I32_SUB && a_safe &&
                         def >= 0 && body->op_kind[def] == BODY_OP_I32_SUB) {
-                        int32_t a_def = cur_writer[a];
-                        if (a_def >= 0 && body->op_kind[a_def] == BODY_OP_I32_CONST &&
-                            body->op_a[a_def] == 0) {
+                        int32_t inner_a_def2 = cur_writer[a];
+                        if (inner_a_def2 >= 0 && body->op_kind[inner_a_def2] == BODY_OP_I32_CONST &&
+                            body->op_a[inner_a_def2] == 0) {
                             int32_t inner_a = body->op_a[def];
                             if (inner_a >= 0 && inner_a < slot_count) {
-                                int32_t inner_a_def = cur_writer[inner_a];
-                                if (inner_a_def >= 0 && body->op_kind[inner_a_def] == BODY_OP_I32_CONST &&
-                                    body->op_a[inner_a_def] == 0) {
+                                int32_t inner_inner_a_def = cur_writer[inner_a];
+                                if (inner_inner_a_def >= 0 && body->op_kind[inner_inner_a_def] == BODY_OP_I32_CONST &&
+                                    body->op_a[inner_inner_a_def] == 0) {
                                     body->op_kind[i] = BODY_OP_COPY_I32;
                                     body->op_a[i] = body->op_b[def];
                                     body->op_b[i] = 0;
@@ -11899,15 +11901,15 @@ static void cold_apply_identity_rewrites(BodyIR *body) {
                     if (kind == BODY_OP_I32_XOR && a_safe &&
                         def >= 0 && body->op_kind[def] == BODY_OP_I32_CONST &&
                         body->op_a[def] == -1) {
-                        int32_t a_def = cur_writer[a];
-                        if (a_def >= 0 && body->op_kind[a_def] == BODY_OP_I32_XOR) {
-                            int32_t inner_b = body->op_b[a_def];
+                        int32_t inner_xor_idx = cur_writer[a];
+                        if (inner_xor_idx >= 0 && body->op_kind[inner_xor_idx] == BODY_OP_I32_XOR) {
+                            int32_t inner_b = body->op_b[inner_xor_idx];
                             if (inner_b >= 0 && inner_b < slot_count) {
                                 int32_t inner_b_def = cur_writer[inner_b];
                                 if (inner_b_def >= 0 && body->op_kind[inner_b_def] == BODY_OP_I32_CONST &&
                                     body->op_a[inner_b_def] == -1) {
                                     body->op_kind[i] = BODY_OP_COPY_I32;
-                                    body->op_a[i] = body->op_a[a_def];
+                                    body->op_a[i] = body->op_a[inner_xor_idx];
                                     body->op_b[i] = 0;
                                     __atomic_add_fetch(&cold_egraph_rewrite_count, 1, __ATOMIC_RELAXED);
                                 }
@@ -13255,7 +13257,7 @@ static void cold_collect_body_stats(Symbols *symbols, BodyIR **function_bodies, 
         /* count parameters and ABI placement */
         int32_t fn_reg = 0;
         int32_t fn_stack = 0;
-        if (!body->slot_kind || !body->param_slot) continue;
+        if (!body->slot_kind) continue;
         for (int32_t p = 0; p < body->param_count; p++) {
             int32_t slot = body->param_slot[p];
             if (slot < 0 || slot >= body->slot_count) continue;
@@ -19766,6 +19768,7 @@ int main(int argc, char **argv) {
         /* Route public command to canonical primary-object facts. */
         int32_t new_argc = argc + 1;
         const char **new_argv = (const char **)malloc((size_t)(new_argc + 1) * sizeof(char *));
+        if (!new_argv) die("emit-cold-csg-v2 argv allocation failed");
         new_argv[0] = argv[0];
         new_argv[1] = "system-link-exec";
         new_argv[2] = "--emit:csg-v2-primary";

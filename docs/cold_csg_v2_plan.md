@@ -156,10 +156,10 @@ reloc -> cold linkerless/object linker applies reloc
 
 ## 当前实测
 
-- `bootstrap/cheng_cold.c` 已实现完整 CSG v2 reader/writer，支持 `--emit:csg-v2`（独立命令）和 `--csg-in`（BodyIR + 指令字两种格式）。
-- 当前自动卡口是 `tools/cold_csg_v2_roundtrip_test.sh`：backend driver 产 `CHENGCSG` section-binary facts，cold reader 连续两次产 `.o`，`cmp` 确定性通过，并验证 writer/reader report、facts 预算、unknown/truncated hard-fail、provider archive 多 member/export、`--csg-in --provider-archive`。本地实跑结果为 724/724 PASS。
-- `CHENG_CSG_V2` text object facts reader 已有最小 object smoke：`_main` 两条 ARM64 instruction word 连续两次读入生成 `.o` bit-identical，`cc` 链接后运行 exit 0。它是 PrimaryObjectPlan 指令字 object facts 入口；当前主体 smoke 仍使用 `CHENGCSG` section-binary，不能把两者的验证结论混写。
-- **internal fixed-point 验证通过**：当前自动门禁主体验证的是 `CHENGCSG` section-binary facts 的 writer/reader 确定性；canonical `CHENG_CSG_V2` writer 已在 `primary_object_plan.cheng` 中存在，但当前 `artifacts/backend_driver/cheng emit-cold-csg-v2` 仍产 `CHENGCSG`，不能把 724/724 结论外推为 canonical writer 完成。
+- `bootstrap/cheng_cold.c` 已实现 CSG v2 双 reader/writer：public `emit-cold-csg-v2` 写 canonical `CHENG_CSG_V2` facts；显式 `system-link-exec --emit:csg-v2` 写 internal `CHENGCSG` self-test facts；`--csg-in` 同时消费 BodyIR 快照和 canonical 指令字 facts。
+- 当前自动卡口是 `tools/cold_csg_v2_roundtrip_test.sh`：public canonical writer 覆盖 ordinary writer/read/link/run；internal writer/reader 连续两次产 `.o` 并 `cmp` 确定性通过；同时验证 writer/reader report、facts 预算、unknown/truncated hard-fail、provider archive 多 member/export、`--csg-in --provider-archive`。本地实跑结果为 732/732 PASS。
+- `CHENG_CSG_V2` text object facts reader 已有最小 object smoke：`_main` 两条 ARM64 instruction word 连续两次读入生成 `.o` bit-identical，`cc` 链接后运行 exit 0。新增 public writer smoke 从 `ordinary_zero_exit_fixture` 写 canonical facts，再由 cold reader 生成 object 并链接运行 exit 0。
+- **internal fixed-point 验证通过**：`CHENGCSG` section-binary facts 只保留为显式 cold self-test，锁 writer/reader 确定性；canonical `CHENG_CSG_V2` public writer 已有最小链路 smoke。完整 Cheng `PrimaryObjectPlan` writer 刷新仍受 `build-backend-driver` smoke mismatch 阻塞，不能把 732/732 结论外推为全量 PrimaryObjectPlan 管线闭合。
 - `ordinary_zero_exit_fixture`: facts 280 bytes, exe 0.13-0.19ms, exit 0（codesign 后）。
 - `cold_subset_coverage`: facts 19,666 bytes (23 函数/411+ ops), exe 0.15-0.22ms, MD5 一致。
 - `--csg-in --emit:obj`: 两次产出 bit-identical, `_main` 全局符号, cc 链接后运行 exit 0。
@@ -167,7 +167,7 @@ reloc -> cold linkerless/object linker applies reloc
 - report 字段：`facts_bytes`, `facts_mmap_ms`, `facts_verify_ms`, `facts_decode_ms`, `facts_total_ms`, `facts_function_count` 全部输出。
 - 三架构 codegen 100% op 覆盖（ARM64/x86_64/RISC-V），全部通过自检。
 - `build-backend-driver` 已完成，产出 `artifacts/backend_driver/cheng`，contract hash `41cf6b574eae643f`。
-- `tools/cold_csg_v2_roundtrip_test.sh` 本地实跑 724/724 PASS，其中主体是 internal `CHENGCSG`，新增 canonical `CHENG_CSG_V2` reader/object/link 最小 smoke。
+- `tools/cold_csg_v2_roundtrip_test.sh` 本地实跑 732/732 PASS，public `emit-cold-csg-v2` 已锁 canonical `CHENG_CSG_V2` writer/read/link/run smoke；internal `CHENGCSG` 仅作为显式 cold self-test 子门禁保留。
 
 ## 验收命令
 
@@ -189,18 +189,18 @@ tools/cold_csg_v2_roundtrip_test.sh
 
 ```sh
 artifacts/backend_driver/cheng emit-cold-csg-v2 --root:/Users/lbcheng/cheng-lang --in:tests/cheng/backend/fixtures/return_let.cheng --out:/tmp/cheng_csg_v2_zero.facts --report-out:/tmp/cheng_csg_v2_zero.writer.report.txt
-bootstrap/cheng_cold --system-link-exec --csg-in:/tmp/cheng_csg_v2_zero.facts --emit:obj --out:/tmp/cheng_csg_v2_zero.cold.1.o --target:arm64-apple-darwin --report-out:/tmp/cheng_csg_v2_zero.reader.1.report.txt
-bootstrap/cheng_cold --system-link-exec --csg-in:/tmp/cheng_csg_v2_zero.facts --emit:obj --out:/tmp/cheng_csg_v2_zero.cold.2.o --target:arm64-apple-darwin --report-out:/tmp/cheng_csg_v2_zero.reader.2.report.txt
+/tmp/cheng_cold system-link-exec --csg-in:/tmp/cheng_csg_v2_zero.facts --emit:obj --out:/tmp/cheng_csg_v2_zero.cold.1.o --target:arm64-apple-darwin --report-out:/tmp/cheng_csg_v2_zero.reader.1.report.txt
+/tmp/cheng_cold system-link-exec --csg-in:/tmp/cheng_csg_v2_zero.facts --emit:obj --out:/tmp/cheng_csg_v2_zero.cold.2.o --target:arm64-apple-darwin --report-out:/tmp/cheng_csg_v2_zero.reader.2.report.txt
 cmp /tmp/cheng_csg_v2_zero.cold.1.o /tmp/cheng_csg_v2_zero.cold.2.o
 ```
 
-这组命令要求 `artifacts/backend_driver/cheng` 已由包含 `emit-cold-csg-v2` 的源码刷新。刷新前只运行 cold reader/object writer 的最小 facts smoke。
+这组命令要求 `artifacts/backend_driver/cheng emit-cold-csg-v2` 输出 magic `CHENG_CSG_V2`。若退回 `CHENGCSG`，应视为 public writer 回归；`CHENGCSG` 只允许出现在显式 cold self-test。
 
 当前最小 provider archive 链路已允许运行验证；runtime provider 10 个纯常量 roots 已锁链接报告，首个非纯常量 root 已锁 `get_nprocs` 未解析 hard-fail。真实 runtime roots 验证命令：
 
 ```sh
-bootstrap/cheng_cold --link-object:/tmp/cheng_csg_v2_zero.cold.1.o --provider-archive:/tmp/cheng_provider_runtime.chenga --emit:exe --out:/tmp/cheng_csg_v2_zero.1 --target:arm64-apple-darwin
-bootstrap/cheng_cold --link-object:/tmp/cheng_csg_v2_zero.cold.2.o --provider-archive:/tmp/cheng_provider_runtime.chenga --emit:exe --out:/tmp/cheng_csg_v2_zero.2 --target:arm64-apple-darwin
+/tmp/cheng_cold system-link-exec --link-object:/tmp/cheng_csg_v2_zero.cold.1.o --provider-archive:/tmp/cheng_provider_runtime.chenga --emit:exe --out:/tmp/cheng_csg_v2_zero.1 --target:arm64-apple-darwin
+/tmp/cheng_cold system-link-exec --link-object:/tmp/cheng_csg_v2_zero.cold.2.o --provider-archive:/tmp/cheng_provider_runtime.chenga --emit:exe --out:/tmp/cheng_csg_v2_zero.2 --target:arm64-apple-darwin
 /tmp/cheng_csg_v2_zero.1
 /tmp/cheng_csg_v2_zero.2
 ```
@@ -208,7 +208,7 @@ bootstrap/cheng_cold --link-object:/tmp/cheng_csg_v2_zero.cold.2.o --provider-ar
 linkerless 接入后：
 
 ```sh
-bootstrap/cheng_cold --csg-in:/tmp/cheng_csg_v2_zero.facts --emit:exe --out:/tmp/cheng_csg_v2_zero --target:arm64-apple-darwin --provider-archive:/tmp/cheng_provider_runtime.chenga
+/tmp/cheng_cold system-link-exec --csg-in:/tmp/cheng_csg_v2_zero.facts --emit:exe --out:/tmp/cheng_csg_v2_zero --target:arm64-apple-darwin --provider-archive:/tmp/cheng_provider_runtime.chenga
 /tmp/cheng_csg_v2_zero
 ```
 

@@ -1,15 +1,18 @@
 # CSG v2 Architecture
 
-Cheng 编译器的冷启动后端架构。Cheng 完整编译器产出 CSG v2 二进制事实文件，C 冷编译器消费事实并产出可执行文件。
+Cheng 编译器的冷启动后端架构。public facts 使用 canonical `CHENG_CSG_V2`；internal `CHENGCSG` 只用于 cold 自检快照。
 
 ## Pipeline
 
 ```
 Cheng Source
-  └─ Cheng full compiler (artifacts/backend_driver/cheng)
-       └─ parser → typed_expr → lowering → PrimaryObjectPlan
-            └─ PrimaryBodyIrEmitCsgV2BinaryFacts (primary_object_plan.cheng)
-                 └─ CSG v2 binary facts (CHENGCSG magic, 280B–489KB)
+  └─ emit-cold-csg-v2
+       └─ parser → BodyIR/codegen-ready function set
+            └─ canonical CSG v2 facts (CHENG_CSG_V2)
+
+Internal self-test only
+  └─ system-link-exec --emit:csg-v2
+       └─ BodyIR snapshot facts (CHENGCSG)
 
 CSG v2 facts
   └─ C cold compiler (cheng_cold --csg-in)
@@ -23,7 +26,25 @@ CSG v2 facts
             └─ COFF (x86_64-pc-windows-msvc)
 ```
 
-## Binary Format (cold_csg_v2_format.h)
+## Facts Formats
+
+### canonical `CHENG_CSG_V2`
+
+Text-record object facts consumed by `system-link-exec --csg-in`.
+
+```
+MAGIC: CHENG_CSG_V2\n
+R0001 target triple
+R0002 object format
+R0003 entry symbol
+R0004 function records
+R0005 instruction words
+R0006 relocation records
+```
+
+### internal `CHENGCSG`
+
+Section-binary BodyIR snapshot used only by explicit cold self-test commands.
 
 ```
 HEADER (64 bytes): magic("CHENGCSG") version(2) target(32) abi ptr_width endian reserved
@@ -56,12 +77,11 @@ TRAILER (32 bytes): section_count + hash(28)
 - Patch resolution: internal BL → delta, external → relocation
 - Object writers: `macho_write_object`, `elf64_write_object`, `coff_write_object`
 
-## Error Recovery
+## Failure Model
 
-- Per-function `setjmp/longjmp`: catches `die()` during codegen, emits stub function
-- `ColdErrorRecoveryEnabled` flag: SIGSEGV/BUS handler → longjmp to recovery point
-- External symbols: auto-registered as `__ext_fn_N` when call target missing
-- Return type mapping: `return_kind` → type string for `symbols_add_fn`
+- Public CSG/object/exe paths hard-fail on unsupported body, unresolved non-external call, bad magic, truncated facts, missing provider export, wrong archive target, or unsupported target.
+- No stub function, no mock provider, no fallback linker path is part of the CSG v2 contract.
+- `ColdErrorRecoveryEnabled` remains an internal parser/import containment tool, not a success path for public artifact generation.
 
 ## Cross-platform Support
 
@@ -74,40 +94,40 @@ TRAILER (32 bytes): section_count + hash(28)
 
 ## Fixed-point Verification
 
-C writer (`cold_emit_csg_v2_facts` in cheng_cold.c) and Cheng writer
-(`PrimaryBodyIrEmitCsgV2BinaryFacts` in primary_object_plan.cheng) produce
-**bit-identical** facts (MD5 match) for the same input. Cold reader consumes
-both identically, producing **bit-identical** executables.
+Current gate: `tools/cold_csg_v2_roundtrip_test.sh` passes 732/732.
+
+- Public `emit-cold-csg-v2` emits canonical `CHENG_CSG_V2`; cold reader emits object; `cc` link/run smoke exits 0.
+- Internal `CHENGCSG` writer/reader fixed-point produces bit-identical objects for repeated reads of the same facts.
+- Full Cheng `PrimaryObjectPlan` writer refresh is still blocked by `build-backend-driver` smoke mismatch, so it is not counted as full PrimaryObjectPlan pipeline closure.
 
 ## Key Files
 
 | File | Role |
 |---|---|
 | `bootstrap/cheng_cold.c` | Cold compiler (reader + codegen + emit) |
-| `bootstrap/cold_csg_v2_format.h` | Binary format schema constants |
+| `bootstrap/cold_csg_v2_format.h` | Internal binary snapshot schema constants |
 | `bootstrap/elf64_direct.h` | ELF64 object + executable writer |
 | `bootstrap/x64_emit.h` | x86_64 instruction encoder |
 | `bootstrap/rv64_emit.h` | RISC-V instruction encoder |
-| `src/core/backend/primary_object_plan.cheng` | Cheng-side facts writer |
+| `src/core/backend/primary_object_plan.cheng` | Cheng-side PrimaryObjectPlan facts writer source |
 | `src/core/tooling/compiler_csg.cheng` | CSG type validation |
-| `tools/cold_csg_v2_roundtrip_test.sh` | Automated roundtrip test (34 checks) |
+| `tools/cold_csg_v2_roundtrip_test.sh` | Automated CSG v2 roundtrip gate |
 
 ## Commands
 
 ```sh
-# Generate facts (C cold compiler)
-cheng_cold emit-cold-csg-v2 --in:source.cheng --out:facts.bin
+# Generate canonical facts
+cheng_cold emit-cold-csg-v2 --in:source.cheng --out:facts.csgv2
 
-# Generate facts (Cheng toolchain sidecar)
-artifacts/backend_driver/cheng system-link-exec --in:source.cheng \
-  --emit:exe --cold-csg-out:facts.bin
+# Generate internal self-test facts
+cheng_cold system-link-exec --in:source.cheng --emit:csg-v2 --out:facts.internal
 
 # Consume facts → exe (all architectures)
-cheng_cold system-link-exec --csg-in:facts.bin --emit:exe \
+cheng_cold system-link-exec --csg-in:facts.csgv2 --emit:exe \
   --target:arm64-apple-darwin --out:program
 
 # Consume facts → obj (determinism check)
-cheng_cold system-link-exec --csg-in:facts.bin --emit:obj \
+cheng_cold system-link-exec --csg-in:facts.csgv2 --emit:obj \
   --target:riscv64-unknown-linux-gnu --out:program.o
 
 # Backend-only mode

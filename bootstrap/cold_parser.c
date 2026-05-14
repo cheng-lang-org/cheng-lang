@@ -1294,7 +1294,7 @@ void parse_type(Parser *parser) {
             qn_ptr[type_name.len] = '.';
             memcpy(qn_ptr + type_name.len + 1, variant->name.ptr, (size_t)variant->name.len);
             qn_ptr[qn_len] = '\0';
-            Span qn = {qn_ptr, qn_len};
+            Span qn = {(const uint8_t *)qn_ptr, qn_len};
             symbols_add_const(parser->symbols, qn, vi);
         }
         parser->pos = line_end;
@@ -1302,6 +1302,9 @@ void parse_type(Parser *parser) {
     }
     if (cold_span_starts_with(rhs_check, "fn") ||
         cold_type_is_builtin_surface(rhs_check)) {
+        /* Register type alias so that cold_slot_kind_from_type_with_symbols
+           can resolve the name to a concrete slot kind later. */
+        symbols_add_type(parser->symbols, type_name, 0);
         parser->pos = line_end;
         return;
     }
@@ -1543,7 +1546,7 @@ void parse_type(Parser *parser) {
         qn_ptr[type_name.len] = '.';
         memcpy(qn_ptr + type_name.len + 1, variant->name.ptr, (size_t)variant->name.len);
         qn_ptr[qn_len] = '\0';
-        Span qn = {qn_ptr, qn_len};
+        Span qn = {(const uint8_t *)qn_ptr, qn_len};
         symbols_add_const(parser->symbols, qn, variant->tag);
     }
     type->generic_count = generic_count;
@@ -6482,10 +6485,6 @@ int32_t parse_field_assign(Parser *parser, BodyIR *body, Locals *locals,
     if (!object) die("field assignment object type missing");
     ObjectField *field = object_find_field(object, field_name);
     if (!field) {
-        fprintf(stderr, "[field_assign] object=%.*s field=%.*s local_kind=%d\n",
-                object ? (int)object->name.len : 0,
-                object ? (const char *)object->name.ptr : "?",
-                (int)field_name.len, field_name.ptr, local->kind);
         die("unknown field assignment target");
     }
     if (!parser_take(parser, "=")) die("expected = in field assignment");
@@ -8275,4 +8274,5 @@ BodyIR *parse_fn(Parser *parser, int32_t *symbol_index_out) {
     if (body && body->block_count > 0 && body->block_term[0] < 0) {
         body->has_fallback = true;
     }
+    return body;
 }

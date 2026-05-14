@@ -1,6 +1,6 @@
 # Cheng 正式规范（语法与语义）
 
-> 版本：2026-05-13
+> 版本：2026-05-14
 
 > 本文包含两类内容：  
 > 1) `规范性要求`（决定语言语法与语义的行为边界）；  
@@ -14,7 +14,7 @@
 
 ---
 
-## 0.0 实现对齐注记（截至 2026-05-13）
+## 0.0 实现对齐注记（截至 2026-05-14）
 
 - `verify_backend_ffi_slice_shim` 已完成脚本拼接到 native 路径的迁移，缩小脚本失败与构建超时耦合面。
 - `artifacts/tooling_cmd/cheng_tooling` 与 `artifacts/backend_driver/cheng` 在 verify/closure 主链路中的地位是默认路径；脚本仅保留兼容或应急回退，不得成为默认发布入口。
@@ -28,7 +28,7 @@
 - `compile/chengc` 的主验证职责从 shell 入口剥离，工具主链路改走 canonical tooling 命令。
 - no-pointer / Raw Pointer Safety 约束在发布链路中按 hard-fail 收口（ZRPC）。
 - `uirCoreFindTypeDeclByName` 热点路径已加入一次性建表与可重入防护，避免已知死循环与重复扫描；配套的调用计数/超时抽样告警已持续保留。
-- CSG v2 已收口为后端事实格式：canonical `CHENG_CSG_V2` writer 源码位于 `PrimaryObjectPlan`，cold compiler 的 `system-link-exec --csg-in` 只负责加载校验、object emit 与 direct-exe 生成。当前 artifact `artifacts/backend_driver/cheng emit-cold-csg-v2` 仍输出 internal `CHENGCSG`，不能视为 canonical writer 完成；`tools/cold_csg_v2_roundtrip_test.sh` 同时锁 internal 往返和 canonical reader 最小 object/link smoke。
+- CSG v2 已收口为后端事实格式：public `emit-cold-csg-v2` 输出 canonical `CHENG_CSG_V2` facts；cold compiler 的 `system-link-exec --csg-in` 负责加载校验、object emit 与 direct-exe 生成。internal `CHENGCSG` 只用于显式 `system-link-exec --emit:csg-v2` 自检；完整 Cheng `PrimaryObjectPlan` writer 刷新仍受 `build-backend-driver` smoke mismatch 阻塞，不能写成全量 PrimaryObjectPlan 管线闭合。
 
 #### 进行中
 

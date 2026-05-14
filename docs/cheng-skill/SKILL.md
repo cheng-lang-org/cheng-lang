@@ -6,7 +6,7 @@ description: Cheng 语言语法与语义、所有权/ORC、并发与模块导入
 # Cheng 编程（稳定版）
 
 ## 维护元数据
-- `last_verified_date`: `2026-05-13`
+- `last_verified_date`: `2026-05-14`
 - `last_verified_commit`: `workspace-local`
 - `upstream_spec`: `docs/cheng-formal-spec.md`
 
@@ -112,7 +112,7 @@ let d = RunResult { outputText: "ok" }
   - `artifacts/bootstrap/cheng.stage3 run-cross-target-smokes`
   - `artifacts/backend_driver/cheng system-link-exec --root:/abs/root --in:/abs/path/file.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/app`
 - `cheng` 固定 dev-only；release 仅允许 `release-compile`。`cheng`/`release-compile` 不接受 `--linker` 或 `BACKEND_LINKER` 覆盖，链接器由命令轨道固定。
-- CSG v2 口径：当前 `tools/cold_csg_v2_roundtrip_test.sh` 通过 724/724；主体仍是 internal `CHENGCSG` 往返，canonical `CHENG_CSG_V2` reader 已有最小 object/link smoke。当前 artifact `emit-cold-csg-v2` 仍输出 `CHENGCSG`，不能把它当作 canonical writer 完成。
+- CSG v2 口径：当前 `tools/cold_csg_v2_roundtrip_test.sh` 通过 732/732；public `emit-cold-csg-v2` 输出 canonical `CHENG_CSG_V2` facts，internal `CHENGCSG` 只保留给显式 cold self-test。完整 Cheng `PrimaryObjectPlan` writer 刷新仍受 `build-backend-driver` smoke mismatch 阻塞，不能写成全量 PrimaryObjectPlan 管线闭合。
 - Dev 默认 self-link/direct-exe/host runner hotpatch；Release 默认 system linker/substrate runtime。`100ms` 编译和二进制原地更新只属于 dev host-only dedicated witness。
 - `BACKEND_JOBS` 是唯一公开 worker 数控制面；`BACKEND_FN_SCHED=serial` 只保留给内部诊断、perf 对照和低内存 bring-up。
 - `run-production-regression` 是当前聚合回归入口；它会串起 driver 自举、stage0/stage3/backend_driver 命令面 smoke、driver build report 合同、function task 合同、BodyIR DoD/SoA/noalias/CFG 合同、perf gate 合同、线程/原子/ORC runtime provider 合同、文档/skill 一致性、显式默认值正反例与防回潮门禁、跨目标 smoke 和 stage2/stage3 libp2p smoke。
