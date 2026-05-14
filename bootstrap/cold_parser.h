@@ -151,7 +151,9 @@ bool cold_compile_source_path_to_macho(const char *out_path,
                                        ColdCompileStats *stats);
 bool cold_compile_source_to_object(const char *out_path,
                                    const char *src_path,
-                                   const char *target);
+                                   const char *target,
+                                   const char *export_roots_csv,
+                                   const char *symbol_visibility);
 
 int cold_cmd_compile_bootstrap(int argc, char **argv, const char *self_path);
 int cold_cmd_bootstrap_bridge(int argc, char **argv, const char *self_path);

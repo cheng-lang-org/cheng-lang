@@ -86,6 +86,20 @@ else
 fi
 assert "import_use_linkerless" 1 "$ACT"
 
+rm -f /tmp/ct_link_providers /tmp/ct_link_providers.report
+if $COLD system-link-exec --in:src/tests/import_use.cheng \
+    --target:arm64-apple-darwin --out:/tmp/ct_link_providers \
+    --report-out:/tmp/ct_link_providers.report --link-providers >/dev/null 2>&1; then
+    ACT="UNEXPECTED_SUCCESS"
+elif grep -q '^system_link_exec=0$' /tmp/ct_link_providers.report 2>/dev/null &&
+     grep -q '^error=--link-providers requires explicit provider archive$' /tmp/ct_link_providers.report 2>/dev/null &&
+     [ ! -e /tmp/ct_link_providers ]; then
+    ACT="HARD_FAIL"
+else
+    ACT="WRONG_FAILURE"
+fi
+assert "link_providers_requires_archive" "HARD_FAIL" "$ACT"
+
 rm -f /tmp/ct_bad_import
 quiet $COLD system-link-exec --in:src/tests/cold_bad_import_unresolved_main.cheng \
     --target:arm64-apple-darwin --out:/tmp/ct_bad_import
@@ -458,6 +472,61 @@ else
 fi
 assert "provider_archive_multi_link" 1 "$ACT"
 
+cat > /tmp/ct_providers/alias_provider.cheng << 'PROVEOF'
+@exportc("ct_alias_provider_bridge")
+fn AliasProviderLocalName(): int32 = return 17
+PROVEOF
+cat > /tmp/ct_providers/alias_primary.cheng << 'PROVEOF'
+@importc("ct_alias_provider_bridge")
+fn AliasPrimaryLocalName(): int32
+
+fn main(): int32 = return AliasPrimaryLocalName()
+PROVEOF
+
+quiet $COLD system-link-exec --in:/tmp/ct_providers/alias_provider.cheng \
+    --emit:obj --target:riscv64-unknown-linux-gnu \
+    --out:/tmp/ct_providers/alias_provider.o \
+    --report-out:/tmp/ct_providers/alias_provider.report.txt
+quiet $COLD system-link-exec --in:/tmp/ct_providers/alias_primary.cheng \
+    --emit:obj --target:riscv64-unknown-linux-gnu \
+    --out:/tmp/ct_providers/alias_primary.o \
+    --report-out:/tmp/ct_providers/alias_primary.report.txt
+quiet $COLD provider-archive-pack \
+    --target:riscv64-unknown-linux-gnu \
+    --object:/tmp/ct_providers/alias_provider.o \
+    --export:ct_alias_provider_bridge \
+    --module:ct_alias_provider \
+    --source:/tmp/ct_providers/alias_provider.cheng \
+    --out:/tmp/ct_providers/alias_provider.chenga \
+    --report-out:/tmp/ct_providers/alias_provider.pack.report.txt
+if [ -f /tmp/ct_providers/alias_provider.chenga ] &&
+   grep -q '^provider_export=ct_alias_provider_bridge$' /tmp/ct_providers/alias_provider.pack.report.txt 2>/dev/null &&
+   grep -q '^provider_archive_member_count=1$' /tmp/ct_providers/alias_provider.pack.report.txt 2>/dev/null &&
+   grep -q '^provider_export_count=1$' /tmp/ct_providers/alias_provider.pack.report.txt 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "provider_archive_alias_pack" 1 "$ACT"
+
+quiet $COLD system-link-exec \
+    --link-object:/tmp/ct_providers/alias_primary.o \
+    --provider-archive:/tmp/ct_providers/alias_provider.chenga \
+    --emit:exe --target:riscv64-unknown-linux-gnu \
+    --out:/tmp/ct_providers/alias_linked \
+    --report-out:/tmp/ct_providers/alias_link.report.txt
+if grep -q '^provider_archive_member_count=1$' /tmp/ct_providers/alias_link.report.txt 2>/dev/null &&
+   grep -q '^provider_export_count=1$' /tmp/ct_providers/alias_link.report.txt 2>/dev/null &&
+   grep -q '^provider_resolved_symbol_count=1$' /tmp/ct_providers/alias_link.report.txt 2>/dev/null &&
+   grep -q '^unresolved_symbol_count=0$' /tmp/ct_providers/alias_link.report.txt 2>/dev/null &&
+   grep -q '^system_link=0$' /tmp/ct_providers/alias_link.report.txt 2>/dev/null &&
+   grep -q '^linkerless_image=1$' /tmp/ct_providers/alias_link.report.txt 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "provider_archive_alias_link" 1 "$ACT"
+
 rm -rf /tmp/ct_providers
 
 # 8: language subset coverage
@@ -516,9 +585,9 @@ assert "atomic_provider_assemble" 1 "$ACT"
 quiet $COLD provider-archive-pack \
     --target:aarch64-unknown-linux-gnu \
     --object:/tmp/ct_runtime/atomic_provider.o \
-    --export:atomicCasRaw \
-    --export:atomicStoreRaw \
-    --export:atomicLoadRaw \
+    --export:cheng_atomic_cas_i32 \
+    --export:cheng_atomic_store_i32 \
+    --export:cheng_atomic_load_i32 \
     --module:atomic_provider \
     --source:src/core/runtime \
     --out:/tmp/ct_runtime/atomic_provider.chenga
@@ -556,6 +625,45 @@ else
     ACT=0
 fi
 assert "atomic_provider_archive_link" 1 "$ACT"
+
+rm -f /tmp/ct_runtime/core_runtime_af_inet.o \
+    /tmp/ct_runtime/core_runtime_af_inet.report.txt \
+    /tmp/ct_runtime/core_runtime_af_inet.chenga \
+    /tmp/ct_runtime/core_runtime_af_inet.pack.report.txt
+quiet $COLD system-link-exec --root:"$PWD" \
+    --in:src/core/runtime/core_runtime_provider_linux.cheng \
+    --emit:obj --target:aarch64-unknown-linux-gnu \
+    --symbol-visibility:internal \
+    --export-roots:cheng_native_af_inet_bridge \
+    --out:/tmp/ct_runtime/core_runtime_af_inet.o \
+    --report-out:/tmp/ct_runtime/core_runtime_af_inet.report.txt
+if [ -s /tmp/ct_runtime/core_runtime_af_inet.o ] &&
+   file /tmp/ct_runtime/core_runtime_af_inet.o 2>/dev/null | grep -q 'ELF 64-bit.*relocatable.*aarch64' &&
+   grep -q '^emit=obj$' /tmp/ct_runtime/core_runtime_af_inet.report.txt 2>/dev/null &&
+   grep -q '^system_link=0$' /tmp/ct_runtime/core_runtime_af_inet.report.txt 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "runtime_provider_linux_af_inet_single_root_obj" 1 "$ACT"
+
+quiet $COLD provider-archive-pack \
+    --target:aarch64-unknown-linux-gnu \
+    --object:/tmp/ct_runtime/core_runtime_af_inet.o \
+    --export:cheng_native_af_inet_bridge \
+    --module:runtime_core_runtime \
+    --source:src/core/runtime/core_runtime_provider_linux.cheng \
+    --out:/tmp/ct_runtime/core_runtime_af_inet.chenga \
+    --report-out:/tmp/ct_runtime/core_runtime_af_inet.pack.report.txt
+if [ -f /tmp/ct_runtime/core_runtime_af_inet.chenga ] &&
+   grep -q '^provider_export=cheng_native_af_inet_bridge$' /tmp/ct_runtime/core_runtime_af_inet.pack.report.txt 2>/dev/null &&
+   grep -q '^provider_archive_member_count=1$' /tmp/ct_runtime/core_runtime_af_inet.pack.report.txt 2>/dev/null &&
+   grep -q '^provider_export_count=1$' /tmp/ct_runtime/core_runtime_af_inet.pack.report.txt 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "runtime_provider_linux_af_inet_single_root_export" 1 "$ACT"
 
 rm -rf /tmp/ct_runtime
 
@@ -743,6 +851,126 @@ CHENG
 ACT=$(compile_run /tmp/ct_large_frame.cheng /tmp/ct_large_frame_out)
 assert "large_frame" 43 "$ACT"
 rm -f /tmp/ct_large_frame.cheng /tmp/ct_large_frame_out
+
+# --- int_edge_cases ---
+cat > /tmp/ct_int_edge.cheng << 'CHENG'
+fn main(): int32 =
+    var r: int32
+    let a: int32 = 2147483647 + 1
+    if a == -2147483648:
+        r = r | 1
+    let b: int32 = -2147483648 - 1
+    if b == 2147483647:
+        r = r | 2
+    let c: int32 = -42 / 5
+    if c == -8:
+        r = r | 4
+    let d: int32 = -42 % 5
+    if d == -2:
+        r = r | 8
+    return r
+CHENG
+ACT=$(compile_run /tmp/ct_int_edge.cheng /tmp/ct_int_edge_out)
+assert "int_edge_cases" 15 "$ACT"
+rm -f /tmp/ct_int_edge.cheng /tmp/ct_int_edge_out
+
+# --- variant_payload_sizes ---
+cat > /tmp/ct_var_payload.cheng << 'CHENG'
+type V = A(x: int32, y: int32) | B(a: int32, b: int32)
+
+fn main(): int32 =
+    let v: V = V.A(10, 20)
+    match v:
+        A(x, y) => return x + y
+        B(a, b) => return a + b
+CHENG
+ACT=$(compile_run /tmp/ct_var_payload.cheng /tmp/ct_var_payload_out)
+assert "variant_payload_sizes" 30 "$ACT"
+rm -f /tmp/ct_var_payload.cheng /tmp/ct_var_payload_out
+
+# --- switch_many_arms ---
+cat > /tmp/ct_switch_arms.cheng << 'CHENG'
+type Digit = Zero | One | Two | Three | Four | Five | Six | Seven | Eight | Nine | Ten | Eleven
+
+fn digit_val(d: Digit): int32 =
+    match d:
+        Zero => return 0
+        One => return 1
+        Two => return 2
+        Three => return 3
+        Four => return 4
+        Five => return 5
+        Six => return 6
+        Seven => return 7
+        Eight => return 8
+        Nine => return 9
+        Ten => return 10
+        Eleven => return 11
+
+fn main(): int32 =
+    if digit_val(Digit.Zero) != 0: return 255
+    if digit_val(Digit.One) != 1: return 255
+    if digit_val(Digit.Two) != 2: return 255
+    if digit_val(Digit.Three) != 3: return 255
+    if digit_val(Digit.Four) != 4: return 255
+    if digit_val(Digit.Five) != 5: return 255
+    if digit_val(Digit.Six) != 6: return 255
+    if digit_val(Digit.Seven) != 7: return 255
+    if digit_val(Digit.Eight) != 8: return 255
+    if digit_val(Digit.Nine) != 9: return 255
+    if digit_val(Digit.Ten) != 10: return 255
+    if digit_val(Digit.Eleven) != 11: return 255
+    return 0
+CHENG
+ACT=$(compile_run /tmp/ct_switch_arms.cheng /tmp/ct_switch_arms_out)
+assert "switch_many_arms" 0 "$ACT"
+rm -f /tmp/ct_switch_arms.cheng /tmp/ct_switch_arms_out
+
+# --- composite_sret ---
+cat > /tmp/ct_composite_sret.cheng << 'CHENG'
+type Big =
+    a: int32
+    b: int32
+    c: int32
+    d: int32
+    e: int32
+    f: int32
+
+fn make_big(): Big =
+    return Big{
+        a: 10,
+        b: 20,
+        c: 30,
+        d: 40,
+        e: 50,
+        f: 60,
+    }
+
+fn main(): int32 =
+    let obj: Big = make_big()
+    return obj.a + obj.b + obj.c + obj.d + obj.e + obj.f
+CHENG
+ACT=$(compile_run /tmp/ct_composite_sret.cheng /tmp/ct_composite_sret_out)
+assert "composite_sret" 210 "$ACT"
+rm -f /tmp/ct_composite_sret.cheng /tmp/ct_composite_sret_out
+
+# --- long_function_1500ops ---
+python3 -c "
+import sys
+code = 'fn main(): int32 =\n'
+code += '    var x: int32\n'
+code += '    var y: int32 = 1\n'
+for i in range(500):
+    code += f'    x = x + {i}\n'
+    code += '    y = y + 1\n'
+    code += '    if y > 1000: y = 0\n'
+code += '    return x\n'
+with open('/tmp/ct_long_func.cheng', 'w') as f:
+    f.write(code)
+"
+ACT=$(compile_run_timed /tmp/cheng_cold /tmp/ct_long_func.cheng /tmp/ct_long_func_out 30)
+assert "long_function_1500ops" 78 "$ACT"
+rm -f /tmp/ct_long_func.cheng /tmp/ct_long_func_out
 
 echo ""
 echo "=== $PASS passed, $FAIL failed ==="

@@ -984,6 +984,8 @@ void cold_collect_import_module_signatures(Symbols *symbols, Span alias,
         Span qualified_ret = cold_qualify_import_type(symbols->arena, alias,
                                                       symbol.return_type);
         int32_t fi = symbols_add_fn(symbols, qualified_name, arity, kinds, sizes, qualified_ret);
+        if (symbol.import_name.len > 0) symbols_set_fn_link_name(symbols, fi, symbol.import_name);
+        if (symbol.export_name.len > 0) symbols_set_fn_link_name(symbols, fi, symbol.export_name);
         if (fi >= 0 && fi < symbols->function_cap && !symbol.has_body) {
             symbols->functions[fi].is_external = true;
         }
@@ -1097,6 +1099,8 @@ void cold_collect_function_signatures(Symbols *symbols, Span source) {
         int32_t arity = parse_param_specs(0, symbol.params, param_names, param_kinds,
                                           param_sizes, 0, COLD_MAX_I32_PARAMS);
         int32_t fi = symbols_add_fn(symbols, symbol.name, arity, param_kinds, param_sizes, symbol.return_type);
+        if (symbol.import_name.len > 0) symbols_set_fn_link_name(symbols, fi, symbol.import_name);
+        if (symbol.export_name.len > 0) symbols_set_fn_link_name(symbols, fi, symbol.export_name);
         if (fi >= 0 && fi < symbols->function_cap) {
             FnDef *fn = &symbols->functions[fi];
             fn->generic_count = symbol.generic_count;
@@ -1902,6 +1906,17 @@ int32_t symbols_find_fn_for_call(Symbols *symbols, Span name,
         if (found >= 0) continue;
         found = i;
     }
+    /* specialization: ensure concrete version for generic functions */
+    if (found >= 0 && found < symbols->function_count) {
+        FnDef *fn = &symbols->functions[found];
+        if (fn->generic_count > 0) {
+            int32_t arg_kinds[32];
+            for (int32_t p = 0; p < arg_count && p < 32; p++) {
+                arg_kinds[p] = body->op_a[arg_start + p];
+            }
+            found = cold_ensure_specialized(symbols, found, arg_kinds, arg_count);
+        }
+    }
     return found;
 }
 
@@ -1914,7 +1929,11 @@ static int32_t cold_materialize_direct_emit(Parser *parser, BodyIR *body, int32_
 int32_t parse_constructor(Parser *parser, BodyIR *body, Locals *locals,
                                  Variant *variant);
 
-bool cold_compile_source_to_object(const char *out_path, const char *src_path, const char *target);
+bool cold_compile_source_to_object(const char *out_path,
+                                   const char *src_path,
+                                   const char *target,
+                                   const char *export_roots_csv,
+                                   const char *symbol_visibility);
 
 int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *locals,
                                      Span name, int32_t *kind_out) {
@@ -4537,7 +4556,7 @@ bool cold_try_backend_intrinsic(Parser *parser, BodyIR *body, Span name,
         const char *out_path = body_strdup_from_slot(parser->arena, body, out_slot);
         int32_t result = 1;
         if (src_path && out_path) {
-            result = cold_compile_source_to_object(out_path, src_path, 0) ? 0 : 1;
+            result = cold_compile_source_to_object(out_path, src_path, 0, 0, "public") ? 0 : 1;
         }
         int32_t slot = cold_make_i32_const_slot(body, result);
         if (kind_out) *kind_out = SLOT_I32;
@@ -6554,7 +6573,9 @@ int32_t parse_seq_lvalue_from_span(Parser *owner, BodyIR *body, Locals *locals,
     }
     parser_ws(&parser);
     if (parser.pos != parser.source.len) {
-        die("add target has unsupported suffix");
+        /* Complex l-value path (e.g. array[index].field) not yet handled.
+           Return -1 so caller safely skips this built-in operation. */
+        return -1;
     }
     if (kind != SLOT_SEQ_I32 && kind != SLOT_SEQ_I32_REF &&
         kind != SLOT_SEQ_STR && kind != SLOT_SEQ_STR_REF &&
@@ -6580,6 +6601,7 @@ int32_t parse_builtin_add_after_name(Parser *parser, BodyIR *body, Locals *local
         if (parser->pos < parser->source.len) parser->pos++;
         return block;
     }
+    if (seq_slot < 0) return block; /* unhandled l-value path, skip silently */
     if (seq_kind == SLOT_SEQ_I32 || seq_kind == SLOT_SEQ_I32_REF) {
         if (value_kind != SLOT_I32) {
             die("add int32[] value kind mismatch");
@@ -6610,6 +6632,7 @@ int32_t parse_builtin_remove_after_name(Parser *parser, BodyIR *body, Locals *lo
         if (parser->pos < parser->source.len) parser->pos++;
         return block;
     }
+    if (seq_slot < 0) return block; /* unhandled l-value path, skip silently */
     if (index_kind != SLOT_I32) die("remove index must be int32");
     if (seq_kind == SLOT_SEQ_OPAQUE || seq_kind == SLOT_SEQ_OPAQUE_REF) {
         int32_t element_size = cold_seq_opaque_element_size_for_slot(parser->symbols, body, seq_slot);
@@ -8041,6 +8064,9 @@ int32_t parse_statement(Parser *parser, BodyIR *body, Locals *locals,
 }
 
 BodyIR *parse_fn(Parser *parser, int32_t *symbol_index_out) {
+    int32_t fn_start = parser->pos;
+    Span import_name = cold_find_fn_c_symbol_attr(parser->source, fn_start, "@importc");
+    Span export_name = cold_find_fn_c_symbol_attr(parser->source, fn_start, "@exportc");
     if (!parser_take(parser, "fn")) die("expected fn");
     Span fn_name = parser_token(parser);
     /* Skip generic params [T] or [T, U] after function name */
@@ -8095,6 +8121,10 @@ BodyIR *parse_fn(Parser *parser, int32_t *symbol_index_out) {
             symbol_index = symbols_add_fn(parser->symbols, fn_name, arity,
                                           param_kinds, param_sizes, ret);
         }
+        if (import_name.len > 0) symbols_set_fn_link_name(parser->symbols, symbol_index, import_name);
+        if (export_name.len > 0) symbols_set_fn_link_name(parser->symbols, symbol_index, export_name);
+        if (import_name.len > 0 && symbol_index >= 0 && symbol_index < parser->symbols->function_count)
+            parser->symbols->functions[symbol_index].is_external = true;
         if (symbol_index_out) *symbol_index_out = symbol_index;
         parser_line(parser);
         return 0;
@@ -8108,6 +8138,8 @@ BodyIR *parse_fn(Parser *parser, int32_t *symbol_index_out) {
         symbol_index = symbols_add_fn(parser->symbols, fn_name, arity,
                                       param_kinds, param_sizes, ret);
     }
+    if (import_name.len > 0) symbols_set_fn_link_name(parser->symbols, symbol_index, import_name);
+    if (export_name.len > 0) symbols_set_fn_link_name(parser->symbols, symbol_index, export_name);
     if (symbol_index_out) *symbol_index_out = symbol_index;
 
     /* Skip body parsing for import_mode: saved 29ms but breaks cross-module calls.

@@ -250,6 +250,53 @@ roundtrip_fixture return_while_continue tests/cheng/backend/fixtures/return_whil
 roundtrip_fixture ptr_object_by_value_probe tests/cheng/backend/fixtures/ptr_object_by_value_probe.cheng 131072
 roundtrip_fixture ptr_object_var_assign_probe tests/cheng/backend/fixtures/ptr_object_var_assign_probe.cheng 131072
 
+# I32 arithmetic: multiplication, division, modulo, multiply-add
+roundtrip_fixture return_i32_mul tests/cheng/backend/fixtures/return_i32_mul.cheng 4096
+roundtrip_fixture return_i32_div_mod tests/cheng/backend/fixtures/return_i32_div_mod.cheng 4096
+roundtrip_fixture return_i32_madd tests/cheng/backend/fixtures/return_i32_madd.cheng 4096
+
+# I32 bitwise operations: AND, OR, XOR, SHL, ASR
+roundtrip_fixture return_i32_bitwise tests/cheng/backend/fixtures/return_i32_bitwise.cheng 8192
+
+# I64 arithmetic: add, sub, mul, i64-from-i32 conversion
+roundtrip_fixture return_i64_arith tests/cheng/backend/fixtures/return_i64_arith.cheng 4096
+
+# I64 bitwise operations: AND, OR, XOR, SHL, ASR
+roundtrip_fixture return_i64_bitwise tests/cheng/backend/fixtures/return_i64_bitwise.cheng 8192
+
+# Mixed I64 operations: bitwise chain with arithmetic
+roundtrip_fixture return_i64_chain tests/cheng/backend/fixtures/return_i64_chain.cheng 4096
+
+# Float64 arithmetic: mul, add, comparison
+roundtrip_fixture return_float64_arith tests/cheng/backend/fixtures/return_float64_arith.cheng 4096
+
+# String operations: length
+roundtrip_fixture return_str_ops tests/cheng/backend/fixtures/return_str_ops.cheng 4096
+
+# Nested/multi-level object types: objects containing objects
+roundtrip_fixture return_nested_object tests/cheng/backend/fixtures/return_nested_object.cheng 4096
+
+# Multi-level function call depth: 3+ call chain
+roundtrip_fixture return_multi_depth_call tests/cheng/backend/fixtures/return_multi_depth_call.cheng 8192
+
+# Multiple global variables
+roundtrip_fixture return_multi_global tests/cheng/backend/fixtures/return_multi_global.cheng 4096
+
+# Pointer load/store operations
+roundtrip_fixture return_ptr_load_store tests/cheng/backend/fixtures/return_ptr_load_store.cheng 4096
+
+# Mixed control flow: if/elif/else inside while loop
+roundtrip_fixture return_if_while_mix tests/cheng/backend/fixtures/return_if_while_mix.cheng 8192
+
+# Nested loops with if conditions (for-for-if)
+roundtrip_fixture return_nested_control tests/cheng/backend/fixtures/return_nested_control.cheng 8192
+
+# Boolean logical expressions: && and ||
+roundtrip_fixture return_logical_expr tests/cheng/backend/fixtures/return_logical_expr.cheng 8192
+
+# Import chain: file A imports B imports C (transitive import compilation)
+roundtrip_fixture import_chain_a tests/cheng/backend/fixtures/import_chain_a.cheng 4096
+
 # Roundtrip stability: all fixtures must converge in 1 csg-v2 step
 echo "  - roundtrip_stability"
 for f in "$WORK"/*.facts; do
@@ -292,13 +339,15 @@ if "$COLD" system-link-exec \
     --in:"$darwin_runtime_provider_source" \
     --emit:obj \
     --target:arm64-apple-darwin \
+    --symbol-visibility:internal \
+    --export-roots:core_runtime_stub_trace \
     --out:"$darwin_runtime_provider_obj" \
     --report-out:"$darwin_runtime_provider_report" >/dev/null 2>&1 &&
    [ -s "$darwin_runtime_provider_obj" ] &&
    grep -q '^direct_macho=1$' "$darwin_runtime_provider_report" &&
    grep -q '^system_link=0$' "$darwin_runtime_provider_report" &&
    grep -q '^linkerless_image=1$' "$darwin_runtime_provider_report" &&
-   nm -g "$darwin_runtime_provider_obj" 2>/dev/null | grep -q '_core_runtime_stub_trace_export$'; then
+   nm -g "$darwin_runtime_provider_obj" 2>/dev/null | grep -q '_core_runtime_stub_trace$'; then
     ok "darwin_runtime_provider_marker_object"
 else
     bad "darwin_runtime_provider_marker_object"
@@ -311,7 +360,7 @@ darwin_pack_report="$WORK/core_runtime_provider_darwin.pack.report.txt"
 if "$COLD" provider-archive-pack \
     --target:arm64-apple-darwin \
     --object:"$darwin_runtime_provider_obj" \
-    --export:_core_runtime_stub_trace_export \
+    --export:_core_runtime_stub_trace \
     --module:runtime/core_runtime \
     --source:"$darwin_runtime_provider_source" \
     --out:"$darwin_pack_archive" \
