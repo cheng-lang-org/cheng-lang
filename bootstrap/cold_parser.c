@@ -5857,7 +5857,8 @@ int32_t parse_term(Parser *parser, BodyIR *body, Locals *locals, int32_t *kind) 
             left_kind = SLOT_I64;
             continue;
         }
-        if (left_kind != SLOT_I32 || right_kind != SLOT_I32) {
+        if ((left_kind != SLOT_I32 && left_kind != SLOT_OPAQUE && left_kind != SLOT_OPAQUE_REF) ||
+            (right_kind != SLOT_I32 && right_kind != SLOT_OPAQUE && right_kind != SLOT_OPAQUE_REF)) {
             /* Non-int32 arithmetic: fall through with zero */
             int32_t zero = body_slot(body, SLOT_I32, 4);
             body_op(body, BODY_OP_I32_CONST, zero, 0, 0);
@@ -5911,7 +5912,8 @@ int32_t parse_arith_expr(Parser *parser, BodyIR *body, Locals *locals, int32_t *
             left_kind = SLOT_I64;
             continue;
         }
-        if (left_kind != SLOT_I32 || right_kind != SLOT_I32) {
+        if ((left_kind != SLOT_I32 && left_kind != SLOT_OPAQUE && left_kind != SLOT_OPAQUE_REF) ||
+            (right_kind != SLOT_I32 && right_kind != SLOT_OPAQUE && right_kind != SLOT_OPAQUE_REF)) {
             /* Non-int32 arithmetic: fall through with zero */
             int32_t zero = body_slot(body, SLOT_I32, 4);
             body_op(body, BODY_OP_I32_CONST, zero, 0, 0);
