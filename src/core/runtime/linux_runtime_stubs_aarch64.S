@@ -1,8 +1,7 @@
 /* Runtime provider stubs for AArch64 Linux ELF targets.
  *
- * These provide weak fallback definitions for external symbols that
- * Cheng programs reference via @importc. The symbol names match the
- * Cheng-level function names.
+ * These provide provider definitions for external symbols that Cheng programs
+ * reference via @importc. The symbol names match the C ABI names.
  *
  * Each function is declared .globl so the ELF symbol table entry is
  * STB_GLOBAL, making it visible to cold_link_elf64_object_with_provider_archive
@@ -20,10 +19,10 @@
 /* Atomic operations (used by std/atomic)                             */
 /* ------------------------------------------------------------------ */
 
-/* int32 atomicCasRaw(ptr p, int32 expect, int32 desired)
+/* int32 cheng_atomic_cas_i32(ptr p, int32 expect, int32 desired)
    Returns 1 on success, 0 on failure (matches __sync_bool_compare_and_swap). */
-.globl atomicCasRaw
-atomicCasRaw:
+.globl cheng_atomic_cas_i32
+cheng_atomic_cas_i32:
     mov     w3, #1
 .Lcas_loop_a64:
     ldaxr   w4, [x0]
@@ -38,15 +37,15 @@ atomicCasRaw:
     mov     w0, wzr
     ret
 
-/* void atomicStoreRaw(ptr p, int32 val) */
-.globl atomicStoreRaw
-atomicStoreRaw:
+/* void cheng_atomic_store_i32(ptr p, int32 val) */
+.globl cheng_atomic_store_i32
+cheng_atomic_store_i32:
     stlr    w1, [x0]
     ret
 
-/* int32 atomicLoadRaw(ptr p) */
-.globl atomicLoadRaw
-atomicLoadRaw:
+/* int32 cheng_atomic_load_i32(ptr p) */
+.globl cheng_atomic_load_i32
+cheng_atomic_load_i32:
     ldar    w0, [x0]
     ret
 
