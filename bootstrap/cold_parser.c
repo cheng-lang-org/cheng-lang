@@ -729,6 +729,20 @@ void cold_collect_import_module_types(Symbols *symbols, Span alias, Span source)
     int32_t source_type_count = local_symbols->type_count;
     for (int32_t ti = 0; ti < source_type_count; ti++) {
         TypeDef *src = &local_symbols->types[ti];
+        if (src->alias_type.len <= 0) continue;
+        Span qualified_type = cold_arena_join3(symbols->arena, alias, ".", src->name);
+        TypeDef *dst = symbols_find_type(symbols, qualified_type);
+        if (!dst) dst = symbols_add_type(symbols, qualified_type, 0);
+        if (dst->variant_count != 0 || dst->is_enum) die("imported type alias conflicts with concrete type");
+        dst->generic_count = src->generic_count;
+        for (int32_t gi = 0; gi < src->generic_count; gi++) {
+            dst->generic_names[gi] = cold_arena_span_copy(symbols->arena, src->generic_names[gi]);
+        }
+        Span qualified_alias = cold_qualify_import_type(symbols->arena, alias, src->alias_type);
+        symbols_set_type_alias(dst, qualified_alias);
+    }
+    for (int32_t ti = 0; ti < source_type_count; ti++) {
+        TypeDef *src = &local_symbols->types[ti];
         if (!src->is_enum) continue;
         Span qualified_type = cold_arena_join3(symbols->arena, alias, ".", src->name);
         TypeDef *dst = symbols_find_type(symbols, qualified_type);
@@ -1399,9 +1413,10 @@ void parse_type(Parser *parser) {
     }
     if (cold_span_starts_with(rhs_check, "fn") ||
         cold_type_is_builtin_surface(rhs_check)) {
-        /* Register type alias so that cold_slot_kind_from_type_with_symbols
-           can resolve the name to a concrete slot kind later. */
-        symbols_add_type(parser->symbols, type_name, 0);
+        TypeDef *type = symbols_add_type(parser->symbols, type_name, 0);
+        type->generic_count = generic_count;
+        for (int32_t gi = 0; gi < generic_count; gi++) type->generic_names[gi] = generic_names[gi];
+        symbols_set_type_alias(type, parser_scope_type(parser, rhs_check));
         parser->pos = line_end;
         return;
     }
@@ -1478,6 +1493,10 @@ void parse_type(Parser *parser) {
         cold_span_find_top_level_char(rhs_check, '(') < 0 &&
         !cold_span_starts_with(rhs_check, "object") &&
         !cold_span_starts_with(rhs_check, "tuple")) {
+        TypeDef *type = symbols_add_type(parser->symbols, type_name, 0);
+        type->generic_count = generic_count;
+        for (int32_t gi = 0; gi < generic_count; gi++) type->generic_names[gi] = generic_names[gi];
+        symbols_set_type_alias(type, parser_scope_type(parser, rhs_check));
         parser->pos = line_end;
         return;
     }
@@ -1934,7 +1953,7 @@ bool cold_validate_call_args(BodyIR *body, FnDef *fn, int32_t arg_start, int32_t
         } else if (fn->param_kind[i] == SLOT_OBJECT_REF) {
             if (arg_kind != SLOT_OBJECT && arg_kind != SLOT_OBJECT_REF && arg_kind != SLOT_SEQ_OPAQUE && arg_kind != SLOT_SEQ_OPAQUE_REF) { return false; }
         } else if (fn->param_kind[i] == SLOT_VARIANT) {
-            if (arg_kind != SLOT_VARIANT && arg_kind != SLOT_I32 && arg_kind != SLOT_OBJECT && arg_kind != SLOT_PTR) { return false; }
+            if (arg_kind != SLOT_VARIANT && arg_kind != SLOT_I32 && arg_kind != SLOT_OBJECT && arg_kind != SLOT_PTR && arg_kind != SLOT_OPAQUE) { return false; }
         } else if (fn->param_kind[i] == SLOT_SEQ_I32 && arg_kind == SLOT_SEQ_I32_REF) {
             continue;
         } else if (fn->param_kind[i] == SLOT_SEQ_STR && arg_kind == SLOT_SEQ_STR_REF) {
@@ -5925,10 +5944,10 @@ int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32_t *kin
             return sl;
         }
         if (!span_eq(parser_peek(parser), "(")) {
-            /* Skip qualified expression that's not a call */
-            int32_t zero = body_slot(body, SLOT_I32, 4);
-            body_op(body, BODY_OP_I32_CONST, zero, 0, 0);
-            return zero;
+            fprintf(stderr, "cheng_cold: unsupported qualified expression name=%.*s offset=%d\n",
+                    call_name.len, call_name.ptr,
+                    cold_span_offset(parser->source, call_name));
+            die("unsupported qualified expression");
         }
         return parse_call_after_name(parser, body, locals, call_name, kind);
     }
@@ -6063,6 +6082,9 @@ int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32_t *kin
                 }
             }
         }
+        fprintf(stderr, "cheng_cold: unknown qualified identifier token=%.*s qualified=%.*s offset=%d\n",
+                token.len, token.ptr, qualified.len, qualified.ptr,
+                cold_span_offset(parser->source, qualified));
         die("unknown qualified identifier");
     }
     ConstDef *constant = parser_find_const(parser, token);
@@ -6099,11 +6121,10 @@ int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32_t *kin
         }
     }
     int32_t off = cold_span_offset(parser->source, token);
-    /* Return zero constant and continue */
-    int32_t zero = body_slot(body, SLOT_I32, 4);
-    body_op(body, BODY_OP_I32_CONST, zero, 0, 0);
-    *kind = SLOT_I32;
-    return zero;
+    fprintf(stderr, "cheng_cold: unknown identifier token=%.*s offset=%d\n",
+            token.len, token.ptr, off);
+    die("unknown identifier");
+    return -1;
 }
 
 /* Parse anonymous function/closure expression: fn(params): ret = body
@@ -6229,7 +6250,19 @@ int32_t parse_postfix(Parser *parser, BodyIR *body, Locals *locals,
                              int32_t slot, int32_t *kind) {
     for (;;) {
         if (span_eq(parser_peek(parser), ".")) {
-            (void)parser_token(parser);
+            (void)parser_token(parser); /* consume . */
+        } else if (span_eq(parser_peek(parser), "-")) {
+            int32_t saved = parser->pos;
+            (void)parser_token(parser); /* consume - */
+            if (!span_eq(parser_peek(parser), ">")) {
+                parser->pos = saved;
+                break;
+            }
+            (void)parser_token(parser); /* consume > */
+        } else {
+            break;
+        }
+        {
             Span field_name = parser_token(parser);
             if (field_name.len <= 0) die("expected field name");
             if (*kind == SLOT_ARRAY_I32 && span_eq(field_name, "len")) {
