@@ -1824,6 +1824,8 @@ bool cold_validate_call_args(BodyIR *body, FnDef *fn, int32_t arg_start, int32_t
             if (arg_kind != SLOT_STR && arg_kind != SLOT_STR_REF) { return false; }
         } else if (fn->param_kind[i] == SLOT_OBJECT_REF) {
             if (arg_kind != SLOT_OBJECT && arg_kind != SLOT_OBJECT_REF) { return false; }
+        } else if (fn->param_kind[i] == SLOT_VARIANT) {
+            if (arg_kind != SLOT_VARIANT && arg_kind != SLOT_I32 && arg_kind != SLOT_OBJECT && arg_kind != SLOT_PTR) { return false; }
         } else if (fn->param_kind[i] == SLOT_I32 && arg_kind == SLOT_I32_REF) {
             continue;
         } else if (fn->param_kind[i] == SLOT_I32 && arg_kind == SLOT_VARIANT) {
@@ -3599,6 +3601,12 @@ bool cold_try_os_intrinsic(Parser *parser, BodyIR *body, Span name,
         int32_t ptr_kind = body->slot_kind[ptr_slot];
         int32_t off_kind = body->slot_kind[off_slot];
         if (ptr_kind != SLOT_PTR && ptr_kind != SLOT_OPAQUE) die("RawmemPtrAdd ptr must be ptr");
+        if (off_kind == SLOT_I32_REF) {
+            int32_t loaded = body_slot(body, SLOT_I32, 4);
+            body_op(body, BODY_OP_I32_REF_LOAD, loaded, off_slot, 0);
+            off_slot = loaded;
+            off_kind = SLOT_I32;
+        }
         if (off_kind != SLOT_I32 && off_kind != SLOT_I64) die("RawmemPtrAdd offset must be int");
         int32_t slot = body_slot(body, SLOT_PTR, 8);
         body_slot_set_type(body, slot, cold_cstr_span("ptr"));
@@ -6299,6 +6307,12 @@ int32_t cold_materialize_i64_value(BodyIR *body, int32_t slot, int32_t *kind) {
     if (*kind == SLOT_I32) {
         int32_t dst = body_slot(body, SLOT_I64, 8);
         body_op(body, BODY_OP_I64_FROM_I32, dst, slot, 0);
+        *kind = SLOT_I64;
+        return dst;
+    }
+    if (*kind == SLOT_VARIANT || *kind == SLOT_OBJECT || *kind == SLOT_PTR) {
+        int32_t dst = body_slot(body, SLOT_I64, 8);
+        body_op(body, BODY_OP_COPY_I64, dst, slot, 0);
         *kind = SLOT_I64;
         return dst;
     }
