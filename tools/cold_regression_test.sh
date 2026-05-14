@@ -862,6 +862,16 @@ ACT=$(compile_run /tmp/ct_large_frame.cheng /tmp/ct_large_frame_out)
 assert "large_frame" 43 "$ACT"
 rm -f /tmp/ct_large_frame.cheng /tmp/ct_large_frame_out
 
+# --- large_array_literal (regression: >64 elements, previously hit "cold array literal too large") ---
+cat > /tmp/ct_large_array_literal.cheng << 'CHENG'
+fn main(): int32 =
+    var arr: int32[65] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64]
+    return arr[0] + arr[64]
+CHENG
+ACT=$(compile_run /tmp/ct_large_array_literal.cheng /tmp/ct_large_array_literal_out)
+assert "large_array_literal" 64 "$ACT"
+rm -f /tmp/ct_large_array_literal.cheng /tmp/ct_large_array_literal_out
+
 # --- int_edge_cases ---
 cat > /tmp/ct_int_edge.cheng << 'CHENG'
 fn main(): int32 =

@@ -2676,11 +2676,11 @@ int32_t parse_object_constructor(Parser *parser, BodyIR *body, Locals *locals,
 int32_t parse_i32_array_literal(Parser *parser, BodyIR *body, Locals *locals,
                                        int32_t *kind) {
     int32_t count = 0;
-    int32_t element_slots[64];
-    int32_t element_kinds[64];
+    int32_t element_slots[1024];
+    int32_t element_kinds[1024];
     int32_t first_kind = SLOT_I32;
     while (!span_eq(parser_peek(parser), "]")) {
-        if (count >= 64) die("cold array literal too large");
+        if (count >= 1024) die("cold array literal too large");
         int32_t value_kind = SLOT_I32;
         int32_t value_slot = parse_expr(parser, body, locals, &value_kind);
         if (count == 0) first_kind = value_kind;
@@ -2729,9 +2729,9 @@ int32_t parse_i32_seq_literal(Parser *parser, BodyIR *body, Locals *locals,
                                      int32_t *kind) {
     if (!parser_take(parser, "[")) die("expected [ before int32[] literal");
     int32_t count = 0;
-    int32_t element_slots[64];
+    int32_t element_slots[1024];
     while (!span_eq(parser_peek(parser), "]")) {
-        if (count >= 64) die("cold int32[] literal too large");
+        if (count >= 1024) die("cold int32[] literal too large");
         int32_t value_kind = SLOT_I32;
         int32_t value_slot = parse_expr(parser, body, locals, &value_kind);
         if (value_kind != SLOT_I32) die("cold int32[] literal supports int32 only");
