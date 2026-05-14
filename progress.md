@@ -16,14 +16,14 @@
 - 已覆盖真实 bootstrap slice：frontend scanner、outline parser scanner、parser statement sequence scanner、expression token scanner/facts、phase arena、dense layout cursor、work-stealing CAS model、AArch64 encode、object/field/index 写回、dynamic `int32[]`、ADT/match、Result `?`、str payload、复合返回、inline suite。
 - **新增 I64 位运算支持**：`& | ^ << >>` 五种 64 位位运算 + I64→I32 降窄转换。Combined kernel 的 uint64 AND/OR/SHL 表达式不再掉零。
 
-## 最新通过基线（2026-05-12）
+## 最新通过基线（2026-05-14）
 
-- `cc_cheng_cold_ms≈2040 rc=0`，无 error。
-- combined direct：报告 `cold_compile_elapsed_ms=12.588`，exit `42`。
-- aarch64_encode direct：报告 `cold_compile_elapsed_ms=10.454`，exit `42`。
-- frontend_scan direct：exit `42`。
-- v2 回归矩阵：28 个冷编译器回归全部通过。13 个核心 cold slice 全部通过。3 个 kernel 全部通过。
-- `build-backend-driver`：冷 linkerless 构建通过，`cold_frontend_function_count=3154`，`cold_compile_elapsed_ms≈89ms`。
+- `cc -std=c11 -O2 -o /tmp/cheng_cold bootstrap/cheng_cold.c` 通过，仍有 4 个既有 warning。
+- `tools/cold_regression_test.sh`：75/75 PASS。
+- `tools/cold_csg_v2_roundtrip_test.sh`：716/716 PASS。
+- `generic_arithmetic_smoke` 已纳入冷回归并运行 exit 0。
+- `runtime_provider_autolink_af_inet` 已纳入冷回归：`--link-providers` 从 primary undefined symbol 自动选择 `cheng_native_af_inet_bridge`，生成真实 Linux runtime provider archive 后 cold linkerless 产出 AArch64 ELF executable，`provider_resolved_symbol_count=1`、`unresolved_symbol_count=0`、`system_link=0`。
+- E-Graph 主线只保留 DSE 和已证明的局部恒等式 rewrite；LICM 变换未进入当前 codegen 主线。
 
 ## 当前进行中
 
@@ -43,8 +43,8 @@
 - 当前 `backend_driver_dispatch_min.cheng` 已越过签名类型层、bodyless `@importc fn`、直接 import module surface、qualified call 识别、imported overload 按参数 kind 解析、void 函数隐式 return、`Fmt"..."` lowering、top-level `const`、imported enum/object layout refinement、`Result[T]` object intrinsics、Darwin stack 参数 ABI、stdio 写入、真实 `argc/argv/envp`、`gettimeofday/getrusage/exit` syscall、path 文件读写、`GetEnv/ParseInt/Len/SliceBytes/Split/Strip/Join` 和 `CompilerCsgTextSet` 最小集合操作。
 - 已越过 `slplan.BuildSystemLinkPlanStubWithFields`：冷端新增结构化 `SystemLinkPlanStub` materializer，生成物 `backend_driver_dispatch_min_probe status --root:. --in:... --out:...` 已输出 `flag_exec_edges=0`、`flag_exec_unresolved=0` 并 exit 0。
 - 此前 `backend_driver_dispatch_min.cheng` 已可被 cold `system-link-exec` 消费并生成 Mach-O：`backend_driver_dispatch_min_probe` 编译成功，报告 `cold_compile_elapsed_ms=33.410`。
-- 本轮重建 direct import body 编译：`cold_compile_one_import_direct` 按直接 import 解析 body，不递归编译；Parser 带 `import_alias` 仅用于限定当前模块边界，导入模块内本地名调用走模块局部精确查找，不自动拼 `alias.name`，也不做 bare-name fallback；bodyless/imported 签名注册为 `external`，有 body 后清掉 external；linkerless codegen 只发射入口可达函数闭包并跳过 external。
-- 本轮继续收紧 cold codegen 正确性：入口可达函数闭包先做 DFS，任何可达 body 缺失、fallback body、未终结 block 或未解析 patch 都 hard-fail，不再生成 `mov x0,#0` 假返回；`assert` 和 `strings.strContains` 走精确 intrinsic；CSG 无体函数不再合成默认 return；`emit:obj` 不再为坏 body 生成 stub。
+- 本轮重建 direct import body 编译：`cold_compile_one_import_direct` 按直接 import 解析 body，不递归编译；Parser 带 `import_alias` 仅用于限定当前模块边界，导入模块内本地名调用走模块局部精确查找，不自动拼 `alias.name`；bodyless/imported 签名注册为 `external`，有 body 后清掉 external；linkerless codegen 只发射入口可达函数闭包并跳过 external。
+- 本轮继续收紧 cold codegen 正确性：入口可达函数闭包先做 DFS，任何可达 body 缺失、未终结 block 或未解析 patch 都 hard-fail，不再生成 `mov x0,#0` 假返回；`assert` 和 `strings.strContains` 走精确 intrinsic；CSG 无体函数不再合成默认 return；`emit:obj` 不再为坏 body 生成占位产物。
 - `emit:obj` 的 C ABI 边界已硬化：未声明外部调用直接失败；显式 `fn puts(s: cstring): int32` 走单指针 cstring ABI，并为 `str` 实参生成 NUL 结尾缓冲；`examples/test_hello.cheng -> .o -> cc -> exe` 输出精确 `Hello World!\n`。
 - direct Mach-O 路径已移除 upfront 全量 import body 编译；现在先解析入口 body，再按 BodyIR call/FN_ADDR 可达闭包精确加载 import source、精确匹配目标签名并编译对应 body。缺失 body、bodyless import、external 可达调用都 hard-fail，不再 setjmp 恢复、不再 skip body。
 - Heisenbug 修复基线：普通 `emit=exe` 不再因 `import` 自动切到 provider/system linker；direct codegen 只发射入口可达闭包，坏 body、未终结 block、未解析 patch 均 hard-fail；`emit:obj` writer 改为动态符号/重定位表，不再 128/256 截断。
@@ -65,6 +65,6 @@
 - 距离完全体还差：真实 CSG source closure、真实 lowering plan、真实 primary object plan、direct object/exe/linkerless image、完整 ARM64 编码与重定位、每次编译稳定 phase/report sidecar、mmap span/phase arena/SoA/int32 index/单扫 facts、lock-free work-stealing 并行、10万-30万行核心 30-80ms 冷自举验证。
 - source->CSG 仍未同步本轮能力：`cold_bootstrap_backend_dispatch_type_surface --csg-out` 当前失败，原因是旧 statement scanner 仍会把多行函数签名续行当成 statement；下一步修 CSG writer 必须按 `ColdFunctionSymbol.body` 边界跳过签名续行。
 - 本轮修正 Darwin 入栈参数 ABI：callee prologue 保存 `x19/x20` 与 `fp/lr` 后，stack 参数从 `FP+32+offset` 读取；`cold_stack_arg_abi` 锁住第 9/10 个参数不再错读前一组字符串。`RunSystemLinkExecFromCmdline` cold self-exec 短路已移除，生成版 `backend_driver_dispatch_min` 现在可真实执行 `system-link-exec ordinary_zero_exit_fixture`，生成 Mach-O 运行 exit 0。
-- 回归当前为 `28/28 PASS`，新增 `stack_arg_abi`；同时移除 `symbols_add_fn` 的 bare/qualified name 合并和 direct emit 的最小 stub 兜底，失败路径改为 hard-fail。
+- 历史回归曾为 `28/28 PASS`，新增 `stack_arg_abi`；同时移除 `symbols_add_fn` 的 bare/qualified name 合并和 direct emit 的最小占位产物，失败路径改为 hard-fail。当前基线为 75/75。
 - 下一步继续把 expr token facts 接到 statement payload 并向 3000 行推进，同时保持 `cold_compile_elapsed_ms` 三路径一致。
 - 每轮继续记录 `cold_compile_elapsed_ms`，并保持 source-direct、source->CSG、facts direct 三路径一致。

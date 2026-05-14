@@ -1,6 +1,6 @@
 #!/bin/bash
 # CSG v2 Phase 0/1 roundtrip guard.
-# Locks: Cheng writer -> canonical facts -> cold reader -> object writer.
+# Locks: Cheng writer -> explicit CSG fact flavor -> cold reader -> object writer.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -59,6 +59,17 @@ require_grep() {
     fi
 }
 
+facts_magic_kind() {
+    local path="$1"
+    if head -c 13 "$path" | LC_ALL=C grep -aq '^CHENG_CSG_V2$'; then
+        echo canonical
+    elif head -c 8 "$path" | LC_ALL=C grep -aq '^CHENGCSG$'; then
+        echo internal
+    else
+        echo unknown
+    fi
+}
+
 roundtrip_fixture() {
     local name="$1"
     local source="$2"
@@ -82,14 +93,14 @@ roundtrip_fixture() {
         return
     fi
 
-    local magic8
-    local magic13
-    magic8="$(head -c 8 "$facts")"
-    magic13="$(head -c 13 "$facts")"
-    if [ "$magic13" = "CHENG_CSG_V2" ] || [ "$magic8" = "CHENGCSG" ]; then
-        ok "$name csg_v2_magic"
+    local facts_kind
+    facts_kind="$(facts_magic_kind "$facts")"
+    if [ "$facts_kind" = "canonical" ]; then
+        ok "$name canonical_cheng_csg_v2_magic"
+    elif [ "$facts_kind" = "internal" ]; then
+        ok "$name internal_chengcsg_magic"
     else
-        bad "$name csg_v2_magic"
+        bad "$name csg_v2_magic actual=$facts_kind"
     fi
 
     local bytes
