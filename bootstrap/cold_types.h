@@ -331,6 +331,10 @@ enum {
     BODY_OP_CLOSURE_NEW = 132,
     BODY_OP_CLOSURE_CALL = 133,
     BODY_OP_PATH_WRITE_BYTES = 134,
+    BODY_OP_PTR_ADD = 135,
+    BODY_OP_COPY_RAW = 136,
+    BODY_OP_PATH_IS_ABSOLUTE = 137,
+    BODY_OP_THREAD_YIELD = 138,
 };
 
 enum {
@@ -513,6 +517,7 @@ typedef struct GlobalDef {
     int32_t kind;
     int32_t size;
     Span type_name;
+    int32_t init_value;
 } GlobalDef;
 
 typedef struct Symbols {
@@ -766,7 +771,7 @@ ConstDef *symbols_add_const(Symbols *symbols, Span name, int32_t value);
 ConstDef *symbols_find_const(Symbols *symbols, Span name);
 GlobalDef *symbols_find_global(Symbols *symbols, Span name);
 void symbols_add_global(Symbols *symbols, Span name, int32_t kind,
-                        int32_t size, Span type_name);
+                        int32_t size, Span type_name, int32_t init_value);
 ObjectDef *symbols_resolve_object(Symbols *symbols, Span name);
 void symbols_refine_object_layouts(Symbols *symbols);
 

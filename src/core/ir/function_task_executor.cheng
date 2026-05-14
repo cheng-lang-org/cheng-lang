@@ -6,6 +6,8 @@ import std/async_rt as async
 import std/thread
 import cheng/core/ir/core_types as coreir
 import cheng/core/ir/function_task as ftask
+import cheng/core/backend/lowering_plan as lower
+import cheng/core/lang/typed_expr as texpr
 
 type
     FunctionTaskWorker =
@@ -24,59 +26,36 @@ var
     functionTaskWsLastWorkerCount: int32
     functionTaskWsLastCompletedWorkerCount: int32
 
+var
+    functionTaskLoweringPlan: lower.LoweringPlanStub
+    functionTaskLoweringSourceTexts: texpr.TypedExprSourceText[]
+    functionTaskLoweringLetCallReturnLiteralStart: int32
+    functionTaskLoweringContextSet: bool
+
+fn FunctionTaskSetLoweringContext(plan: lower.LoweringPlanStub,
+                                   sourceTexts: texpr.TypedExprSourceText[]) =
+    functionTaskLoweringPlan = plan
+    functionTaskLoweringSourceTexts = sourceTexts
+    functionTaskLoweringLetCallReturnLiteralStart = texpr.BodyKindLetCallReturnI32ConstPrefixLen
+    functionTaskLoweringContextSet = true
+
 fn FunctionTaskExecuteBodyIr(task: ftask.FunctionTask): ftask.FunctionTaskResult =
     var result = ftask.FunctionTaskResultEmpty(task.funcIndex)
     result.outputKind = ftask.FunctionTaskResultKindBodyIr()
     result.bodyIR = task.extra.bodyIR
-    var wc: int32
-    for oi in 0..<task.extra.bodyIR.ops.len:
-        let op = task.extra.bodyIR.ops[oi]
-        if op.kind == coreir.BodyOpInvalidTag:
-            wc = -1
-            break
-        if op.kind == coreir.BodyOpCallTag:
-            wc = wc + 4
-        elif op.kind == coreir.BodyOpLoadConstTag:
-            wc = wc + 3
-        elif op.kind == coreir.BodyOpCopyLocalTag:
-            wc = wc + 3
-        elif op.kind == coreir.BodyOpBinOpTag:
-            wc = wc + 4
-        elif op.kind == coreir.BodyOpStrEqLiteralTag:
-            wc = wc + 5
-        elif op.kind == coreir.BodyOpFieldLoadTag ||
-             op.kind == coreir.BodyOpFieldStoreTag:
-            wc = wc + 4
-        elif op.kind == coreir.BodyOpStoreLocalTag ||
-             op.kind == coreir.BodyOpLoadLocalTag:
-            wc = wc + 3
-        elif op.kind == coreir.BodyOpStrEqTag:
-            wc = wc + 4
-        elif op.kind == coreir.BodyOpCmpTag:
-            wc = wc + 4
-        elif op.kind == coreir.BodyOpBranchTag:
-            wc = wc + 6
-        else:
-            wc = -1
-            break
-    if wc < 0:
-        ftask.FunctionTaskPlanAppendDiag(result, "function_task_body_ir_unsupported_op")
+    if !functionTaskLoweringContextSet:
+        ftask.FunctionTaskPlanAppendDiag(result, "function_task_lowering_context_not_set")
         return result
-    for ti in 0..<task.extra.bodyIR.terms.len:
-        let term = task.extra.bodyIR.terms[ti]
-        if term.kind == coreir.BodyTermReturnTag:
-            wc = wc + 2
-        elif term.kind == coreir.BodyTermCbrTag:
-            wc = wc + 5
-        elif term.kind == coreir.BodyTermBrTag:
-            wc = wc + 1
-        else:
-            wc = -1
-            break
-    if wc < 0:
-        ftask.FunctionTaskPlanAppendDiag(result, "function_task_body_ir_unsupported_term")
+    let i = task.funcIndex
+    if i < 0 || i >= functionTaskLoweringPlan.functionNames.len:
+        ftask.FunctionTaskPlanAppendDiag(result, "function_task_func_index_out_of_range")
         return result
-    result.wordCount = wc
+    let fnIr = lower.LoweringBuildOneFunction(functionTaskLoweringPlan,
+                                               functionTaskLoweringSourceTexts,
+                                               i,
+                                               functionTaskLoweringLetCallReturnLiteralStart)
+    result.loweredFunction = fnIr
+    result.wordCount = fnIr.statementCount
     return result
 
 fn FunctionTaskExecuteOne(task: ftask.FunctionTask): ftask.FunctionTaskResult =

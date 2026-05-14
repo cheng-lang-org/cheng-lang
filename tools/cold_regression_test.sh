@@ -162,18 +162,15 @@ timeout 30 "$COLD" system-link-exec --in:src/core/tooling/backend_driver_dispatc
     --target:arm64-apple-darwin --out:/tmp/ct_dm --report-out:/tmp/ct_dm.report \
     >/tmp/ct_dm.stdout 2>/tmp/ct_dm.stderr
 dm_status=$?
-if [ "$dm_status" -ne 0 ] &&
-   grep -q '^unresolved_symbol_count=3$' /tmp/ct_dm.report 2>/dev/null &&
-   grep -q '^first_unresolved_symbol=os.cheng_fopen$' /tmp/ct_dm.report 2>/dev/null &&
-   grep -q '^egraph_licm_hoisted=0$' /tmp/ct_dm.report 2>/dev/null &&
-   [ ! -e /tmp/ct_dm ]; then
-    ACT="HARD_FAIL"
+if [ "$dm_status" -eq 0 ] &&
+   [ -x /tmp/ct_dm ]; then
+    ACT="COMPILE_OK"
 else
-    ACT="WRONG_RESULT"
+    ACT="COMPILE_FAILED"
 fi
-assert "dispatch_min_direct_unresolved_hard_fail" "HARD_FAIL" "$ACT"
-if [ ! -x /tmp/ct_dm ]; then ACT=1; else ACT=0; fi
-assert "dispatch_min_no_stale_binary" 1 "$ACT"
+assert "dispatch_min_direct_compile_ok" "COMPILE_OK" "$ACT"
+if [ -x /tmp/ct_dm ]; then ACT=0; else ACT=1; fi
+assert "dispatch_min_direct_binary_exists" 0 "$ACT"
 if [ ! -e /tmp/ct_dm_self ]; then ACT=1; else ACT=0; fi
 assert "dispatch_min_self_ordinary_blocked_no_driver" 1 "$ACT"
 if [ ! -e /tmp/ct_dm_import ]; then ACT=1; else ACT=0; fi
@@ -314,17 +311,13 @@ timeout 30 "$COLD" system-link-exec --root:"$PWD" \
     --report-out:/tmp/ct_pure_backend_driver.report \
     >/tmp/ct_pure_backend_driver.stdout 2>/tmp/ct_pure_backend_driver.stderr
 pure_driver_status=$?
-if [ "$pure_driver_status" -ne 0 ] &&
-   grep -q '^cold_system_link_exec=1$' /tmp/ct_pure_backend_driver.report 2>/dev/null &&
-   grep -q '^unresolved_symbol_count=3$' /tmp/ct_pure_backend_driver.report 2>/dev/null &&
-   grep -q '^first_unresolved_symbol=os.cheng_fopen$' /tmp/ct_pure_backend_driver.report 2>/dev/null &&
-   grep -q '^egraph_licm_hoisted=0$' /tmp/ct_pure_backend_driver.report 2>/dev/null &&
-   [ ! -e /tmp/ct_pure_backend_driver ]; then
-    ACT="HARD_FAIL"
+if [ "$pure_driver_status" -eq 0 ] &&
+   [ -x /tmp/ct_pure_backend_driver ]; then
+    ACT="COMPILE_OK"
 else
-    ACT="WRONG_RESULT"
+    ACT="COMPILE_FAILED"
 fi
-assert "pure_backend_driver_direct_hard_fail" "HARD_FAIL" "$ACT"
+assert "pure_backend_driver_direct_compile_ok" "COMPILE_OK" "$ACT"
 
 rm -f /tmp/ct_compiler_runtime_smoke /tmp/ct_compiler_runtime_smoke.report \
     /tmp/ct_compiler_runtime_smoke.stdout /tmp/ct_compiler_runtime_smoke.stderr
