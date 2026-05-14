@@ -605,6 +605,20 @@ else
 fi
 assert "ownership_report_off_fields" 1 "$ACT"
 
+# Ownership phase consistency: --ownership-on and without must produce identical stdout markers
+rm -f /tmp/ct_ownership_marker_diff
+if [ -f /tmp/ct_ownership.stdout ] && [ -f /tmp/ct_ownership_off.stdout ]; then
+    if cmp -s /tmp/ct_ownership.stdout /tmp/ct_ownership_off.stdout; then
+        ACT=1
+    else
+        ACT=0
+        diff /tmp/ct_ownership.stdout /tmp/ct_ownership_off.stdout > /tmp/ct_ownership_marker_diff 2>&1 || true
+    fi
+else
+    ACT="MISSING_STDOUT"
+fi
+assert "ownership_phase_consistency" 1 "$ACT"
+
 # 12: emit:obj with object fields (int32 + str)
 rm -f /tmp/ct_eo_fields.cheng /tmp/ct_eo_fields /tmp/ct_eo_fields.o /tmp/ct_eo_fields_link
 cat > /tmp/ct_eo_fields.cheng << 'EOF'
