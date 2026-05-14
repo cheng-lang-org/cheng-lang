@@ -5768,6 +5768,18 @@ int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32_t *kin
                 variant_name = cold_span_strip_generic_suffix(variant_name);
                 TypeDef *ty = symbols_find_type(parser->symbols, type_name);
                 if (ty) qualified_variant = type_find_variant(ty, variant_name);
+                /* Import alias fallback: type_name might be an import alias */
+                if (!qualified_variant && parser->import_source_count > 0 && parser->import_sources) {
+                    for (int32_t isi = 0; isi < parser->import_source_count; isi++) {
+                        if (!span_same(parser->import_sources[isi].alias, type_name)) continue;
+                        Span aliased = cold_arena_join3(parser->arena,
+                            parser->import_sources[isi].alias, ".", variant_name);
+                        qualified_variant = symbols_find_variant(parser->symbols, aliased);
+                        if (!qualified_variant)
+                            qualified_variant = symbols_find_variant(parser->symbols, variant_name);
+                        if (qualified_variant) break;
+                    }
+                }
             }
             if (!qualified_variant) {
                 qualified_variant = symbols_find_variant(parser->symbols, qualified);
