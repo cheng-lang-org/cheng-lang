@@ -3595,7 +3595,13 @@ bool cold_try_os_intrinsic(Parser *parser, BodyIR *body, Span name,
     if (cold_name_is_param_str(name)) {
         if (arg_count != 1) die("paramStr intrinsic arity mismatch");
         int32_t index_slot = body->call_arg_slot[arg_start];
-        if (body->slot_kind[index_slot] != SLOT_I32) die("paramStr index must be int32");
+        if (body->slot_kind[index_slot] == SLOT_I32_REF) {
+            int32_t loaded = body_slot(body, SLOT_I32, 4);
+            body_op(body, BODY_OP_I32_REF_LOAD, loaded, index_slot, 0);
+            index_slot = loaded;
+        } else if (body->slot_kind[index_slot] != SLOT_I32) {
+            die("paramStr index must be int32");
+        }
         int32_t slot = body_slot(body, SLOT_STR, COLD_STR_SLOT_SIZE);
         body_slot_set_type(body, slot, cold_cstr_span("cstring"));
         body_op(body, BODY_OP_ARGV_STR, slot, index_slot, 0);
@@ -5679,6 +5685,7 @@ int32_t parse_postfix(Parser *parser, BodyIR *body, Locals *locals,
                         die("unsupported str index expression");
                     }
                 }
+                index_slot = cold_materialize_i32_ref(body, index_slot, &index_kind);
                 if (index_kind != SLOT_I32) die("str index expression must be int32");
                 int32_t dst = body_slot(body, SLOT_I32, 4);
                 body_op(body, BODY_OP_STR_INDEX, dst, slot, index_slot);
@@ -5701,6 +5708,7 @@ int32_t parse_postfix(Parser *parser, BodyIR *body, Locals *locals,
                         die("unsupported str[] index expression");
                     }
                 }
+                index_slot = cold_materialize_i32_ref(body, index_slot, &index_kind);
                 if (index_kind != SLOT_I32) die("str[] index expression must be int32");
                 int32_t dst = body_slot(body, SLOT_STR, COLD_STR_SLOT_SIZE);
                 body_op(body, BODY_OP_SEQ_STR_INDEX_DYNAMIC, dst, slot, index_slot);
@@ -5722,6 +5730,7 @@ int32_t parse_postfix(Parser *parser, BodyIR *body, Locals *locals,
                         die("unsupported opaque[] index expression");
                     }
                 }
+                index_slot = cold_materialize_i32_ref(body, index_slot, &index_kind);
                 if (index_kind != SLOT_I32) die("opaque[] index expression must be int32");
                 Span elem_type = cold_seq_opaque_element_type(body->slot_type[slot]);
                 int32_t elem_kind = cold_slot_kind_from_type_with_symbols(parser->symbols, elem_type);
@@ -5757,6 +5766,7 @@ int32_t parse_postfix(Parser *parser, BodyIR *body, Locals *locals,
                 int32_t index_slot = parse_expr(&index_parser, body, locals, &index_kind);
                 parser_ws(&index_parser);
                 if (index_parser.pos != index_parser.source.len) return 0; /* skip unsupported index */;
+                index_slot = cold_materialize_i32_ref(body, index_slot, &index_kind);
                 if (index_kind != SLOT_I32) return 0; /* skip non-int32 index */;
                 body_op3(body,
                          *kind == SLOT_ARRAY_I32 ? BODY_OP_ARRAY_I32_INDEX_DYNAMIC
@@ -6639,6 +6649,7 @@ int32_t parse_builtin_remove_after_name(Parser *parser, BodyIR *body, Locals *lo
         return block;
     }
     if (seq_slot < 0) return block; /* unhandled l-value path, skip silently */
+    index_slot = cold_materialize_i32_ref(body, index_slot, &index_kind);
     if (index_kind != SLOT_I32) die("remove index must be int32");
     if (seq_kind == SLOT_SEQ_OPAQUE || seq_kind == SLOT_SEQ_OPAQUE_REF) {
         int32_t element_size = cold_seq_opaque_element_size_for_slot(parser->symbols, body, seq_slot);
