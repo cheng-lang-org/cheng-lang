@@ -92,13 +92,13 @@ if $COLD system-link-exec --in:src/tests/import_use.cheng \
     --report-out:/tmp/ct_link_providers.report --link-providers >/dev/null 2>&1; then
     ACT="UNEXPECTED_SUCCESS"
 elif grep -q '^system_link_exec=0$' /tmp/ct_link_providers.report 2>/dev/null &&
-     grep -q '^error=--link-providers requires explicit provider archive$' /tmp/ct_link_providers.report 2>/dev/null &&
+     grep -q '^error=--link-providers requires ELF target$' /tmp/ct_link_providers.report 2>/dev/null &&
      [ ! -e /tmp/ct_link_providers ]; then
     ACT="HARD_FAIL"
 else
     ACT="WRONG_FAILURE"
 fi
-assert "link_providers_requires_archive" "HARD_FAIL" "$ACT"
+assert "link_providers_requires_elf" "HARD_FAIL" "$ACT"
 
 rm -f /tmp/ct_bad_import
 quiet $COLD system-link-exec --in:src/tests/cold_bad_import_unresolved_main.cheng \
@@ -674,6 +674,31 @@ else
     ACT=0
 fi
 assert "runtime_provider_linux_af_inet_single_root_export" 1 "$ACT"
+
+rm -f /tmp/ct_runtime/autolink_af_inet \
+    /tmp/ct_runtime/autolink_af_inet.report.txt
+quiet $COLD system-link-exec \
+    --in:testdata/runtime_provider_autolink_af_inet.cheng \
+    --target:aarch64-unknown-linux-gnu \
+    --out:/tmp/ct_runtime/autolink_af_inet \
+    --report-out:/tmp/ct_runtime/autolink_af_inet.report.txt \
+    --link-providers
+if [ -s /tmp/ct_runtime/autolink_af_inet ] &&
+   file /tmp/ct_runtime/autolink_af_inet 2>/dev/null | grep -q 'ELF 64-bit.*executable.*aarch64' &&
+   grep -q '^system_link_exec=1$' /tmp/ct_runtime/autolink_af_inet.report.txt 2>/dev/null &&
+   grep -q '^system_link_exec_scope=cold_runtime_provider_archive$' /tmp/ct_runtime/autolink_af_inet.report.txt 2>/dev/null &&
+   grep -q '^provider_archive=1$' /tmp/ct_runtime/autolink_af_inet.report.txt 2>/dev/null &&
+   grep -q '^provider_object_count=1$' /tmp/ct_runtime/autolink_af_inet.report.txt 2>/dev/null &&
+   grep -q '^provider_archive_member_count=1$' /tmp/ct_runtime/autolink_af_inet.report.txt 2>/dev/null &&
+   grep -q '^provider_export_count=1$' /tmp/ct_runtime/autolink_af_inet.report.txt 2>/dev/null &&
+   grep -q '^provider_resolved_symbol_count=1$' /tmp/ct_runtime/autolink_af_inet.report.txt 2>/dev/null &&
+   grep -q '^unresolved_symbol_count=0$' /tmp/ct_runtime/autolink_af_inet.report.txt 2>/dev/null &&
+   grep -q '^system_link=0$' /tmp/ct_runtime/autolink_af_inet.report.txt 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "runtime_provider_autolink_af_inet" 1 "$ACT"
 
 rm -rf /tmp/ct_runtime
 

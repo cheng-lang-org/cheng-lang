@@ -43,7 +43,6 @@ static bool cold_diag_dump_per_fn = false;
 static bool cold_diag_dump_slots = false;
 static int32_t cold_egraph_rewrite_count = 0;
 static int32_t cold_egraph_dedup_count = 0;
-static int32_t cold_egraph_licm_hoisted = 0;
 
 #include "macho_direct.h"
 #include "elf64_direct.h"
@@ -3216,7 +3215,7 @@ static int cold_cmd_status(int argc, char **argv) {
     puts("bootstrap_mode=selfhost");
     puts("compiler_entry=src/core/tooling/backend_driver_dispatch_min.cheng");
     puts("ordinary_command=system-link-exec");
-    puts("ordinary_pipeline=canonical_csg_verified_primary_object_codegen_ready");
+    puts("ordinary_pipeline=internal_csg_verified_primary_object_codegen_ready");
     puts("stage3=artifacts/bootstrap/cheng.stage3");
     printf("flag_root=%s\n", root);
     printf("flag_in=%s\n", source);
@@ -3927,11 +3926,6 @@ static uint64_t cold_body_ir_canonical_hash_normalized(BodyIR *body) {
             kind == BODY_OP_I64_XOR) {
             if (a > b) { int32_t t = a; a = b; b = t; }
         }
-        if (kind == BODY_OP_F32_ADD || kind == BODY_OP_F32_MUL ||
-            kind == BODY_OP_F64_ADD || kind == BODY_OP_F64_MUL) {
-            if (a > b) { int32_t t = a; a = b; b = t; }
-        }
-
         /* SHL(x,0)/ASR(x,0) -> COPY(x) for hash normalization */
         if ((kind == BODY_OP_I32_SHL || kind == BODY_OP_I32_ASR) &&
             slot_def && b >= 0 && b < body->slot_count) {
@@ -4315,33 +4309,8 @@ static int32_t cold_ensure_specialized(Symbols *symbols, int32_t template_idx,
                                        arg_kinds, 0, tmpl->ret);
     if (spec_idx >= 0 && spec_idx < symbols->function_count) {
         symbols->functions[spec_idx].generic_count = 0;
-        /* OPAQUE->I64/F32/F64 body IR op patching:
-           I32_ADD(8)->I64_ADD(77)/F32_ADD(97)/F64_ADD(98)
-           I32_SUB(9)->I64_SUB(78)/F32_SUB(99)/F64_SUB(100)
-           I32_MUL(20)->I64_MUL(79)/F32_MUL(101)/F64_MUL(102)
-           Patch in codegen when param_kind differs from template. */
     }
     return spec_idx >= 0 ? spec_idx : template_idx;
-}
-
-/* Patch body IR ops for non-I32 specialization.
-   Converts I32 arithmetic ops to I64/F32/F64 based on target kind. */
-static void cold_patch_body_ir_for_kind(BodyIR *body, int32_t target_kind) {
-    if (!body || target_kind == SLOT_I32) return;
-    int32_t add_op, sub_op, mul_op;
-    if (target_kind == SLOT_I64) {
-        add_op = BODY_OP_I64_ADD; sub_op = BODY_OP_I64_SUB; mul_op = BODY_OP_I64_MUL;
-    } else if (target_kind == SLOT_F32) {
-        add_op = BODY_OP_F32_ADD; sub_op = BODY_OP_F32_SUB; mul_op = BODY_OP_F32_MUL;
-    } else if (target_kind == SLOT_F64) {
-        add_op = BODY_OP_F64_ADD; sub_op = BODY_OP_F64_SUB; mul_op = BODY_OP_F64_MUL;
-    } else return;
-    for (int32_t i = 0; i < body->op_count; i++) {
-        int32_t k = body->op_kind[i];
-        if (k == BODY_OP_I32_ADD) body->op_kind[i] = add_op;
-        else if (k == BODY_OP_I32_SUB) body->op_kind[i] = sub_op;
-        else if (k == BODY_OP_I32_MUL) body->op_kind[i] = mul_op;
-    }
 }
 
 static TypeDef *symbols_find_type(Symbols *symbols, Span name);
@@ -11711,115 +11680,6 @@ static bool cold_is_same_block_as(BodyIR *body, int32_t idx_a, int32_t idx_b) {
     return false;
 }
 
-/* Loop-invariant code motion: hoist I32_CONST / I64_CONST out of loop bodies.
-   A CONST op is always safe to hoist because it has no data-flow dependencies.
-   Uses op-position range (not block-index range) to identify blocks in the loop,
-   avoiding false positives from body_reopen_block reordering. */
-static void cold_apply_licm(BodyIR *body) {
-    if (!body || body->block_count < 2) return;
-    int32_t block_count = body->block_count;
-
-    /* Step 1: Find all back edges (block terminator targets a smaller block index) */
-    enum { BACK_EDGE_CAP = 128 };
-    int32_t back_header[BACK_EDGE_CAP], back_source[BACK_EDGE_CAP];
-    int32_t loop_count = 0;
-    for (int32_t b = 1; b < block_count; b++) {
-        int32_t t = body->block_term[b];
-        if (t < 0 || t >= body->term_count) continue;
-        int32_t tb = body->term_true_block[t];
-        int32_t fb = body->term_false_block[t];
-        if (tb >= 0 && tb < b && loop_count < BACK_EDGE_CAP) {
-            back_header[loop_count] = tb; back_source[loop_count] = b; loop_count++;
-        }
-        if (fb >= 0 && fb < b && loop_count < BACK_EDGE_CAP) {
-            back_header[loop_count] = fb; back_source[loop_count] = b; loop_count++;
-        }
-    }
-    if (loop_count == 0) return;
-
-    /* Step 2: Sort by range ascending (innermost loops first) */
-    for (int32_t i = 0; i < loop_count - 1; i++) {
-        for (int32_t j = i + 1; j < loop_count; j++) {
-            int32_t ri = back_source[i] - back_header[i];
-            int32_t rj = back_source[j] - back_header[j];
-            if (rj < ri) {
-                int32_t tmp = back_header[i]; back_header[i] = back_header[j]; back_header[j] = tmp;
-                tmp = back_source[i]; back_source[i] = back_source[j]; back_source[j] = tmp;
-            }
-        }
-    }
-
-    /* Step 3: Hoist CONST ops from each loop to its header.
-       We detect loop membership by OP POSITION (not block index), because
-       body_reopen_block can place a block's ops at a different flat-array
-       position than its index implies. */
-    for (int32_t li = 0; li < loop_count; li++) {
-        int32_t hdr = back_header[li], src = back_source[li];
-        int32_t loop_op_start = body->block_op_start[hdr];
-        int32_t loop_op_end   = body->block_op_start[src] + body->block_op_count[src];
-        if (loop_op_start >= loop_op_end) continue; /* malformed loop */
-
-        /* Collect CONST ops from all blocks whose ops lie within [loop_op_start, loop_op_end) */
-        enum { CONST_CAP = 256 };
-        int32_t const_kind[CONST_CAP], const_dst[CONST_CAP];
-        int32_t const_a[CONST_CAP], const_b[CONST_CAP], const_c[CONST_CAP];
-        int32_t n_const = 0;
-        for (int32_t b = 0; b < block_count; b++) {
-            int32_t b_start = body->block_op_start[b];
-            int32_t b_len   = body->block_op_count[b];
-            if (b_len <= 0) continue;
-            if (b_start < loop_op_start || b_start + b_len > loop_op_end) continue;
-            int32_t end = b_start + b_len;
-            for (int32_t oi = b_start; oi < end; oi++) {
-                int32_t kind = body->op_kind[oi];
-                if ((kind == BODY_OP_I32_CONST || kind == BODY_OP_I64_CONST) && n_const < CONST_CAP) {
-                    const_kind[n_const] = kind; const_dst[n_const] = body->op_dst[oi];
-                    const_a[n_const]    = body->op_a[oi];   const_b[n_const]    = body->op_b[oi];
-                    const_c[n_const]    = body->op_c[oi];   n_const++;
-                    body->op_kind[oi] = 0; /* mark original as dead */
-                }
-            }
-        }
-        if (n_const == 0) continue;
-
-        /* Ensure capacity for the new ops */
-        while (body->op_count + n_const > body->op_cap) {
-            int32_t saved = body->op_count;
-            body->op_count = body->op_cap;
-            body_ensure_ops(body);
-            body->op_count = saved;
-        }
-
-        /* Insert collected CONST ops before the header's first op */
-        int32_t insert_pos = body->block_op_start[hdr];
-        for (int32_t ci = 0; ci < n_const; ci++) {
-            size_t shift = (size_t)(body->op_count - insert_pos) * sizeof(int32_t);
-            memmove(&body->op_kind[insert_pos + 1], &body->op_kind[insert_pos], shift);
-            memmove(&body->op_dst[insert_pos + 1],  &body->op_dst[insert_pos],  shift);
-            memmove(&body->op_a[insert_pos + 1],    &body->op_a[insert_pos],    shift);
-            memmove(&body->op_b[insert_pos + 1],    &body->op_b[insert_pos],    shift);
-            memmove(&body->op_c[insert_pos + 1],    &body->op_c[insert_pos],    shift);
-            body->op_kind[insert_pos] = const_kind[ci];
-            body->op_dst[insert_pos]  = const_dst[ci];
-            body->op_a[insert_pos]    = const_a[ci];
-            body->op_b[insert_pos]    = const_b[ci];
-            body->op_c[insert_pos]    = const_c[ci];
-            body->op_count++;
-
-            /* Adjust block boundaries: header's count grows; all others with
-               start >= insert_pos shift right by one (except hdr, whose start
-               is insert_pos and intentionally unchanged). */
-            for (int32_t bi = 0; bi < block_count; bi++) {
-                if (bi != hdr && body->block_op_start[bi] >= insert_pos)
-                    body->block_op_start[bi]++;
-            }
-            body->block_op_count[hdr]++;
-        }
-
-        __atomic_add_fetch(&cold_egraph_licm_hoisted, n_const, __ATOMIC_RELAXED);
-    }
-}
-
 /* Algebraic identity rewrites (constant folding for provably-correct patterns).
    These are safe because the rewrites are mathematically provable algebraic
    identities, independent of BodyIR slot mutability:
@@ -12012,6 +11872,26 @@ static void cold_apply_identity_rewrites(BodyIR *body) {
                         __atomic_add_fetch(&cold_egraph_rewrite_count, 1, __ATOMIC_RELAXED);
                     }
                     break;
+
+                case BODY_OP_I32_CMP:
+                    if (body->op_c[i] == COND_EQ && a == b &&
+                        a >= 0 && a < slot_count) {
+                        body->op_kind[i] = BODY_OP_I32_CONST;
+                        body->op_a[i] = 1;
+                        body->op_b[i] = 0;
+                        __atomic_add_fetch(&cold_egraph_rewrite_count, 1, __ATOMIC_RELAXED);
+                    }
+                    break;
+
+                case BODY_OP_I64_CMP:
+                    if (body->op_c[i] == COND_EQ && a == b &&
+                        a >= 0 && a < slot_count) {
+                        body->op_kind[i] = BODY_OP_I64_CONST;
+                        body->op_a[i] = 1;
+                        body->op_b[i] = 0;
+                        __atomic_add_fetch(&cold_egraph_rewrite_count, 1, __ATOMIC_RELAXED);
+                    }
+                    break;
             }
         }
 
@@ -12026,7 +11906,7 @@ static void cold_apply_identity_rewrites(BodyIR *body) {
 
 /* Optimize a BodyIR function with dead store elimination.
    BodyIR slots are mutable, so CSE belongs after SSA/equivalence proof. */
-static void cold_optimize_body(BodyIR *body, bool enable_licm) {
+static void cold_optimize_body(BodyIR *body) {
     if (!body || body->slot_count <= 0 || body->op_count <= 0) return;
 
     int32_t slot_count = body->slot_count;
@@ -12100,17 +11980,12 @@ static void cold_optimize_body(BodyIR *body, bool enable_licm) {
        Runs after DSE so slot writer counts reflect only live ops. */
     cold_apply_identity_rewrites(body);
 
-    if (enable_licm) {
-        /* Loop-invariant code motion: hoist CONST ops out of loop bodies.
-           Runs after all other local optimizations. */
-        cold_apply_licm(body);
-    }
 }
 
 static void codegen_func(Code *code, BodyIR *body, Symbols *symbols,
                          FunctionPatchList *function_patches) {
     na_reset();
-    cold_optimize_body(body, true);
+    cold_optimize_body(body);
     int32_t frame_size = align_i32(body->frame_size, 16);
     code_emit(code, a64_stp_pre(19, 20, SP, -16));
     code_emit(code, a64_stp_pre(FP, LR, SP, -16));
@@ -12378,14 +12253,6 @@ static void cold_mark_reachable_functions(Symbols *symbols,
         int32_t fn_index = stack[--stack_count];
         if (fn_index < 0 || fn_index >= function_count) die("reachable cold function index out of range");
         BodyIR *body = function_bodies[fn_index];
-/* Patch specialized generic function body if params are non-I32 */
-if (symbols->functions[fn_index].generic_count == 0 &&
-symbols->functions[fn_index].arity > 0) {
-int32_t pk = symbols->functions[fn_index].param_kind[0];
-if (pk == SLOT_I64 || pk == SLOT_F32 || pk == SLOT_F64) {
-cold_patch_body_ir_for_kind(body, pk);
-}
-}
         if (!cold_body_codegen_ready(body)) {
             if (symbols->functions[fn_index].is_external) continue;
             cold_die_missing_reachable_body(symbols, fn_index);
@@ -12423,7 +12290,6 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
                                   entry_function, reachable_functions);
 
     cold_egraph_rewrite_count = 0;
-    cold_egraph_licm_hoisted = 0;
     FunctionPatchList function_patches = {0};
     function_patches.arena = code->arena;
 
@@ -12720,7 +12586,7 @@ static const char *cold_entry_dispatch_output_text(int32_t command_code) {
                "bootstrap_mode=selfhost\n"
                "compiler_entry=src/core/tooling/backend_driver_dispatch_min.cheng\n"
                "ordinary_command=system-link-exec\n"
-               "ordinary_pipeline=canonical_csg_verified_primary_object_codegen_ready\n"
+               "ordinary_pipeline=internal_csg_verified_primary_object_codegen_ready\n"
                "stage3=artifacts/bootstrap/cheng.stage3\n"
                "linkerless_image=1\n"
                "system_link=0\n";
@@ -13062,7 +12928,6 @@ typedef struct ColdCompileStats {
     int32_t canonical_normalized_count;
     int32_t egraph_rewrite_count;
     int32_t egraph_dedup_count;
-    int32_t egraph_licm_hoisted;
     int32_t total_function_count;
     int32_t link_object;
     int32_t provider_archive;
@@ -13079,6 +12944,7 @@ typedef struct ColdCompileStats {
     int32_t lowering_parallel_schedule;
     int32_t ownership_compile_entry;
     int32_t ownership_runtime_witness;
+    char system_link_exec_scope[COLD_NAME_CAP];
 } ColdCompileStats;
 
 static void cold_print_exec_phase_report(FILE *file, ColdCompileStats *stats) {
@@ -15204,7 +15070,6 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
             stats->function_count = symbols->function_count;
             stats->egraph_rewrite_count = cold_egraph_rewrite_count;
             stats->egraph_dedup_count = cold_egraph_dedup_count;
-            stats->egraph_licm_hoisted = cold_egraph_licm_hoisted;
             stats->csg_lowering = 1;
             stats->arena_kb = arena->used / 1024;
             uint64_t end_us = cold_now_us();
@@ -15907,14 +15772,6 @@ void cold_compile_reachable_import_bodies(Symbols *symbols,
             }
         }
         BodyIR *body = function_bodies[fn_index];
-/* Patch specialized generic function body if params are non-I32 */
-if (symbols->functions[fn_index].generic_count == 0 &&
-symbols->functions[fn_index].arity > 0) {
-int32_t pk = symbols->functions[fn_index].param_kind[0];
-if (pk == SLOT_I64 || pk == SLOT_F32 || pk == SLOT_F64) {
-cold_patch_body_ir_for_kind(body, pk);
-}
-}
         if (!cold_body_codegen_ready(body)) {
             if (symbols->functions[fn_index].is_external) continue;
             cold_die_missing_reachable_body(symbols, fn_index);
@@ -16175,7 +16032,6 @@ bool cold_compile_source_path_to_macho(const char *out_path,
         stats->function_count = symbols->function_count;
         stats->type_count = symbols->type_count + symbols->object_count;
         stats->egraph_rewrite_count = cold_egraph_rewrite_count;
-        stats->egraph_licm_hoisted = cold_egraph_licm_hoisted;
         if (demo_body) {
             stats->op_count = demo_body->op_count;
             stats->block_count = demo_body->block_count;
@@ -16216,7 +16072,9 @@ static bool cold_write_system_link_exec_report(const char *path,
     fprintf(file, "system_link_exec=%d\n", success ? 1 : 0);
     fprintf(file, "real_backend_codegen=%d\n", success ? 1 : 0);
     fputs("cold_system_link_exec=1\n", file);
-    if (stats && stats->link_object) {
+    if (stats && stats->system_link_exec_scope[0]) {
+        fprintf(file, "system_link_exec_scope=%s\n", stats->system_link_exec_scope);
+    } else if (stats && stats->link_object) {
         fputs("system_link_exec_scope=cold_link_object\n", file);
     } else {
         fputs("system_link_exec_scope=cold_subset_direct_macho\n", file);
@@ -16285,7 +16143,6 @@ static bool cold_write_system_link_exec_report(const char *path,
         fprintf(file, "total_function_count=%d\n", stats->total_function_count);
         fprintf(file, "egraph_rewrite_count=%d\n", stats->egraph_rewrite_count);
         fprintf(file, "egraph_dedup_count=%d\n", stats->egraph_dedup_count);
-        fprintf(file, "egraph_licm_hoisted=%d\n", stats->egraph_licm_hoisted);
         fprintf(file, "ownership_compile_entry=%d\n", stats->ownership_compile_entry);
         fprintf(file, "ownership_runtime_witness=%d\n", stats->ownership_runtime_witness);
         cold_print_elapsed_ms(file, "cold_compile_elapsed_ms", stats->elapsed_us);
@@ -17340,6 +17197,62 @@ done:
     if (primary_span.len > 0) munmap((void *)primary_span.ptr, (size_t)primary_span.len);
     if (archive_span.len > 0) munmap((void *)archive_span.ptr, (size_t)archive_span.len);
     return ok;
+}
+
+static bool cold_runtime_provider_linux_root_supported(const char *symbol) {
+    static const char *roots[] = {
+        "cheng_native_af_inet_bridge",
+        "cheng_native_af_inet6_bridge",
+        "cheng_native_sock_stream_bridge",
+        "cheng_native_sock_dgram_bridge",
+        "cheng_native_ipproto_ip_bridge",
+        "cheng_native_sol_socket_bridge",
+        "cheng_native_so_reuseaddr_bridge",
+        "cheng_native_so_broadcast_bridge",
+        "cheng_native_msg_waitall_bridge",
+        "cheng_native_sockaddr_use_len_field_bridge",
+    };
+    if (!symbol || symbol[0] == '\0') return false;
+    for (size_t i = 0; i < sizeof(roots) / sizeof(roots[0]); i++) {
+        if (strcmp(symbol, roots[i]) == 0) return true;
+    }
+    return false;
+}
+
+static int32_t cold_collect_elf_undefined_reloc_symbols(const char *object_path,
+                                                        const char *target,
+                                                        const char **symbols,
+                                                        int32_t symbol_cap,
+                                                        Arena *arena) {
+    if (!object_path || !target || !symbols || symbol_cap <= 0 || !arena) return -1;
+    Span object_span = source_open(object_path);
+    if (object_span.len <= 0) return -1;
+    ColdElfObjectView object;
+    int32_t count = -1;
+    if (!cold_read_elf64_relocatable_view(object_span.ptr, object_span.len, target, &object)) goto done;
+    count = 0;
+    for (int32_t ri = 0; ri < object.reloc_count; ri++) {
+        const Elf64_Rela *reloc = &object.relas[ri];
+        uint32_t sym_index = (uint32_t)(reloc->r_info >> 32);
+        if (sym_index >= (uint32_t)object.sym_count) { count = -1; goto done; }
+        const Elf64_Sym *sym = &object.syms[sym_index];
+        if (sym->st_shndx != 0) continue;
+        const char *name = cold_elf_symbol_name(&object, sym_index);
+        if (!name || name[0] == '\0') { count = -1; goto done; }
+        bool seen = false;
+        for (int32_t si = 0; si < count; si++) {
+            if (strcmp(symbols[si], name) == 0) { seen = true; break; }
+        }
+        if (seen) continue;
+        if (count >= symbol_cap) { count = -1; goto done; }
+        size_t n = strlen(name);
+        char *copy = arena_alloc(arena, n + 1);
+        memcpy(copy, name, n + 1);
+        symbols[count++] = copy;
+    }
+done:
+    munmap((void *)object_span.ptr, (size_t)object_span.len);
+    return count;
 }
 
 static bool cold_write_provider_archive_pack_report(const char *path,
@@ -18418,6 +18331,8 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
     if (link_object_path && link_object_path[0] != '\0') {
         ColdCompileStats stats = {0};
         stats.link_object = 1;
+        snprintf(stats.system_link_exec_scope, sizeof(stats.system_link_exec_scope),
+                 "cold_link_object");
         if (provider_archive_path && provider_archive_path[0] != '\0') stats.provider_archive = 1;
         if ((source_path && source_path[0] != '\0') ||
             (csg_in_path && csg_in_path[0] != '\0') ||
@@ -18469,6 +18384,8 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
         strcmp(emit, "exe") == 0) {
         ColdCompileStats stats = {0};
         stats.provider_archive = 1;
+        snprintf(stats.system_link_exec_scope, sizeof(stats.system_link_exec_scope),
+                 "cold_csg_provider_archive");
         if (!is_elf) {
             const char *error = is_macho
                 ? COLD_PROVIDER_ARCHIVE_MACHO_ERROR
@@ -18577,7 +18494,7 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
                 /* Apply dead-store elimination (the primary BodyIR mutation) */
                 for (int32_t i = 0; i < rp_count; i++) {
                     BodyIR *b = rp_bodies[i];
-                    if (b && !b->has_fallback) cold_optimize_body(b, false);
+                    if (b && !b->has_fallback) cold_optimize_body(b);
                 }
                 rp_ok = cold_emit_csg_v2_facts(out_path, rp_bodies, rp_count, rp_sym, target);
             }
@@ -18790,7 +18707,8 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
         }
     }
 
-    /* --link-providers: compile primary + each import + link with cc */
+    /* --link-providers: compile primary, derive provider roots from undefined symbols,
+       build a provider archive, then link with the cold ELF linker. */
     int link_providers = 0;
     for (int di = 2; di < argc; di++) {
         if (strcmp(argv[di], "--link-providers") == 0) link_providers = 1;
@@ -18798,115 +18716,154 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
 
     ColdCompileStats stats = {0};
     if (link_providers) {
-        cold_write_system_link_exec_report(report_path, false, source_path, effective_csg_path,
-                                           out_path, target, emit, &stats,
-                                           "--link-providers requires explicit provider archive");
-        fprintf(stderr, "[cheng_cold] --link-providers requires explicit provider archive\n");
-        return 2;
-    }
-    int compiled = 0;
-    if (link_providers && strcmp(emit, "exe") == 0 &&
-        ((source_path && source_path[0]) || (effective_csg_path && effective_csg_path[0]))) {
-        char primary_o[PATH_MAX], host_stubs_o[PATH_MAX];
-        snprintf(primary_o, sizeof(primary_o), "%s.primary.o", out_path);
-        snprintf(host_stubs_o, sizeof(host_stubs_o), "%s.host_stubs.o", out_path);
-
+        snprintf(stats.system_link_exec_scope, sizeof(stats.system_link_exec_scope),
+                 "cold_runtime_provider_archive");
+        char primary_o[PATH_MAX], provider_o[PATH_MAX], provider_archive[PATH_MAX];
+        const char *error = "";
+        bool linked = false;
+        bool primary_written = false;
+        bool provider_written = false;
+        bool archive_written = false;
+        int n1 = snprintf(primary_o, sizeof(primary_o), "%s.primary.o", out_path);
+        int n2 = snprintf(provider_o, sizeof(provider_o), "%s.provider.o", out_path);
+        int n3 = snprintf(provider_archive, sizeof(provider_archive), "%s.provider.chenga", out_path);
+        if (strcmp(emit, "exe") != 0) {
+            error = "--link-providers requires --emit:exe";
+            goto link_providers_done;
+        }
+        if (!is_elf) {
+            error = "--link-providers requires ELF target";
+            goto link_providers_done;
+        }
+        if (n1 <= 0 || n1 >= (int)sizeof(primary_o) ||
+            n2 <= 0 || n2 >= (int)sizeof(provider_o) ||
+            n3 <= 0 || n3 >= (int)sizeof(provider_archive)) {
+            error = "temporary provider path too long";
+            goto link_providers_done;
+        }
         if (effective_csg_path && effective_csg_path[0]) {
-            /* CSG path: compile facts → primary .o */
-            if (!cold_compile_csg_path_to_macho(primary_o, effective_csg_path, 0, 0, target, &stats, true, 0)) {
-                fprintf(stderr, "[cheng_cold] --link-providers: csg primary compile failed\n");
-                return 2;
+            if (!cold_compile_csg_path_to_macho(primary_o, effective_csg_path, 0, 0,
+                                                target, &stats, true, 0)) {
+                error = "primary object emit failed";
+                goto link_providers_done;
             }
         } else {
 #ifndef COLD_BACKEND_ONLY
+            if (!source_path || source_path[0] == '\0') {
+                error = "missing --in";
+                goto link_providers_done;
+            }
             setenv("CHENG_NO_IMPORT_BODIES", "1", 1);
-            if (!cold_compile_source_to_object(primary_o, source_path, target, 0, "public")) {
-                fprintf(stderr, "[cheng_cold] --link-providers: primary compile failed\n");
-                return 2;
-            }
+            bool primary_ok = cold_compile_source_to_object(primary_o, source_path,
+                                                            target, 0, "public");
             unsetenv("CHENG_NO_IMPORT_BODIES");
-#endif /* COLD_BACKEND_ONLY */
-        }
-
-        { char cmd[PATH_MAX * 2];
-          snprintf(cmd, sizeof(cmd),
-            "cc -std=c11 -c -o %s src/core/runtime/host_runtime_stubs.c 2>/dev/null",
-            host_stubs_o);
-          int rc = system(cmd);
-          (void)rc;
-        }
-
-#ifndef COLD_BACKEND_ONLY
-        Span source = source_path ? source_open(source_path) : (Span){0};
-        char import_paths[32][PATH_MAX];
-        int import_count = 0;
-        if (source.len > 0) {
-            int pos = 0;
-            while (pos < source.len && import_count < 32) {
-                while (pos < source.len && source.ptr[pos] != 'i') pos++;
-                if (pos >= source.len) break;
-                if (strncmp((const char *)(source.ptr + pos), "import ", 7) == 0) {
-                    int start = pos;
-                    pos += 7;
-                    while (pos < source.len && source.ptr[pos] != '\n') pos++;
-                    Span import_line = {source.ptr + start, pos - start};
-                    Span module_path = {0}, alias = {0};
-                    if (cold_parse_import_line(import_line, &module_path, &alias) &&
-                        module_path.len > 0) {
-                        char resolved[PATH_MAX];
-                        if (cold_import_source_path(module_path, resolved, sizeof(resolved))) {
-                            snprintf(import_paths[import_count], PATH_MAX, "%s", resolved);
-                            import_count++;
-                        }
-                    }
-                }
-                pos++;
+            if (!primary_ok) {
+                error = "primary object emit failed";
+                goto link_providers_done;
             }
-            munmap((void *)source.ptr, (size_t)source.len);
-        }
-        /* For CSG path: facts already contain all needed code; skip import scanning.
-           Only link with pre-compiled provider .o files if --provider-objects is specified. */
-
-        char provider_o[32][PATH_MAX];
-        int provider_count = 0;
-        for (int i = 0; i < import_count; i++) {
-            snprintf(provider_o[provider_count], PATH_MAX,
-              "%s.provider.%d.o", out_path, i);
-            if (!cold_compile_source_to_object(provider_o[provider_count],
-                                               import_paths[i],
-                                               target,
-                                               0,
-                                               "public")) {
-                fprintf(stderr, "[cheng_cold] --link-providers: import compile failed: %s\n",
-                  import_paths[i]);
-                cold_write_system_link_exec_report(report_path, false, source_path, 0, out_path,
-                                                   target, emit, &stats, "provider import compile failed");
-                return 2;
-            }
-            provider_count++;
-        }
-#endif /* COLD_BACKEND_ONLY */
-
-#ifndef COLD_BACKEND_ONLY
-        { char cmd[PATH_MAX * 8];
-          int off = snprintf(cmd, sizeof(cmd),
-            "cc -arch arm64 %s %s", host_stubs_o, primary_o);
-          for (int i = 0; i < provider_count; i++)
-              off += snprintf(cmd + off, sizeof(cmd) - off, " %s", provider_o[i]);
-          snprintf(cmd + off, sizeof(cmd) - off, " -lc -o %s", out_path);
-          int rc = system(cmd);
-          unlink(primary_o);
-          for (int i = 0; i < provider_count; i++) unlink(provider_o[i]);
-          if (rc != 0) {
-            fprintf(stderr, "[cheng_cold] --link-providers: link failed\n");
-            cold_write_system_link_exec_report(report_path, false, source_path, 0, out_path,
-                                               target, emit, &stats, "provider link failed");
-            return 2;
-          }
-          compiled = 1;
-        }
+#else
+            error = "source compile disabled in backend-only mode";
+            goto link_providers_done;
 #endif
-    } else if (effective_csg_path && effective_csg_path[0]) {
+        }
+        primary_written = true;
+
+        Arena *provider_arena = mmap(0, sizeof(Arena), PROT_READ | PROT_WRITE,
+                                     MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (provider_arena == MAP_FAILED) {
+            error = "provider arena allocation failed";
+            goto link_providers_done;
+        }
+        const char *undefined_symbols[128];
+        int32_t undefined_count = cold_collect_elf_undefined_reloc_symbols(primary_o,
+                                                                           target,
+                                                                           undefined_symbols,
+                                                                           128,
+                                                                           provider_arena);
+        if (undefined_count <= 0) {
+            error = undefined_count == 0 ? "no provider roots selected" : "primary undefined symbol scan failed";
+            goto link_providers_done;
+        }
+        const char *export_symbols[128];
+        int32_t export_count = 0;
+        char roots_csv[4096];
+        roots_csv[0] = '\0';
+        for (int32_t ui = 0; ui < undefined_count; ui++) {
+            const char *sym = undefined_symbols[ui];
+            if (!cold_runtime_provider_linux_root_supported(sym)) {
+                error = "unsupported runtime provider symbol";
+                goto link_providers_done;
+            }
+            size_t used = strlen(roots_csv);
+            size_t need = strlen(sym) + (used ? 1u : 0u) + 1u;
+            if (used + need >= sizeof(roots_csv) || export_count >= 128) {
+                error = "too many runtime provider roots";
+                goto link_providers_done;
+            }
+            if (used) strcat(roots_csv, ",");
+            strcat(roots_csv, sym);
+            export_symbols[export_count++] = sym;
+        }
+        const char *provider_source = "src/core/runtime/core_runtime_provider_linux.cheng";
+#ifndef COLD_BACKEND_ONLY
+        if (!cold_compile_source_to_object(provider_o, provider_source, target,
+                                           roots_csv, "internal")) {
+            error = "runtime provider object emit failed";
+            goto link_providers_done;
+        }
+        provider_written = true;
+#else
+        error = "provider source compile disabled in backend-only mode";
+        goto link_providers_done;
+#endif
+        const char *object_paths[1] = { provider_o };
+        int32_t archive_member_count = 0;
+        uint64_t archive_hash = 0;
+        if (!cold_write_provider_archive(provider_archive, target,
+                                         object_paths, 1,
+                                         "runtime_core_runtime",
+                                         provider_source,
+                                         export_symbols, export_count,
+                                         &archive_member_count,
+                                         &archive_hash) ||
+            archive_member_count != 1 ||
+            !cold_verify_provider_archive(provider_archive, target,
+                                          &archive_member_count,
+                                          &archive_hash)) {
+            error = "runtime provider archive write failed";
+            goto link_providers_done;
+        }
+        archive_written = true;
+        linked = cold_link_elf64_object_with_provider_archive(primary_o,
+                                                              provider_archive,
+                                                              out_path,
+                                                              target,
+                                                              &stats);
+        if (!linked) error = "runtime provider archive link failed";
+
+link_providers_done:
+        if (linked) {
+            cold_write_system_link_exec_report(report_path, true, source_path,
+                                               effective_csg_path, out_path,
+                                               target, emit, &stats, "");
+            printf("system_link_exec=1\n");
+            printf("real_backend_codegen=1\n");
+            printf("system_link_exec_scope=cold_runtime_provider_archive\n");
+            cold_print_elapsed_ms(stdout, "cold_compile_elapsed_ms", stats.elapsed_us);
+            printf("output=%s\n", out_path);
+        } else {
+            cold_write_system_link_exec_report(report_path, false, source_path,
+                                               effective_csg_path, out_path,
+                                               target, emit, &stats, error);
+            fprintf(stderr, "[cheng_cold] %s\n", error);
+        }
+        if (primary_written) unlink(primary_o);
+        if (provider_written) unlink(provider_o);
+        if (archive_written) unlink(provider_archive);
+        return linked ? 0 : 2;
+    }
+    int compiled = 0;
+    if (effective_csg_path && effective_csg_path[0]) {
         compiled = cold_compile_csg_path_to_macho(out_path, effective_csg_path, source_path,
                                                   workspace_root[0] ? workspace_root : 0,
                                                   target, &stats, false, provider_objects);
