@@ -19714,20 +19714,9 @@ static int32_t cold_materialize_self_exec(Parser *parser, BodyIR *body) {
 
 static int32_t cold_materialize_direct_emit(Parser *parser, BodyIR *body, int32_t output) {
     if (cold_cached_minimal_macho.len <= 0) {
-        /* Embed our own binary so the probe IS a cold compiler */
         const char *self_path = ColdArgv0 ? ColdArgv0[0] : "/proc/self/exe";
         cold_cached_minimal_macho = source_open(self_path);
-        if (cold_cached_minimal_macho.len <= 0) {
-            /* Fallback: build minimal stub */
-            Code *emit_code = code_new(parser->arena, 64);
-            code_emit(emit_code, a64_movz(R0, 0, 0));
-            code_emit(emit_code, a64_ret());
-            char tmp[PATH_MAX];
-            snprintf(tmp, sizeof(tmp), "/tmp/cold_emit_%d", getpid());
-            macho_write_exec(tmp, emit_code->words, emit_code->count);
-            cold_cached_minimal_macho = source_open(tmp);
-            unlink(tmp);
-        }
+        if (cold_cached_minimal_macho.len <= 0) die("cold direct emit materializer source open failed");
     }
     if (cold_cached_minimal_macho.len <= 0) return 0;
     int32_t li = body_string_literal(body, cold_cached_minimal_macho);

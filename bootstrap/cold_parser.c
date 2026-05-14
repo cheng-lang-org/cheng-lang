@@ -4194,6 +4194,56 @@ int32_t cold_make_empty_str_seq_slot(BodyIR *body, Span type_name) {
     return slot;
 }
 
+int32_t cold_make_str_seq_from_slots(BodyIR *body, Span type_name,
+                                     const int32_t *items,
+                                     int32_t item_count) {
+    if (item_count < 0) die("invalid str seq materializer");
+    int32_t slot = cold_make_empty_str_seq_slot(body, type_name);
+    for (int32_t i = 0; i < item_count; i++) {
+        if (body->slot_kind[items[i]] != SLOT_STR &&
+            body->slot_kind[items[i]] != SLOT_STR_REF) {
+            die("str seq materializer item must be str");
+        }
+        body_op(body, BODY_OP_SEQ_STR_ADD, slot, items[i], 0);
+    }
+    return slot;
+}
+
+int32_t cold_make_str_seq_from_cstrs(BodyIR *body, Span type_name,
+                                     const char **items,
+                                     int32_t item_count) {
+    if (item_count < 0) die("invalid str seq materializer");
+    int32_t slots[16];
+    if (item_count > (int32_t)(sizeof(slots) / sizeof(slots[0]))) {
+        die("str seq materializer too large");
+    }
+    for (int32_t i = 0; i < item_count; i++) {
+        slots[i] = cold_make_str_literal_cstr_slot(body, items[i]);
+    }
+    return cold_make_str_seq_from_slots(body, type_name, slots, item_count);
+}
+
+int32_t cold_make_i32_seq_from_values(BodyIR *body, Span type_name,
+                                      const int32_t *items,
+                                      int32_t item_count) {
+    if (item_count < 0) die("invalid int32 seq materializer");
+    int32_t data_slot = -1;
+    if (item_count > 0) {
+        int32_t payload_start = body->call_arg_count;
+        for (int32_t i = 0; i < item_count; i++) {
+            body_call_arg_with_offset(body, cold_make_i32_const_slot(body, items[i]), i * 4);
+        }
+        data_slot = body_slot(body, SLOT_ARRAY_I32, align_i32(item_count * 4, 8));
+        body_slot_set_array_len(body, data_slot, item_count);
+        body_op3(body, BODY_OP_MAKE_COMPOSITE, data_slot, 0, payload_start, item_count);
+    }
+    int32_t slot = body_slot(body, SLOT_SEQ_I32, 16);
+    body_slot_set_type(body, slot, type_name.len > 0 ? type_name : cold_cstr_span("int32[]"));
+    body_slot_set_array_len(body, slot, item_count);
+    body_op3(body, BODY_OP_MAKE_SEQ_I32, slot, data_slot, -1, item_count);
+    return slot;
+}
+
 __attribute__((unused))
 int32_t cold_make_empty_seq_slot_for_field(BodyIR *body, ObjectField *field) {
     if (field->kind != SLOT_SEQ_I32 && field->kind != SLOT_SEQ_STR &&
@@ -4460,16 +4510,17 @@ int32_t cold_make_error_result_slot(Parser *parser, BodyIR *body,
     return slot;
 }
 
+ObjectDef *cold_resolve_object_any(Symbols *symbols, Span actual_type,
+                                   const char *qualified,
+                                   const char *unqualified);
+void cold_store_required_field(BodyIR *body, int32_t object_slot,
+                               ObjectDef *object,
+                               const char *field_name,
+                               int32_t value_slot);
+
 bool cold_try_backend_intrinsic(Parser *parser, BodyIR *body, Span name,
                                        int32_t arg_start, int32_t arg_count,
                                        int32_t *slot_out, int32_t *kind_out) {
-    if (span_eq(name, "BackendDriverDispatchMinRunSystemLinkExecFromCmdline")) {
-        if (arg_count != 0) die("RunSystemLinkExecFromCmdline arity mismatch");
-        int32_t slot = cold_materialize_self_exec(parser, body);
-        if (kind_out) *kind_out = SLOT_I32;
-        *slot_out = slot;
-        return true;
-    }
     const char *target_needle = 0;
     if (span_eq(name, "tmat.TargetIsWasm") || span_eq(name, "TargetIsWasm")) {
         target_needle = "wasm";
@@ -4671,14 +4722,105 @@ bool cold_try_backend_intrinsic(Parser *parser, BodyIR *body, Span name,
         int32_t plan_slot = body_slot(body, SLOT_OBJECT, symbols_object_slot_size(lp_obj));
         body_slot_set_type(body, plan_slot, lp_obj->name);
         body_op3(body, BODY_OP_MAKE_COMPOSITE, plan_slot, 0, -1, 0);
-        for (int32_t fi = 0; fi < lp_obj->field_count; fi++) {
-            ObjectField *f = &lp_obj->fields[fi];
-            if (f->kind == SLOT_STR) {
-                int32_t s = body_slot(body, SLOT_STR, COLD_STR_SLOT_SIZE);
-                body_op(body, BODY_OP_STR_LITERAL, s, 0, 0);
-                body_op3(body, BODY_OP_PAYLOAD_STORE, plan_slot, s, f->offset, f->size);
-            }
-        }
+        ObjectDef *slp_obj = cold_slplan_object_from_slot(parser, body, link_plan);
+        ObjectDef *csg_obj = cold_resolve_object_any(parser->symbols,
+                                                     body->slot_type[csg],
+                                                     "ccsg.CompilerCsg",
+                                                     "CompilerCsg");
+        if (!csg_obj) die("CompilerCsg layout missing for lowering materializer");
+        int32_t workspace_root = cold_load_object_field_slot(body, link_plan,
+                                                             cold_required_object_field(slp_obj, "workspaceRoot"));
+        int32_t package_root = cold_load_object_field_slot(body, link_plan,
+                                                           cold_required_object_field(slp_obj, "packageRoot"));
+        int32_t package_id = cold_load_object_field_slot(body, link_plan,
+                                                         cold_required_object_field(slp_obj, "packageId"));
+        int32_t entry_path = cold_load_object_field_slot(body, link_plan,
+                                                         cold_required_object_field(slp_obj, "entryPath"));
+        int32_t entry_symbol = cold_load_object_field_slot(body, link_plan,
+                                                           cold_required_object_field(slp_obj, "entrySymbol"));
+        int32_t module_stem = cold_load_object_field_slot(body, link_plan,
+                                                          cold_required_object_field(slp_obj, "moduleStem"));
+        int32_t sep = cold_make_str_literal_cstr_slot(body, "::");
+        int32_t symbol_prefix = cold_concat_str_slots(body, module_stem, sep);
+        int32_t symbol_text = cold_concat_str_slots(body, symbol_prefix, entry_symbol);
+
+        int32_t source_paths[1] = { entry_path };
+        int32_t owner_modules[1] = { module_stem };
+        int32_t names[1] = { entry_symbol };
+        int32_t symbols[1] = { symbol_text };
+        int32_t export_names[1] = { entry_symbol };
+        int32_t flag_values[1] = { 1 };
+        int32_t name_id_values[1] = { 0 };
+        int32_t call_conv_values[1] = { 1 };
+        int32_t layout_values[1] = { 5 };
+        const char *missing_items[1] = { "lowering_typed_expr_facts_missing" };
+
+        cold_store_required_field(body, plan_slot, lp_obj, "workspaceRoot", workspace_root);
+        cold_store_required_field(body, plan_slot, lp_obj, "packageRoot", package_root);
+        cold_store_required_field(body, plan_slot, lp_obj, "packageId", package_id);
+        cold_store_required_field(body, plan_slot, lp_obj, "entryPath", entry_path);
+        cold_store_required_field(body, plan_slot, lp_obj, "entrySymbol", entry_symbol);
+        cold_store_required_field(body, plan_slot, lp_obj, "sourceBundleCid",
+                                  cold_load_object_field_slot(body, csg,
+                                                              cold_required_object_field(csg_obj, "sourceBundleCid")));
+        cold_store_required_field(body, plan_slot, lp_obj, "compilerCsgCid",
+                                  cold_load_object_field_slot(body, csg,
+                                                              cold_required_object_field(csg_obj, "graphCid")));
+        cold_store_required_field(body, plan_slot, lp_obj, "exprLayer",
+                                  cold_load_object_field_slot(body, csg,
+                                                              cold_required_object_field(csg_obj, "exprLayer")));
+        cold_store_required_field(body, plan_slot, lp_obj, "typedExprFacts",
+                                  cold_load_object_field_slot(body, csg,
+                                                              cold_required_object_field(csg_obj, "typedExprFacts")));
+        cold_store_required_field(body, plan_slot, lp_obj, "typedIr",
+                                  cold_load_object_field_slot(body, csg,
+                                                              cold_required_object_field(csg_obj, "typedIr")));
+        cold_store_required_field(body, plan_slot, lp_obj, "functionSourcePaths",
+                                  cold_make_str_seq_from_slots(body,
+                                                               cold_required_object_field(lp_obj, "functionSourcePaths")->type_name,
+                                                               source_paths, 1));
+        cold_store_required_field(body, plan_slot, lp_obj, "functionOwnerModulePaths",
+                                  cold_make_str_seq_from_slots(body,
+                                                               cold_required_object_field(lp_obj, "functionOwnerModulePaths")->type_name,
+                                                               owner_modules, 1));
+        cold_store_required_field(body, plan_slot, lp_obj, "functionNames",
+                                  cold_make_str_seq_from_slots(body,
+                                                               cold_required_object_field(lp_obj, "functionNames")->type_name,
+                                                               names, 1));
+        cold_store_required_field(body, plan_slot, lp_obj, "functionSymbolTexts",
+                                  cold_make_str_seq_from_slots(body,
+                                                               cold_required_object_field(lp_obj, "functionSymbolTexts")->type_name,
+                                                               symbols, 1));
+        cold_store_required_field(body, plan_slot, lp_obj, "functionExportedFlags",
+                                  cold_make_i32_seq_from_values(body,
+                                                                cold_required_object_field(lp_obj, "functionExportedFlags")->type_name,
+                                                                flag_values, 1));
+        cold_store_required_field(body, plan_slot, lp_obj, "functionExportSymbolNames",
+                                  cold_make_str_seq_from_slots(body,
+                                                               cold_required_object_field(lp_obj, "functionExportSymbolNames")->type_name,
+                                                               export_names, 1));
+        cold_store_required_field(body, plan_slot, lp_obj, "functionNameIds",
+                                  cold_make_i32_seq_from_values(body,
+                                                                cold_required_object_field(lp_obj, "functionNameIds")->type_name,
+                                                                name_id_values, 1));
+        cold_store_required_field(body, plan_slot, lp_obj, "functionEntryFlags",
+                                  cold_make_i32_seq_from_values(body,
+                                                                cold_required_object_field(lp_obj, "functionEntryFlags")->type_name,
+                                                                flag_values, 1));
+        cold_store_required_field(body, plan_slot, lp_obj, "functionCallConvs",
+                                  cold_make_i32_seq_from_values(body,
+                                                                cold_required_object_field(lp_obj, "functionCallConvs")->type_name,
+                                                                call_conv_values, 1));
+        cold_store_required_field(body, plan_slot, lp_obj, "functionResultLayoutKinds",
+                                  cold_make_i32_seq_from_values(body,
+                                                                cold_required_object_field(lp_obj, "functionResultLayoutKinds")->type_name,
+                                                                layout_values, 1));
+        cold_store_required_field(body, plan_slot, lp_obj, "missingReasons",
+                                  cold_make_str_seq_from_cstrs(body,
+                                                               cold_required_object_field(lp_obj, "missingReasons")->type_name,
+                                                               missing_items, 1));
+        cold_store_required_field(body, plan_slot, lp_obj, "pipelineStage",
+                                  cold_make_str_literal_cstr_slot(body, "cold_csg_to_lowering_plan_partial"));
         if (plan >= 0 && plan < body->slot_count && body->slot_size[plan] >= 8)
             body_op3(body, BODY_OP_PAYLOAD_STORE, plan, plan_slot, 0, body->slot_size[plan]);
         int32_t ok_slot = cold_make_i32_const_slot(body, 1);
@@ -4703,6 +4845,28 @@ bool cold_try_backend_intrinsic(Parser *parser, BodyIR *body, Span name,
         int32_t slot = body_slot(body, SLOT_OBJECT, symbols_object_slot_size(object));
         body_slot_set_type(body, slot, object->name);
         body_op3(body, BODY_OP_MAKE_COMPOSITE, slot, 0, -1, 0);
+        ObjectDef *slp_obj = cold_slplan_object_from_slot(parser, body, link_plan);
+        const char *missing_items[1] = { "primary_object_typed_body_ir_missing" };
+        cold_store_required_field(body, slot, object, "targetTriple",
+                                  cold_load_object_field_slot(body, link_plan,
+                                                              cold_required_object_field(slp_obj, "targetTriple")));
+        cold_store_required_field(body, slot, object, "objectFormat",
+                                  cold_make_str_literal_cstr_slot(body, "macho"));
+        cold_store_required_field(body, slot, object, "outputPath",
+                                  cold_load_object_field_slot(body, link_plan,
+                                                              cold_required_object_field(slp_obj, "outputPath")));
+        cold_store_required_field(body, slot, object, "entryPath",
+                                  cold_load_object_field_slot(body, link_plan,
+                                                              cold_required_object_field(slp_obj, "entryPath")));
+        cold_store_required_field(body, slot, object, "entrySymbol",
+                                  cold_load_object_field_slot(body, link_plan,
+                                                              cold_required_object_field(slp_obj, "entrySymbol")));
+        cold_store_required_field(body, slot, object, "missingReasons",
+                                  cold_make_str_seq_from_cstrs(body,
+                                                               cold_required_object_field(object, "missingReasons")->type_name,
+                                                               missing_items, 1));
+        cold_store_required_field(body, slot, object, "pipelineStage",
+                                  cold_make_str_literal_cstr_slot(body, "cold_primary_object_plan_unmaterialized"));
         if (kind_out) *kind_out = SLOT_OBJECT;
         *slot_out = slot;
         return true;
@@ -4887,7 +5051,7 @@ bool cold_try_csg_intrinsic(Parser *parser, BodyIR *body, Span name,
         }
         cold_store_required_field(body, out_csg, csg_obj, "version", cold_make_i32_const_slot(body, 1));
         cold_store_required_field(body, out_csg, csg_obj, "packageId", package_id);
-        cold_store_required_field_if_fits(body, out_csg, csg_obj, "sourceBundleCid", source_bundle_cid);
+        cold_store_required_field(body, out_csg, csg_obj, "sourceBundleCid", source_bundle_cid);
         cold_store_required_field_zero(body, out_csg, csg_obj, "exprLayer");
         cold_store_required_field_zero(body, out_csg, csg_obj, "typedExprFacts");
         cold_store_required_field_zero(body, out_csg, csg_obj, "typedIr");
@@ -4895,8 +5059,8 @@ bool cold_try_csg_intrinsic(Parser *parser, BodyIR *body, Span name,
         cold_store_required_field(body, out_csg, csg_obj, "edgeCount", cold_make_i32_const_slot(body, 2));
         cold_store_required_field(body, out_csg, csg_obj, "nodes", nodes_seq);
         cold_store_required_field(body, out_csg, csg_obj, "edges", edges_seq);
-        cold_store_required_field_if_fits(body, out_csg, csg_obj, "canonicalGraphCid", source_bundle_cid);
-        cold_store_required_field_if_fits(body, out_csg, csg_obj, "graphCid", source_bundle_cid);
+        cold_store_required_field_zero(body, out_csg, csg_obj, "canonicalGraphCid");
+        cold_store_required_field_zero(body, out_csg, csg_obj, "graphCid");
         cold_store_str_out_slot(body, err, empty, "BuildCompilerCsgInto err");
         int32_t slot = cold_make_i32_const_slot(body, 1);
         if (kind_out) *kind_out = SLOT_I32;

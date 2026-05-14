@@ -390,7 +390,25 @@ if [ -x /tmp/ct_bd/cheng ]; then
 else
     ACT="COMPILE_FAILED"
 fi
-assert "build_backend_driver_system_link_while_only" 62 "$ACT"
+assert "build_backend_driver_cold_candidate_system_link_while_only" 62 "$ACT"
+rm -f /tmp/ct_pure_backend_driver /tmp/ct_pure_backend_driver.report \
+    /tmp/ct_pure_backend_driver.stdout /tmp/ct_pure_backend_driver.stderr
+timeout 30 "$COLD" system-link-exec --root:"$PWD" \
+    --in:src/core/tooling/backend_driver_dispatch_min.cheng \
+    --emit:exe --target:arm64-apple-darwin \
+    --out:/tmp/ct_pure_backend_driver \
+    --report-out:/tmp/ct_pure_backend_driver.report \
+    >/tmp/ct_pure_backend_driver.stdout 2>/tmp/ct_pure_backend_driver.stderr
+pure_driver_status=$?
+if [ "$pure_driver_status" -ne 0 ] &&
+   grep -q '^cold_system_link_exec=1$' /tmp/ct_pure_backend_driver.report 2>/dev/null &&
+   grep -q '^error=invalid string literal index$' /tmp/ct_pure_backend_driver.report 2>/dev/null &&
+   [ ! -e /tmp/ct_pure_backend_driver ]; then
+    ACT="HARD_FAIL"
+else
+    ACT="WRONG_RESULT"
+fi
+assert "pure_backend_driver_direct_hard_fail" "HARD_FAIL" "$ACT"
 
 rm -f /tmp/ct_compiler_runtime_smoke /tmp/ct_compiler_runtime_smoke.report \
     /tmp/ct_compiler_runtime_smoke.stdout /tmp/ct_compiler_runtime_smoke.stderr
@@ -1412,6 +1430,83 @@ EOF
 ACT=$(compile_run /tmp/ct_shift_ops.cheng /tmp/ct_shift_ops_out)
 assert "shift_ops" 0 "$ACT"
 rm -f /tmp/ct_shift_ops.cheng /tmp/ct_shift_ops_out
+
+# 23: modulo with positive values
+cat > /tmp/ct_mod_positive.cheng << 'EOF'
+fn main(): int32 =
+    let a: int32 = 17 % 5
+    let b: int32 = 100 % 7
+    let c: int32 = 42 % 1
+    return a + b + c
+EOF
+ACT=$(compile_run /tmp/ct_mod_positive.cheng /tmp/ct_mod_positive_out)
+assert "modulo_positive" 4 "$ACT"
+rm -f /tmp/ct_mod_positive.cheng /tmp/ct_mod_positive_out
+
+# 24: global const at module scope
+cat > /tmp/ct_global_const.cheng << 'EOF'
+const MY_VAL: int32 = 42
+
+fn main(): int32 =
+    return MY_VAL
+EOF
+ACT=$(compile_run /tmp/ct_global_const.cheng /tmp/ct_global_const_out)
+assert "global_const" 42 "$ACT"
+rm -f /tmp/ct_global_const.cheng /tmp/ct_global_const_out
+
+# 25: bitwise AND/OR/XOR
+cat > /tmp/ct_bitwise_ops.cheng << 'EOF'
+fn main(): int32 =
+    let a: int32 = 12 & 10
+    let b: int32 = 12 | 10
+    let c: int32 = 12 ^ 10
+    if a != 8: return 1
+    if b != 14: return 2
+    if c != 6: return 3
+    return 0
+EOF
+ACT=$(compile_run /tmp/ct_bitwise_ops.cheng /tmp/ct_bitwise_ops_out)
+assert "bitwise_and_or_xor" 0 "$ACT"
+rm -f /tmp/ct_bitwise_ops.cheng /tmp/ct_bitwise_ops_out
+
+# 26: function returning variant type
+cat > /tmp/ct_fn_variant.cheng << 'EOF'
+type Res = Ok(val: int32) | Err
+
+fn try_get(): Res =
+    return Res.Ok(42)
+
+fn main(): int32 =
+    let r: Res = try_get()
+    return r?
+EOF
+ACT=$(compile_run /tmp/ct_fn_variant.cheng /tmp/ct_fn_variant_out)
+assert "fn_return_variant" 42 "$ACT"
+rm -f /tmp/ct_fn_variant.cheng /tmp/ct_fn_variant_out
+
+# 27: early return from loop
+cat > /tmp/ct_early_return.cheng << 'EOF'
+fn main(): int32 =
+    for i in 0..<10:
+        if i == 3:
+            return 42
+    return 0
+EOF
+ACT=$(compile_run /tmp/ct_early_return.cheng /tmp/ct_early_return_out)
+assert "early_return_loop" 42 "$ACT"
+rm -f /tmp/ct_early_return.cheng /tmp/ct_early_return_out
+
+# 28: large number of parameters (10+)
+cat > /tmp/ct_many_params.cheng << 'EOF'
+fn sum10(a: int32, b: int32, c: int32, d: int32, e: int32, f: int32, g: int32, h: int32, i: int32, j: int32): int32 =
+    return a + b + c + d + e + f + g + h + i + j
+
+fn main(): int32 =
+    return sum10(1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
+EOF
+ACT=$(compile_run /tmp/ct_many_params.cheng /tmp/ct_many_params_out)
+assert "many_params" 55 "$ACT"
+rm -f /tmp/ct_many_params.cheng /tmp/ct_many_params_out
 
 echo ""
 echo "=== $PASS passed, $FAIL failed ==="
