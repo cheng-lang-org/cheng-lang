@@ -1303,6 +1303,84 @@ ACT=$(compile_run_timed "$COLD" /tmp/ct_i32_mul_large.cheng /tmp/ct_i32_mul_larg
 assert "i32_mul_large" 0 "$ACT"
 rm -f /tmp/ct_i32_mul_large.cheng /tmp/ct_i32_mul_large_out
 
+# 17: object array field access
+cat > /tmp/ct_obj_arr_field.cheng << 'EOF'
+type Config =
+    values: int32[10]
+    count: int32
+
+fn main(): int32 =
+    var cfg: Config
+    cfg.values = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+    cfg.count = 5
+    return cfg.values[0] + cfg.values[4]
+EOF
+ACT=$(compile_run /tmp/ct_obj_arr_field.cheng /tmp/ct_obj_arr_field_out)
+assert "obj_array_field" 60 "$ACT"
+rm -f /tmp/ct_obj_arr_field.cheng /tmp/ct_obj_arr_field_out
+
+# 18: empty object
+cat > /tmp/ct_empty_obj.cheng << 'EOF'
+type Empty =
+
+fn main(): int32 =
+    var e: Empty
+    return 42
+EOF
+ACT=$(compile_run /tmp/ct_empty_obj.cheng /tmp/ct_empty_obj_out)
+assert "empty_object" 42 "$ACT"
+rm -f /tmp/ct_empty_obj.cheng /tmp/ct_empty_obj_out
+
+# 19: variant with different payload sizes per arm
+cat > /tmp/ct_var_diff_payload.cheng << 'EOF'
+type V = Small(x: int32) | Big(a: int32, b: int32, c: int32, d: int32)
+
+fn main(): int32 =
+    let v: V = V.Small(42)
+    match v:
+        Small(x) => return x
+        Big(a, b, c, d) => return a + b + c + d
+EOF
+ACT=$(compile_run /tmp/ct_var_diff_payload.cheng /tmp/ct_var_diff_payload_out)
+assert "variant_diff_payload" 42 "$ACT"
+rm -f /tmp/ct_var_diff_payload.cheng /tmp/ct_var_diff_payload_out
+
+# 20: boolean not operator
+cat > /tmp/ct_bool_not.cheng << 'EOF'
+fn main(): int32 =
+    var flag = 0
+    if !flag:
+        return 42
+    else:
+        return 0
+EOF
+ACT=$(compile_run /tmp/ct_bool_not.cheng /tmp/ct_bool_not_out)
+assert "bool_not" 42 "$ACT"
+rm -f /tmp/ct_bool_not.cheng /tmp/ct_bool_not_out
+
+# 21: very long function name (50+ chars)
+cat > /tmp/ct_long_fn_name.cheng << 'EOF'
+fn this_is_a_very_long_function_name_that_is_over_fifty_characters_long(): int32 =
+    return 42
+
+fn main(): int32 =
+    return this_is_a_very_long_function_name_that_is_over_fifty_characters_long()
+EOF
+ACT=$(compile_run /tmp/ct_long_fn_name.cheng /tmp/ct_long_fn_name_out)
+assert "long_fn_name" 42 "$ACT"
+rm -f /tmp/ct_long_fn_name.cheng /tmp/ct_long_fn_name_out
+
+# 22: shift left/right operators
+cat > /tmp/ct_shift_ops.cheng << 'EOF'
+fn main(): int32 =
+    let a: int32 = 1 << 4
+    let b: int32 = 256 >> 4
+    return a + b - 32
+EOF
+ACT=$(compile_run /tmp/ct_shift_ops.cheng /tmp/ct_shift_ops_out)
+assert "shift_ops" 0 "$ACT"
+rm -f /tmp/ct_shift_ops.cheng /tmp/ct_shift_ops_out
+
 echo ""
 echo "=== $PASS passed, $FAIL failed ==="
 [ "$FAIL" -eq 0 ]
