@@ -290,6 +290,22 @@ EOF
 ACT=$(compile_run_timed "$COLD" /tmp/ct_while_only.cheng /tmp/ct_while_only 10)
 assert "while_only" 62 "$ACT"
 
+cat > /tmp/ct_cmp.cheng << 'EOF'
+fn main(): int32 =
+    var x = 5
+    if x != 0:
+        x = 1
+    else:
+        return 255
+    if x >= 5:
+        return 255
+    if x <= 3:
+        return 0
+    return 255
+EOF
+ACT=$(compile_run_timed "$COLD" /tmp/ct_cmp.cheng /tmp/ct_cmp 10)
+assert "compare_ops" 0 "$ACT"
+
 cat > /tmp/ct_while_and.cheng << 'EOF'
 fn touch(x: int32): int32 =
     return x
