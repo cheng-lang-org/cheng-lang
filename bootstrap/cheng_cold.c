@@ -12176,7 +12176,7 @@ static void cold_apply_licm(BodyIR *body) {
 static void codegen_func(Code *code, BodyIR *body, Symbols *symbols,
                          FunctionPatchList *function_patches) {
     na_reset();
-    cold_optimize_body(body, true);
+    cold_optimize_body(body, false);
     int32_t frame_size = align_i32(body->frame_size, 16);
     code_emit(code, a64_stp_pre(19, 20, SP, -16));
     code_emit(code, a64_stp_pre(FP, LR, SP, -16));
@@ -12715,6 +12715,10 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
                     out_unresolved_pos[idx] = patch.pos;
                     out_unresolved_fn[idx] = patch.target_function;
                     (*out_unresolved_count)++;
+                } else if (out_unresolved_pos && out_unresolved_fn && out_unresolved_count) {
+                    die("too many unresolved function patches");
+                } else {
+                    die("unresolved function patch target");
                 }
                 fprintf(stderr, "cheng_cold: unresolved function patch target: ");
                 cold_diag_fn_name(symbols->functions[patch.target_function].name);
@@ -16209,8 +16213,40 @@ bool cold_compile_source_path_to_macho(const char *out_path,
         cold_compile_reachable_import_bodies(symbols, function_bodies, body_cap,
                                              main_function, import_sources,
                                              import_source_count);
+        int32_t unresolved_cap = symbols->function_count * 8;
+        int32_t *unresolved_pos = arena_alloc(arena, (size_t)unresolved_cap * sizeof(int32_t));
+        int32_t *unresolved_fn = arena_alloc(arena, (size_t)unresolved_cap * sizeof(int32_t));
+        int32_t unresolved_count = 0;
         codegen_program(code, function_bodies, symbols->function_count, main_function, symbols, 0,
-                        NULL, NULL, NULL);
+                        unresolved_pos, unresolved_fn, &unresolved_count);
+        if (unresolved_count > 0) {
+            if (stats) {
+                stats->function_count = symbols->function_count;
+                stats->type_count = symbols->type_count + symbols->object_count;
+                cold_collect_body_stats(symbols, function_bodies, symbols->function_count, stats);
+                stats->code_words = code->count;
+                stats->arena_kb = arena->used / 1024;
+                stats->unresolved_symbol_count = unresolved_count;
+                int32_t first = unresolved_fn[0];
+                if (first >= 0 && first < symbols->function_count) {
+                    Span nm = symbols->functions[first].name;
+                    int32_t n = nm.len < (int32_t)sizeof(stats->first_unresolved_symbol) - 1
+                        ? nm.len
+                        : (int32_t)sizeof(stats->first_unresolved_symbol) - 1;
+                    if (n > 0) memcpy(stats->first_unresolved_symbol, nm.ptr, (size_t)n);
+                    stats->first_unresolved_symbol[n] = '\0';
+                }
+                uint64_t fail_us = cold_now_us();
+                if (start_us > 0 && parse_end_us >= start_us)
+                    stats->parse_us = parse_end_us - start_us;
+                if (parse_end_us > 0 && fail_us >= parse_end_us)
+                    stats->codegen_us = fail_us - parse_end_us;
+                if (start_us > 0 && fail_us >= start_us)
+                    stats->elapsed_us = fail_us - start_us;
+            }
+            if (mapped_source.len > 0) munmap((void *)mapped_source.ptr, (size_t)mapped_source.len);
+            return false;
+        }
     }
 
     uint64_t codegen_end_us = cold_now_us();

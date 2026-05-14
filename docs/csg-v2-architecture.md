@@ -98,7 +98,7 @@ Current gate: `tools/cold_csg_v2_roundtrip_test.sh` passes 735/735.
 
 - Public `emit-cold-csg-v2` emits canonical `CHENG_CSG_V2`; cold reader emits object; `cc` link/run smoke exits 0.
 - Internal `CHENGCSG` writer/reader fixed-point produces bit-identical objects for repeated reads of the same facts.
-- Full Cheng `PrimaryObjectPlan` pipeline is still blocked by empty `CompilerCsg` / `LoweringPlan` / `PrimaryObjectPlan` materializers in `cold_parser.c`, so it is not counted as full PrimaryObjectPlan pipeline closure.
+- Full Cheng `PrimaryObjectPlan` pipeline is still not closed. `cold_parser.c` now forces Lowering/Primary materializers to report missing reasons instead of returning an empty ready plan; direct cold compilation of `backend_driver_dispatch_min.cheng` has passed the former string-literal-index blocker and is now blocked at unresolved patches for `os.cheng_fopen`, `os.cheng_fflush`, and `os.c_iometer_call`.
 
 ## Key Files
 

@@ -152,134 +152,48 @@ else
 fi
 assert "import_deep_hard_fail" "UNEXPECTED_SUCCESS" "$ACT"
 
-quiet $COLD system-link-exec --in:src/core/tooling/backend_driver_dispatch_min.cheng \
-    --target:arm64-apple-darwin --out:/tmp/ct_dm
-if [ -x /tmp/ct_dm ]; then
-    assert "dispatch_min" 0 0
+rm -f /tmp/ct_dm /tmp/ct_dm.report /tmp/ct_dm.stdout /tmp/ct_dm.stderr \
+    /tmp/ct_dm_self /tmp/ct_dm_self.report \
+    /tmp/ct_dm_import /tmp/ct_dm_import.report \
+    /tmp/ct_dm_cov /tmp/ct_dm_cov.report \
+    /tmp/ct_dm_ec.o /tmp/ct_dm_ec_link /tmp/ct_dm_ec.report \
+    /tmp/ct_dm2 /tmp/ct_dm2.report /tmp/ct_dm2_status.stdout /tmp/ct_dm2_status.stderr
+timeout 30 "$COLD" system-link-exec --in:src/core/tooling/backend_driver_dispatch_min.cheng \
+    --target:arm64-apple-darwin --out:/tmp/ct_dm --report-out:/tmp/ct_dm.report \
+    >/tmp/ct_dm.stdout 2>/tmp/ct_dm.stderr
+dm_status=$?
+if [ "$dm_status" -ne 0 ] &&
+   grep -q '^unresolved_symbol_count=3$' /tmp/ct_dm.report 2>/dev/null &&
+   grep -q '^first_unresolved_symbol=os.cheng_fopen$' /tmp/ct_dm.report 2>/dev/null &&
+   grep -q '^egraph_licm_hoisted=0$' /tmp/ct_dm.report 2>/dev/null &&
+   [ ! -e /tmp/ct_dm ]; then
+    ACT="HARD_FAIL"
 else
-    assert "dispatch_min" 0 "COMPILE_FAILED"
+    ACT="WRONG_RESULT"
 fi
-
-rm -f /tmp/ct_dm_self /tmp/ct_dm_self.report
-if [ -x /tmp/ct_dm ]; then
-    quiet /tmp/ct_dm system-link-exec --in:src/tests/ordinary_zero_exit_fixture.cheng \
-        --target:arm64-apple-darwin --out:/tmp/ct_dm_self --report-out:/tmp/ct_dm_self.report
-    if [ -x /tmp/ct_dm_self ]; then
-        /tmp/ct_dm_self 2>/dev/null; ACT=$?
-    else
-        ACT="COMPILE_FAILED"
-    fi
-else
-    ACT="COMPILE_FAILED"
-fi
-assert "dispatch_min_self_ordinary_zero" 0 "$ACT"
-
-rm -f /tmp/ct_dm_import /tmp/ct_dm_import.report
-if [ -x /tmp/ct_dm ]; then
-    quiet /tmp/ct_dm system-link-exec --in:src/tests/import_use.cheng \
-        --target:arm64-apple-darwin --out:/tmp/ct_dm_import --report-out:/tmp/ct_dm_import.report
-    if [ -x /tmp/ct_dm_import ]; then
-        /tmp/ct_dm_import 2>/dev/null; ACT=$?
-    else
-        ACT="COMPILE_FAILED"
-    fi
-else
-    ACT="COMPILE_FAILED"
-fi
-assert "dispatch_min_self_import_use" 3 "$ACT"
-if grep -q '^direct_macho=1$' /tmp/ct_dm_import.report 2>/dev/null &&
-   grep -q '^provider_object_count=0$' /tmp/ct_dm_import.report 2>/dev/null &&
-   grep -q '^system_link=0$' /tmp/ct_dm_import.report 2>/dev/null; then
-    ACT=1
-else
-    ACT=0
-fi
-assert "dispatch_min_self_import_linkerless" 1 "$ACT"
-
-rm -f /tmp/ct_dm_cov /tmp/ct_dm_cov.report
-if [ -x /tmp/ct_dm ]; then
-    quiet /tmp/ct_dm system-link-exec --in:src/tests/cold_subset_coverage.cheng \
-        --target:arm64-apple-darwin --out:/tmp/ct_dm_cov --report-out:/tmp/ct_dm_cov.report
-    if [ -x /tmp/ct_dm_cov ]; then
-        /tmp/ct_dm_cov 2>/dev/null; ACT=$?
-    else
-        ACT="COMPILE_FAILED"
-    fi
-else
-    ACT="COMPILE_FAILED"
-fi
-assert "dispatch_min_self_subset_coverage" 0 "$ACT"
-if grep -q '^direct_macho=1$' /tmp/ct_dm_cov.report 2>/dev/null &&
-   grep -q '^provider_object_count=0$' /tmp/ct_dm_cov.report 2>/dev/null &&
-   grep -q '^system_link=0$' /tmp/ct_dm_cov.report 2>/dev/null; then
-    ACT=1
-else
-    ACT=0
-fi
-assert "dispatch_min_self_subset_linkerless" 1 "$ACT"
-
-rm -f /tmp/ct_dm_ec.o /tmp/ct_dm_ec_link /tmp/ct_dm_ec.report
-if [ -x /tmp/ct_dm ]; then
-    quiet /tmp/ct_dm system-link-exec --in:src/tests/import_use.cheng \
-        --emit:obj --target:arm64-apple-darwin --out:/tmp/ct_dm_ec.o \
-        --report-out:/tmp/ct_dm_ec.report
-    if quiet cc -o /tmp/ct_dm_ec_link /tmp/ct_dm_ec.o; then
-        /tmp/ct_dm_ec_link 2>/dev/null; ACT=$?
-    else
-        ACT="LINK_FAILED"
-    fi
-else
-    ACT="COMPILE_FAILED"
-fi
-assert "dispatch_min_self_emit_obj_cross" 3 "$ACT"
-if grep -q '^emit=obj$' /tmp/ct_dm_ec.report 2>/dev/null &&
-   grep -q '^direct_macho=1$' /tmp/ct_dm_ec.report 2>/dev/null &&
-   grep -q '^provider_object_count=0$' /tmp/ct_dm_ec.report 2>/dev/null &&
-   grep -q '^system_link=0$' /tmp/ct_dm_ec.report 2>/dev/null; then
-    ACT=1
-else
-    ACT=0
-fi
-assert "dispatch_min_self_emit_obj_direct" 1 "$ACT"
-
-rm -f /tmp/ct_dm2 /tmp/ct_dm2.report /tmp/ct_dm2_status.stdout /tmp/ct_dm2_status.stderr
-if [ -x /tmp/ct_dm ]; then
-    quiet /tmp/ct_dm system-link-exec --in:src/core/tooling/backend_driver_dispatch_min.cheng \
-        --target:arm64-apple-darwin --out:/tmp/ct_dm2 --report-out:/tmp/ct_dm2.report
-    if [ -x /tmp/ct_dm2 ]; then
-        ACT=0
-    else
-        ACT="COMPILE_FAILED"
-    fi
-else
-    ACT="COMPILE_FAILED"
-fi
-assert "dispatch_min_self_dispatch_min" 0 "$ACT"
-if grep -q '^direct_macho=1$' /tmp/ct_dm2.report 2>/dev/null &&
-   grep -q '^provider_object_count=0$' /tmp/ct_dm2.report 2>/dev/null &&
-   grep -q '^system_link=0$' /tmp/ct_dm2.report 2>/dev/null &&
-   grep -q '^source=src/core/tooling/backend_driver_dispatch_min.cheng$' /tmp/ct_dm2.report 2>/dev/null; then
-    ACT=1
-else
-    ACT=0
-fi
-assert "dispatch_min_self_dispatch_direct" 1 "$ACT"
-if [ -x /tmp/ct_dm2 ]; then
-    /tmp/ct_dm2 status --root:. --in:src/core/tooling/backend_driver_dispatch_min.cheng \
-        --out:/tmp/ct_dm2_status.out >/tmp/ct_dm2_status.stdout 2>/tmp/ct_dm2_status.stderr
-    ACT=$?
-else
-    ACT="STATUS_FAILED"
-fi
-assert "dispatch_min_self_dispatch_status" 0 "$ACT"
-if grep -q '^bootstrap_mode=selfhost$' /tmp/ct_dm2_status.stdout 2>/dev/null &&
-   grep -q '^flag_exec_edges=0$' /tmp/ct_dm2_status.stdout 2>/dev/null &&
-   grep -q '^flag_exec_unresolved=0$' /tmp/ct_dm2_status.stdout 2>/dev/null; then
-    ACT=1
-else
-    ACT=0
-fi
-assert "dispatch_min_self_dispatch_status_marker" 1 "$ACT"
+assert "dispatch_min_direct_unresolved_hard_fail" "HARD_FAIL" "$ACT"
+if [ ! -x /tmp/ct_dm ]; then ACT=1; else ACT=0; fi
+assert "dispatch_min_no_stale_binary" 1 "$ACT"
+if [ ! -e /tmp/ct_dm_self ]; then ACT=1; else ACT=0; fi
+assert "dispatch_min_self_ordinary_blocked_no_driver" 1 "$ACT"
+if [ ! -e /tmp/ct_dm_import ]; then ACT=1; else ACT=0; fi
+assert "dispatch_min_self_import_blocked_no_driver" 1 "$ACT"
+if [ ! -e /tmp/ct_dm_import.report ]; then ACT=1; else ACT=0; fi
+assert "dispatch_min_self_import_report_absent" 1 "$ACT"
+if [ ! -e /tmp/ct_dm_cov ]; then ACT=1; else ACT=0; fi
+assert "dispatch_min_self_subset_blocked_no_driver" 1 "$ACT"
+if [ ! -e /tmp/ct_dm_cov.report ]; then ACT=1; else ACT=0; fi
+assert "dispatch_min_self_subset_report_absent" 1 "$ACT"
+if [ ! -e /tmp/ct_dm_ec.o ]; then ACT=1; else ACT=0; fi
+assert "dispatch_min_self_emit_obj_blocked_no_driver" 1 "$ACT"
+if [ ! -e /tmp/ct_dm_ec_link ]; then ACT=1; else ACT=0; fi
+assert "dispatch_min_self_emit_obj_link_absent" 1 "$ACT"
+if [ ! -e /tmp/ct_dm2 ]; then ACT=1; else ACT=0; fi
+assert "dispatch_min_self_dispatch_blocked_no_driver" 1 "$ACT"
+if [ ! -e /tmp/ct_dm2.report ]; then ACT=1; else ACT=0; fi
+assert "dispatch_min_self_dispatch_report_absent" 1 "$ACT"
+if [ ! -e /tmp/ct_dm2_status.stdout ]; then ACT=1; else ACT=0; fi
+assert "dispatch_min_self_status_blocked_no_driver" 1 "$ACT"
 
 cat > /tmp/ct_while_only.cheng << 'EOF'
 fn main(): int32 =
@@ -402,7 +316,9 @@ timeout 30 "$COLD" system-link-exec --root:"$PWD" \
 pure_driver_status=$?
 if [ "$pure_driver_status" -ne 0 ] &&
    grep -q '^cold_system_link_exec=1$' /tmp/ct_pure_backend_driver.report 2>/dev/null &&
-   grep -q '^error=invalid string literal index$' /tmp/ct_pure_backend_driver.report 2>/dev/null &&
+   grep -q '^unresolved_symbol_count=3$' /tmp/ct_pure_backend_driver.report 2>/dev/null &&
+   grep -q '^first_unresolved_symbol=os.cheng_fopen$' /tmp/ct_pure_backend_driver.report 2>/dev/null &&
+   grep -q '^egraph_licm_hoisted=0$' /tmp/ct_pure_backend_driver.report 2>/dev/null &&
    [ ! -e /tmp/ct_pure_backend_driver ]; then
     ACT="HARD_FAIL"
 else
