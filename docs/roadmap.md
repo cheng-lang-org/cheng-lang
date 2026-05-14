@@ -13,7 +13,7 @@
 | cold linkerless exe | 68% | provider-free 可行；A/B witness 通过；多 provider archive ELF 链路和 `--csg-in --provider-archive` 已闭环 |
 | provider archive | 62% | `provider-archive-pack` + `--link-object/--csg-in --provider-archive` 已覆盖多 ELF member/export、缺 export hard-fail |
 | backend driver fixed-point | 35% | A/B witness 通过（产物 SHA 一致，关键报告字段对等）；cross-version 确定性待定 |
-| Ownership / E-Graph | 38% | No-Alias 局部标量基础；ownership proof driver + witness 可编译运行 exit 0；E-Graph 已有两级CID（canonical_hash + canonical_graph_cid），I32规范化已实现，待扩展I64/F32/F64 |
+| Ownership / E-Graph | 34% | No-Alias 局部标量基础；ownership proof driver + witness 可编译运行 exit 0；UIR E-Graph 明确 unavailable，rewrite=0 |
 | C seed 替代 | 35% | 闭包✅，泛型FnDef字段已激活，async是库级特性不阻塞，仍需泛型函数特化 |
 | 跨端 | 60% | 三架构 exe + COFF obj 均产出，CI 中有 COFF 格式验证 |
 
@@ -44,7 +44,7 @@
 
 | gap | 状态 | 下一步 |
 |---|---|---|
-| provider archive 生成与链接 | 多 provider ELF member/export 已由 cold linkerless 链路闭合；runtime provider roots/Darwin runtime marker 未闭合 | 把 runtime provider 预编译 archive 接入并锁 root 选择 |
+| provider archive 生成与链接 | 多 provider ELF member/export 已由 cold linkerless 链路闭合；Darwin runtime marker object 已锁；runtime provider roots 未闭合 | 把 runtime provider 预编译 archive 接入并锁 root 选择 |
 | runtime smoke cc 链接 | 同上，内置 ELF 链接器已绕过 | 三 smoke RISC-V linked ELF 均已 QEMU 验证 |
 | 删除 cold source parser | COLD_BACKEND_ONLY 42% 缩减 | parser 代码保留，cold_parser.c 独立文件 |
 | C seed 替代 | cheng_seed.c 仍是完整 Cheng 语言实现（66K 行，3.0MB） | 冷编译器子集覆盖足够后可退役 |
@@ -79,10 +79,10 @@
 - 缺 export hard-fail 锁 `unresolved_symbol_count=1` 和 `first_unresolved_symbol`
 
 **阶段5 E-Graph 审计**（2026-05-14 子代理）：
-- 已有两级 CID 架构：`cold_body_ir_canonical_hash`（cold 层）+ `CompilerCsgCanonicalGraphCid`（Cheng 层）
-- I32 操作的交换律规范化已实现
-- Gap：I64/F32/F64 交换律/结合律未规范化；两层 CID 未连接
-- E-Graph 不是从零开始——需要扩展操作覆盖范围和连接两层
+- `compiler_csg_egraph_contract` 已明确输出 `uir_egraph_status=unavailable`
+- `uir_egraph_rewrite_enabled=0`、`uir_egraph_rewrite_rule_count=0` 已由 smoke 锁定
+- 现有 canonical hash / graph CID 只能算 CSG 等价合同，不是 UIR E-Graph
+- 后续 rewrite 必须先有只读等价证明和 cost model
 
 **阶段6 async/await 审计**（2026-05-14 子代理）：
 - `async fn` 在解析器层面被识别（行954-968），但处理方式与 `fn` 完全相同
@@ -614,7 +614,7 @@ fn LoweringBuildPrimaryObjectIr(...): PrimaryObjectIr =
 
 进入默认门槛全部满足：
 - 核心 `build-backend-driver` 和 ordinary `system-link-exec` 稳定 ✅
-- cold source-direct runtime smoke 已运行通过；runtime provider roots/Darwin marker 尚未闭合 ⚠️
+- cold source-direct runtime smoke 已运行通过；Darwin runtime marker object 已锁，runtime provider roots 尚未闭合 ⚠️
 - cross-target smoke 证明 Mach-O/ELF/COFF 产物合法 ✅
 
 ## 当前优先级
@@ -626,7 +626,7 @@ fn LoweringBuildPrimaryObjectIr(...): PrimaryObjectIr =
 5. ✅ **函数级并行 + lock-free work-stealing**：pthread + `__atomic_fetch_add` + 确定性 merge。`COLD_NO_SIGN=1` 下任意 `BACKEND_JOBS` 值产物 SHA 一致。
 6. ✅ **30-80ms 架构合规**：6 个 report 字段全部输出，冷进程内微秒级计时。实测 135 函数/5293 ops 编译 total=22.5ms。
 7. ✅ **回归测试**：`tools/cold_regression_test.sh` 35/35 PASS，`tools/cold_csg_v2_roundtrip_test.sh` 51/51 PASS。
-8. ✅ **cold source-direct runtime smoke 通过**：`atomic_i32_runtime_smoke`、`thread_atomic_orc_runtime_smoke`、`compiler_runtime_smoke`、source-direct `while` 均通过；runtime provider roots/Darwin marker 仍是下一步。
+8. ✅ **cold source-direct runtime smoke 通过**：`atomic_i32_runtime_smoke`、`thread_atomic_orc_runtime_smoke`、`compiler_runtime_smoke`、source-direct `while` 均通过；runtime provider roots 仍是下一步。
 9. 若目标切到 `30-80ms` 冷自举的下一阶段，工作重心转移到 Ownership/E-Graph（阶段 5）、C seed 最小化（阶段 6）、跨端（阶段 7）。
 
 ## 诊断命令

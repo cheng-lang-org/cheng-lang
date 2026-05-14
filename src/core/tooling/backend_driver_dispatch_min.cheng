@@ -588,7 +588,7 @@ fn BackendDriverDispatchMinPrintBuildPlanCommandFromCmdline(): int32 =
 
 fn BackendDriverDispatchMinHelp(): int32 =
     BackendDriverDispatchMinPrintLine("usage: cheng <command> [args]")
-    BackendDriverDispatchMinPrintLine("core commands: status, print-build-plan, system-link-exec, emit-cold-csg-v2, run-host-smokes cold_csg_sidecar_smoke")
+    BackendDriverDispatchMinPrintLine("core commands: status, print-build-plan, system-link-exec, emit-cold-csg-v2, run-host-smokes cold_csg_sidecar_smoke compiler_csg_egraph_active_contract_smoke")
     return 0
 
 fn BackendDriverDispatchMinCurrentCompiler(rootDir: str): str =
@@ -2116,10 +2116,59 @@ fn BackendDriverDispatchMinRunChengSkillConsistencySmoke(rootDir: str): int32 =
     BackendDriverDispatchMinPrintLine(" cheng_skill_consistency_smoke ok")
     return 0
 
+fn BackendDriverDispatchMinRunCompilerCsgEgraphActiveContractSmoke(rootDir: str): int32 =
+    let smokeName = "compiler_csg_egraph_active_contract_smoke"
+    let compilerPath = BackendDriverDispatchMinCurrentCompiler(rootDir)
+    if len(compilerPath) <= 0 || !chengpath.FileExistsNonEmpty(rootDir, compilerPath):
+        return BackendDriverDispatchMinUnsupported(Fmt"backend driver direct: missing compiler: {compilerPath}")
+    let label = BackendDriverDispatchMinReadFlagOrDefault("--label", "dispatch_min")
+    let outDir = chengpath.PathAbsolute(rootDir, Fmt"artifacts/hostrun/{label}")
+    if !BackendDriverDispatchMinEnsureDir(rootDir, outDir):
+        return 1
+    let src = chengpath.PathAbsolute(rootDir, "src/tests/compiler_csg_egraph_active_contract_smoke.cheng")
+    if !chengpath.FileExistsNonEmpty(rootDir, src):
+        BackendDriverDispatchMinPrintErr(Fmt"backend driver direct: missing source: {src}")
+        return 1
+    let outBin = chengpath.PathJoin(outDir, smokeName)
+    let reportPath = Fmt"{outBin}.compile.report.txt"
+    let compileLog = Fmt"{outBin}.compile.log"
+    let runLog = Fmt"{outBin}.run.log"
+    BackendDriverDispatchMinRemoveIfExists(outBin)
+    BackendDriverDispatchMinRemoveIfExists(reportPath)
+    BackendDriverDispatchMinRemoveIfExists(compileLog)
+    BackendDriverDispatchMinRemoveIfExists(runLog)
+    BackendDriverDispatchMinRemoveIfExists(Fmt"{outBin}.map")
+    BackendDriverDispatchMinPrintLine(Fmt"[cheng host smokes] compile {smokeName}")
+    var startNs = BackendDriverDispatchMinNowNs()
+    let compileCommand = Fmt"CHENG_NO_BACKEND_DRIVER_HANDOFF=1 CHENG_BACKEND_DRIVER_HANDOFF=0 BACKEND_INCREMENTAL=0 BACKEND_MULTI_MODULE_CACHE=0 CHENG_DISABLE_PRIMARY_OBJECT_CACHE=1 BACKEND_BUILD_DRIVER_QUICK_STAMP_CACHE=0 BACKEND_BUILD_DRIVER_QUICK_SHARED_CACHE=0 CHENG_PROGRESS=1 CHENG_PROCESS_MAX_RSS_BYTES=8589934592 {os.QuoteShell(compilerPath)} system-link-exec --root:{os.QuoteShell(rootDir)} --in:{os.QuoteShell(src)} --emit:exe --target:arm64-apple-darwin --out:{os.QuoteShell(outBin)} --report-out:{os.QuoteShell(reportPath)}"
+    let compileRun = BackendDriverDispatchMinRunShellLogged(rootDir,
+                                                            compileCommand,
+                                                            compileLog)
+    let compileRc = os.ExecCmdResultExitCode(compileRun)
+    BackendDriverDispatchMinPrintLine(Fmt"compiler_csg_egraph_active_contract_compile_ms={BackendDriverDispatchMinElapsedMsText(startNs)} rc={compileRc}")
+    if compileRc != 0:
+        BackendDriverDispatchMinPrintErr(Fmt"backend driver direct: compiler csg egraph active contract compile failed log={compileLog}")
+        return compileRc
+    if !chengpath.FileExistsNonEmpty(rootDir, outBin):
+        BackendDriverDispatchMinPrintErr(Fmt"backend driver direct: compiler csg egraph active contract output missing: {outBin}")
+        return 1
+    startNs = BackendDriverDispatchMinNowNs()
+    let runRc = BackendDriverDispatchMinRunExecutable(rootDir, outBin, runLog)
+    BackendDriverDispatchMinPrintLine(Fmt"compiler_csg_egraph_active_contract_run_ms={BackendDriverDispatchMinElapsedMsText(startNs)} rc={runRc}")
+    let runText = chengpath.ReadTextFile(rootDir, runLog)
+    if runRc != 0:
+        BackendDriverDispatchMinPrintErr(Fmt"backend driver direct: compiler csg egraph active contract run failed log={runLog}")
+        return runRc
+    if !BackendDriverDispatchMinHostSmokeExpectContains(smokeName, runText, " compiler_csg_egraph_active_contract_smoke ok"):
+        return 1
+    BackendDriverDispatchMinPrintLine(" compiler_csg_egraph_active_contract_smoke ok")
+    return 0
+
 fn BackendDriverDispatchMinRunHostSmokesFromCmdline(): int32 =
     let count = BackendDriverDispatchMinParamCount()
     var requestedCold = false
     var requestedSkill = false
+    var requestedEgraphContract = false
     var unknown = ""
     if count >= 2:
         for i in 2..count:
@@ -2130,12 +2179,14 @@ fn BackendDriverDispatchMinRunHostSmokesFromCmdline(): int32 =
                 requestedCold = true
             elif arg == "cheng_skill_consistency_smoke":
                 requestedSkill = true
+            elif arg == "compiler_csg_egraph_active_contract_smoke":
+                requestedEgraphContract = true
             else:
                 unknown = arg
     if len(unknown) > 0:
         return BackendDriverDispatchMinUnsupported(Fmt"backend driver direct: dispatch_min run-host-smokes unsupported smoke: {unknown}")
-    if !requestedCold && !requestedSkill:
-        return BackendDriverDispatchMinUnsupported("backend driver direct: dispatch_min run-host-smokes requires cold_csg_sidecar_smoke or cheng_skill_consistency_smoke")
+    if !requestedCold && !requestedSkill && !requestedEgraphContract:
+        return BackendDriverDispatchMinUnsupported("backend driver direct: dispatch_min run-host-smokes requires cold_csg_sidecar_smoke, cheng_skill_consistency_smoke, or compiler_csg_egraph_active_contract_smoke")
     let rootDir = BackendDriverDispatchMinReadFlagOrDefault("--root", chengpath.PathCurrentDir())
     if requestedCold:
         let coldRc = BackendDriverDispatchMinRunColdCsgSidecarSmoke(rootDir)
@@ -2145,6 +2196,10 @@ fn BackendDriverDispatchMinRunHostSmokesFromCmdline(): int32 =
         let skillRc = BackendDriverDispatchMinRunChengSkillConsistencySmoke(rootDir)
         if skillRc != 0:
             return skillRc
+    if requestedEgraphContract:
+        let egraphRc = BackendDriverDispatchMinRunCompilerCsgEgraphActiveContractSmoke(rootDir)
+        if egraphRc != 0:
+            return egraphRc
     return 0
 
 fn BackendDriverDispatchMinCommandCode(cmd: str): int32 =

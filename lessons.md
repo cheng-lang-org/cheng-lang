@@ -94,6 +94,7 @@
 - cold DSE 活跃性根必须包含 terminator、`call_arg` side table、以及会读写容器/引用的 dst slot；否则 `while` 条件、call 参数、sequence/object 初始化会被当作死写删除。
 - BodyIR slot 是可变非 SSA；CSE、hash dedup、跨 slot 等价替换必须等 SSA/等价证明后再启用。当前只允许 DSE 和可证明代数恒等式，不允许靠相似 op 做值复用。
 - `build-backend-driver` 候选门禁必须保留 source-direct `while` 运行测试；禁止把真实控制流 smoke 改成 `for`、compile-only 或其它绕路。
+- runtime provider archive 门禁禁止用 allocator/entry/panic stub 冒充闭合；只允许导出真实实现的符号。原子 provider smoke 只能证明 atomic 外部符号解析，不能外推成 runtime roots 完成。
 
 ## Resolved
 

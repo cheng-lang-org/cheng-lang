@@ -501,45 +501,33 @@ TUPLEEOF
 ACT=$(compile_run_timed "$COLD" /tmp/ct_tuple_default_bracket.cheng /tmp/ct_tuple_default_bracket 10)
 assert "tuple_default_bracket" 0 "$ACT"
 
-# 10: runtime provider archive (AArch64 ELF)
+# 10: atomic provider archive (AArch64 ELF, no runtime stubs)
 rm -rf /tmp/ct_runtime
 mkdir -p /tmp/ct_runtime
-quiet as -target aarch64-unknown-linux-gnu -o /tmp/ct_runtime/runtime_stubs.o \
-    src/core/runtime/linux_runtime_stubs_aarch64.S
-if [ -f /tmp/ct_runtime/runtime_stubs.o ]; then
+quiet as -target aarch64-unknown-linux-gnu -o /tmp/ct_runtime/atomic_provider.o \
+    src/core/runtime/linux_atomic_provider_aarch64.S
+if [ -f /tmp/ct_runtime/atomic_provider.o ]; then
     ACT=1
 else
     ACT=0
 fi
-assert "runtime_stubs_assemble" 1 "$ACT"
+assert "atomic_provider_assemble" 1 "$ACT"
 
 quiet $COLD provider-archive-pack \
     --target:aarch64-unknown-linux-gnu \
-    --object:/tmp/ct_runtime/runtime_stubs.o \
+    --object:/tmp/ct_runtime/atomic_provider.o \
     --export:atomicCasRaw \
     --export:atomicStoreRaw \
     --export:atomicLoadRaw \
-    --export:_start \
-    --export:__cheng_setCmdLine \
-    --export:cheng_host_malloc \
-    --export:cheng_host_free \
-    --export:cheng_host_realloc \
-    --export:cheng_host_exit_runtime \
-    --export:cheng_host_exit_immediate_runtime \
-    --export:cheng_panic_cstring_and_exit \
-    --export:cheng_program_argv_entry \
-    --export:cheng_malloc \
-    --export:cheng_free \
-    --export:cheng_cstrlen \
-    --module:runtime \
+    --module:atomic_provider \
     --source:src/core/runtime \
-    --out:/tmp/ct_runtime/runtime.chenga
-if [ -f /tmp/ct_runtime/runtime.chenga ]; then
+    --out:/tmp/ct_runtime/atomic_provider.chenga
+if [ -f /tmp/ct_runtime/atomic_provider.chenga ]; then
     ACT=1
 else
     ACT=0
 fi
-assert "runtime_provider_archive_pack" 1 "$ACT"
+assert "atomic_provider_archive_pack" 1 "$ACT"
 
 quiet $COLD system-link-exec --in:src/tests/atomic_i32_direct_runtime_smoke.cheng \
     --emit:obj --target:aarch64-unknown-linux-gnu \
@@ -554,20 +542,49 @@ assert "runtime_atomic_obj" 1 "$ACT"
 rm -f /tmp/ct_runtime/linked /tmp/ct_runtime/link.report.txt
 quiet $COLD system-link-exec \
     --link-object:/tmp/ct_runtime/atomic.o \
-    --provider-archive:/tmp/ct_runtime/runtime.chenga \
+    --provider-archive:/tmp/ct_runtime/atomic_provider.chenga \
     --emit:exe --target:aarch64-unknown-linux-gnu \
     --out:/tmp/ct_runtime/linked \
     --report-out:/tmp/ct_runtime/link.report.txt
-if grep -q '^provider_resolved_symbol_count=6$' /tmp/ct_runtime/link.report.txt 2>/dev/null &&
+if grep -q '^provider_archive_member_count=1$' /tmp/ct_runtime/link.report.txt 2>/dev/null &&
+   grep -q '^provider_export_count=3$' /tmp/ct_runtime/link.report.txt 2>/dev/null &&
+   grep -q '^provider_resolved_symbol_count=6$' /tmp/ct_runtime/link.report.txt 2>/dev/null &&
    grep -q '^unresolved_symbol_count=0$' /tmp/ct_runtime/link.report.txt 2>/dev/null &&
    grep -q '^system_link=0$' /tmp/ct_runtime/link.report.txt 2>/dev/null; then
     ACT=1
 else
     ACT=0
 fi
-assert "runtime_provider_archive_link" 1 "$ACT"
+assert "atomic_provider_archive_link" 1 "$ACT"
 
 rm -rf /tmp/ct_runtime
+
+# 11: ownership proof driver report fields
+rm -f /tmp/ct_ownership /tmp/ct_ownership.report /tmp/ct_ownership.stdout
+quiet $COLD system-link-exec --in:src/tests/ownership_proof_driver_cold.cheng \
+    --target:arm64-apple-darwin --out:/tmp/ct_ownership \
+    --report-out:/tmp/ct_ownership.report \
+    --ownership-on
+if [ -x /tmp/ct_ownership ]; then
+    /tmp/ct_ownership >/tmp/ct_ownership.stdout 2>/dev/null; ACT=$?
+else
+    ACT="COMPILE_FAILED"
+fi
+assert "ownership_proof_exit" 0 "$ACT"
+if grep -q 'ownership_proof_driver ok' /tmp/ct_ownership.stdout 2>/dev/null &&
+   grep -q 'ownership_runtime_witness=1' /tmp/ct_ownership.stdout 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "ownership_proof_output" 1 "$ACT"
+if grep -q '^ownership_compile_entry=1$' /tmp/ct_ownership.report 2>/dev/null &&
+   grep -q '^ownership_runtime_witness=1$' /tmp/ct_ownership.report 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "ownership_report_fields" 1 "$ACT"
 
 echo ""
 echo "=== $PASS passed, $FAIL failed ==="

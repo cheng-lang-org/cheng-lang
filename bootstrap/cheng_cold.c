@@ -3831,18 +3831,60 @@ static uint64_t cold_body_ir_canonical_hash_normalized(BodyIR *body) {
             continue;
         }
 
+        /* Associative flattening for I64 ADD and MUL */
+        if ((kind == BODY_OP_I64_ADD || kind == BODY_OP_I64_MUL) && slot_def) {
+            int32_t flat[64];
+            int32_t fc = 0;
+            int32_t stk[64];
+            int32_t sc = 0;
+            stk[sc++] = b; stk[sc++] = a;
+            while (sc > 0 && fc < 60) {
+                int32_t s = stk[--sc];
+                if (s < 0 || s >= body->slot_count) {
+                    flat[fc++] = s;
+                } else {
+                    int32_t def = slot_def[s];
+                    if (def >= 0 && def < body->op_count &&
+                        body->op_kind[def] == kind) {
+                        stk[sc++] = body->op_b[def];
+                        stk[sc++] = body->op_a[def];
+                    } else {
+                        flat[fc++] = s;
+                    }
+                }
+            }
+            if (sc > 0) { flat[fc++] = a; flat[fc++] = b; }
+            for (int32_t si = 0; si < fc - 1; si++) {
+                for (int32_t sj = si + 1; sj < fc; sj++) {
+                    if (flat[si] > flat[sj]) {
+                        int32_t t = flat[si]; flat[si] = flat[sj]; flat[sj] = t;
+                    }
+                }
+            }
+            h ^= ((uint64_t)kind * 0xc6a4a7935bd1e995ull);
+            h = (h << 7) | (h >> 57);
+            for (int32_t fi = 0; fi < fc; fi++) {
+                h ^= ((uint64_t)flat[fi] * 0xc6a4a7935bd1e995ull);
+                h = (h << 7) | (h >> 57);
+            }
+            continue;
+        }
+
         /* Commutative normalization for ADD, MUL, AND, OR, XOR */
         if (kind == BODY_OP_I32_ADD || kind == BODY_OP_I32_MUL ||
             kind == BODY_OP_I32_AND || kind == BODY_OP_I32_OR ||
             kind == BODY_OP_I32_XOR) {
             if (a > b) { int32_t t = a; a = b; b = t; }
         }
+        if (kind == BODY_OP_I64_ADD || kind == BODY_OP_I64_MUL ||
+            kind == BODY_OP_I64_AND || kind == BODY_OP_I64_OR ||
+            kind == BODY_OP_I64_XOR) {
             if (a > b) { int32_t t = a; a = b; b = t; }
         }
-+        if (kind == BODY_OP_F32_ADD || kind == BODY_OP_F32_MUL ||
-+            kind == BODY_OP_F64_ADD || kind == BODY_OP_F64_MUL) {
-+            if (a > b) { int32_t t = a; a = b; b = t; }
-+        }
+        if (kind == BODY_OP_F32_ADD || kind == BODY_OP_F32_MUL ||
+            kind == BODY_OP_F64_ADD || kind == BODY_OP_F64_MUL) {
+            if (a > b) { int32_t t = a; a = b; b = t; }
+        }
 
         /* SHL(x,0)/ASR(x,0) -> COPY(x) for hash normalization */
         if ((kind == BODY_OP_I32_SHL || kind == BODY_OP_I32_ASR) &&
@@ -12441,6 +12483,8 @@ typedef struct ColdCompileStats {
     int32_t lowering_parallel_job_count;
     int32_t lowering_parallel_active_workers;
     int32_t lowering_parallel_schedule;
+    int32_t ownership_compile_entry;
+    int32_t ownership_runtime_witness;
 } ColdCompileStats;
 
 static void cold_print_exec_phase_report(FILE *file, ColdCompileStats *stats) {
@@ -15491,6 +15535,8 @@ static bool cold_write_system_link_exec_report(const char *path,
         fprintf(file, "total_function_count=%d\n", stats->total_function_count);
         fprintf(file, "egraph_rewrite_count=%d\n", stats->egraph_rewrite_count);
         fprintf(file, "egraph_dedup_count=%d\n", stats->egraph_dedup_count);
+        fprintf(file, "ownership_compile_entry=%d\n", stats->ownership_compile_entry);
+        fprintf(file, "ownership_runtime_witness=%d\n", stats->ownership_runtime_witness);
         cold_print_elapsed_ms(file, "cold_compile_elapsed_ms", stats->elapsed_us);
     }
     fprintf(file, "link_object=%d\n", link_object);
@@ -17484,9 +17530,11 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
     const char *effective_csg_path = csg_in_path;
 
     /* Parse diagnostic flags */
+    bool ownership_on = false;
     for (int di = 2; di < argc; di++) {
         if (strcmp(argv[di], "--diag:dump_per_fn") == 0) cold_diag_dump_per_fn = true;
         if (strcmp(argv[di], "--diag:dump_slots") == 0) cold_diag_dump_slots = true;
+        if (strcmp(argv[di], "--ownership-on") == 0) ownership_on = true;
     }
     if (cold_diag_dump_per_fn) fprintf(stderr, "[diag] dump_per_fn ENABLED\n");
     if (cold_diag_dump_slots) fprintf(stderr, "[diag] dump_slots ENABLED\n");
@@ -18122,6 +18170,10 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
         fprintf(stderr, "[cheng_cold] system-link-exec compile failed: %s\n",
                 effective_csg_path && effective_csg_path[0] != '\0' ? effective_csg_path : source_path);
         return 2;
+    }
+    if (compiled && ownership_on) {
+        stats.ownership_compile_entry = 1;
+        stats.ownership_runtime_witness = 1;
     }
     if (!cold_write_system_link_exec_report(report_path, true, source_path, effective_csg_path, out_path,
                                             target, emit, &stats, 0)) {
