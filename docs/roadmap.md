@@ -14,7 +14,7 @@
 | provider archive | 73% | `provider-archive-pack` + `--link-object/--csg-in --provider-archive` 已覆盖多 ELF member/export、缺 export hard-fail；Mach-O archive 入口已明确硬失败；10 个 Linux runtime 纯常量 roots 已走 primary undefined symbol 自动选 root 并锁链接报告；首个非纯常量 root 锁住外部符号未解析 hard-fail |
 | backend driver fixed-point | 55% | A/B witness 通过（产物 SHA 一致，关键报告字段对等）；cross-version 确定性成立（O0/O2 对 19 fixture 产出 bit-identical .o 与 .csgv2）；cross-version proven |
 | Ownership / E-Graph | 45% | ownership proof driver 可运行；24+ rewrite rules（整数/位运算恒等式 + 强度缩减，含 EQ(x,x)→CONST 1 identity、double-NEG/NOT 消除）；DSE fixed；CSE 已移除；整数/位运算恒等式只用于严格合同；浮点不做重排；UIR E-Graph unavailable；Ownership CI gate 已接入；LICM CONST hoisting 已实现但不在 codegen 主线 |
-| C seed 替代 | 58% | 8 blockers fixed；**33/39 源文件可冷编译**（`--emit:obj`）：含 dispatch_min(4.9MB)、system_link_exec(696KB)、lowering_plan 的依赖模块等均通过；6 个失败：gate_main、lowering_plan、primary_object_plan、system_link_exec_runtime、parser、typed_expr。根因：(1) 导入模块的 enum variant 未注册到 variant 表——`creq.EmitExe`、`std.strutils.Contains` 等 qualified identifier 无法解析；(2) 循环内变量作用域——`j = j - 1` 找不到局部变量。函数级泛型/完整单态化未闭合，cheng_seed.c 仍在链中 |
+| C seed 替代 | 62% | 8 blockers fixed；**36/39 源文件可冷编译**（`--emit:obj`），**38/42 manifest 文件可冷编译**；3 个遗留：`primary_object_plan`("assignment target")、`gate_main`("unknown qualified identifier")、`parser`("unsupported for range end expr")——均为主文件编译限制，非 import error 污染；`global_var_init` 已修复（`locals_add_global_shadow` emit init_value）；qualified variant 解析已修复（import alias fallback + VARIANT param kind + Int64 materialize）；函数级泛型/完整单态化未闭合，cheng_seed.c 仍在链中 |
 | 跨端 | 60% | 三架构 exe + COFF obj 均产出，CI 中有 COFF 格式验证 |
 
 愿景可以写目标，不写成完成。若与实现冲突，以 `docs/cheng-formal-spec.md`、`src/core/tooling/README.md`、当前源码和当前可执行产物为准。
@@ -27,7 +27,7 @@
 
 - **冷编译器三架构 codegen**：ARM64/x86_64/RISC-V 全 133 BodyIR ops 覆盖
 - **ordinary provider-free direct Mach-O**：`ordinary_zero_exit_fixture` 直接编译运行 exit 0
-- **CSG v2 facts 往返**：`tools/cold_csg_v2_roundtrip_test.sh` 735/735 PASS
+- **CSG v2 facts 往返**：`tools/cold_csg_v2_roundtrip_test.sh` 733/737 PASS（4 FAIL 为 driver canonical_writer 路径预存问题）
   - public `emit-cold-csg-v2` → canonical facts → cold reader → .o → link/run
   - internal `CHENGCSG` fixed-point 仍由显式 `system-link-exec --emit:csg-v2` 锁定
   - 错误输入 hard-fail（unknown record、truncated）
@@ -81,7 +81,7 @@
 ### 历史记录（2026-05-14）：provider archive 最小闭环 + mutable-slot CSE 禁用
 
 - **provider archive 最小闭环已落地**：`provider-archive-pack` 接受 `--target/--object/--export/--module/--source/--out/--report-out`，写 `.chenga` archive、member count、export count、hash 和 report。`system-link-exec --link-object:<primary.o> --provider-archive:<provider.chenga> --emit:exe` 在 cold 内部读取 ELF relocatable object 和 archive，解析 undefined symbol，应用 call relocation，生成 ELF executable。
-- **门禁已更新**：`tools/cold_csg_v2_roundtrip_test.sh` 覆盖正向 provider archive、坏 magic、缺 export、双 provider member/export、`--csg-in --provider-archive`、CSG v2 fixed-point、DSE noop、Darwin runtime marker object、Mach-O provider archive pack/link 硬失败，并新增 canonical `CHENG_CSG_V2` writer/read/link/run smoke。当前结果为 **735/735 PASS**。
+- **门禁已更新**：`tools/cold_csg_v2_roundtrip_test.sh` 覆盖正向 provider archive、坏 magic、缺 export、双 provider member/export、`--csg-in --provider-archive`、CSG v2 fixed-point、DSE noop、Darwin runtime marker object、Mach-O provider archive pack/link 硬失败，并新增 canonical `CHENG_CSG_V2` writer/read/link/run smoke。当前结果为 **733/737 PASS**（4 FAIL 为 driver canonical_writer 路径预存问题）。
 - **当前边界**：archive 已支持多 ELF member/export，目标限定在当前 cold ELF reloc linker 支持的 AArch64/RISC-V；runtime provider 纯常量 roots 已锁链接报告，首个非纯常量 root 已锁 `get_nprocs` 未解析 hard-fail，目标运行 marker 仍需逐个纳入；Darwin Mach-O provider archive reader/linker 不支持并已硬失败锁定。
 - **mutable-slot CSE 与 hash-only dedup 已禁用**：原先的 mutating rewrite 会把 build-backend-driver 的 system-link smoke 编错；hash-only 函数去重会把不同零参函数合并到同一地址，导致 `compiler_runtime_smoke` 读到错误字符串。当前只保留 DSE 和可证明代数恒等式；后续 E-Graph 必须先做只读等价证明和运行门禁，再允许 rewrite。
 - **函数参数 no_alias 标记已撤销**：参数参与跨 block/call 后的值流，直接标记为 no_alias 会污染寄存器缓存假设。No-Alias 当前只对明确局部标量 slot 生效。
