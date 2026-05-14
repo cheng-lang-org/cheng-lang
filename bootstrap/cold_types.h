@@ -508,6 +508,13 @@ typedef struct ConstDef {
     Span  str_val;
 } ConstDef;
 
+typedef struct GlobalDef {
+    Span name;
+    int32_t kind;
+    int32_t size;
+    Span type_name;
+} GlobalDef;
+
 typedef struct Symbols {
     FnDef *functions;
     int32_t function_count;
@@ -521,6 +528,9 @@ typedef struct Symbols {
     ConstDef *consts;
     int32_t const_count;
     int32_t const_cap;
+    GlobalDef *globals;
+    int32_t global_count;
+    int32_t global_cap;
     Arena *arena;
 } Symbols;
 
@@ -754,6 +764,9 @@ ObjectDef *symbols_add_object(Symbols *symbols, Span name, int32_t field_count);
 ObjectDef *symbols_find_object(Symbols *symbols, Span name);
 ConstDef *symbols_add_const(Symbols *symbols, Span name, int32_t value);
 ConstDef *symbols_find_const(Symbols *symbols, Span name);
+GlobalDef *symbols_find_global(Symbols *symbols, Span name);
+void symbols_add_global(Symbols *symbols, Span name, int32_t kind,
+                        int32_t size, Span type_name);
 ObjectDef *symbols_resolve_object(Symbols *symbols, Span name);
 void symbols_refine_object_layouts(Symbols *symbols);
 

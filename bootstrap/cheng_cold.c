@@ -4081,6 +4081,13 @@ typedef struct ConstDef {
     Span  str_val;
 } ConstDef;
 
+typedef struct GlobalDef {
+    Span name;
+    int32_t kind;
+    int32_t size;
+    Span type_name;
+} GlobalDef;
+
 typedef struct Symbols {
     FnDef *functions;
     int32_t function_count;
@@ -4094,6 +4101,9 @@ typedef struct Symbols {
     ConstDef *consts;
     int32_t const_count;
     int32_t const_cap;
+    GlobalDef *globals;
+    int32_t global_count;
+    int32_t global_cap;
     Arena *arena;
 } Symbols;
 
@@ -4128,10 +4138,12 @@ static Symbols *symbols_new(Arena *arena) {
     symbols->type_cap = 16;
     symbols->object_cap = 16;
     symbols->const_cap = 16;
+    symbols->global_cap = 64;
     symbols->functions = arena_alloc(arena, (size_t)symbols->function_cap * sizeof(FnDef));
     symbols->types = arena_alloc(arena, (size_t)symbols->type_cap * sizeof(TypeDef));
     symbols->objects = arena_alloc(arena, (size_t)symbols->object_cap * sizeof(ObjectDef));
     symbols->consts = arena_alloc(arena, (size_t)symbols->const_cap * sizeof(ConstDef));
+    symbols->globals = arena_alloc(arena, (size_t)symbols->global_cap * sizeof(GlobalDef));
     return symbols;
 }
 
@@ -4172,6 +4184,37 @@ void symbols_add_str_const(Symbols *symbols, Span name, Span str_val) {
     constant->value = 0;
     constant->is_str = true;
     constant->str_val = cold_arena_span_copy(symbols->arena, str_val);
+}
+
+GlobalDef *symbols_find_global(Symbols *symbols, Span name) {
+    for (int32_t i = 0; i < symbols->global_count; i++) {
+        if (span_same(symbols->globals[i].name, name)) return &symbols->globals[i];
+    }
+    return 0;
+}
+
+void symbols_add_global(Symbols *symbols, Span name, int32_t kind,
+                        int32_t size, Span type_name) {
+    GlobalDef *existing = symbols_find_global(symbols, name);
+    if (existing) {
+        if (existing->kind != kind || existing->size != size ||
+            !span_same(existing->type_name, type_name)) {
+            die("cold duplicate global type mismatch");
+        }
+        return;
+    }
+    if (symbols->global_count >= symbols->global_cap) {
+        int32_t next = symbols->global_cap * 2;
+        GlobalDef *fresh = arena_alloc(symbols->arena, (size_t)next * sizeof(GlobalDef));
+        memcpy(fresh, symbols->globals, (size_t)symbols->global_count * sizeof(GlobalDef));
+        symbols->globals = fresh;
+        symbols->global_cap = next;
+    }
+    GlobalDef *global = &symbols->globals[symbols->global_count++];
+    global->name = cold_arena_span_copy(symbols->arena, name);
+    global->kind = kind;
+    global->size = size;
+    global->type_name = cold_arena_span_copy(symbols->arena, type_name);
 }
 
 static bool cold_fn_param_kind_can_refine(int32_t existing, int32_t fresh) {
@@ -8822,6 +8865,14 @@ static void codegen_seq_opaque_header_addr(Code *code, BodyIR *body, int32_t seq
         a64_emit_add_large(code, reg, SP, body->slot_offset[seq_slot], true);
         return;
     }
+    if (kind == SLOT_SEQ_STR) {
+        a64_emit_add_large(code, reg, SP, body->slot_offset[seq_slot], true);
+        return;
+    }
+    if (kind == SLOT_SEQ_STR_REF) {
+        a64_emit_ldr_sp_off(code, reg, body->slot_offset[seq_slot], true);
+        return;
+    }
     if (kind == SLOT_SEQ_OPAQUE_REF || kind == SLOT_OBJECT_REF || kind == SLOT_PTR) {
         a64_emit_ldr_sp_off(code, reg, body->slot_offset[seq_slot], true);
         return;
@@ -12449,6 +12500,7 @@ static void cold_mark_reachable_functions(Symbols *symbols,
         BodyIR *body = function_bodies[fn_index];
         if (!cold_body_codegen_ready(body)) {
             if (symbols->functions[fn_index].is_external) continue;
+            if (body) cold_die_reachable_body_invalid(symbols, fn_index);
             cold_die_missing_reachable_body(symbols, fn_index);
         }
         for (int32_t op = 0; op < body->op_count; op++) {
@@ -12718,10 +12770,6 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
                     out_unresolved_pos[idx] = patch.pos;
                     out_unresolved_fn[idx] = patch.target_function;
                     (*out_unresolved_count)++;
-                } else if (out_unresolved_pos && out_unresolved_fn && out_unresolved_count) {
-                    die("too many unresolved function patches");
-                } else {
-                    die("unresolved function patch target");
                 }
                 fprintf(stderr, "cheng_cold: unresolved function patch target: ");
                 cold_diag_fn_name(symbols->functions[patch.target_function].name);
@@ -15758,6 +15806,69 @@ static int32_t cold_collect_import_source_closure(Symbols *symbols,
     return import_count;
 }
 
+static void cold_collect_global_vars_from_source(Symbols *symbols, Span alias,
+                                                 Span source) {
+    int32_t pos = 0;
+    bool in_triple = false;
+    while (pos < source.len) {
+        int32_t start = pos;
+        while (pos < source.len && source.ptr[pos] != '\n') pos++;
+        int32_t end = pos;
+        if (pos < source.len) pos++;
+        Span line = span_sub(source, start, end);
+        if (in_triple) {
+            if (cold_line_has_triple_quote(line)) in_triple = false;
+            continue;
+        }
+        if (!cold_line_top_level(line)) {
+            if (cold_line_has_triple_quote(line)) in_triple = true;
+            continue;
+        }
+        Span trimmed = span_trim(line);
+        Span inline_decl = {0};
+        bool var_block = span_eq(trimmed, "var");
+        if (!var_block && cold_span_starts_with(trimmed, "var ")) {
+            inline_decl = span_trim(span_sub(trimmed, 4, trimmed.len));
+        }
+        if (!var_block && inline_decl.len <= 0) continue;
+
+        for (;;) {
+            Span decl = inline_decl;
+            inline_decl = (Span){0};
+            if (decl.len <= 0) {
+                if (pos >= source.len) break;
+                int32_t ds = pos;
+                while (pos < source.len && source.ptr[pos] != '\n') pos++;
+                int32_t de = pos;
+                if (pos < source.len) pos++;
+                Span dline = span_sub(source, ds, de);
+                if (cold_line_top_level(dline)) {
+                    pos = ds;
+                    break;
+                }
+                decl = span_trim(dline);
+                if (decl.len <= 0) continue;
+            }
+            Parser gp = {decl, 0, symbols->arena, symbols};
+            Span name = parser_token(&gp);
+            if (name.len <= 0) continue;
+            if (!parser_take(&gp, ":")) continue;
+            Span type = parser_take_type_span(&gp);
+            if (type.len <= 0) continue;
+            Span scoped_name = alias.len > 0
+                                   ? cold_arena_join3(symbols->arena, alias, ".", name)
+                                   : cold_arena_span_copy(symbols->arena, name);
+            Span scoped_type = alias.len > 0
+                                   ? cold_qualify_import_type(symbols->arena, alias, type)
+                                   : cold_arena_span_copy(symbols->arena, type);
+            int32_t kind = cold_slot_kind_from_type_with_symbols(symbols, scoped_type);
+            int32_t size = cold_slot_size_from_type_with_symbols(symbols, scoped_type, kind);
+            symbols_add_global(symbols, scoped_name, kind, size, scoped_type);
+            if (!var_block) break;
+        }
+    }
+}
+
 static bool cold_import_symbol_parts(Span qualified_name, Span *alias, Span *local_name) {
     int32_t dot = cold_span_find_char(qualified_name, '.');
     if (dot <= 0 || dot + 1 >= qualified_name.len) return false;
@@ -15864,6 +15975,9 @@ static void cold_compile_import_function_direct(Symbols *symbols,
         bool symbol_matches = cold_import_function_symbol_matches(symbols, import_source, &symbol,
                                                                   target_fn);
         if (!symbol_matches) {
+            fprintf(stderr,
+                    "cheng_cold: import body signature mismatch target=%.*s path=%s line=%d\n",
+                    (int)fn->name.len, fn->name.ptr, import_source->path, line_no);
             continue;
         }
         if (!symbol.has_body) {
@@ -16183,6 +16297,7 @@ static void cold_collect_transitive_imports_rec(Symbols *symbols, Span source,
             cold_collect_import_module_types_from_path(symbols, alias, module_path);
             symbols_refine_object_layouts(symbols);
             cold_collect_import_module_signatures(symbols, alias, module_path);
+            cold_collect_global_vars_from_source(symbols, alias, sub_source);
             cold_collect_imported_function_signatures(symbols, sub_source);
         } else {
             /* Transitive type loading skipped (depth/visited limit) */
@@ -16231,6 +16346,7 @@ bool cold_compile_source_path_to_macho(const char *out_path,
                                                                  64);
         cold_collect_imported_function_signatures(symbols, mapped_source);
         cold_collect_function_signatures(symbols, mapped_source);
+        cold_collect_global_vars_from_source(symbols, (Span){0}, mapped_source);
         cold_collect_all_transitive_imports(symbols, mapped_source);
         { char ws_root[PATH_MAX] = {0};
           const char *sm = strstr(src_path, "/src/");

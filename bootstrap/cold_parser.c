@@ -512,6 +512,41 @@ ConstDef *parser_find_const(Parser *parser, Span name) {
     return symbols_find_const(parser->symbols, name);
 }
 
+GlobalDef *parser_find_global(Parser *parser, Span name) {
+    if (parser_can_scope_bare_name(parser, name)) {
+        Span scoped = parser_scoped_bare_name(parser, name);
+        GlobalDef *global = symbols_find_global(parser->symbols, scoped);
+        if (global) return global;
+    }
+    return symbols_find_global(parser->symbols, name);
+}
+
+int32_t cold_global_ref_kind(int32_t kind) {
+    if (kind == SLOT_I32) return SLOT_I32_REF;
+    if (kind == SLOT_I64) return SLOT_I64_REF;
+    if (kind == SLOT_STR) return SLOT_STR_REF;
+    if (kind == SLOT_SEQ_I32) return SLOT_SEQ_I32_REF;
+    if (kind == SLOT_SEQ_STR) return SLOT_SEQ_STR_REF;
+    if (kind == SLOT_SEQ_OPAQUE) return SLOT_SEQ_OPAQUE_REF;
+    if (kind == SLOT_OBJECT || kind == SLOT_VARIANT || kind == SLOT_ARRAY_I32) return SLOT_OBJECT_REF;
+    return SLOT_OPAQUE_REF;
+}
+
+Local *locals_add_global_shadow(Parser *parser, BodyIR *body, Locals *locals,
+                                Span local_name, GlobalDef *global) {
+    Local *existing = locals_find(locals, local_name);
+    if (existing) return existing;
+    int32_t value_slot = body_slot(body, global->kind, global->size);
+    body_slot_set_type(body, value_slot, global->type_name);
+    int32_t ref_kind = cold_global_ref_kind(global->kind);
+    int32_t ref_slot = body_slot(body, ref_kind, 8);
+    body_slot_set_type(body, ref_slot, global->type_name);
+    body_op3(body, BODY_OP_FIELD_REF, ref_slot, value_slot, 0, 0);
+    locals_add(locals, local_name, ref_slot, ref_kind);
+    (void)parser;
+    return locals_find(locals, local_name);
+}
+
 Span cold_import_default_alias(Span module_path) {
     int32_t start = 0;
     for (int32_t i = 0; i < module_path.len; i++) {
@@ -5491,9 +5526,10 @@ int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32_t *kin
         if (nobj && nobj->slot_size > 0) {
             int32_t len = body_slot(body, SLOT_I32, 4);
             body_op(body, BODY_OP_I32_CONST, len, nobj->slot_size, 0);
-            int32_t ns = body_slot(body, SLOT_PTR, 8);
+            int32_t ns = body_slot(body, SLOT_OBJECT_REF, 8);
+            body_slot_set_type(body, ns, nobj->name);
             body_op(body, BODY_OP_MMAP, ns, len, 0);
-            *kind = SLOT_PTR;
+            *kind = SLOT_OBJECT_REF;
             return ns;
         }
         die("new(Type): type missing or invalid");
@@ -5555,6 +5591,13 @@ int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32_t *kin
         int32_t slot = local->slot;
         *kind = local->kind;
         return slot;
+    }
+    GlobalDef *global = parser_find_global(parser, token);
+    if (global) {
+        local = locals_add_global_shadow(parser, body, locals, token, global);
+        if (!local) die("global local shadow creation failed");
+        *kind = local->kind;
+        return local->slot;
     }
     if (span_eq(parser_peek(parser), "{") &&
         token.len > 0 && token.ptr[0] >= 'A' && token.ptr[0] <= 'Z') {
@@ -6643,10 +6686,18 @@ int32_t parse_let_binding(Parser *parser, BodyIR *body, Locals *locals,
 void parse_assign(Parser *parser, BodyIR *body, Locals *locals, Span name) {
     Local *local = locals_find(locals, name);
     if (!local) {
-        /* Consume the value expression and continue */
-        int32_t dummy_kind = SLOT_I32;
-        (void)parse_expr(parser, body, locals, &dummy_kind);
-        return;
+        GlobalDef *global = parser_find_global(parser, name);
+        if (global) local = locals_add_global_shadow(parser, body, locals, name, global);
+    }
+    if (!local) {
+        int32_t ls = parser->pos;
+        while (ls > 0 && parser->source.ptr[ls - 1] != '\n') ls--;
+        int32_t le = parser->pos;
+        while (le < parser->source.len && parser->source.ptr[le] != '\n') le++;
+        fprintf(stderr, "cheng_cold: assignment target is not local/global: %.*s\n",
+                (int)name.len, name.ptr);
+        fprintf(stderr, "cheng_cold: assignment line: %.*s\n", le - ls, parser->source.ptr + ls);
+        die("assignment target must be local or global");
     }
     if (!parser_take(parser, "=")) die("expected = in assignment");
     int32_t kind = SLOT_I32;
@@ -6759,7 +6810,20 @@ int32_t parse_field_assign(Parser *parser, BodyIR *body, Locals *locals,
             }
         }
     }
-    if (!object) die("field assignment object type missing");
+    if (!object) {
+        int32_t ls = parser->pos;
+        while (ls > 0 && parser->source.ptr[ls - 1] != '\n') ls--;
+        int32_t le = parser->pos;
+        while (le < parser->source.len && parser->source.ptr[le] != '\n') le++;
+        fprintf(stderr,
+                "cheng_cold: field assignment object type missing base=%.*s type=%.*s field=%.*s\n",
+                (int)base_name.len, base_name.ptr,
+                (int)object_type.len, object_type.ptr,
+                (int)field_name.len, field_name.ptr);
+        fprintf(stderr, "cheng_cold: field assignment line: %.*s\n",
+                le - ls, parser->source.ptr + ls);
+        die("field assignment object type missing");
+    }
     ObjectField *field = object_find_field(object, field_name);
     if (!field) {
         die("unknown field assignment target");
@@ -6833,7 +6897,15 @@ int32_t parse_seq_lvalue_from_span(Parser *owner, BodyIR *body, Locals *locals,
     Span name = parser_token(&parser);
     if (name.len <= 0) die("add target must name an int32[]");
     Local *local = locals_find(locals, name);
-    if (!local) die("add target must be a local sequence");
+    if (!local) {
+        GlobalDef *global = parser_find_global(owner, name);
+        if (global) local = locals_add_global_shadow(owner, body, locals, name, global);
+    }
+    if (!local) {
+        fprintf(stderr, "cheng_cold: add target is not local/global: %.*s\n",
+                (int)target.len, target.ptr);
+        die("add target must be a local sequence");
+    }
     int32_t slot = local->slot;
     int32_t kind = local->kind;
     if (span_eq(parser_peek(&parser), ".")) {
@@ -6895,7 +6967,15 @@ int32_t parse_builtin_add_after_name(Parser *parser, BodyIR *body, Locals *local
     }
     if (seq_slot < 0) return block; /* unhandled l-value path, skip silently */
     if (seq_kind == SLOT_SEQ_I32 || seq_kind == SLOT_SEQ_I32_REF) {
+        value_slot = cold_materialize_i32_ref(body, value_slot, &value_kind);
         if (value_kind != SLOT_I32) {
+            fprintf(stderr,
+                    "cheng_cold: add int32[] target=%.*s value_kind=%d value_type=%.*s\n",
+                    (int)target.len, target.ptr, value_kind,
+                    (value_slot >= 0 && value_slot < body->slot_count)
+                        ? (int)body->slot_type[value_slot].len : 0,
+                    (value_slot >= 0 && value_slot < body->slot_count)
+                        ? (const char *)body->slot_type[value_slot].ptr : "");
             die("add int32[] value kind mismatch");
         }
         body_op(body, BODY_OP_SEQ_I32_ADD, seq_slot, value_slot, 0);
@@ -8259,6 +8339,10 @@ int32_t parse_statement(Parser *parser, BodyIR *body, Locals *locals,
                     body_op3(body, BODY_OP_ARRAY_I32_INDEX_STORE, vs, ref_slot, is, 0);
                 else if (fld->kind == SLOT_SEQ_I32 || fld->kind == SLOT_SEQ_I32_REF)
                     body_op3(body, BODY_OP_SEQ_I32_INDEX_STORE, vs, ref_slot, is, 0);
+                else if (fld->kind == SLOT_SEQ_STR) {
+                    if (vk != SLOT_STR && vk != SLOT_STR_REF) die("str[] index store value must be str");
+                    body_op3(body, BODY_OP_SEQ_OPAQUE_INDEX_STORE, vs, ref_slot, is, COLD_STR_SLOT_SIZE);
+                }
                 else if (fld->kind == SLOT_SEQ_OPAQUE) {
                     int32_t element_size = cold_seq_opaque_element_size_for_slot(parser->symbols, body, ref_slot);
                     if (body->slot_size[vs] > element_size) die("opaque sequence store value too large");
@@ -8351,6 +8435,10 @@ int32_t parse_statement(Parser *parser, BodyIR *body, Locals *locals,
                 body_op3(body, BODY_OP_ARRAY_I32_INDEX_STORE, vs, base->slot, is, 0);
             else if (base->kind == SLOT_SEQ_I32 || base->kind == SLOT_SEQ_I32_REF)
                 body_op3(body, BODY_OP_SEQ_I32_INDEX_STORE, vs, base->slot, is, 0);
+            else if (base->kind == SLOT_SEQ_STR || base->kind == SLOT_SEQ_STR_REF) {
+                if (vk != SLOT_STR && vk != SLOT_STR_REF) die("str[] index store value must be str");
+                body_op3(body, BODY_OP_SEQ_OPAQUE_INDEX_STORE, vs, base->slot, is, COLD_STR_SLOT_SIZE);
+            }
             else if (base->kind == SLOT_SEQ_OPAQUE || base->kind == SLOT_SEQ_OPAQUE_REF) {
                 int32_t element_size = cold_seq_opaque_element_size_for_slot(parser->symbols, body, base->slot);
                 if (body->slot_size[vs] > element_size) die("opaque sequence store value too large");
