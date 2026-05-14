@@ -8,6 +8,7 @@
 #ifndef COLD_CHENG_INCLUDE
 #include "cold_types.h"
 #endif
+
 #include "cold_parser.h"
 
 #include <string.h>
@@ -7983,10 +7984,58 @@ int32_t parse_statement(Parser *parser, BodyIR *body, Locals *locals,
                 return block;
             }
         }
-        /* not followed by =: rewind and parse as field-read expression */
+        /* not followed by = or [ at first level: check multi-level field assign or field-read */
         parser->pos = saved;
         Local *expr_local = locals_find(locals, kw);
-        if (expr_local) {
+        if (!expr_local) return block;
+        if (is_assign) {
+            /* Multi-level field assignment: a.b.c = expr */
+            int32_t cur_slot = expr_local->slot;
+            int32_t total_offset = 0;
+            Span obj_type = cold_type_strip_var(body->slot_type[cur_slot], 0);
+            ObjectDef *obj = obj_type.len > 0 ? symbols_resolve_object(parser->symbols, obj_type) : 0;
+            if (!obj && obj_type.len > 0) {
+                for (int32_t oi = 0; oi < parser->symbols->object_count; oi++) {
+                    ObjectDef *co = &parser->symbols->objects[oi];
+                    if (co->name.len > obj_type.len + 1 &&
+                        co->name.ptr[co->name.len - obj_type.len - 1] == '.' &&
+                        memcmp(co->name.ptr + co->name.len - obj_type.len, obj_type.ptr, (size_t)obj_type.len) == 0) {
+                        obj = co; break;
+                    }
+                }
+            }
+            while (span_eq(parser_peek(parser), ".")) {
+                (void)parser_token(parser); /* . */
+                Span fname = parser_token(parser);
+                if (fname.len <= 0) die("expected field name");
+                if (!obj) { int32_t vk; (void)parse_expr(parser, body, locals, &vk); break; }
+                ObjectField *fld = object_find_field(obj, fname);
+                if (!fld) { int32_t vk; (void)parse_expr(parser, body, locals, &vk); break; }
+                parser_inline_ws(parser);
+                if (parser->pos < parser->source.len && parser->source.ptr[parser->pos] == '=') {
+                    /* Last field: parse RHS and store directly at cumulative offset */
+                    parser->pos++;
+                    int32_t vk = SLOT_I32;
+                    int32_t vs = parse_expr(parser, body, locals, &vk);
+                    body_op3(body, BODY_OP_PAYLOAD_STORE, cur_slot, vs, total_offset + fld->offset, fld->size);
+                    break;
+                }
+                /* Intermediate field: accumulate offset, resolve type for next iteration */
+                total_offset += fld->offset;
+                Span next_type = fld->type_name;
+                obj = next_type.len > 0 ? symbols_resolve_object(parser->symbols, next_type) : 0;
+                if (!obj && next_type.len > 0) {
+                    for (int32_t oi = 0; oi < parser->symbols->object_count; oi++) {
+                        ObjectDef *co = &parser->symbols->objects[oi];
+                        if (co->name.len > next_type.len + 1 &&
+                            co->name.ptr[co->name.len - next_type.len - 1] == '.' &&
+                            memcmp(co->name.ptr + co->name.len - next_type.len, next_type.ptr, (size_t)next_type.len) == 0) {
+                            obj = co; break;
+                        }
+                    }
+                }
+            }
+        } else {
             int32_t expr_kind = expr_local->kind;
             (void)parse_postfix(parser, body, locals, expr_local->slot, &expr_kind);
         }

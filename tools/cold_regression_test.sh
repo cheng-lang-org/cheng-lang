@@ -741,6 +741,33 @@ else
 fi
 assert "runtime_provider_autolink_constants" 1 "$ACT"
 
+rm -f /tmp/ct_runtime/autolink_cpu_cores \
+    /tmp/ct_runtime/autolink_cpu_cores.report.txt
+$COLD system-link-exec \
+    --in:testdata/runtime_provider_autolink_cpu_cores.cheng \
+    --target:aarch64-unknown-linux-gnu \
+    --out:/tmp/ct_runtime/autolink_cpu_cores \
+    --report-out:/tmp/ct_runtime/autolink_cpu_cores.report.txt \
+    --link-providers >/tmp/ct_runtime/autolink_cpu_cores.stdout 2>/tmp/ct_runtime/autolink_cpu_cores.stderr
+CPU_CORES_STATUS=$?
+if [ "$CPU_CORES_STATUS" -ne 0 ] &&
+   [ ! -f /tmp/ct_runtime/autolink_cpu_cores ] &&
+   grep -q '^system_link_exec=0$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null &&
+   grep -q '^system_link_exec_scope=cold_runtime_provider_archive$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null &&
+   grep -q '^provider_archive=1$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null &&
+   grep -q '^provider_object_count=1$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null &&
+   grep -q '^provider_archive_member_count=1$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null &&
+   grep -q '^provider_export_count=1$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null &&
+   grep -q '^provider_resolved_symbol_count=1$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null &&
+   grep -q '^unresolved_symbol_count=1$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null &&
+   grep -q '^first_unresolved_symbol=get_nprocs$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null &&
+   grep -q '^error=runtime provider archive link failed$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "runtime_provider_autolink_cpu_cores_hard_fail" 1 "$ACT"
+
 rm -rf /tmp/ct_runtime
 
 # 11: ownership proof driver report fields
@@ -1215,6 +1242,29 @@ EOF
 ACT=$(compile_run_timed "$COLD" /tmp/ct_nested_obj.cheng /tmp/ct_nested_obj_out 10)
 assert "nested_object_fields" 42 "$ACT"
 rm -f /tmp/ct_nested_obj.cheng /tmp/ct_nested_obj_out
+
+# --- multi_level_field_assign (obj.field.subfield = val/[]) ---
+cat > /tmp/ct_multi_field_assign.cheng << 'EOF'
+type Inner =
+    slots: int32[]
+    totalCount: int32
+
+type Outer =
+    inner: Inner
+    tag: int32
+
+fn main(): int32 =
+    var outer: Outer
+    outer.inner.slots = []
+    outer.inner.totalCount = 0
+    outer.tag = 1
+    if outer.inner.totalCount != 0: return 1
+    if outer.tag != 1: return 2
+    return 0
+EOF
+ACT=$(compile_run_timed "$COLD" /tmp/ct_multi_field_assign.cheng /tmp/ct_multi_field_assign_out 10)
+assert "multi_level_field_assign" 0 "$ACT"
+rm -f /tmp/ct_multi_field_assign.cheng /tmp/ct_multi_field_assign_out
 
 # --- mutual_recursion (forward reference with circular calls) ---
 cat > /tmp/ct_mutual_rec.cheng << 'EOF'
