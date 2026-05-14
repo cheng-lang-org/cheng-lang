@@ -7004,8 +7004,8 @@ fn PrimaryFillInstructionWordsChunked(words: var int32[],
 # -- Parallel fill: workers fill disjoint word ranges concurrently --
 
 type
-    PrimaryFillWorkerCtx =
-        words: var int32[]
+    PrimaryFillWorkerCtx = ref
+        words: int32[]
         functionWordOffsets: int32[]
         functionWordCounts: int32[]
         functionBodyKinds: str[]
@@ -7013,18 +7013,13 @@ type
         startIndex: int32
         endIndex: int32
         ok: bool
+        failedIndex: int32
         workerId: int32
-        completedCount: ptr
-        errorCount: ptr
+        completedCount: atomic.I32
+        errorCount: atomic.I32
 
 fn PrimaryFillWorkerMain(ctx: ptr) =
-    let w = memCastToVar(ctx)
-    if w == nil:
-        if w.errorCount != nil:
-            let _ = atomic.AddI32(w.errorCount, 1)
-        if w.completedCount != nil:
-            let _ = atomic.AddI32(w.completedCount, 1)
-        return
+    let w: PrimaryFillWorkerCtx = PrimaryFillWorkerCtx(ctx)
     var failedIndex: int32
     failedIndex = -1
     let chunkOk = PrimaryFillFunctionChunk(w.words,
@@ -7036,10 +7031,15 @@ fn PrimaryFillWorkerMain(ctx: ptr) =
                                             w.endIndex,
                                             failedIndex)
     w.ok = chunkOk
-    if !chunkOk && w.errorCount != nil:
-        let _ = atomic.AddI32(w.errorCount, 1)
+    if !chunkOk:
+        if failedIndex < 0:
+            failedIndex = w.startIndex
+        w.failedIndex = failedIndex
+        if w.errorCount != nil:
+            let _ = atomic.AddI32(w.errorCount, 1)
     if w.completedCount != nil:
         let _ = atomic.AddI32(w.completedCount, 1)
+    memRelease(w)
 
 fn PrimaryFillInstructionWordsParallel(words: var int32[],
                                         functionWordOffsets: int32[],
@@ -7063,12 +7063,8 @@ fn PrimaryFillInstructionWordsParallel(words: var int32[],
     let completedCount = atomic.NewI32(0)
     let errorCount = atomic.NewI32(0)
     if completedCount == nil || errorCount == nil:
-        return PrimaryFillInstructionWords(words,
-                                            functionWordOffsets,
-                                            functionWordCounts,
-                                            functionBodyKinds,
-                                            functionBodyIRs,
-                                            failedIndex)
+        failedIndex = 0
+        return false
     failedIndex = -1
     var ctxs: PrimaryFillWorkerCtx[]
     for workerId in 0..<workerCount:
@@ -7076,7 +7072,10 @@ fn PrimaryFillInstructionWordsParallel(words: var int32[],
         let finish = (totalFunctions * (workerId + 1)) / workerCount
         if start >= finish:
             continue
-        var ctx: PrimaryFillWorkerCtx
+        let ctx = new(PrimaryFillWorkerCtx)
+        if ctx == nil:
+            failedIndex = start
+            return false
         ctx.words = words
         ctx.functionWordOffsets = functionWordOffsets
         ctx.functionWordCounts = functionWordCounts
@@ -7085,21 +7084,25 @@ fn PrimaryFillInstructionWordsParallel(words: var int32[],
         ctx.startIndex = start
         ctx.endIndex = finish
         ctx.ok = true
+        ctx.failedIndex = -1
         ctx.workerId = workerId
         ctx.completedCount = completedCount
         ctx.errorCount = errorCount
         add(ctxs, ctx)
-        let ctxPtr = &ctxs[ctxs.len - 1]
-        async.SpawnPtr(PrimaryFillWorkerMain, memCastToVoid(ctxPtr))
+    for ci in 0..<ctxs.len:
+        memRetain(ctxs[ci])
+        async.SpawnPtr(PrimaryFillWorkerMain, ctxs[ci])
     while atomic.LoadI32(completedCount) < ctxs.len:
         thread.Yield()
-    var allOk = true
-    for ci in 0..<ctxs.len:
-        if !ctxs[ci].ok:
-            allOk = false
-            if failedIndex < 0:
-                failedIndex = ctxs[ci].startIndex
-    return allOk
+    let errors = atomic.LoadI32(errorCount)
+    if errors > 0:
+        for ci in 0..<ctxs.len:
+            if !ctxs[ci].ok && failedIndex < 0:
+                failedIndex = ctxs[ci].failedIndex
+        if failedIndex < 0:
+            failedIndex = 0
+        return false
+    return true
 
 
 fn PrimaryBodyIrWordCount(bodyIR: coreir.BodyIR): int32 =

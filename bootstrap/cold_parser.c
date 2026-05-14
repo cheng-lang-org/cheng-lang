@@ -1826,6 +1826,12 @@ bool cold_validate_call_args(BodyIR *body, FnDef *fn, int32_t arg_start, int32_t
             if (arg_kind != SLOT_OBJECT && arg_kind != SLOT_OBJECT_REF) { return false; }
         } else if (fn->param_kind[i] == SLOT_VARIANT) {
             if (arg_kind != SLOT_VARIANT && arg_kind != SLOT_I32 && arg_kind != SLOT_OBJECT && arg_kind != SLOT_PTR) { return false; }
+        } else if (fn->param_kind[i] == SLOT_SEQ_I32 && arg_kind == SLOT_SEQ_I32_REF) {
+            continue;
+        } else if (fn->param_kind[i] == SLOT_SEQ_STR && arg_kind == SLOT_SEQ_STR_REF) {
+            continue;
+        } else if (fn->param_kind[i] == SLOT_SEQ_OPAQUE && arg_kind == SLOT_SEQ_OPAQUE_REF) {
+            continue;
         } else if (fn->param_kind[i] == SLOT_I32 && arg_kind == SLOT_I32_REF) {
             continue;
         } else if (fn->param_kind[i] == SLOT_I32 && arg_kind == SLOT_VARIANT) {
@@ -1847,12 +1853,14 @@ bool cold_validate_call_args(BodyIR *body, FnDef *fn, int32_t arg_start, int32_t
                     arg_kind == SLOT_I32_REF || arg_kind == SLOT_I64_REF ||
                     arg_kind == SLOT_OBJECT || arg_kind == SLOT_OBJECT_REF ||
                     arg_kind == SLOT_VARIANT || arg_kind == SLOT_SEQ_OPAQUE ||
-                    arg_kind == SLOT_SEQ_OPAQUE_REF || arg_kind == SLOT_OPAQUE)) {
+                    arg_kind == SLOT_SEQ_OPAQUE_REF || arg_kind == SLOT_PTR ||
+                    arg_kind == SLOT_OPAQUE || arg_kind == SLOT_OPAQUE_REF)) {
             continue;
         } else if (fn->param_kind[i] == SLOT_OPAQUE_REF &&
                    (arg_kind == SLOT_I32 || arg_kind == SLOT_I64 ||
                     arg_kind == SLOT_I32_REF || arg_kind == SLOT_I64_REF ||
                     arg_kind == SLOT_OBJECT || arg_kind == SLOT_OBJECT_REF ||
+                    arg_kind == SLOT_PTR ||
                     arg_kind == SLOT_SEQ_OPAQUE || arg_kind == SLOT_SEQ_OPAQUE_REF ||
                     arg_kind == SLOT_OPAQUE || arg_kind == SLOT_OPAQUE_REF ||
                     arg_kind == SLOT_VARIANT)) {
@@ -1896,6 +1904,12 @@ bool cold_call_args_match(BodyIR *body, FnDef *fn, int32_t arg_start, int32_t ar
             if (arg_kind != SLOT_STR && arg_kind != SLOT_STR_REF) return false;
         } else if (fn->param_kind[i] == SLOT_OBJECT_REF) {
             if (arg_kind != SLOT_OBJECT && arg_kind != SLOT_OBJECT_REF) return false;
+        } else if (fn->param_kind[i] == SLOT_SEQ_I32 && arg_kind == SLOT_SEQ_I32_REF) {
+            continue;
+        } else if (fn->param_kind[i] == SLOT_SEQ_STR && arg_kind == SLOT_SEQ_STR_REF) {
+            continue;
+        } else if (fn->param_kind[i] == SLOT_SEQ_OPAQUE && arg_kind == SLOT_SEQ_OPAQUE_REF) {
+            continue;
         } else if (fn->param_kind[i] == SLOT_I32 && arg_kind == SLOT_I32_REF) {
             continue;
         } else if (fn->param_kind[i] == SLOT_I32 && arg_kind == SLOT_VARIANT) {
@@ -1915,13 +1929,14 @@ bool cold_call_args_match(BodyIR *body, FnDef *fn, int32_t arg_start, int32_t ar
         } else if (fn->param_kind[i] == SLOT_OPAQUE &&
                    (arg_kind == SLOT_OBJECT || arg_kind == SLOT_OBJECT_REF ||
                     arg_kind == SLOT_VARIANT || arg_kind == SLOT_SEQ_OPAQUE ||
-                    arg_kind == SLOT_SEQ_OPAQUE_REF || arg_kind == SLOT_OPAQUE)) {
+                    arg_kind == SLOT_SEQ_OPAQUE_REF || arg_kind == SLOT_PTR ||
+                    arg_kind == SLOT_OPAQUE || arg_kind == SLOT_OPAQUE_REF)) {
             continue;
         } else if (fn->param_kind[i] == SLOT_OPAQUE_REF &&
                    (arg_kind == SLOT_I32 || arg_kind == SLOT_I64 ||
                     arg_kind == SLOT_I32_REF || arg_kind == SLOT_I64_REF ||
                     arg_kind == SLOT_OBJECT || arg_kind == SLOT_OBJECT_REF ||
-                    arg_kind == SLOT_VARIANT ||
+                    arg_kind == SLOT_VARIANT || arg_kind == SLOT_PTR ||
                     arg_kind == SLOT_SEQ_OPAQUE || arg_kind == SLOT_SEQ_OPAQUE_REF ||
                     arg_kind == SLOT_OPAQUE || arg_kind == SLOT_OPAQUE_REF)) {
             continue;
@@ -1974,7 +1989,9 @@ int32_t symbols_find_fn_for_call(Symbols *symbols, Span name,
                 (arg_kind == SLOT_I32 || arg_kind == SLOT_I64 ||
                  arg_kind == SLOT_I32_REF || arg_kind == SLOT_I64_REF ||
                  arg_kind == SLOT_OBJECT || arg_kind == SLOT_OBJECT_REF ||
-                 arg_kind == SLOT_VARIANT || arg_kind == SLOT_OPAQUE || arg_kind == SLOT_OPAQUE_REF)) continue;
+                 arg_kind == SLOT_SEQ_OPAQUE || arg_kind == SLOT_SEQ_OPAQUE_REF ||
+                 arg_kind == SLOT_VARIANT || arg_kind == SLOT_PTR ||
+                 arg_kind == SLOT_OPAQUE || arg_kind == SLOT_OPAQUE_REF)) continue;
             match = false;
             break;
         }
@@ -1998,7 +2015,9 @@ int32_t symbols_find_fn_for_call(Symbols *symbols, Span name,
                 (arg_kind == SLOT_I32 || arg_kind == SLOT_I64 ||
                  arg_kind == SLOT_I32_REF || arg_kind == SLOT_I64_REF ||
                  arg_kind == SLOT_OBJECT || arg_kind == SLOT_OBJECT_REF ||
-                 arg_kind == SLOT_VARIANT || arg_kind == SLOT_OPAQUE || arg_kind == SLOT_OPAQUE_REF)) continue;
+                 arg_kind == SLOT_SEQ_OPAQUE || arg_kind == SLOT_SEQ_OPAQUE_REF ||
+                 arg_kind == SLOT_VARIANT || arg_kind == SLOT_PTR ||
+                 arg_kind == SLOT_OPAQUE || arg_kind == SLOT_OPAQUE_REF)) continue;
             match = false;
             break;
         }
@@ -2071,15 +2090,15 @@ int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *locals,
     int32_t arg_start = body->call_arg_count;
     for (int32_t i = 0; i < arg_count; i++) body_call_arg(body, arg_slots[i]);
     int32_t intrinsic_slot = -1;
-    if (cold_try_str_len_intrinsic(body, name, arg_start, arg_count,
+    if (cold_try_str_len_intrinsic(body, stripped_name, arg_start, arg_count,
                                    &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_try_str_slice_intrinsic(body, name, arg_start, arg_count,
+    if (cold_try_str_slice_intrinsic(body, stripped_name, arg_start, arg_count,
                                      &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_is_i32_to_str_intrinsic(name)) {
+    if (cold_is_i32_to_str_intrinsic(stripped_name)) {
         if (arg_count != 1) die("int to str intrinsic arity mismatch");
         int32_t arg_slot = body->call_arg_slot[arg_start];
         if (body->slot_kind[arg_slot] != SLOT_I32 && body->slot_kind[arg_slot] != SLOT_I64) { /* skip unsupported arg kind */ return false; }
@@ -2088,39 +2107,39 @@ int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *locals,
         if (kind_out) *kind_out = SLOT_STR;
         return slot;
     }
-    if (cold_try_parse_int_intrinsic(body, name, arg_start, arg_count,
+    if (cold_try_parse_int_intrinsic(body, stripped_name, arg_start, arg_count,
                                      &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_try_str_join_intrinsic(body, name, arg_start, arg_count,
+    if (cold_try_str_join_intrinsic(body, stripped_name, arg_start, arg_count,
                                     &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_try_str_split_intrinsic(body, name, arg_start, arg_count,
+    if (cold_try_str_split_intrinsic(body, stripped_name, arg_start, arg_count,
                                      &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_try_str_strip_intrinsic(body, name, arg_start, arg_count,
+    if (cold_try_str_strip_intrinsic(body, stripped_name, arg_start, arg_count,
                                      &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_try_result_intrinsic(parser, body, name, arg_start, arg_count,
+    if (cold_try_result_intrinsic(parser, body, stripped_name, arg_start, arg_count,
                                   &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_try_os_intrinsic(parser, body, name, arg_start, arg_count,
+    if (cold_try_os_intrinsic(parser, body, stripped_name, arg_start, arg_count,
                               &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_try_path_intrinsic(parser, body, name, arg_start, arg_count,
+    if (cold_try_path_intrinsic(parser, body, stripped_name, arg_start, arg_count,
                                 &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_try_csg_intrinsic(parser, body, name, arg_start, arg_count,
+    if (cold_try_csg_intrinsic(parser, body, stripped_name, arg_start, arg_count,
                                &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_try_slplan_intrinsic(parser, body, name, arg_start, arg_count,
+    if (cold_try_slplan_intrinsic(parser, body, stripped_name, arg_start, arg_count,
                                   &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
@@ -2152,15 +2171,15 @@ int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *locals,
         if (kind_out) *kind_out = SLOT_I32;
         return slot;
     }
-    if (cold_try_backend_intrinsic(parser, body, name, arg_start, arg_count,
+    if (cold_try_backend_intrinsic(parser, body, stripped_name, arg_start, arg_count,
                                    &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_try_assert_intrinsic(body, name, arg_start, arg_count,
+    if (cold_try_assert_intrinsic(body, stripped_name, arg_start, arg_count,
                                   &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_try_bootstrap_intrinsic(body, name, arg_start, arg_count,
+    if (cold_try_bootstrap_intrinsic(body, stripped_name, arg_start, arg_count,
                                      &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
@@ -2437,15 +2456,15 @@ int32_t parse_call_from_args_span(Parser *owner, BodyIR *body, Locals *locals,
     int32_t arg_start = body->call_arg_count;
     for (int32_t i = 0; i < arg_count; i++) body_call_arg(body, arg_slots[i]);
     int32_t intrinsic_slot = -1;
-    if (cold_try_str_len_intrinsic(body, name, arg_start, arg_count,
+    if (cold_try_str_len_intrinsic(body, stripped_name, arg_start, arg_count,
                                    &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_try_str_slice_intrinsic(body, name, arg_start, arg_count,
+    if (cold_try_str_slice_intrinsic(body, stripped_name, arg_start, arg_count,
                                      &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_is_i32_to_str_intrinsic(name)) {
+    if (cold_is_i32_to_str_intrinsic(stripped_name)) {
         if (arg_count != 1) die("int to str intrinsic arity mismatch");
         int32_t arg_slot = body->call_arg_slot[arg_start];
         if (body->slot_kind[arg_slot] != SLOT_I32) die("int to str intrinsic expects int32");
@@ -2454,51 +2473,51 @@ int32_t parse_call_from_args_span(Parser *owner, BodyIR *body, Locals *locals,
         if (kind_out) *kind_out = SLOT_STR;
         return slot;
     }
-    if (cold_try_parse_int_intrinsic(body, name, arg_start, arg_count,
+    if (cold_try_parse_int_intrinsic(body, stripped_name, arg_start, arg_count,
                                      &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_try_str_join_intrinsic(body, name, arg_start, arg_count,
+    if (cold_try_str_join_intrinsic(body, stripped_name, arg_start, arg_count,
                                     &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_try_str_split_intrinsic(body, name, arg_start, arg_count,
+    if (cold_try_str_split_intrinsic(body, stripped_name, arg_start, arg_count,
                                      &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_try_str_strip_intrinsic(body, name, arg_start, arg_count,
+    if (cold_try_str_strip_intrinsic(body, stripped_name, arg_start, arg_count,
                                      &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_try_result_intrinsic(owner, body, name, arg_start, arg_count,
+    if (cold_try_result_intrinsic(owner, body, stripped_name, arg_start, arg_count,
                                   &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_try_os_intrinsic(owner, body, name, arg_start, arg_count,
+    if (cold_try_os_intrinsic(owner, body, stripped_name, arg_start, arg_count,
                               &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_try_path_intrinsic(owner, body, name, arg_start, arg_count,
+    if (cold_try_path_intrinsic(owner, body, stripped_name, arg_start, arg_count,
                                 &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_try_csg_intrinsic(owner, body, name, arg_start, arg_count,
+    if (cold_try_csg_intrinsic(owner, body, stripped_name, arg_start, arg_count,
                                &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_try_slplan_intrinsic(owner, body, name, arg_start, arg_count,
+    if (cold_try_slplan_intrinsic(owner, body, stripped_name, arg_start, arg_count,
                                   &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_try_backend_intrinsic(owner, body, name, arg_start, arg_count,
+    if (cold_try_backend_intrinsic(owner, body, stripped_name, arg_start, arg_count,
                                    &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_try_assert_intrinsic(body, name, arg_start, arg_count,
+    if (cold_try_assert_intrinsic(body, stripped_name, arg_start, arg_count,
                                   &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_try_bootstrap_intrinsic(body, name, arg_start, arg_count,
+    if (cold_try_bootstrap_intrinsic(body, stripped_name, arg_start, arg_count,
                                      &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
@@ -6935,7 +6954,10 @@ int32_t parse_field_assign(Parser *parser, BodyIR *body, Locals *locals,
     Local *local = locals_find(locals, base_name);
     if (!local) return block; /* skip non-local field assign */;
     if (local->kind != SLOT_OBJECT && local->kind != SLOT_OBJECT_REF &&
-        local->kind != SLOT_PTR && local->kind != SLOT_STR) {
+        local->kind != SLOT_PTR && local->kind != SLOT_STR &&
+        local->kind != SLOT_STR_REF &&
+        local->kind != SLOT_SEQ_I32_REF && local->kind != SLOT_SEQ_STR_REF &&
+        local->kind != SLOT_SEQ_OPAQUE_REF) {
         int32_t skip_kind = SLOT_I32;
         (void)parse_expr(parser, body, locals, &skip_kind);
         return block;

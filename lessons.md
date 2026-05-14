@@ -95,6 +95,7 @@
 - BodyIR slot 是可变非 SSA；CSE、hash dedup、跨 slot 等价替换必须等 SSA/等价证明后再启用。当前只允许 DSE 和可证明代数恒等式，不允许靠相似 op 做值复用。
 - `build-backend-driver` 候选门禁必须保留 source-direct `while` 运行测试；禁止把真实控制流 smoke 改成 `for`、compile-only 或其它绕路。
 - runtime provider archive 门禁禁止用 allocator/entry/panic stub 冒充闭合；只允许导出真实实现的符号。原子 provider smoke 只能证明 atomic 外部符号解析，不能外推成 runtime roots 完成。
+- Cheng `str` 是 24 字节值布局：data@0、len@8、store_id@12、flags@16；`str[]/uint8[]` 是 16 字节动态序列头。cold ABI/codegen 禁止把二者混成 16 字节字符串。
 
 - 冷编译器强度折减修改常量原地时，必须校验 op_read_count==1 排他使用，防止共享常量槽被 SHL/ASR 错误读取 op_b 作为 slot index。
 - 内联 tuple field 切分必须追踪括号深度；`[default, values]` 内的逗号不能错误分割字段。

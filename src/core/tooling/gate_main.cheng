@@ -57,6 +57,11 @@ type
         aliceBalance: str
         bobBalance: str
 
+    GateBftNodeStatusResult =
+        ok: bool
+        value: BftNodeStatus
+        errorText: str
+
     OracleBftThreeNodeDeploy =
         appId: str
         serverSsh: str
@@ -79,6 +84,15 @@ type
         latestPriceE8: str
         twapCode: str
         twapPriceE8: str
+
+    GateOracleBftNodeStatusResult =
+        ok: bool
+        value: OracleBftNodeStatus
+        errorText: str
+
+fn GateEmptyStrSeq(): str[] =
+    var out: str[]
+    return out
 
 fn GatePrintLine(text: str) =
     os.WriteLine(os.Get_stdout(), text)
@@ -134,7 +148,7 @@ fn GateVerifyExportVisibilityParallel(root: str): int32 =
     return GateRunStage3Command(root,
                                   "verify_export_visibility_parallel",
                                   "verify-export-visibility-parallel",
-                                  [],
+                                  GateEmptyStrSeq(),
                                   "verify-export-visibility-parallel.log",
                                   false)
 
@@ -1020,12 +1034,12 @@ fn GateRunProductionRegression(root: str): int32 =
     if GateRunStage3Command(root,
                               "run_production_regression_cross_target",
                               "run-cross-target-smokes",
-                              [],
+                              GateEmptyStrSeq(),
                               "run-production-regression.cross-target.log",
                               false) != 0:
         return 1
     GatePrintLine("[ gate] production regression: stage2/stage3 libp2p smokes")
-    if GateRunStage23Libp2pSmokes(root, []) != 0:
+    if GateRunStage23Libp2pSmokes(root, GateEmptyStrSeq()) != 0:
         return 1
     GatePrintLine("[ gate] production regression: ok")
     return 0
@@ -1814,11 +1828,31 @@ fn GateBftNodeStatusZero(name: str): BftNodeStatus =
                            aliceBalance: "",
                            bobBalance: "")
 
+fn GateBftNodeStatusResultOk(value: BftNodeStatus): GateBftNodeStatusResult =
+    var out: GateBftNodeStatusResult
+    out.ok = true
+    out.value = value
+    return out
+
+fn GateBftNodeStatusResultErr(errorText: str): GateBftNodeStatusResult =
+    var out: GateBftNodeStatusResult
+    out.errorText = errorText
+    return out
+
+fn GateBftNodeStatusResultIsErr(resultValue: GateBftNodeStatusResult): bool =
+    return !resultValue.ok
+
+fn GateBftNodeStatusResultValue(resultValue: GateBftNodeStatusResult): BftNodeStatus =
+    return resultValue.value
+
+fn GateBftNodeStatusResultError(resultValue: GateBftNodeStatusResult): str =
+    return resultValue.errorText
+
 fn GateBftCollectLocalNodeStatus(root: str,
                                    cfg: BftThreeNodeDeploy,
                                    nodeName: str,
                                    statePath: str,
-                                   logPrefix: str): Result[BftNodeStatus] =
+                                   logPrefix: str): GateBftNodeStatusResult =
     let binPath = GateBftLocalBin(root)
     let summaryRun = hostops.RunFileLogged(root,
                                              strutil.Join([nodeName, "_show_state"], ""),
@@ -1829,7 +1863,7 @@ fn GateBftCollectLocalNodeStatus(root: str,
                                              20,
                                              strutil.Join([logPrefix, ".show.log"], ""))
     if !hostops.LoggedRunOk(summaryRun):
-        return Err[BftNodeStatus](summaryRun.output)
+        return GateBftNodeStatusResultErr(summaryRun.output)
     let aliceRun = hostops.RunFileLogged(root,
                                            strutil.Join([nodeName, "_alice_balance"], ""),
                                            binPath,
@@ -1842,7 +1876,7 @@ fn GateBftCollectLocalNodeStatus(root: str,
                                            20,
                                            strutil.Join([logPrefix, ".alice.log"], ""))
     if !hostops.LoggedRunOk(aliceRun):
-        return Err[BftNodeStatus](aliceRun.output)
+        return GateBftNodeStatusResultErr(aliceRun.output)
     let bobRun = hostops.RunFileLogged(root,
                                          strutil.Join([nodeName, "_bob_balance"], ""),
                                          binPath,
@@ -1855,8 +1889,8 @@ fn GateBftCollectLocalNodeStatus(root: str,
                                          20,
                                          strutil.Join([logPrefix, ".bob.log"], ""))
     if !hostops.LoggedRunOk(bobRun):
-        return Err[BftNodeStatus](bobRun.output)
-    return Ok[BftNodeStatus](BftNodeStatus(
+        return GateBftNodeStatusResultErr(bobRun.output)
+    return GateBftNodeStatusResultOk(BftNodeStatus(
         name: nodeName,
         summary: summaryRun.output,
         aliceQuery: aliceRun.output,
@@ -1873,7 +1907,7 @@ fn GateBftCollectRemoteNodeStatus(root: str,
                                     sshHost: str,
                                     repoRoot: str,
                                     statePath: str,
-                                    logPrefix: str): Result[BftNodeStatus] =
+                                    logPrefix: str): GateBftNodeStatusResult =
     let binPath = GateBftRemoteBin(repoRoot)
     let summaryRun = GateRunRemoteShellLogged(root,
                                                 strutil.Join([nodeName, "_show_state"], ""),
@@ -1884,7 +1918,7 @@ fn GateBftCollectRemoteNodeStatus(root: str,
                                                 strutil.Join([logPrefix, ".show.log"], ""),
                                                 20)
     if !hostops.LoggedRunOk(summaryRun):
-        return Err[BftNodeStatus](summaryRun.output)
+        return GateBftNodeStatusResultErr(summaryRun.output)
     let aliceRun = GateRunRemoteShellLogged(root,
                                               strutil.Join([nodeName, "_alice_balance"], ""),
                                               sshHost,
@@ -1896,7 +1930,7 @@ fn GateBftCollectRemoteNodeStatus(root: str,
                                               strutil.Join([logPrefix, ".alice.log"], ""),
                                               20)
     if !hostops.LoggedRunOk(aliceRun):
-        return Err[BftNodeStatus](aliceRun.output)
+        return GateBftNodeStatusResultErr(aliceRun.output)
     let bobRun = GateRunRemoteShellLogged(root,
                                             strutil.Join([nodeName, "_bob_balance"], ""),
                                             sshHost,
@@ -1908,8 +1942,8 @@ fn GateBftCollectRemoteNodeStatus(root: str,
                                             strutil.Join([logPrefix, ".bob.log"], ""),
                                             20)
     if !hostops.LoggedRunOk(bobRun):
-        return Err[BftNodeStatus](bobRun.output)
-    return Ok[BftNodeStatus](BftNodeStatus(
+        return GateBftNodeStatusResultErr(bobRun.output)
+    return GateBftNodeStatusResultOk(BftNodeStatus(
         name: nodeName,
         summary: summaryRun.output,
         aliceQuery: aliceRun.output,
@@ -2021,7 +2055,7 @@ fn GateBftWaitClusterState(root: str,
                                                          cfg.serverRepoRoot,
                                                          os.JoinPath(serverDir, "server.state"),
                                                          strutil.Join([logPrefix, "_server"], ""))
-        if IsErr(serverRes):
+        if GateBftNodeStatusResultIsErr(serverRes):
             os.SleepMs(200)
             continue
         let relayRes = GateBftCollectRemoteNodeStatus(root,
@@ -2031,7 +2065,7 @@ fn GateBftWaitClusterState(root: str,
                                                         cfg.relayRepoRoot,
                                                         os.JoinPath(relayDir, "relay.state"),
                                                         strutil.Join([logPrefix, "_relay"], ""))
-        if IsErr(relayRes):
+        if GateBftNodeStatusResultIsErr(relayRes):
             os.SleepMs(200)
             continue
         let localRes = GateBftCollectLocalNodeStatus(root,
@@ -2039,12 +2073,12 @@ fn GateBftWaitClusterState(root: str,
                                                        "local",
                                                        os.JoinPath(localDir, "local.state"),
                                                        strutil.Join([logPrefix, "_local"], ""))
-        if IsErr(localRes):
+        if GateBftNodeStatusResultIsErr(localRes):
             os.SleepMs(200)
             continue
-        serverStatus = Value(serverRes)
-        relayStatus = Value(relayRes)
-        localStatus = Value(localRes)
+        serverStatus = GateBftNodeStatusResultValue(serverRes)
+        relayStatus = GateBftNodeStatusResultValue(relayRes)
+        localStatus = GateBftNodeStatusResultValue(localRes)
         if GateBftClusterMatches(serverStatus,
                                    relayStatus,
                                    localStatus,
@@ -2446,9 +2480,9 @@ fn GateStatusBftValidatorThreeNode(root: str): int32 =
                                                      cfg.serverRepoRoot,
                                                      os.JoinPath(serverDir, "server.state"),
                                                      "artifacts/gate/bft_server_status")
-    if IsErr(serverRes):
+    if GateBftNodeStatusResultIsErr(serverRes):
         GatePrintErr(" bft deploy: server status failed")
-        GatePrintErr(strutil.Strip(Error(serverRes)))
+        GatePrintErr(strutil.Strip(GateBftNodeStatusResultError(serverRes)))
         return 1
     let relayRes = GateBftCollectRemoteNodeStatus(root,
                                                     cfg,
@@ -2457,24 +2491,24 @@ fn GateStatusBftValidatorThreeNode(root: str): int32 =
                                                     cfg.relayRepoRoot,
                                                     os.JoinPath(relayDir, "relay.state"),
                                                     "artifacts/gate/bft_relay_status")
-    if IsErr(relayRes):
+    if GateBftNodeStatusResultIsErr(relayRes):
         GatePrintErr(" bft deploy: relay status failed")
-        GatePrintErr(strutil.Strip(Error(relayRes)))
+        GatePrintErr(strutil.Strip(GateBftNodeStatusResultError(relayRes)))
         return 1
     let localRes = GateBftCollectLocalNodeStatus(root,
                                                    cfg,
                                                    "local",
                                                    os.JoinPath(localDir, "local.state"),
                                                    "artifacts/gate/bft_local_status")
-    if IsErr(localRes):
+    if GateBftNodeStatusResultIsErr(localRes):
         GatePrintErr(" bft deploy: local status failed")
-        GatePrintErr(strutil.Strip(Error(localRes)))
+        GatePrintErr(strutil.Strip(GateBftNodeStatusResultError(localRes)))
         return 1
-    GateBftPrintNodeStatus(Value(serverRes))
+    GateBftPrintNodeStatus(GateBftNodeStatusResultValue(serverRes))
     GatePrintLine("---")
-    GateBftPrintNodeStatus(Value(relayRes))
+    GateBftPrintNodeStatus(GateBftNodeStatusResultValue(relayRes))
     GatePrintLine("---")
-    GateBftPrintNodeStatus(Value(localRes))
+    GateBftPrintNodeStatus(GateBftNodeStatusResultValue(localRes))
     return 0
 
 fn GateStopBftValidatorThreeNode(root: str): int32 =
@@ -2756,7 +2790,7 @@ fn GateDeployBftValidatorThreeNode(root: str): int32 =
                                                          cfg.serverRepoRoot,
                                                          os.JoinPath(serverDir, "server.state"),
                                                          "artifacts/gate/bft_server_wait")
-        if IsErr(serverRes):
+        if GateBftNodeStatusResultIsErr(serverRes):
             os.SleepMs(200)
             continue
         let relayRes = GateBftCollectRemoteNodeStatus(root,
@@ -2766,7 +2800,7 @@ fn GateDeployBftValidatorThreeNode(root: str): int32 =
                                                         cfg.relayRepoRoot,
                                                         os.JoinPath(relayDir, "relay.state"),
                                                         "artifacts/gate/bft_relay_wait")
-        if IsErr(relayRes):
+        if GateBftNodeStatusResultIsErr(relayRes):
             os.SleepMs(200)
             continue
         let localRes = GateBftCollectLocalNodeStatus(root,
@@ -2774,12 +2808,12 @@ fn GateDeployBftValidatorThreeNode(root: str): int32 =
                                                        "local",
                                                        os.JoinPath(localDir, "local.state"),
                                                        "artifacts/gate/bft_local_wait")
-        if IsErr(localRes):
+        if GateBftNodeStatusResultIsErr(localRes):
             os.SleepMs(200)
             continue
-        lastServer = Value(serverRes)
-        lastRelay = Value(relayRes)
-        lastLocal = Value(localRes)
+        lastServer = GateBftNodeStatusResultValue(serverRes)
+        lastRelay = GateBftNodeStatusResultValue(relayRes)
+        lastLocal = GateBftNodeStatusResultValue(localRes)
         if lastServer.height == wantHeight &&
            lastRelay.height == wantHeight &&
            lastLocal.height == wantHeight &&
@@ -2855,13 +2889,13 @@ fn GateVerifyBftValidatorThreeNode(root: str): int32 =
                                                    "local",
                                                    os.JoinPath(localDir, "local.state"),
                                                    "artifacts/gate/bft_verify_local")
-    if !IsErr(serverRes):
-        serverStatus = Value(serverRes)
-    if !IsErr(relayRes):
-        relayStatus = Value(relayRes)
-    if !IsErr(localRes):
-        localStatus = Value(localRes)
-    if !IsErr(serverRes) && !IsErr(relayRes) && !IsErr(localRes):
+    if !GateBftNodeStatusResultIsErr(serverRes):
+        serverStatus = GateBftNodeStatusResultValue(serverRes)
+    if !GateBftNodeStatusResultIsErr(relayRes):
+        relayStatus = GateBftNodeStatusResultValue(relayRes)
+    if !GateBftNodeStatusResultIsErr(localRes):
+        localStatus = GateBftNodeStatusResultValue(localRes)
+    if !GateBftNodeStatusResultIsErr(serverRes) && !GateBftNodeStatusResultIsErr(relayRes) && !GateBftNodeStatusResultIsErr(localRes):
         verified = GateBftClusterMatches(serverStatus,
                                            relayStatus,
                                            localStatus,
@@ -2879,17 +2913,17 @@ fn GateVerifyBftValidatorThreeNode(root: str): int32 =
         let _ = GateStopBftValidatorThreeNode(root)
         return 1
     let stopCode = GateStopBftValidatorThreeNode(root)
-    if IsErr(serverRes):
+    if GateBftNodeStatusResultIsErr(serverRes):
         GatePrintErr(" bft verify: server status failed")
-        GatePrintErr(strutil.Strip(Error(serverRes)))
+        GatePrintErr(strutil.Strip(GateBftNodeStatusResultError(serverRes)))
         return 1
-    if IsErr(relayRes):
+    if GateBftNodeStatusResultIsErr(relayRes):
         GatePrintErr(" bft verify: relay status failed")
-        GatePrintErr(strutil.Strip(Error(relayRes)))
+        GatePrintErr(strutil.Strip(GateBftNodeStatusResultError(relayRes)))
         return 1
-    if IsErr(localRes):
+    if GateBftNodeStatusResultIsErr(localRes):
         GatePrintErr(" bft verify: local status failed")
-        GatePrintErr(strutil.Strip(Error(localRes)))
+        GatePrintErr(strutil.Strip(GateBftNodeStatusResultError(localRes)))
         return 1
     if !verified:
         GatePrintErr(" bft verify: three-node cluster drifted")
@@ -5888,23 +5922,23 @@ fn GateRunHostSmokes(root: str, args: str[]): int32 =
         outDir = os.JoinPath(hostrunRoot, label)
     if len(tailOnly) > 0:
         if tailOnly == "wasm":
-            return GateRunWasmSmokes(root, compiler, label, [])
+            return GateRunWasmSmokes(root, compiler, label, GateEmptyStrSeq())
         if tailOnly == "browser_host_wasm":
-            return GateRunBrowserHostWasmSmoke(root, compiler, label, [])
+            return GateRunBrowserHostWasmSmoke(root, compiler, label, GateEmptyStrSeq())
         if tailOnly == "chain_node_cli":
-            return GateRunChainNodeCliSmoke(root, compiler, label, [])
+            return GateRunChainNodeCliSmoke(root, compiler, label, GateEmptyStrSeq())
         if tailOnly == "chain_node_process":
-            return GateRunChainNodeProcessSmokeWithCompiler(root, compiler, label, [])
+            return GateRunChainNodeProcessSmokeWithCompiler(root, compiler, label, GateEmptyStrSeq())
         if tailOnly == "chain_node_three_node":
-            return GateRunChainNodeThreeNodeSmokeWithCompiler(root, compiler, label, [])
+            return GateRunChainNodeThreeNodeSmokeWithCompiler(root, compiler, label, GateEmptyStrSeq())
         if tailOnly == "chain_node_resilience":
-            return GateRunChainNodeResilienceSmoke(root, compiler, label, [])
+            return GateRunChainNodeResilienceSmoke(root, compiler, label, GateEmptyStrSeq())
         if tailOnly == "tailnet_control":
-            return GateRunTailnetControlSmoke(root, compiler, label, [])
+            return GateRunTailnetControlSmoke(root, compiler, label, GateEmptyStrSeq())
         if tailOnly == "fresh_node_selfhost":
-            return GateRunFreshNodeSelfhostGate(root, compiler, label, [])
+            return GateRunFreshNodeSelfhostGate(root, compiler, label, GateEmptyStrSeq())
         if tailOnly == "migration":
-            return GateRunMigrationGate(root, compiler, label, [])
+            return GateRunMigrationGate(root, compiler, label, GateEmptyStrSeq())
         GatePrintErr(strutil.Join(["cheng host smokes: unknown --tail-only: ", tailOnly], ""))
         return 1
     var tests: str[] = GateDefaultHostSmokes()
@@ -5915,17 +5949,17 @@ fn GateRunHostSmokes(root: str, args: str[]): int32 =
     for i in 0..<tests.len:
         let smokeName: str = tests[i]
         let outBin: str = os.JoinPath(outDir, smokeName)
-        if GateRunSingleFixtureSmoke(root, " host smokes", compiler, smokeName, outBin, label, []) != 0:
+        if GateRunSingleFixtureSmoke(root, " host smokes", compiler, smokeName, outBin, label, GateEmptyStrSeq()) != 0:
             return 1
         if smokeName == "libp2p_quic_tls_smoke":
-            if GateRunQuicTwoprocSmoke(root, compiler, label, []) != 0:
+            if GateRunQuicTwoprocSmoke(root, compiler, label, GateEmptyStrSeq()) != 0:
                 return 1
     if runTail:
-        if GateRunTailnetControlSmoke(root, compiler, label, []) != 0:
+        if GateRunTailnetControlSmoke(root, compiler, label, GateEmptyStrSeq()) != 0:
             return 1
-        if GateRunFreshNodeSelfhostGate(root, compiler, label, []) != 0:
+        if GateRunFreshNodeSelfhostGate(root, compiler, label, GateEmptyStrSeq()) != 0:
             return 1
-        if GateRunMigrationGate(root, compiler, label, []) != 0:
+        if GateRunMigrationGate(root, compiler, label, GateEmptyStrSeq()) != 0:
             return 1
     GatePrintLine("cheng host smokes: ok")
     return 0
@@ -5997,7 +6031,7 @@ fn GateRunStage23Libp2pSmokes(root: str, args: str[]): int32 =
             return 1
         if GateRunMigrationGate(root, stage3, "stage3", envOverrides) != 0:
             return 1
-        if GateRunBrowserWebrtcSmokes(root, [], envOverrides) != 0:
+        if GateRunBrowserWebrtcSmokes(root, GateEmptyStrSeq(), envOverrides) != 0:
             return 1
     GatePrintLine(" stage2/stage3 libp2p: ok")
     return 0
@@ -6594,10 +6628,30 @@ fn GateOracleBftNodeStatusZero(name: str): OracleBftNodeStatus =
     out.twapPriceE8 = ""
     return out
 
+fn GateOracleBftNodeStatusResultOk(value: OracleBftNodeStatus): GateOracleBftNodeStatusResult =
+    var out: GateOracleBftNodeStatusResult
+    out.ok = true
+    out.value = value
+    return out
+
+fn GateOracleBftNodeStatusResultErr(errorText: str): GateOracleBftNodeStatusResult =
+    var out: GateOracleBftNodeStatusResult
+    out.errorText = errorText
+    return out
+
+fn GateOracleBftNodeStatusResultIsErr(resultValue: GateOracleBftNodeStatusResult): bool =
+    return !resultValue.ok
+
+fn GateOracleBftNodeStatusResultValue(resultValue: GateOracleBftNodeStatusResult): OracleBftNodeStatus =
+    return resultValue.value
+
+fn GateOracleBftNodeStatusResultError(resultValue: GateOracleBftNodeStatusResult): str =
+    return resultValue.errorText
+
 fn GateOracleBftCollectLocalNodeStatus(root: str,
                                          nodeName: str,
                                          statePath: str,
-                                         logPrefix: str): Result[OracleBftNodeStatus] =
+                                         logPrefix: str): GateOracleBftNodeStatusResult =
     let binPath = GateOracleBftLocalBin(root)
     let summaryRun = hostops.RunFileLogged(root,
                                              strutil.Join([nodeName, "_oracle_show_state"], ""),
@@ -6608,7 +6662,7 @@ fn GateOracleBftCollectLocalNodeStatus(root: str,
                                              20,
                                              strutil.Join([logPrefix, ".show.log"], ""))
     if !hostops.LoggedRunOk(summaryRun):
-        return Err[OracleBftNodeStatus](summaryRun.output)
+        return GateOracleBftNodeStatusResultErr(summaryRun.output)
     let latestRun = hostops.RunFileLogged(root,
                                             strutil.Join([nodeName, "_oracle_latest"], ""),
                                             binPath,
@@ -6621,7 +6675,7 @@ fn GateOracleBftCollectLocalNodeStatus(root: str,
                                             20,
                                             strutil.Join([logPrefix, ".latest.log"], ""))
     if !hostops.LoggedRunOk(latestRun):
-        return Err[OracleBftNodeStatus](latestRun.output)
+        return GateOracleBftNodeStatusResultErr(latestRun.output)
     let twapRun = hostops.RunFileLogged(root,
                                           strutil.Join([nodeName, "_oracle_twap"], ""),
                                           binPath,
@@ -6635,8 +6689,8 @@ fn GateOracleBftCollectLocalNodeStatus(root: str,
                                           20,
                                           strutil.Join([logPrefix, ".twap.log"], ""))
     if !hostops.LoggedRunOk(twapRun):
-        return Err[OracleBftNodeStatus](twapRun.output)
-    return Ok[OracleBftNodeStatus](OracleBftNodeStatus(
+        return GateOracleBftNodeStatusResultErr(twapRun.output)
+    return GateOracleBftNodeStatusResultOk(OracleBftNodeStatus(
         name: nodeName,
         summary: summaryRun.output,
         latestQuery: latestRun.output,
@@ -6656,7 +6710,7 @@ fn GateOracleBftCollectRemoteNodeStatus(root: str,
                                           sshHost: str,
                                           repoRoot: str,
                                           statePath: str,
-                                          logPrefix: str): Result[OracleBftNodeStatus] =
+                                          logPrefix: str): GateOracleBftNodeStatusResult =
     let binPath = GateOracleBftRemoteBin(repoRoot)
     let summaryRun = GateRunRemoteShellLogged(root,
                                                 strutil.Join([nodeName, "_oracle_show_state"], ""),
@@ -6667,7 +6721,7 @@ fn GateOracleBftCollectRemoteNodeStatus(root: str,
                                                 strutil.Join([logPrefix, ".show.log"], ""),
                                                 20)
     if !hostops.LoggedRunOk(summaryRun):
-        return Err[OracleBftNodeStatus](summaryRun.output)
+        return GateOracleBftNodeStatusResultErr(summaryRun.output)
     let latestRun = GateRunRemoteShellLogged(root,
                                                strutil.Join([nodeName, "_oracle_latest"], ""),
                                                sshHost,
@@ -6679,7 +6733,7 @@ fn GateOracleBftCollectRemoteNodeStatus(root: str,
                                                strutil.Join([logPrefix, ".latest.log"], ""),
                                                20)
     if !hostops.LoggedRunOk(latestRun):
-        return Err[OracleBftNodeStatus](latestRun.output)
+        return GateOracleBftNodeStatusResultErr(latestRun.output)
     let twapRun = GateRunRemoteShellLogged(root,
                                              strutil.Join([nodeName, "_oracle_twap"], ""),
                                              sshHost,
@@ -6692,8 +6746,8 @@ fn GateOracleBftCollectRemoteNodeStatus(root: str,
                                              strutil.Join([logPrefix, ".twap.log"], ""),
                                              20)
     if !hostops.LoggedRunOk(twapRun):
-        return Err[OracleBftNodeStatus](twapRun.output)
-    return Ok[OracleBftNodeStatus](OracleBftNodeStatus(
+        return GateOracleBftNodeStatusResultErr(twapRun.output)
+    return GateOracleBftNodeStatusResultOk(OracleBftNodeStatus(
         name: nodeName,
         summary: summaryRun.output,
         latestQuery: latestRun.output,
@@ -6921,31 +6975,31 @@ fn GateDeployOracleBftThreeNode(root: str): int32 =
                                                            cfg.serverRepoRoot,
                                                            GateOracleBftStatePath(serverDir),
                                                            "artifacts/gate/oracle_bft_server_status")
-    if IsErr(serverRes):
+    if GateOracleBftNodeStatusResultIsErr(serverRes):
         GatePrintErr(" oracle bft deploy: server status failed")
-        GatePrintErr(strutil.Strip(Error(serverRes)))
+        GatePrintErr(strutil.Strip(GateOracleBftNodeStatusResultError(serverRes)))
         return 1
-    serverStatus = Value(serverRes)
+    serverStatus = GateOracleBftNodeStatusResultValue(serverRes)
     let relayRes = GateOracleBftCollectRemoteNodeStatus(root,
                                                           "relay",
                                                           cfg.relaySsh,
                                                           cfg.relayRepoRoot,
                                                           GateOracleBftStatePath(relayDir),
                                                           "artifacts/gate/oracle_bft_relay_status")
-    if IsErr(relayRes):
+    if GateOracleBftNodeStatusResultIsErr(relayRes):
         GatePrintErr(" oracle bft deploy: relay status failed")
-        GatePrintErr(strutil.Strip(Error(relayRes)))
+        GatePrintErr(strutil.Strip(GateOracleBftNodeStatusResultError(relayRes)))
         return 1
-    relayStatus = Value(relayRes)
+    relayStatus = GateOracleBftNodeStatusResultValue(relayRes)
     let localRes = GateOracleBftCollectLocalNodeStatus(root,
                                                          "local",
                                                          GateOracleBftStatePath(localDir),
                                                          "artifacts/gate/oracle_bft_local_status")
-    if IsErr(localRes):
+    if GateOracleBftNodeStatusResultIsErr(localRes):
         GatePrintErr(" oracle bft deploy: local status failed")
-        GatePrintErr(strutil.Strip(Error(localRes)))
+        GatePrintErr(strutil.Strip(GateOracleBftNodeStatusResultError(localRes)))
         return 1
-    localStatus = Value(localRes)
+    localStatus = GateOracleBftNodeStatusResultValue(localRes)
     if !GateOracleBftClusterMatches(serverStatus, relayStatus, localStatus):
         GatePrintErr(" oracle bft deploy: three-node cluster drifted")
         GateOracleBftPrintNodeStatus(serverStatus)
@@ -6972,9 +7026,9 @@ fn GateStatusOracleBftThreeNode(root: str): int32 =
                                                            cfg.serverRepoRoot,
                                                            GateOracleBftStatePath(serverDir),
                                                            "artifacts/gate/oracle_bft_server_live")
-    if IsErr(serverRes):
+    if GateOracleBftNodeStatusResultIsErr(serverRes):
         GatePrintErr(" oracle bft status: server failed")
-        GatePrintErr(strutil.Strip(Error(serverRes)))
+        GatePrintErr(strutil.Strip(GateOracleBftNodeStatusResultError(serverRes)))
         return 1
     let relayRes = GateOracleBftCollectRemoteNodeStatus(root,
                                                           "relay",
@@ -6982,23 +7036,23 @@ fn GateStatusOracleBftThreeNode(root: str): int32 =
                                                           cfg.relayRepoRoot,
                                                           GateOracleBftStatePath(relayDir),
                                                           "artifacts/gate/oracle_bft_relay_live")
-    if IsErr(relayRes):
+    if GateOracleBftNodeStatusResultIsErr(relayRes):
         GatePrintErr(" oracle bft status: relay failed")
-        GatePrintErr(strutil.Strip(Error(relayRes)))
+        GatePrintErr(strutil.Strip(GateOracleBftNodeStatusResultError(relayRes)))
         return 1
     let localRes = GateOracleBftCollectLocalNodeStatus(root,
                                                          "local",
                                                          GateOracleBftStatePath(localDir),
                                                          "artifacts/gate/oracle_bft_local_live")
-    if IsErr(localRes):
+    if GateOracleBftNodeStatusResultIsErr(localRes):
         GatePrintErr(" oracle bft status: local failed")
-        GatePrintErr(strutil.Strip(Error(localRes)))
+        GatePrintErr(strutil.Strip(GateOracleBftNodeStatusResultError(localRes)))
         return 1
-    GateOracleBftPrintNodeStatus(Value(serverRes))
+    GateOracleBftPrintNodeStatus(GateOracleBftNodeStatusResultValue(serverRes))
     GatePrintLine("---")
-    GateOracleBftPrintNodeStatus(Value(relayRes))
+    GateOracleBftPrintNodeStatus(GateOracleBftNodeStatusResultValue(relayRes))
     GatePrintLine("---")
-    GateOracleBftPrintNodeStatus(Value(localRes))
+    GateOracleBftPrintNodeStatus(GateOracleBftNodeStatusResultValue(localRes))
     return 0
 
 fn GateVerifyOracleBftThreeNode(root: str): int32 =
@@ -7027,14 +7081,14 @@ fn GateVerifyOracleBftThreeNode(root: str): int32 =
                                                          "local",
                                                          GateOracleBftStatePath(localDir),
                                                          "artifacts/gate/oracle_bft_verify_local")
-    if !IsErr(serverRes):
-        serverStatus = Value(serverRes)
-    if !IsErr(relayRes):
-        relayStatus = Value(relayRes)
-    if !IsErr(localRes):
-        localStatus = Value(localRes)
+    if !GateOracleBftNodeStatusResultIsErr(serverRes):
+        serverStatus = GateOracleBftNodeStatusResultValue(serverRes)
+    if !GateOracleBftNodeStatusResultIsErr(relayRes):
+        relayStatus = GateOracleBftNodeStatusResultValue(relayRes)
+    if !GateOracleBftNodeStatusResultIsErr(localRes):
+        localStatus = GateOracleBftNodeStatusResultValue(localRes)
     var verified = false
-    if !IsErr(serverRes) && !IsErr(relayRes) && !IsErr(localRes):
+    if !GateOracleBftNodeStatusResultIsErr(serverRes) && !GateOracleBftNodeStatusResultIsErr(relayRes) && !GateOracleBftNodeStatusResultIsErr(localRes):
         verified = GateOracleBftClusterMatches(serverStatus, relayStatus, localStatus)
     let reportPath = GateOracleBftVerifyReportPath(root)
     let reportText = GateOracleBftVerifyReportText(cfg, verified, serverStatus, relayStatus, localStatus)
@@ -7043,17 +7097,17 @@ fn GateVerifyOracleBftThreeNode(root: str): int32 =
         let _ = GateStopOracleBftThreeNode(root)
         return 1
     let stopCode = GateStopOracleBftThreeNode(root)
-    if IsErr(serverRes):
+    if GateOracleBftNodeStatusResultIsErr(serverRes):
         GatePrintErr(" oracle bft verify: server status failed")
-        GatePrintErr(strutil.Strip(Error(serverRes)))
+        GatePrintErr(strutil.Strip(GateOracleBftNodeStatusResultError(serverRes)))
         return 1
-    if IsErr(relayRes):
+    if GateOracleBftNodeStatusResultIsErr(relayRes):
         GatePrintErr(" oracle bft verify: relay status failed")
-        GatePrintErr(strutil.Strip(Error(relayRes)))
+        GatePrintErr(strutil.Strip(GateOracleBftNodeStatusResultError(relayRes)))
         return 1
-    if IsErr(localRes):
+    if GateOracleBftNodeStatusResultIsErr(localRes):
         GatePrintErr(" oracle bft verify: local status failed")
-        GatePrintErr(strutil.Strip(Error(localRes)))
+        GatePrintErr(strutil.Strip(GateOracleBftNodeStatusResultError(localRes)))
         return 1
     if !verified:
         GatePrintErr(" oracle bft verify: three-node cluster drifted")
@@ -7522,7 +7576,7 @@ fn GateRunChainNodeProcessSmoke(root: str, args: str[]): int32 =
                                   compiler) != 0:
         return 1
     let label: str = GateResolveSmokeLabel(args, "CHENG_CHAIN_NODE_LABEL", "host")
-    return GateRunChainNodeProcessSmokeWithCompiler(root, compiler, label, [])
+    return GateRunChainNodeProcessSmokeWithCompiler(root, compiler, label, GateEmptyStrSeq())
 
 fn GateRunChainNodeThreeNodeSmoke(root: str, args: str[]): int32 =
     let explicitCompiler: str = GateReadFlag(args, "--compiler", "")
@@ -7534,7 +7588,7 @@ fn GateRunChainNodeThreeNodeSmoke(root: str, args: str[]): int32 =
                                   compiler) != 0:
         return 1
     let label: str = GateResolveSmokeLabel(args, "CHENG_CHAIN_NODE_LABEL", "host")
-    return GateRunChainNodeThreeNodeSmokeWithCompiler(root, compiler, label, [])
+    return GateRunChainNodeThreeNodeSmokeWithCompiler(root, compiler, label, GateEmptyStrSeq())
 
 fn GateSlice(root: str): int32 =
     GatePrintLine("[ gate] hot-path forbidden scan")
@@ -7559,7 +7613,7 @@ fn GateSlice(root: str): int32 =
     if GateRunStage3Command(root,
                               "verify_debug_tools",
                               "verify-debug-tools",
-                              [],
+                              GateEmptyStrSeq(),
                               "verify-debug-tools.log",
                               false) != 0:
         return 1
@@ -7596,15 +7650,15 @@ fn GateSlice(root: str): int32 =
     if GateRunStage3Command(root,
                               "run_cross_target_smokes",
                               "run-cross-target-smokes",
-                              [],
+                              GateEmptyStrSeq(),
                               "run-cross-target-smokes.log",
                               false) != 0:
         return 1
     GatePrintLine("[ gate]  host smokes")
-    if GateRunHostSmokes(root, []) != 0:
+    if GateRunHostSmokes(root, GateEmptyStrSeq()) != 0:
         return 1
     GatePrintLine("[ gate] stage2/stage3 libp2p smokes")
-    if GateRunStage23Libp2pSmokes(root, []) != 0:
+    if GateRunStage23Libp2pSmokes(root, GateEmptyStrSeq()) != 0:
         return 1
     GatePrintLine("[ gate] remote x86 linux release gate")
     if GateVerifyX86LinuxRemote(root) != 0:
@@ -7788,7 +7842,7 @@ fn GateMain(argc: int32, argv: str*): int32 =
                                       compiler) != 0:
             return 1
         let label: str = GateResolveSmokeLabel(args, "CHENG_CHAIN_NODE_LABEL", "host_resilience_gate")
-        return GateRunChainNodeResilienceSmoke(root, compiler, label, [])
+        return GateRunChainNodeResilienceSmoke(root, compiler, label, GateEmptyStrSeq())
     if cmd == "verify-oracle-resilience":
         return GateRunStage3Command(root,
                                       "verify_oracle_resilience",
@@ -7884,14 +7938,14 @@ fn GateMain(argc: int32, argv: str*): int32 =
         if GateResolveSmokeCompiler(root, explicitCompiler, "CHENG_SMOKE_COMPILER", "", compiler) != 0:
             return 1
         let label: str = GateResolveSmokeLabel(args, "CHENG_SMOKE_LABEL", "host")
-        return GateRunTcpTwoprocSmoke(root, compiler, label, [])
+        return GateRunTcpTwoprocSmoke(root, compiler, label, GateEmptyStrSeq())
     if cmd == "run-quic-twoproc-smoke":
         let explicitCompiler: str = GateReadFlag(args, "--compiler", "")
         var compiler = ""
         if GateResolveSmokeCompiler(root, explicitCompiler, "CHENG_SMOKE_COMPILER", "", compiler) != 0:
             return 1
         let label: str = GateResolveSmokeLabel(args, "CHENG_SMOKE_LABEL", "host")
-        return GateRunQuicTwoprocSmoke(root, compiler, label, [])
+        return GateRunQuicTwoprocSmoke(root, compiler, label, GateEmptyStrSeq())
     if cmd == "run-udp-importc-smoke":
         return GateRunUdpImportcSmoke(root, args)
     if cmd == "run-wasm-smokes":
@@ -7904,7 +7958,7 @@ fn GateMain(argc: int32, argv: str*): int32 =
                                       compiler) != 0:
             return 1
         let label: str = GateResolveSmokeLabel(args, "CHENG_WASM_LABEL", "host")
-        return GateRunWasmSmokes(root, compiler, label, [])
+        return GateRunWasmSmokes(root, compiler, label, GateEmptyStrSeq())
     if cmd == "run-browser-host-wasm-smoke":
         let explicitCompiler: str = GateReadFlag(args, "--compiler", "")
         var compiler = ""
@@ -7915,7 +7969,7 @@ fn GateMain(argc: int32, argv: str*): int32 =
                                       compiler) != 0:
             return 1
         let label: str = GateResolveSmokeLabel(args, "CHENG_WASM_LABEL", "host")
-        return GateRunBrowserHostWasmSmoke(root, compiler, label, [])
+        return GateRunBrowserHostWasmSmoke(root, compiler, label, GateEmptyStrSeq())
     if cmd == "run-chain-node-cli-smoke":
         let explicitCompiler: str = GateReadFlag(args, "--compiler", "")
         var compiler = ""
@@ -7926,7 +7980,7 @@ fn GateMain(argc: int32, argv: str*): int32 =
                                       compiler) != 0:
             return 1
         let label: str = GateResolveSmokeLabel(args, "CHENG_CHAIN_NODE_LABEL", "host")
-        return GateRunChainNodeCliSmoke(root, compiler, label, [])
+        return GateRunChainNodeCliSmoke(root, compiler, label, GateEmptyStrSeq())
     if cmd == "run-chain-node-process-smoke":
         return GateRunChainNodeProcessSmoke(root, args)
     if cmd == "run-chain-node-three-node-smoke":
@@ -7941,7 +7995,7 @@ fn GateMain(argc: int32, argv: str*): int32 =
                                       compiler) != 0:
             return 1
         let label: str = GateResolveSmokeLabel(args, "CHENG_CHAIN_NODE_LABEL", "host")
-        return GateRunChainNodeResilienceSmoke(root, compiler, label, [])
+        return GateRunChainNodeResilienceSmoke(root, compiler, label, GateEmptyStrSeq())
     if cmd == "run-oracle-resilience-smoke":
         return GateRunStage3Command(root,
                                       "run_oracle_resilience_smoke",
@@ -7966,7 +8020,7 @@ fn GateMain(argc: int32, argv: str*): int32 =
                                       compiler) != 0:
             return 1
         let label: str = GateResolveSmokeLabel(args, "CHENG_TAILNET_LABEL", "host")
-        return GateRunTailnetControlSmoke(root, compiler, label, [])
+        return GateRunTailnetControlSmoke(root, compiler, label, GateEmptyStrSeq())
     if cmd == "run-fresh-node-selfhost-gate":
         let explicitCompiler: str = GateReadFlag(args, "--compiler", "")
         var compiler = ""
@@ -7977,7 +8031,7 @@ fn GateMain(argc: int32, argv: str*): int32 =
                                       compiler) != 0:
             return 1
         let label: str = GateResolveSmokeLabel(args, "CHENG_FRESH_NODE_LABEL", "host")
-        return GateRunFreshNodeSelfhostGate(root, compiler, label, [])
+        return GateRunFreshNodeSelfhostGate(root, compiler, label, GateEmptyStrSeq())
     if cmd == "run-migration-gate":
         let explicitCompiler: str = GateReadFlag(args, "--compiler", "")
         var compiler = ""
@@ -7988,7 +8042,7 @@ fn GateMain(argc: int32, argv: str*): int32 =
                                       compiler) != 0:
             return 1
         let label: str = GateResolveSmokeLabel(args, "CHENG_MIGRATION_LABEL", "host")
-        return GateRunMigrationGate(root, compiler, label, [])
+        return GateRunMigrationGate(root, compiler, label, GateEmptyStrSeq())
     if cmd == "run-browser-webrtc-smokes":
         return GateRunBrowserWebrtcSmokes(root, GateCollectPositionals(args), GateStage23EnvOverrides())
     if cmd == "r2c-react":
