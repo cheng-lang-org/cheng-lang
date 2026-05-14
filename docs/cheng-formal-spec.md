@@ -28,7 +28,7 @@
 - `compile/chengc` 的主验证职责从 shell 入口剥离，工具主链路改走 canonical tooling 命令。
 - no-pointer / Raw Pointer Safety 约束在发布链路中按 hard-fail 收口（ZRPC）。
 - `uirCoreFindTypeDeclByName` 热点路径已加入一次性建表与可重入防护，避免已知死循环与重复扫描；配套的调用计数/超时抽样告警已持续保留。
-- CSG v2 已收口为后端事实格式：public `emit-cold-csg-v2` 输出 canonical `CHENG_CSG_V2` facts；cold compiler 的 `system-link-exec --csg-in` 负责加载校验、object emit 与 direct-exe 生成。internal `CHENGCSG` 只用于显式 `system-link-exec --emit:csg-v2` 自检；完整 Cheng `PrimaryObjectPlan` writer 刷新仍受 `build-backend-driver` smoke mismatch 阻塞，不能写成全量 PrimaryObjectPlan 管线闭合。
+- CSG v2 已收口为后端事实格式：public `emit-cold-csg-v2` 输出 canonical `CHENG_CSG_V2` facts；cold compiler 的 `system-link-exec --csg-in` 负责加载校验、object emit 与 direct-exe 生成。internal `CHENGCSG` 只用于显式 `system-link-exec --emit:csg-v2` 自检；完整 Cheng `PrimaryObjectPlan` 管线仍受 cold_parser 里的 CompilerCsg/LoweringPlan/PrimaryObjectPlan materializer 空结构阻塞，不能写成全量 PrimaryObjectPlan 管线闭合。
 
 #### 进行中
 

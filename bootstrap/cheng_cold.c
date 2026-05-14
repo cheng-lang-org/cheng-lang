@@ -9931,9 +9931,7 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
             if (ret_kind == SLOT_I32 && body->slot_no_alias && body->slot_no_alias[dst]) na_set(0, dst);
         }
     } else if (kind == BODY_OP_COPY_I32) {
-        int __cr2 = na_find(a);
-        if (__cr2 >= 0) { if (__cr2 != 0) code_emit(code, a64_add_imm(R0, __cr2, 0, false)); }
-        else { a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false); }
+        a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
         if (body->slot_no_alias && body->slot_no_alias[dst]) na_set(0, dst);
     } else if (kind == BODY_OP_I32_ADD || kind == BODY_OP_I32_SUB) {
@@ -19141,6 +19139,28 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
         struct stat csg_st;
         if (stat(out_path, &csg_st) == 0 && csg_st.st_size > 0) {
             stats.facts_bytes = (uint64_t)csg_st.st_size;
+        }
+        if (primary_csg_v2_emit) {
+            Span written_facts = source_open(out_path);
+            int32_t written_function_count = 0;
+            int32_t written_word_count = 0;
+            int32_t written_reloc_count = 0;
+            bool counted = written_facts.len > 0 &&
+                cold_csg_v2_count_primary_records(written_facts,
+                                                   &written_function_count,
+                                                   &written_word_count,
+                                                   &written_reloc_count);
+            if (written_facts.len > 0) {
+                munmap((void *)written_facts.ptr, (size_t)written_facts.len);
+            }
+            if (!counted) {
+                cold_write_system_link_exec_report(report_path, false, source_path, out_path, out_path,
+                                                   target, emit, &stats, "csg-v2-primary facts recount failed");
+                return 2;
+            }
+            stats.facts_function_count = written_function_count;
+            stats.facts_word_count = written_word_count;
+            stats.facts_reloc_count = written_reloc_count;
         }
         stats.csg_lowering = 1;
         stats.function_count = symbols->function_count;

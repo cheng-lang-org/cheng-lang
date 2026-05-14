@@ -363,6 +363,13 @@ else
     ACT=0
 fi
 assert "build_backend_driver_no_debug_noise" 1 "$ACT"
+if ! grep -nE '\[DBG\]|\[field_assign\]|\[take_until\]|\[parse_index_bracket\]|backtrace\(|execinfo\.h' \
+    bootstrap/cheng_cold.c bootstrap/cold_parser.c >/tmp/ct_static_debug_markers.txt 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "cold_no_static_debug_markers" 1 "$ACT"
 if [ -x /tmp/ct_bd/cheng ]; then
     /tmp/ct_bd/cheng status --root:. --in:src/core/tooling/backend_driver_dispatch_min.cheng \
         --out:/tmp/ct_bd/status.out >/tmp/ct_bd/status.stdout 2>/tmp/ct_bd/status.stderr
@@ -1131,6 +1138,11 @@ rm -f /tmp/ct_range_leq.cheng /tmp/ct_range_leq_out
 ACT=$(compile_run testdata/double_neg_not_identity.cheng /tmp/ct_dneg_not)
 assert "double_neg_not_identity" 0 "$ACT"
 rm -f /tmp/ct_dneg_not
+
+# --- double_neg_not_direct ---
+ACT=$(compile_run testdata/double_neg_not_direct.cheng /tmp/ct_dneg_not_direct)
+assert "double_neg_not_direct" 0 "$ACT"
+rm -f /tmp/ct_dneg_not_direct
 
 # --- type_alias ---
 cat > /tmp/ct_type_alias.cheng << 'EOF'

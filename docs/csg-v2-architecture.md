@@ -94,11 +94,11 @@ TRAILER (32 bytes): section_count + hash(28)
 
 ## Fixed-point Verification
 
-Current gate: `tools/cold_csg_v2_roundtrip_test.sh` passes 732/732.
+Current gate: `tools/cold_csg_v2_roundtrip_test.sh` passes 735/735.
 
 - Public `emit-cold-csg-v2` emits canonical `CHENG_CSG_V2`; cold reader emits object; `cc` link/run smoke exits 0.
 - Internal `CHENGCSG` writer/reader fixed-point produces bit-identical objects for repeated reads of the same facts.
-- Full Cheng `PrimaryObjectPlan` writer refresh is still blocked by `build-backend-driver` smoke mismatch, so it is not counted as full PrimaryObjectPlan pipeline closure.
+- Full Cheng `PrimaryObjectPlan` pipeline is still blocked by empty `CompilerCsg` / `LoweringPlan` / `PrimaryObjectPlan` materializers in `cold_parser.c`, so it is not counted as full PrimaryObjectPlan pipeline closure.
 
 ## Key Files
 

@@ -59,6 +59,19 @@ require_grep() {
     fi
 }
 
+require_report_positive() {
+    local name="$1"
+    local key="$2"
+    local path="$3"
+    local value
+    value="$(awk -F= -v k="$key" '$1 == k { print $2; exit }' "$path" 2>/dev/null)"
+    if [ -n "$value" ] && [ "$value" -gt 0 ] 2>/dev/null; then
+        ok "$name"
+    else
+        bad "$name"
+    fi
+}
+
 facts_magic_kind() {
     local path="$1"
     if head -c 13 "$path" | LC_ALL=C grep -aq '^CHENG_CSG_V2$'; then
@@ -155,6 +168,9 @@ canonical_writer_smoke() {
     fi
     require_grep "canonical_writer_ordinary_report_emit" '^emit=csg-v2-primary$' "$report"
     require_grep "canonical_writer_ordinary_report_status" '^cold_csg_v2_writer_status=ok$' "$report"
+    require_report_positive "canonical_writer_ordinary_report_facts_bytes" "facts_bytes" "$report"
+    require_grep "canonical_writer_ordinary_report_writer_function_count" '^facts_function_count=1$' "$report"
+    require_report_positive "canonical_writer_ordinary_report_writer_word_count" "facts_word_count" "$report"
     if "$COLD" system-link-exec \
         --csg-in:"$facts" \
         --emit:obj \
