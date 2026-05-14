@@ -3370,6 +3370,7 @@ enum {
     BODY_OP_PATH_IS_ABSOLUTE = 137,
     BODY_OP_THREAD_YIELD = 138,
     BODY_OP_SET_RAW = 139,
+    BODY_OP_BYTES_ALLOC = 140,
 };
 
 enum {
@@ -10556,6 +10557,28 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         a64_patch_bcond(code, set_done, code->count);
         code_emit(code, a64_movz(R0, 0, 0));
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
+    } else if (kind == BODY_OP_BYTES_ALLOC) {
+        if (body->slot_kind[a] != SLOT_I32) die("BytesAlloc length must be int32");
+        codegen_zero_slot(code, body, dst);
+        a64_emit_ldr_sp_off(code, R1, body->slot_offset[a], false);
+        code_emit(code, a64_sxtw(R1, R1));
+        code_emit(code, a64_cmp_imm(R1, 0));
+        int32_t bytes_done = code->count;
+        code_emit(code, a64_bcond(0, COND_LE));
+        codegen_mmap_len_reg(code, R1, R3, 57);
+        a64_emit_str_sp_off(code, R3, body->slot_offset[dst] + 0, true);
+        a64_emit_str_sp_off(code, R1, body->slot_offset[dst] + 8, false);
+        code_emit(code, a64_movz(R6, 0, 0));
+        int32_t zero_loop = code->count;
+        code_emit(code, a64_cmp_imm(R1, 0));
+        int32_t zero_done = code->count;
+        code_emit(code, a64_bcond(0, COND_LE));
+        code_emit(code, a64_strb_imm(R6, R3, 0));
+        code_emit(code, a64_add_imm(R3, R3, 1, true));
+        code_emit(code, a64_sub_imm(R1, R1, 1, true));
+        code_emit(code, a64_b(zero_loop - code->count));
+        a64_patch_bcond(code, zero_done, code->count);
+        a64_patch_bcond(code, bytes_done, code->count);
     } else if (kind == BODY_OP_WRITE_RAW) {
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
         a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], true);
@@ -11824,6 +11847,7 @@ static bool cold_op_has_side_effect(int32_t kind) {
         case BODY_OP_PATH_WRITE_BYTES:
         case BODY_OP_COPY_RAW:
         case BODY_OP_SET_RAW:
+        case BODY_OP_BYTES_ALLOC:
         case BODY_OP_MKDIR_ONE:
         case BODY_OP_OPEN:
         case BODY_OP_READ:
@@ -18229,6 +18253,8 @@ bool cold_compile_source_to_object(const char *out_path,
 
     cold_collect_imported_function_signatures(symbols, mapped_source);
     cold_collect_function_signatures(symbols, mapped_source);
+    cold_collect_global_vars_from_source(symbols, (Span){0}, mapped_source);
+    cold_collect_all_transitive_imports(symbols, mapped_source);
     /* Collect direct imports for bare-name resolution in entry module body */
     ColdImportSource import_sources[64];
     int32_t import_source_count = cold_collect_direct_import_sources(mapped_source,

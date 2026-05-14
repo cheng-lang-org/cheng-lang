@@ -336,6 +336,7 @@ enum {
     BODY_OP_PATH_IS_ABSOLUTE = 137,
     BODY_OP_THREAD_YIELD = 138,
     BODY_OP_SET_RAW = 139,
+    BODY_OP_BYTES_ALLOC = 140,
 };
 
 enum {
