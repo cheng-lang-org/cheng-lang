@@ -972,6 +972,21 @@ ACT=$(compile_run_timed /tmp/cheng_cold /tmp/ct_long_func.cheng /tmp/ct_long_fun
 assert "long_function_1500ops" 78 "$ACT"
 rm -f /tmp/ct_long_func.cheng /tmp/ct_long_func_out
 
+# --- generic_specialize_smoke ---
+ACT=$(compile_run_timed /tmp/cheng_cold testdata/generic_specialize_smoke.cheng /tmp/ct_gen_smoke 30)
+assert "generic_specialize_smoke" 0 "$ACT"
+rm -f /tmp/ct_gen_smoke
+
+# --- generic_pass_smoke ---
+ACT=$(compile_run_timed /tmp/cheng_cold testdata/generic_pass_smoke.cheng /tmp/ct_gen_pass 30)
+assert "generic_pass_smoke" 0 "$ACT"
+rm -f /tmp/ct_gen_pass
+
+# --- generic_multi_smoke ---
+ACT=$(compile_run_timed /tmp/cheng_cold testdata/generic_multi_smoke.cheng /tmp/ct_gen_multi 30)
+assert "generic_multi_smoke" 0 "$ACT"
+rm -f /tmp/ct_gen_multi
+
 echo ""
 echo "=== $PASS passed, $FAIL failed ==="
 [ "$FAIL" -eq 0 ]
