@@ -1095,6 +1095,150 @@ ACT=$(compile_run testdata/double_neg_not_identity.cheng /tmp/ct_dneg_not)
 assert "double_neg_not_identity" 0 "$ACT"
 rm -f /tmp/ct_dneg_not
 
+# --- type_alias ---
+cat > /tmp/ct_type_alias.cheng << 'EOF'
+type MyInt = int32
+
+fn main(): MyInt =
+    var x: MyInt = 42
+    return x
+EOF
+ACT=$(compile_run_timed "$COLD" /tmp/ct_type_alias.cheng /tmp/ct_type_alias_out 10)
+assert "type_alias" 42 "$ACT"
+rm -f /tmp/ct_type_alias.cheng /tmp/ct_type_alias_out
+
+# --- deeply_nested_if (10 levels) ---
+cat > /tmp/ct_deep_if.cheng << 'EOF'
+fn main(): int32 =
+    var x = 0
+    if x == 0:
+        x = 1
+        if x == 1:
+            x = 2
+            if x == 2:
+                x = 3
+                if x == 3:
+                    x = 4
+                    if x == 4:
+                        x = 5
+                        if x == 5:
+                            x = 6
+                            if x == 6:
+                                x = 7
+                                if x == 7:
+                                    x = 8
+                                    if x == 8:
+                                        x = 9
+                                        if x == 9:
+                                            x = 10
+                                            return x
+    return 255
+EOF
+ACT=$(compile_run_timed "$COLD" /tmp/ct_deep_if.cheng /tmp/ct_deep_if_out 10)
+assert "deeply_nested_if" 10 "$ACT"
+rm -f /tmp/ct_deep_if.cheng /tmp/ct_deep_if_out
+
+# --- nested_loops (for inside while inside for) ---
+cat > /tmp/ct_nested_loops.cheng << 'EOF'
+fn main(): int32 =
+    var s = 0
+    for a in 0..<3:
+        var b = 0
+        while b < 3:
+            for c in 0..<3:
+                s = s + 1
+            b = b + 1
+    return s
+EOF
+ACT=$(compile_run_timed "$COLD" /tmp/ct_nested_loops.cheng /tmp/ct_nested_loops_out 10)
+assert "nested_loops" 27 "$ACT"
+rm -f /tmp/ct_nested_loops.cheng /tmp/ct_nested_loops_out
+
+# --- string_compare (== !=) ---
+cat > /tmp/ct_strcmp.cheng << 'EOF'
+fn main(): int32 =
+    let a: str = "hello"
+    let b: str = "hello"
+    let c: str = "world"
+    if a == b:
+        if a != c:
+            return 0
+    return 1
+EOF
+ACT=$(compile_run_timed "$COLD" /tmp/ct_strcmp.cheng /tmp/ct_strcmp_out 10)
+assert "string_compare" 0 "$ACT"
+rm -f /tmp/ct_strcmp.cheng /tmp/ct_strcmp_out
+
+# --- multiple_returns (5 return paths) ---
+cat > /tmp/ct_multi_ret.cheng << 'EOF'
+fn classify(x: int32): int32 =
+    if x < 0:
+        return 1
+    if x == 0:
+        return 2
+    if x > 0 && x < 10:
+        return 3
+    if x >= 10 && x < 100:
+        return 4
+    return 5
+
+fn main(): int32 =
+    let r1 = classify(-5)
+    let r2 = classify(0)
+    let r3 = classify(7)
+    let r4 = classify(50)
+    let r5 = classify(200)
+    return r1 + r2 + r3 + r4 + r5
+EOF
+ACT=$(compile_run_timed "$COLD" /tmp/ct_multi_ret.cheng /tmp/ct_multi_ret_out 10)
+assert "multiple_returns" 15 "$ACT"
+rm -f /tmp/ct_multi_ret.cheng /tmp/ct_multi_ret_out
+
+# --- nested_object_fields (obj.field.subfield read, literal construct) ---
+cat > /tmp/ct_nested_obj.cheng << 'EOF'
+type Inner =
+    val: int32
+
+type Outer =
+    inner: Inner
+    tag: int32
+
+fn main(): int32 =
+    let obj: Outer = Outer{
+        inner: Inner{
+            val: 42,
+        },
+        tag: 1,
+    }
+    return obj.inner.val
+EOF
+ACT=$(compile_run_timed "$COLD" /tmp/ct_nested_obj.cheng /tmp/ct_nested_obj_out 10)
+assert "nested_object_fields" 42 "$ACT"
+rm -f /tmp/ct_nested_obj.cheng /tmp/ct_nested_obj_out
+
+# --- mutual_recursion (forward reference with circular calls) ---
+cat > /tmp/ct_mutual_rec.cheng << 'EOF'
+fn is_even(n: int32): int32 =
+    if n == 0:
+        return 1
+    return is_odd(n - 1)
+
+fn is_odd(n: int32): int32 =
+    if n == 0:
+        return 0
+    return is_even(n - 1)
+
+fn main(): int32 =
+    if is_even(4) != 1: return 1
+    if is_even(5) != 0: return 2
+    if is_odd(3) != 1: return 3
+    if is_odd(6) != 0: return 4
+    return 0
+EOF
+ACT=$(compile_run_timed "$COLD" /tmp/ct_mutual_rec.cheng /tmp/ct_mutual_rec_out 10)
+assert "mutual_recursion" 0 "$ACT"
+rm -f /tmp/ct_mutual_rec.cheng /tmp/ct_mutual_rec_out
+
 echo ""
 echo "=== $PASS passed, $FAIL failed ==="
 [ "$FAIL" -eq 0 ]
