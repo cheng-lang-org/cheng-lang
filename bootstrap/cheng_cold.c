@@ -4220,7 +4220,27 @@ static void symbols_set_fn_generics(Symbols *symbols, int32_t fn_index,
     fn->generic_count = n;
 }
 
-static TypeDef *symbols_find_type(Symbols *symbols, Span name);
+/* Build mangled specialization name: funcName$g<hash> */
+static void cold_specialized_fn_name(Span base_name, int32_t generic_count,
+                                     Span *generic_names,
+                                     int32_t *arg_kinds, int32_t arg_count,
+                                     char *out, size_t cap) {
+    char key[512];
+    int32_t used = snprintf(key, sizeof(key), "%.*s", base_name.len, base_name.ptr);
+    for (int32_t i = 0; i < generic_count && used < (int32_t)sizeof(key) - 4; i++) {
+        const char *kind_str = "?";
+        if (i < arg_count) {
+            if (arg_kinds[i] == SLOT_I32) kind_str = "I32";
+            else if (arg_kinds[i] == SLOT_I64) kind_str = "I64";
+            else if (arg_kinds[i] == SLOT_STR) kind_str = "str";
+        }
+        used += snprintf(key + used, sizeof(key) - (size_t)used,
+                        "|%.*s=%s", generic_names[i].len, generic_names[i].ptr, kind_str);
+    }
+    uint64_t hash = cold_fnv1a64_update_cstr(1469598103934665603ULL, key);
+    snprintf(out, cap, "%.*s$g%016llx", base_name.len, base_name.ptr, (unsigned long long)hash);
+}
+ static TypeDef *symbols_find_type(Symbols *symbols, Span name);
 
 static TypeDef *symbols_add_type(Symbols *symbols, Span name, int32_t variant_count) {
     TypeDef *existing = symbols_find_type(symbols, name);
@@ -6191,15 +6211,19 @@ static uint32_t a64_strb_imm(int rt, int rn, int32_t offset) {
     uint32_t imm = (uint32_t)(offset & 0xFFF);
     return 0x39000000u | (imm << 10) | ((uint32_t)rn << 5) | (uint32_t)rt;
 }
+__attribute__((unused))
 static uint32_t a64_ldr_reg(int rt, int rn, int rm, bool x) {
     return (x ? 0xF8606800u : 0xB8606800u) | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rt;
 }
+__attribute__((unused))
 static uint32_t a64_str_reg(int rt, int rn, int rm, bool x) {
     return (x ? 0xF8206800u : 0xB8206800u) | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rt;
 }
+__attribute__((unused))
 static uint32_t a64_ldrb_reg(int rt, int rn, int rm) {
     return 0x38606800u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rt;
 }
+__attribute__((unused))
 static uint32_t a64_strb_reg(int rt, int rn, int rm) {
     return 0x38206800u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rt;
 }
@@ -6631,6 +6655,7 @@ static void a64_emit_add_large(Code *code, int rd, int rn, int32_t value, bool x
 }
 
 /* Emit movz/movk sequence to load an arbitrary 64-bit value into rd. */
+__attribute__((unused))
 static void a64_emit_mov_large(Code *code, int rd, uint64_t value) {
     int sft = 0;
     bool first = true;
@@ -6650,16 +6675,17 @@ static void a64_emit_mov_large(Code *code, int rd, uint64_t value) {
 
 /* Load from SP with potentially large unsigned offset.
    For offsets within scaled 12-bit range (and properly aligned), use
-   immediate encoding.  Otherwise load offset into X9 and use register-offset
-   addressing: ldr rt, [sp, x9]. */
+   immediate encoding.  Otherwise compute address in scratch register
+   via a64_emit_add_large (ADD immediate which supports SP), then load. */
 static void a64_emit_ldr_sp_off(Code *code, int rt, int32_t offset, bool x64) {
     int32_t max_off = x64 ? 32760 : 16380;
     int32_t align  = x64 ? 7 : 3;
     if (offset >= 0 && offset <= max_off && (offset & align) == 0) {
         code_emit(code, a64_ldr_imm(rt, SP, offset, x64));
     } else {
-        a64_emit_mov_large(code, 9, (uint64_t)(uint32_t)offset);
-        code_emit(code, a64_ldr_reg(rt, SP, 9, x64));
+        int scratch = rt == 16 ? 10 : 16;
+        a64_emit_add_large(code, scratch, SP, offset, true);
+        code_emit(code, a64_ldr_imm(rt, scratch, 0, x64));
     }
 }
 
@@ -6670,19 +6696,21 @@ static void a64_emit_str_sp_off(Code *code, int rt, int32_t offset, bool x64) {
     if (offset >= 0 && offset <= max_off && (offset & align) == 0) {
         code_emit(code, a64_str_imm(rt, SP, offset, x64));
     } else {
-        int scratch = rt == 9 ? 10 : 9;
-        a64_emit_mov_large(code, scratch, (uint64_t)(uint32_t)offset);
-        code_emit(code, a64_str_reg(rt, SP, scratch, x64));
+        int scratch = rt == 16 ? 10 : 16;
+        a64_emit_add_large(code, scratch, SP, offset, true);
+        code_emit(code, a64_str_imm(rt, scratch, 0, x64));
     }
 }
 
 /* Byte load from SP with potentially large offset. */
+__attribute__((unused))
 static void a64_emit_ldrb_sp_off(Code *code, int rt, int32_t offset) {
     if (offset >= 0 && offset <= 4095) {
         code_emit(code, a64_ldrb_imm(rt, SP, offset));
     } else {
-        a64_emit_mov_large(code, 9, (uint64_t)(uint32_t)offset);
-        code_emit(code, a64_ldrb_reg(rt, SP, 9));
+        int scratch = rt == 16 ? 10 : 16;
+        a64_emit_add_large(code, scratch, SP, offset, true);
+        code_emit(code, a64_ldrb_imm(rt, scratch, 0));
     }
 }
 
@@ -6691,9 +6719,9 @@ static void a64_emit_strb_sp_off(Code *code, int rt, int32_t offset) {
     if (offset >= 0 && offset <= 4095) {
         code_emit(code, a64_strb_imm(rt, SP, offset));
     } else {
-        int scratch = rt == 9 ? 10 : 9;
-        a64_emit_mov_large(code, scratch, (uint64_t)(uint32_t)offset);
-        code_emit(code, a64_strb_reg(rt, SP, scratch));
+        int scratch = rt == 16 ? 10 : 16;
+        a64_emit_add_large(code, scratch, SP, offset, true);
+        code_emit(code, a64_strb_imm(rt, scratch, 0));
     }
 }
 
