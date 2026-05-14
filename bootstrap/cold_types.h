@@ -330,6 +330,7 @@ enum {
     BODY_OP_STR_SELECT_NONEMPTY = 131,
     BODY_OP_CLOSURE_NEW = 132,
     BODY_OP_CLOSURE_CALL = 133,
+    BODY_OP_PATH_WRITE_BYTES = 134,
 };
 
 enum {
@@ -492,6 +493,8 @@ typedef struct FnDef {
     int32_t arity;
     int32_t param_kind[COLD_MAX_I32_PARAMS];
     int32_t param_size[COLD_MAX_I32_PARAMS];
+    bool param_has_default[COLD_MAX_I32_PARAMS];
+    int32_t param_default_value[COLD_MAX_I32_PARAMS];
     Span ret;
     bool is_external;
     Span generic_names[4];

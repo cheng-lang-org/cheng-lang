@@ -3364,6 +3364,7 @@ enum {
     BODY_OP_STR_SELECT_NONEMPTY = 131,
     BODY_OP_CLOSURE_NEW = 132,
     BODY_OP_CLOSURE_CALL = 133,
+    BODY_OP_PATH_WRITE_BYTES = 134,
 };
 
 enum {
@@ -4065,6 +4066,8 @@ typedef struct FnDef {
     int32_t arity;
     int32_t param_kind[COLD_MAX_I32_PARAMS];
     int32_t param_size[COLD_MAX_I32_PARAMS];
+    bool param_has_default[COLD_MAX_I32_PARAMS];
+    int32_t param_default_value[COLD_MAX_I32_PARAMS];
     Span ret;
     bool is_external;
     Span generic_names[4];
@@ -15672,6 +15675,89 @@ int32_t cold_collect_direct_import_sources(Span entry_source,
     return count;
 }
 
+static bool cold_import_source_exists(ColdImportSource *imports,
+                                      int32_t import_count,
+                                      Span alias,
+                                      const char *path) {
+    for (int32_t i = 0; i < import_count; i++) {
+        if (!span_same(imports[i].alias, alias)) continue;
+        if (strcmp(imports[i].path, path) == 0) return true;
+        die("cold duplicate import alias maps to different source");
+    }
+    return false;
+}
+
+static void cold_collect_import_sources_rec(Symbols *symbols,
+                                            Span source,
+                                            ColdImportSource *imports,
+                                            int32_t import_cap,
+                                            int32_t *import_count,
+                                            char visited[][PATH_MAX],
+                                            int32_t *visited_count,
+                                            int32_t depth) {
+    if (depth > 32) return;
+    int32_t pos = 0;
+    bool in_triple = false;
+    while (pos < source.len) {
+        int32_t start = pos;
+        while (pos < source.len && source.ptr[pos] != '\n') pos++;
+        int32_t end = pos;
+        if (pos < source.len) pos++;
+        Span line = span_sub(source, start, end);
+        if (in_triple) {
+            if (cold_line_has_triple_quote(line)) in_triple = false;
+            continue;
+        }
+        if (!cold_line_top_level(line)) {
+            if (cold_line_has_triple_quote(line)) in_triple = true;
+            continue;
+        }
+        Span module_path = {0};
+        Span alias = {0};
+        if (!cold_parse_import_line(span_trim(line), &module_path, &alias)) continue;
+        char path[PATH_MAX];
+        if (!cold_import_source_path(module_path, path, sizeof(path))) {
+            die("cold import path is not resolvable");
+        }
+        if (!cold_import_source_exists(imports, *import_count, alias, path)) {
+            if (*import_count >= import_cap) die("too many cold import sources");
+            imports[*import_count].alias = cold_arena_span_copy(symbols->arena, alias);
+            strncpy(imports[*import_count].path, path, PATH_MAX - 1);
+            imports[*import_count].path[PATH_MAX - 1] = 0;
+            (*import_count)++;
+        }
+        char abs_path[PATH_MAX];
+        cold_absolute_path(path, abs_path, sizeof(abs_path));
+        bool seen = false;
+        for (int32_t vi = 0; vi < *visited_count; vi++) {
+            if (strcmp(visited[vi], abs_path) == 0) { seen = true; break; }
+        }
+        if (seen) continue;
+        if (*visited_count >= 64) die("too many cold transitive import sources");
+        strncpy(visited[*visited_count], abs_path, PATH_MAX - 1);
+        visited[*visited_count][PATH_MAX - 1] = 0;
+        (*visited_count)++;
+        Span sub_source = source_open(path);
+        if (sub_source.len <= 0) die("cold import source open failed");
+        cold_collect_import_sources_rec(symbols, sub_source, imports, import_cap,
+                                        import_count, visited, visited_count,
+                                        depth + 1);
+        munmap((void *)sub_source.ptr, (size_t)sub_source.len);
+    }
+}
+
+static int32_t cold_collect_import_source_closure(Symbols *symbols,
+                                                  Span entry_source,
+                                                  ColdImportSource *imports,
+                                                  int32_t import_cap) {
+    int32_t import_count = 0;
+    char visited[64][PATH_MAX];
+    int32_t visited_count = 0;
+    cold_collect_import_sources_rec(symbols, entry_source, imports, import_cap,
+                                    &import_count, visited, &visited_count, 0);
+    return import_count;
+}
+
 static bool cold_import_symbol_parts(Span qualified_name, Span *alias, Span *local_name) {
     int32_t dot = cold_span_find_char(qualified_name, '.');
     if (dot <= 0 || dot + 1 >= qualified_name.len) return false;
@@ -15706,7 +15792,16 @@ static bool cold_import_function_symbol_matches(Symbols *symbols,
                                                   symbol->return_type);
     int32_t resolved = symbols_find_fn(symbols, qualified_name, arity, kinds, sizes,
                                        qualified_ret);
-    return resolved == target_fn;
+    if (resolved == target_fn) return true;
+    int32_t same_name_count = 0;
+    int32_t same_name_index = -1;
+    for (int32_t i = 0; i < symbols->function_count; i++) {
+        if (!span_same(symbols->functions[i].name, qualified_name)) continue;
+        same_name_count++;
+        same_name_index = i;
+        if (same_name_count > 1) break;
+    }
+    return same_name_count == 1 && same_name_index == target_fn;
 }
 
 static void cold_compile_import_function_direct(Symbols *symbols,
@@ -15766,8 +15861,9 @@ static void cold_compile_import_function_direct(Symbols *symbols,
             continue;
         }
         if (!span_same(symbol.name, local_name)) continue;
-        if (!cold_import_function_symbol_matches(symbols, import_source, &symbol,
-                                                target_fn)) {
+        bool symbol_matches = cold_import_function_symbol_matches(symbols, import_source, &symbol,
+                                                                  target_fn);
+        if (!symbol_matches) {
             continue;
         }
         if (!symbol.has_body) {
@@ -16084,6 +16180,9 @@ static void cold_collect_transitive_imports_rec(Symbols *symbols, Span source,
         if (sub_source.len <= 0) continue;
         ColdErrorRecoveryEnabled = true;
         if (setjmp(ColdErrorJumpBuf) == 0) {
+            cold_collect_import_module_types_from_path(symbols, alias, module_path);
+            symbols_refine_object_layouts(symbols);
+            cold_collect_import_module_signatures(symbols, alias, module_path);
             cold_collect_imported_function_signatures(symbols, sub_source);
         } else {
             /* Transitive type loading skipped (depth/visited limit) */
@@ -16126,11 +16225,13 @@ bool cold_compile_source_path_to_macho(const char *out_path,
     if (src_path && src_path[0] != '\0') {
         mapped_source = source_open(src_path);
         if (mapped_source.len <= 0) return false;
-        import_source_count = cold_collect_direct_import_sources(mapped_source,
+        import_source_count = cold_collect_import_source_closure(symbols,
+                                                                 mapped_source,
                                                                  import_sources,
                                                                  64);
         cold_collect_imported_function_signatures(symbols, mapped_source);
         cold_collect_function_signatures(symbols, mapped_source);
+        cold_collect_all_transitive_imports(symbols, mapped_source);
         { char ws_root[PATH_MAX] = {0};
           const char *sm = strstr(src_path, "/src/");
           if (!sm) sm = strstr(src_path, "src/");

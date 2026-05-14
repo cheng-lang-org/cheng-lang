@@ -56,9 +56,12 @@ Span cold_import_default_alias(Span module_path);
 void cold_collect_imported_function_signatures(Symbols *symbols, Span source);
 void cold_collect_function_signatures(Symbols *symbols, Span source);
 void cold_collect_import_module_types(Symbols *symbols, Span alias, Span source);
+void cold_collect_import_module_types_from_path(Symbols *symbols, Span alias,
+                                                Span module_path);
 void cold_collect_import_module_enum_blocks(Symbols *symbols, Span alias, Span source);
 void cold_collect_import_module_consts(Symbols *symbols, Span alias, Span source);
 void cold_collect_import_module_signatures(Symbols *symbols, Span alias, Span source);
+void symbols_refine_object_layouts(Symbols *symbols);
 
 /* ================================================================
  * Source type/const/function/expression parsing

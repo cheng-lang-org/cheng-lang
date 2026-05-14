@@ -1110,6 +1110,29 @@ void cold_collect_function_signatures(Symbols *symbols, Span source) {
             fn->generic_count = symbol.generic_count;
             for (int32_t gi = 0; gi < symbol.generic_count && gi < 4; gi++)
                 fn->generic_names[gi] = symbol.generic_names[gi];
+            /* Re-parse params to find default values (= <int32> after type) */
+            Parser pp = {symbol.params, 0, 0, 0};
+            int32_t pi = 0;
+            while (pp.pos < pp.source.len && pi < arity) {
+                (void)parser_token(&pp); /* param name */
+                if (span_eq(parser_peek(&pp), ":")) {
+                    (void)parser_token(&pp);
+                    (void)parser_take_type_span(&pp); /* skip type */
+                }
+                if (span_eq(parser_peek(&pp), "=")) {
+                    (void)parser_token(&pp);
+                    Span val = parser_token(&pp);
+                    if (span_is_i32(val)) {
+                        fn->param_has_default[pi] = true;
+                        fn->param_default_value[pi] = span_i32(val);
+                    }
+                }
+                while (pp.pos < pp.source.len &&
+                       !span_eq(parser_peek(&pp), ",") &&
+                       !span_eq(parser_peek(&pp), ")")) (void)parser_token(&pp);
+                if (span_eq(parser_peek(&pp), ",")) (void)parser_token(&pp);
+                pi++;
+            }
         }
     }
 }
@@ -1739,8 +1762,16 @@ bool cold_try_bootstrap_intrinsic(BodyIR *body, Span name,
                                          int32_t arg_start, int32_t arg_count,
                                          int32_t *slot_out, int32_t *kind_out);
 
+static bool cold_trailing_params_have_defaults(FnDef *fn, int32_t arg_count) {
+    for (int32_t pi = arg_count; pi < fn->arity; pi++) {
+        if (!fn->param_has_default[pi]) return false;
+    }
+    return true;
+}
+
 bool cold_validate_call_args(BodyIR *body, FnDef *fn, int32_t arg_start, int32_t arg_count, bool import_mode) {
-    if (arg_count != fn->arity) { return false; }
+    if (arg_count > fn->arity) { return false; }
+    if (arg_count < fn->arity && !cold_trailing_params_have_defaults(fn, arg_count)) { return false; }
     for (int32_t i = 0; i < arg_count; i++) {
         int32_t arg_slot = body->call_arg_slot[arg_start + i];
         int32_t arg_kind = body->slot_kind[arg_slot];
@@ -1890,7 +1921,32 @@ int32_t symbols_find_fn_for_call(Symbols *symbols, Span name,
         found = i;
     }
     if (found >= 0) return found;
-    /* second pass: OPAQUE-tolerant match (for CSG lowerer with less precise types) */
+    /* second pass: allow fewer args when trailing params have defaults */
+    for (int32_t i = 0; i < symbols->function_count; i++) {
+        FnDef *fn = &symbols->functions[i];
+        if (fn->arity <= arg_count || !span_same(fn->name, name)) continue;
+        if (!cold_trailing_params_have_defaults(fn, arg_count)) continue;
+        /* Match only the supplied args (first arg_count params) */
+        bool match = true;
+        for (int32_t p = 0; p < arg_count; p++) {
+            int32_t arg_slot = body->call_arg_slot[arg_start + p];
+            int32_t arg_kind = body->slot_kind[arg_slot];
+            int32_t param_kind = fn->param_kind[p];
+            if (arg_kind == param_kind) continue;
+            if ((param_kind == SLOT_OPAQUE || param_kind == SLOT_OPAQUE_REF) &&
+                (arg_kind == SLOT_I32 || arg_kind == SLOT_I64 ||
+                 arg_kind == SLOT_I32_REF || arg_kind == SLOT_I64_REF ||
+                 arg_kind == SLOT_OBJECT || arg_kind == SLOT_OBJECT_REF ||
+                 arg_kind == SLOT_VARIANT || arg_kind == SLOT_OPAQUE || arg_kind == SLOT_OPAQUE_REF)) continue;
+            match = false;
+            break;
+        }
+        if (!match) continue;
+        if (found >= 0) continue;
+        found = i;
+    }
+    if (found >= 0) return found;
+    /* third pass: OPAQUE-tolerant match (for CSG lowerer with less precise types) */
     for (int32_t i = 0; i < symbols->function_count; i++) {
         FnDef *fn = &symbols->functions[i];
         if (fn->arity != arg_count || !span_same(fn->name, name)) continue;
@@ -2277,6 +2333,16 @@ int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *locals,
         if (kind_out) *kind_out = SLOT_I32;
         return slot;
     }
+    /* Fill in default values for missing trailing params */
+    if (arg_count < fn->arity) {
+        for (int32_t pi = arg_count; pi < fn->arity; pi++) {
+            if (fn->param_has_default[pi]) {
+                int32_t def_slot = cold_make_i32_const_slot(body, fn->param_default_value[pi]);
+                body_call_arg(body, def_slot);
+            }
+        }
+        arg_count = fn->arity;
+    }
     int32_t ret_kind = cold_return_kind_from_span(parser->symbols, fn->ret);
     int32_t slot = body_slot(body, ret_kind, cold_return_slot_size(parser->symbols, fn->ret, ret_kind));
     body_slot_set_type(body, slot, fn->ret);
@@ -2493,6 +2559,16 @@ int32_t parse_call_from_args_span(Parser *owner, BodyIR *body, Locals *locals,
         body_op(body, BODY_OP_I32_CONST, slot, 0, 0);
         if (kind_out) *kind_out = SLOT_I32;
         return slot;
+    }
+    /* Fill in default values for missing trailing params */
+    if (arg_count < fn->arity) {
+        for (int32_t pi = arg_count; pi < fn->arity; pi++) {
+            if (fn->param_has_default[pi]) {
+                int32_t def_slot = cold_make_i32_const_slot(body, fn->param_default_value[pi]);
+                body_call_arg(body, def_slot);
+            }
+        }
+        arg_count = fn->arity;
     }
     int32_t ret_kind = cold_return_kind_from_span(owner->symbols, fn->ret);
     int32_t slot = body_slot(body, ret_kind, cold_return_slot_size(owner->symbols, fn->ret, ret_kind));
@@ -3595,6 +3671,45 @@ bool cold_try_os_intrinsic(Parser *parser, BodyIR *body, Span name,
         *slot_out = slot;
         return true;
     }
+    if (span_eq(name, "os.WriteFileBytes") || span_eq(name, "WriteFileBytes") ||
+        span_eq(name, "os.writeFileBytes") || span_eq(name, "writeFileBytes")) {
+        if (arg_count != 2) die("WriteFileBytes arity mismatch");
+        int32_t path = body->call_arg_slot[arg_start];
+        int32_t bytes = body->call_arg_slot[arg_start + 1];
+        path = cold_require_str_value(body, path, "WriteFileBytes path");
+        int32_t bytes_kind = body->slot_kind[bytes];
+        int32_t data_slot = -1;
+        int32_t len_slot = -1;
+        if (bytes_kind == SLOT_SEQ_OPAQUE || bytes_kind == SLOT_SEQ_OPAQUE_REF) {
+            len_slot = body_slot(body, SLOT_I32, 4);
+            body_op3(body, BODY_OP_PAYLOAD_LOAD, len_slot, bytes, 0, 4);
+            data_slot = body_slot(body, SLOT_PTR, 8);
+            body_op3(body, BODY_OP_PAYLOAD_LOAD, data_slot, bytes, 8, 8);
+        } else if (bytes_kind == SLOT_OBJECT || bytes_kind == SLOT_OBJECT_REF) {
+            ObjectDef *object = symbols_resolve_object(parser->symbols, body->slot_type[bytes]);
+            if (!object) object = symbols_resolve_object(parser->symbols, cold_cstr_span("Bytes"));
+            if (!object) die("WriteFileBytes bytes object type missing");
+            ObjectField *data_field = object_find_field(object, cold_cstr_span("data"));
+            if (!data_field) data_field = object_find_field(object, cold_cstr_span("buffer"));
+            ObjectField *len_field = object_find_field(object, cold_cstr_span("len"));
+            if (!data_field || !len_field) die("WriteFileBytes bytes layout mismatch");
+            data_slot = body_slot_for_object_field(body, data_field);
+            len_slot = body_slot_for_object_field(body, len_field);
+            body_op3(body, BODY_OP_PAYLOAD_LOAD, data_slot, bytes, data_field->offset, data_field->size);
+            body_op3(body, BODY_OP_PAYLOAD_LOAD, len_slot, bytes, len_field->offset, len_field->size);
+        } else {
+            die("WriteFileBytes expects uint8[] or Bytes");
+        }
+        if (body->slot_kind[len_slot] != SLOT_I32) die("WriteFileBytes len must be int32");
+        if (body->slot_kind[data_slot] != SLOT_PTR && body->slot_kind[data_slot] != SLOT_OPAQUE) {
+            die("WriteFileBytes data must be ptr");
+        }
+        int32_t slot = body_slot(body, SLOT_I32, 4);
+        body_op3(body, BODY_OP_PATH_WRITE_BYTES, slot, path, data_slot, len_slot);
+        if (kind_out) *kind_out = SLOT_I32;
+        *slot_out = slot;
+        return true;
+    }
     if (cold_name_is_param_str(name)) {
         if (arg_count != 1) die("paramStr intrinsic arity mismatch");
         int32_t index_slot = body->call_arg_slot[arg_start];
@@ -4690,8 +4805,8 @@ bool cold_try_backend_intrinsic(Parser *parser, BodyIR *body, Span name,
         }
         return true;
     }
-    if (span_eq(name, "lower.BuildLoweringPlanStubFromCompilerCsg") ||
-        span_eq(name, "BuildLoweringPlanStubFromCompilerCsg")) {
+    if (0 && (span_eq(name, "lower.BuildLoweringPlanStubFromCompilerCsg") ||
+        span_eq(name, "BuildLoweringPlanStubFromCompilerCsg"))) {
         if (arg_count != 4) die("BuildLoweringPlanStubFromCompilerCsg arity mismatch");
         int32_t link_plan = body->call_arg_slot[arg_start];
         int32_t csg = body->call_arg_slot[arg_start + 1];
@@ -4828,8 +4943,8 @@ bool cold_try_backend_intrinsic(Parser *parser, BodyIR *body, Span name,
         *slot_out = ok_slot;
         return true;
     }
-    if (span_eq(name, "pobj.BuildPrimaryObjectPlan") ||
-        span_eq(name, "BuildPrimaryObjectPlan")) {
+    if (0 && (span_eq(name, "pobj.BuildPrimaryObjectPlan") ||
+        span_eq(name, "BuildPrimaryObjectPlan"))) {
         if (arg_count != 2) die("BuildPrimaryObjectPlan arity mismatch");
         int32_t link_plan = body->call_arg_slot[arg_start];
         int32_t lowering = body->call_arg_slot[arg_start + 1];
@@ -4969,8 +5084,8 @@ int32_t cold_make_csg_edge_slot(BodyIR *body, ObjectDef *edge_obj,
 bool cold_try_csg_intrinsic(Parser *parser, BodyIR *body, Span name,
                                    int32_t arg_start, int32_t arg_count,
                                    int32_t *slot_out, int32_t *kind_out) {
-    if (span_eq(name, "ccsg.BuildCompilerCsgInto") ||
-        span_eq(name, "BuildCompilerCsgInto")) {
+    if (0 && (span_eq(name, "ccsg.BuildCompilerCsgInto") ||
+        span_eq(name, "BuildCompilerCsgInto"))) {
         if (arg_count != 4) die("BuildCompilerCsgInto arity mismatch");
         int32_t link_plan = body->call_arg_slot[arg_start];
         int32_t source_bundle_cid = body->call_arg_slot[arg_start + 1];
@@ -6231,12 +6346,10 @@ int32_t parse_expr_from_span(Parser *owner, BodyIR *body, Locals *locals,
     int32_t slot = parse_expr(&expr_parser, body, locals, kind);
     parser_ws(&expr_parser);
     if (expr_parser.pos != expr_parser.source.len) {
-        /* Trailing tokens in expression: return 0 */
-        body->has_fallback = true;
-        int32_t zero = body_slot(body, SLOT_I32, 4);
-        body_op(body, BODY_OP_I32_CONST, zero, 0, 0);
-        *kind = SLOT_I32;
-        return zero;
+        fprintf(stderr, "cheng_cold: %s: %.*s\n",
+                trailing_message ? trailing_message : "unsupported expression",
+                (int)expr.len, expr.ptr);
+        die(trailing_message ? trailing_message : "unsupported expression");
     }
     return slot;
 }
@@ -8317,6 +8430,8 @@ BodyIR *parse_fn(Parser *parser, int32_t *symbol_index_out) {
     Span param_types[COLD_MAX_I32_PARAMS];
     int32_t param_kinds[COLD_MAX_I32_PARAMS];
     int32_t param_sizes[COLD_MAX_I32_PARAMS];
+    bool param_has_default[COLD_MAX_I32_PARAMS] = {0};
+    int32_t param_default_value[COLD_MAX_I32_PARAMS] = {0};
     while (!span_eq(parser_peek(parser), ")")) {
         Span param = parser_token(parser);
         if (param.len == 0) die("unterminated params");
@@ -8331,6 +8446,15 @@ BodyIR *parse_fn(Parser *parser, int32_t *symbol_index_out) {
             param_types[arity] = param_type;
             param_kinds[arity] = cold_slot_kind_from_type_with_symbols(parser->symbols, param_type);
             param_sizes[arity] = cold_param_size_from_type(parser->symbols, param_type, param_kinds[arity]);
+        }
+        /* Check for default value: param: Type = value */
+        if (span_eq(parser_peek(parser), "=")) {
+            (void)parser_token(parser);
+            Span def_span = parser_token(parser);
+            if (span_is_i32(def_span)) {
+                param_has_default[arity] = true;
+                param_default_value[arity] = span_i32(def_span);
+            }
         }
         arity++;
         while (!span_eq(parser_peek(parser), ",") &&
@@ -8352,6 +8476,13 @@ BodyIR *parse_fn(Parser *parser, int32_t *symbol_index_out) {
             symbol_index = symbols_add_fn(parser->symbols, fn_name, arity,
                                           param_kinds, param_sizes, ret);
         }
+        /* Copy default param values to FnDef */
+        if (symbol_index >= 0 && symbol_index < parser->symbols->function_count) {
+            for (int32_t di = 0; di < arity; di++) {
+                parser->symbols->functions[symbol_index].param_has_default[di] = param_has_default[di];
+                parser->symbols->functions[symbol_index].param_default_value[di] = param_default_value[di];
+            }
+        }
         if (import_name.len > 0) symbols_set_fn_link_name(parser->symbols, symbol_index, import_name);
         if (export_name.len > 0) symbols_set_fn_link_name(parser->symbols, symbol_index, export_name);
         if (import_name.len > 0 && symbol_index >= 0 && symbol_index < parser->symbols->function_count)
@@ -8368,6 +8499,13 @@ BodyIR *parse_fn(Parser *parser, int32_t *symbol_index_out) {
     } else {
         symbol_index = symbols_add_fn(parser->symbols, fn_name, arity,
                                       param_kinds, param_sizes, ret);
+    }
+    /* Copy default param values to FnDef */
+    if (symbol_index >= 0 && symbol_index < parser->symbols->function_count) {
+        for (int32_t di = 0; di < arity; di++) {
+            parser->symbols->functions[symbol_index].param_has_default[di] = param_has_default[di];
+            parser->symbols->functions[symbol_index].param_default_value[di] = param_default_value[di];
+        }
     }
     if (import_name.len > 0) symbols_set_fn_link_name(parser->symbols, symbol_index, import_name);
     if (export_name.len > 0) symbols_set_fn_link_name(parser->symbols, symbol_index, export_name);
@@ -8415,10 +8553,44 @@ BodyIR *parse_fn(Parser *parser, int32_t *symbol_index_out) {
     }
     int32_t block = body_block(body);
 
-    int32_t body_indent = parser_next_indent(parser);
-    int32_t end_block = parse_statements_until(parser, body, &locals, block, body_indent, 0, 0);
-    if (body->block_term[end_block] < 0) {
-        if (cold_return_span_is_void(ret)) {
+    if (cold_same_line_has_content(parser)) {
+        /* Inline body: body on same line as '='. Parse expression or statement
+           and stop — do not use parse_statements_until which would consume
+           the next top-level declaration at the same indent level. */
+        Span first = parser_peek(parser);
+        if (span_eq(first, "return") || span_eq(first, "if") ||
+            span_eq(first, "while") || span_eq(first, "for") ||
+            span_eq(first, "var") || span_eq(first, "let") ||
+            span_eq(first, "match") || span_eq(first, "{")) {
+            /* Inline statement(s) */
+            parse_inline_statements(parser, body, &locals, block, 0);
+        } else {
+            /* Bare expression: add implicit return */
+            int32_t kind = body->return_kind;
+            int32_t slot = parse_expr(parser, body, &locals, &kind);
+            if (kind == SLOT_I32) body_op(body, BODY_OP_LOAD_I32, slot, 0, 0);
+            int32_t term = body_term(body, BODY_TERM_RET, slot, -1, 0, -1, -1);
+            body_end_block(body, block, term);
+        }
+        /* Advance past current line so main parse loop finds next decl */
+        if (parser->pos < parser->source.len) {
+            while (parser->pos < parser->source.len &&
+                   parser->source.ptr[parser->pos] != '\n') parser->pos++;
+            if (parser->pos < parser->source.len) parser->pos++;
+        }
+    } else {
+        int32_t body_indent = parser_next_indent(parser);
+        int32_t end_block = parse_statements_until(parser, body, &locals, block, body_indent, 0, 0);
+        if (body->block_term[end_block] < 0) {
+            if (cold_return_span_is_void(ret)) {
+                int32_t zero = body_slot(body, SLOT_I32, 4);
+                body_op(body, BODY_OP_I32_CONST, zero, 0, 0);
+                body_op(body, BODY_OP_LOAD_I32, zero, 0, 0);
+                int32_t term = body_term(body, BODY_TERM_RET, zero, -1, 0, -1, -1);
+                body_end_block(body, end_block, term);
+                return body;
+            }
+            /* Auto-terminate function body with ret 0 */
             int32_t zero = body_slot(body, SLOT_I32, 4);
             body_op(body, BODY_OP_I32_CONST, zero, 0, 0);
             body_op(body, BODY_OP_LOAD_I32, zero, 0, 0);
@@ -8426,17 +8598,9 @@ BodyIR *parse_fn(Parser *parser, int32_t *symbol_index_out) {
             body_end_block(body, end_block, term);
             return body;
         }
-        /* Auto-terminate function body with ret 0 */
-        /* Add default return 0 using same pattern as void return above */
-        int32_t zero = body_slot(body, SLOT_I32, 4);
-        body_op(body, BODY_OP_I32_CONST, zero, 0, 0);
-        body_op(body, BODY_OP_LOAD_I32, zero, 0, 0);
-        int32_t term = body_term(body, BODY_TERM_RET, zero, -1, 0, -1, -1);
-        body_end_block(body, end_block, term);
-        return body;
-    }
-    if (body && body->block_count > 0 && body->block_term[0] < 0) {
-        body->has_fallback = true;
+        if (body && body->block_count > 0 && body->block_term[0] < 0) {
+            body->has_fallback = true;
+        }
     }
     return body;
 }

@@ -1370,7 +1370,22 @@ ACT=$(compile_run /tmp/ct_global_const.cheng /tmp/ct_global_const_out)
 assert "global_const" 42 "$ACT"
 rm -f /tmp/ct_global_const.cheng /tmp/ct_global_const_out
 
-# 25: bitwise AND/OR/XOR
+# 25: default parameter values
+cat > /tmp/ct_default_param.cheng << 'EOF'
+fn add(x: int32, y: int32 = 10): int32 = x + y
+
+fn main(): int32 =
+    if add(5, 3) != 8: return 1
+    if add(5) != 15: return 2
+    if add(0) != 10: return 3
+    if add(100, 200) != 300: return 4
+    return 0
+EOF
+ACT=$(compile_run /tmp/ct_default_param.cheng /tmp/ct_default_param_out)
+assert "default_param" 0 "$ACT"
+rm -f /tmp/ct_default_param.cheng /tmp/ct_default_param_out
+
+# 26: bitwise AND/OR/XOR
 cat > /tmp/ct_bitwise_ops.cheng << 'EOF'
 fn main(): int32 =
     let a: int32 = 12 & 10
