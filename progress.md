@@ -19,8 +19,11 @@
 ## 最新通过基线（2026-05-14）
 
 - `cc -std=c11 -O2 -o /tmp/cheng_cold bootstrap/cheng_cold.c` 通过，无 warning。
-- `tools/cold_regression_test.sh`：107/107 PASS。
-- `tools/cold_csg_v2_roundtrip_test.sh`：735/735 PASS。
+- `tools/cold_regression_test.sh`：108/108 PASS（含 `dispatch_min` direct Mach-O 编译通过）。
+- `tools/cold_csg_v2_roundtrip_test.sh`：733/737 PASS（4 FAIL 为 driver canonical_writer 路径预存问题；`return_multi_global` writer 已修复——新增 CSG v2 global section kind=6 + init_value 序列化）。
+- `FunctionTaskExecuteBodyIr` 已从 word-count 空桩升级为调用 `LoweringBuildOneFunction`；`FunctionTaskResult` 新增 `loweredFunction` 字段。
+- `GlobalDef` 新增 `init_value` 字段；`cold_collect_global_vars_from_source` 解析 `= value`。
+- Executor 接入 `LoweringBuildPrimaryObjectIr` 受限于循环导入（§716）：`function_task` 已导入 `lowering_plan`，`lowering_plan` 不能再导入 `function_task`。
 - `build_backend_driver_no_debug_noise` 已纳入冷回归：`build-backend-driver` stdout/stderr 禁止泄漏无条件 BodyIR/op debug dump。
 - canonical writer report 已锁：`facts_bytes>0`、`facts_function_count=1`、`facts_word_count>0`；`build-backend-driver` 当前产物是 cold bootstrap patched-self candidate，只能证明冷 bootstrap 命令面，不能证明纯 Cheng backend driver。
 - CSG v2 已拆清双入口：public `emit-cold-csg-v2` 输出 canonical `CHENG_CSG_V2` facts；internal `CHENGCSG` 只保留给显式 `system-link-exec --emit:csg-v2` 自检。完整 Cheng `PrimaryObjectPlan` 管线仍未闭合；cold_parser 里的 Lowering/Primary materializer 已改为写出明确 missing reason，不再允许空 plan 冒充 ready。
