@@ -4118,6 +4118,18 @@ int32_t symbols_add_fn(Symbols *symbols, Span name, int32_t arity,
     return symbols->function_count - 1;
 }
 
+static void symbols_set_fn_generics(Symbols *symbols, int32_t fn_index,
+                                     Span *generic_names, int32_t generic_count) {
+    if (!symbols || fn_index < 0 || fn_index >= symbols->function_count) return;
+    if (!generic_names || generic_count <= 0) return;
+    FnDef *fn = &symbols->functions[fn_index];
+    int32_t n = generic_count < 4 ? generic_count : 4;
+    for (int32_t i = 0; i < n; i++) {
+        fn->generic_names[i] = generic_names[i];
+    }
+    fn->generic_count = n;
+}
+
 static TypeDef *symbols_find_type(Symbols *symbols, Span name);
 
 static TypeDef *symbols_add_type(Symbols *symbols, Span name, int32_t variant_count) {
@@ -4940,6 +4952,8 @@ typedef struct ColdCsgFunction {
     int32_t stmt_start;
     int32_t stmt_count;
     int32_t symbol_index;
+    Span generic_names[4];
+    int32_t generic_count;
 } ColdCsgFunction;
 
 typedef struct ColdCsg {
@@ -5300,7 +5314,11 @@ static void cold_csg_finalize(ColdCsg *csg) {
                                                         kinds,
                                                         sizes,
                                                         csg->functions[i].ret);
-    }
+if (csg->functions[i].generic_count > 0)
+           symbols_set_fn_generics(csg->symbols, csg->functions[i].symbol_index,
+                                   csg->functions[i].generic_names,
+                                   csg->functions[i].generic_count);
+     }
     int32_t prev_fn = -1;
     for (int32_t i = 0; i < csg->stmt_count; i++) {
         ColdCsgStmt *stmt = &csg->stmts[i];
@@ -11345,6 +11363,161 @@ static bool cold_op_reads_dst_slot(int32_t kind) {
     }
 }
 
+/* Check if two op indices are in the same basic block.
+   BodyIR blocks are stored contiguously in the op array, so a linear scan
+   over the small number of blocks is sufficient for cold compilation scale. */
+static bool cold_is_same_block_as(BodyIR *body, int32_t idx_a, int32_t idx_b) {
+    if (idx_a < 0 || idx_b < 0 || !body) return false;
+    for (int32_t b = 0; b < body->block_count; b++) {
+        int32_t start = body->block_op_start[b];
+        int32_t end = start + body->block_op_count[b];
+        if (idx_a >= start && idx_a < end) {
+            return (idx_b >= start && idx_b < end);
+        }
+    }
+    return false;
+}
+
+/* Algebraic identity rewrites (constant folding for provably-correct patterns).
+   These are safe because the rewrites are mathematically provable algebraic
+   identities, independent of BodyIR slot mutability:
+     ADD/SUB(x, 0) -> COPY(x)
+     MUL(x, 0) -> CONST 0
+     MUL(x, 1) -> COPY(x)
+     DIV(x, 1) -> COPY(x)
+   Must run AFTER DSE so writer_count reflects only live ops. */
+static void cold_apply_identity_rewrites(BodyIR *body) {
+    if (!body || body->slot_count <= 0 || body->op_count <= 0) return;
+    int32_t slot_count = body->slot_count;
+    int32_t op_count = body->op_count;
+
+    /* Count how many live ops write each dst slot.
+       A rewrite is only safe when BOTH the dst slot and operand b slot
+       each have exactly one live writer (no aliasing through control flow). */
+    int32_t *writer_count = (int32_t *)calloc((size_t)slot_count, sizeof(int32_t));
+    if (!writer_count) return;
+    for (int32_t i = 0; i < op_count; i++) {
+        int32_t dst = body->op_dst[i], kind = body->op_kind[i];
+        if (kind > 0 && dst >= 0 && dst < slot_count) writer_count[dst]++;
+    }
+
+    /* Forward walk: track the most recent writer for each slot.
+       We need a forward walk so we can verify that operand b's constant
+       producer is the sole writer AND appears earlier in program order. */
+    int32_t *cur_writer = (int32_t *)calloc((size_t)slot_count, sizeof(int32_t));
+    if (!cur_writer) { free(writer_count); return; }
+    for (int32_t s = 0; s < slot_count; s++) cur_writer[s] = -1;
+
+    for (int32_t i = 0; i < op_count; i++) {
+        int32_t kind = body->op_kind[i];
+        if (kind <= 0) continue;
+        int32_t dst = body->op_dst[i];
+        int32_t a = body->op_a[i], b = body->op_b[i];
+
+        /* Check that operand b's last writer is in the same block as this op.
+           This is provably safe even when other blocks write different values
+           to the same slot: within a basic block, execution is sequential, so
+           the writer must execute before this read and the value is guaranteed
+           to be the constant produced by that writer. */
+        bool b_safe = false;
+        if (b >= 0 && b < slot_count) {
+            int32_t b_def = cur_writer[b];
+            if (b_def >= 0) {
+                b_safe = cold_is_same_block_as(body, b_def, i);
+            }
+        }
+
+        if (dst >= 0 && dst < slot_count && writer_count[dst] == 1 && b_safe) {
+            int32_t def = cur_writer[b];
+
+            switch (kind) {
+                case BODY_OP_I32_ADD:
+                case BODY_OP_I32_SUB:
+                    if (def >= 0 && body->op_kind[def] == BODY_OP_I32_CONST &&
+                        body->op_a[def] == 0) {
+                        body->op_kind[i] = BODY_OP_COPY_I32;
+                        body->op_a[i] = a;
+                        body->op_b[i] = 0;
+                        __atomic_add_fetch(&cold_egraph_rewrite_count, 1, __ATOMIC_RELAXED);
+                    }
+                    break;
+
+                case BODY_OP_I32_MUL:
+                    if (def >= 0 && body->op_kind[def] == BODY_OP_I32_CONST) {
+                        int32_t val = body->op_a[def];
+                        if (val == 0) {
+                            body->op_kind[i] = BODY_OP_I32_CONST;
+                            body->op_a[i] = 0;
+                            body->op_b[i] = 0;
+                            __atomic_add_fetch(&cold_egraph_rewrite_count, 1, __ATOMIC_RELAXED);
+                        } else if (val == 1) {
+                            body->op_kind[i] = BODY_OP_COPY_I32;
+                            body->op_a[i] = a;
+                            body->op_b[i] = 0;
+                            __atomic_add_fetch(&cold_egraph_rewrite_count, 1, __ATOMIC_RELAXED);
+                        }
+                    }
+                    break;
+
+                case BODY_OP_I32_DIV:
+                    if (def >= 0 && body->op_kind[def] == BODY_OP_I32_CONST &&
+                        body->op_a[def] == 1) {
+                        body->op_kind[i] = BODY_OP_COPY_I32;
+                        body->op_a[i] = a;
+                        body->op_b[i] = 0;
+                        __atomic_add_fetch(&cold_egraph_rewrite_count, 1, __ATOMIC_RELAXED);
+                    }
+                    break;
+
+                case BODY_OP_I64_ADD:
+                case BODY_OP_I64_SUB:
+                    if (def >= 0 && body->op_kind[def] == BODY_OP_I64_CONST &&
+                        body->op_a[def] == 0 && body->op_b[def] == 0) {
+                        body->op_kind[i] = BODY_OP_COPY_I64;
+                        body->op_a[i] = a;
+                        body->op_b[i] = 0;
+                        __atomic_add_fetch(&cold_egraph_rewrite_count, 1, __ATOMIC_RELAXED);
+                    }
+                    break;
+
+                case BODY_OP_I64_MUL:
+                    if (def >= 0 && body->op_kind[def] == BODY_OP_I64_CONST) {
+                        int32_t av = body->op_a[def], bv = body->op_b[def];
+                        if (av == 0 && bv == 0) {
+                            body->op_kind[i] = BODY_OP_I64_CONST;
+                            body->op_a[i] = 0;
+                            body->op_b[i] = 0;
+                            __atomic_add_fetch(&cold_egraph_rewrite_count, 1, __ATOMIC_RELAXED);
+                        } else if (av == 1 && bv == 0) {
+                            body->op_kind[i] = BODY_OP_COPY_I64;
+                            body->op_a[i] = a;
+                            body->op_b[i] = 0;
+                            __atomic_add_fetch(&cold_egraph_rewrite_count, 1, __ATOMIC_RELAXED);
+                        }
+                    }
+                    break;
+
+                case BODY_OP_I64_DIV:
+                    if (def >= 0 && body->op_kind[def] == BODY_OP_I64_CONST &&
+                        body->op_a[def] == 1 && body->op_b[def] == 0) {
+                        body->op_kind[i] = BODY_OP_COPY_I64;
+                        body->op_a[i] = a;
+                        body->op_b[i] = 0;
+                        __atomic_add_fetch(&cold_egraph_rewrite_count, 1, __ATOMIC_RELAXED);
+                    }
+                    break;
+            }
+        }
+
+        if (body->op_kind[i] > 0 && dst >= 0 && dst < slot_count) {
+            cur_writer[dst] = i;
+        }
+    }
+
+    free(cur_writer);
+    free(writer_count);
+}
+
 /* Optimize a BodyIR function with dead store elimination.
    BodyIR slots are mutable, so CSE belongs after SSA/equivalence proof. */
 static void cold_optimize_body(BodyIR *body) {
@@ -11416,6 +11589,10 @@ static void cold_optimize_body(BodyIR *body) {
     }
 
     free(read_count);
+
+    /* Algebraic identity rewrites (provably-correct constant folding).
+       Runs after DSE so slot writer counts reflect only live ops. */
+    cold_apply_identity_rewrites(body);
 }
 
 static void codegen_func(Code *code, BodyIR *body, Symbols *symbols,
@@ -14441,7 +14618,11 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
                                                         csg.functions[i].name,
                                                         arity, kinds, sizes,
                                                         csg.functions[i].ret);
-    }
+if (csg.functions[i].generic_count > 0)
+           symbols_set_fn_generics(csg.symbols, csg.functions[i].symbol_index,
+                                   csg.functions[i].generic_names,
+                                   csg.functions[i].generic_count);
+     }
     BodyIR **function_bodies = arena_alloc(arena, (size_t)symbols->function_cap * sizeof(BodyIR *));
     memset(function_bodies, 0, (size_t)symbols->function_cap * sizeof(BodyIR *));
     int32_t entry_function = -1;
@@ -15190,6 +15371,7 @@ bool cold_compile_source_path_to_macho(const char *out_path,
     if (stats) {
         stats->function_count = symbols->function_count;
         stats->type_count = symbols->type_count + symbols->object_count;
+        stats->egraph_rewrite_count = cold_egraph_rewrite_count;
         if (demo_body) {
             stats->op_count = demo_body->op_count;
             stats->block_count = demo_body->block_count;
@@ -17498,9 +17680,60 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
         return 0;
 #endif
     }
-#ifndef COLD_BACKEND_ONLY
     /* --emit:csg-v2 = emit binary CSG v2 facts file */
     if (strcmp(emit, "csg-v2") == 0) {
+        /* CSG v2 fixed-point roundtrip: read facts, codegen (DSE), re-emit.
+           This operates on CSG facts directly; no source compilation needed. */
+        if (csg_in_path && csg_in_path[0] != '\0' &&
+            (!source_path || source_path[0] == '\0')) {
+            uint64_t rp_start = cold_now_us();
+            Arena *rp_arena = mmap(0, sizeof(Arena), PROT_READ | PROT_WRITE,
+                                   MAP_PRIVATE | MAP_ANON, -1, 0);
+            if (rp_arena == MAP_FAILED) die("roundtrip arena mmap failed");
+            Symbols *rp_sym = symbols_new(rp_arena);
+            BodyIR **rp_bodies = 0;
+            int32_t rp_count = 0;
+            Span rp_data = source_open(csg_in_path);
+            if (rp_data.len <= 0) {
+                cold_write_system_link_exec_report(report_path, false, source_path,
+                                                   csg_in_path, out_path, target, emit, 0,
+                                                   "csg v2 roundtrip source_open failed");
+                return 2;
+            }
+            ColdCsgV2Timing rp_timing = {0};
+            bool rp_ok = cold_load_csg_v2_facts(rp_data.ptr, rp_data.len,
+                                                 &rp_bodies, &rp_count,
+                                                 rp_sym, rp_arena, &rp_timing);
+            if (rp_ok) {
+                /* Apply dead-store elimination (the primary BodyIR mutation) */
+                for (int32_t i = 0; i < rp_count; i++) {
+                    BodyIR *b = rp_bodies[i];
+                    if (b && !b->has_fallback) cold_optimize_body(b);
+                }
+                rp_ok = cold_emit_csg_v2_facts(out_path, rp_bodies, rp_count, rp_sym, target);
+            }
+            munmap((void *)rp_data.ptr, (size_t)rp_data.len);
+            if (rp_ok) {
+                ColdCompileStats rp_stats = {0};
+                rp_stats.elapsed_us = cold_now_us() - rp_start;
+                rp_stats.csg_lowering = 1;
+                rp_stats.facts_function_count = rp_timing.fn_count;
+                struct stat rp_st;
+                if (stat(out_path, &rp_st) == 0) rp_stats.facts_bytes = (uint64_t)rp_st.st_size;
+                cold_write_system_link_exec_report(report_path, true, source_path, csg_in_path,
+                                                   out_path, target, emit, &rp_stats, "");
+                printf("runtime_csg_v2_roundtrip=1\n");
+                printf("cold_csg_v2_roundtrip=1\n");
+                cold_print_elapsed_ms(stdout, "cold_csg_v2_roundtrip_elapsed_ms", rp_stats.elapsed_us);
+                return 0;
+            }
+            cold_write_system_link_exec_report(report_path, false, source_path, csg_in_path,
+                                               out_path, target, emit, 0,
+                                               "csg v2 roundtrip emit failed");
+            fprintf(stderr, "[cheng_cold] csg v2 roundtrip emit failed\n");
+            return 2;
+        }
+#ifndef COLD_BACKEND_ONLY
         if (!source_path || source_path[0] == '\0') {
             cold_write_system_link_exec_report(report_path, false, source_path, out_path, out_path,
                                                target, emit, 0, "missing --in for emit:csg-v2");

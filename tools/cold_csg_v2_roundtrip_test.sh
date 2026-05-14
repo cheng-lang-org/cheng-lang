@@ -350,6 +350,153 @@ else
   pass=$((pass + 1))
 fi
 
+multi_one_source="$WORK/provider_multi_one.cheng"
+multi_two_source="$WORK/provider_multi_two.cheng"
+multi_primary_source="$WORK/provider_multi_primary.cheng"
+multi_missing_source="$WORK/provider_multi_missing.cheng"
+multi_one_obj="$WORK/provider_multi_one.o"
+multi_two_obj="$WORK/provider_multi_two.o"
+multi_primary_obj="$WORK/provider_multi_primary.o"
+multi_archive="$WORK/provider_multi.chenga"
+multi_facts="$WORK/provider_multi_primary.facts"
+multi_missing_facts="$WORK/provider_multi_missing.facts"
+multi_link_report="$WORK/provider_multi_link.report.txt"
+multi_csg_link_report="$WORK/provider_multi_csg_link.report.txt"
+multi_missing_report="$WORK/provider_multi_missing_link.report.txt"
+
+cat > "$multi_one_source" <<'CHENG'
+@exportc("provider_multi_one")
+fn provider_multi_one(): int32 = return 11
+CHENG
+
+cat > "$multi_two_source" <<'CHENG'
+@exportc("provider_multi_two")
+fn provider_multi_two(): int32 = return 31
+CHENG
+
+cat > "$multi_primary_source" <<'CHENG'
+@importc("provider_multi_one")
+fn provider_multi_one(): int32
+@importc("provider_multi_two")
+fn provider_multi_two(): int32
+fn main(): int32 = return provider_multi_one() + provider_multi_two()
+CHENG
+
+cat > "$multi_missing_source" <<'CHENG'
+@importc("provider_multi_missing")
+fn provider_multi_missing(): int32
+fn main(): int32 = return provider_multi_missing()
+CHENG
+
+echo "  - provider_archive_multi_member_export"
+if "$COLD" system-link-exec \
+  --in:"$multi_one_source" \
+  --emit:obj --target:riscv64-unknown-linux-gnu \
+  --out:"$multi_one_obj" \
+  --report-out:"$WORK/provider_multi_one.obj.report.txt" \
+  > "$WORK/provider_multi_one.obj.stdout" 2>&1 &&
+   "$COLD" system-link-exec \
+  --in:"$multi_two_source" \
+  --emit:obj --target:riscv64-unknown-linux-gnu \
+  --out:"$multi_two_obj" \
+  --report-out:"$WORK/provider_multi_two.obj.report.txt" \
+  > "$WORK/provider_multi_two.obj.stdout" 2>&1 &&
+   "$COLD" provider-archive-pack \
+  --target:riscv64-unknown-linux-gnu \
+  --object:"$multi_one_obj" \
+  --object:"$multi_two_obj" \
+  --export:provider_multi_one \
+  --export:provider_multi_two \
+  --module:provider_multi \
+  --source:"$WORK" \
+  --out:"$multi_archive" \
+  --report-out:"$WORK/provider_multi.pack.report.txt" \
+  > "$WORK/provider_multi.pack.stdout" 2>&1 &&
+   "$COLD" system-link-exec \
+  --in:"$multi_primary_source" \
+  --emit:obj --target:riscv64-unknown-linux-gnu \
+  --out:"$multi_primary_obj" \
+  --report-out:"$WORK/provider_multi_primary.obj.report.txt" \
+  > "$WORK/provider_multi_primary.obj.stdout" 2>&1 &&
+   "$COLD" system-link-exec \
+  --link-object:"$multi_primary_obj" \
+  --provider-archive:"$multi_archive" \
+  --emit:exe --target:riscv64-unknown-linux-gnu \
+  --out:"$WORK/provider_multi_linked" \
+  --report-out:"$multi_link_report" \
+  > "$WORK/provider_multi_link.stdout" 2>&1 &&
+   grep -q '^provider_archive_member_count=2$' "$multi_link_report" &&
+   grep -q '^provider_export_count=2$' "$multi_link_report" &&
+   grep -q '^provider_resolved_symbol_count=2$' "$multi_link_report" &&
+   grep -q '^unresolved_symbol_count=0$' "$multi_link_report" &&
+   grep -q '^system_link=0$' "$multi_link_report"; then
+  echo "PASS provider_archive_multi_member_export"
+  pass=$((pass + 1))
+else
+  echo "FAIL provider_archive_multi_member_export"
+  fail=$((fail + 1))
+fi
+
+echo "  - csg_in_emit_exe_provider_archive"
+if [ ! -s "$multi_archive" ]; then
+  echo "FAIL csg_in_emit_exe_provider_archive (missing archive)"
+  fail=$((fail + 1))
+elif "$DRIVER" emit-cold-csg-v2 \
+  --root:"$ROOT" \
+  --in:"$multi_primary_source" \
+  --out:"$multi_facts" \
+  --target:riscv64-unknown-linux-gnu \
+  --report-out:"$WORK/provider_multi.writer.report.txt" \
+  > "$WORK/provider_multi.writer.stdout" 2>&1 &&
+   "$COLD" system-link-exec \
+  --csg-in:"$multi_facts" \
+  --provider-archive:"$multi_archive" \
+  --emit:exe --target:riscv64-unknown-linux-gnu \
+  --out:"$WORK/provider_multi_csg_linked" \
+  --report-out:"$multi_csg_link_report" \
+  > "$WORK/provider_multi_csg_link.stdout" 2>&1 &&
+   grep -q '^cold_csg_lowering=1$' "$multi_csg_link_report" &&
+   grep -q '^provider_archive_member_count=2$' "$multi_csg_link_report" &&
+   grep -q '^provider_export_count=2$' "$multi_csg_link_report" &&
+   grep -q '^provider_resolved_symbol_count=2$' "$multi_csg_link_report" &&
+   grep -q '^unresolved_symbol_count=0$' "$multi_csg_link_report" &&
+   grep -q '^system_link=0$' "$multi_csg_link_report"; then
+  echo "PASS csg_in_emit_exe_provider_archive"
+  pass=$((pass + 1))
+else
+  echo "FAIL csg_in_emit_exe_provider_archive"
+  fail=$((fail + 1))
+fi
+
+echo "  - csg_in_provider_archive_missing_export_hard_fail"
+if [ ! -s "$multi_archive" ]; then
+  echo "FAIL csg_in_provider_archive_missing_export_hard_fail (missing archive)"
+  fail=$((fail + 1))
+elif "$DRIVER" emit-cold-csg-v2 \
+  --root:"$ROOT" \
+  --in:"$multi_missing_source" \
+  --out:"$multi_missing_facts" \
+  --target:riscv64-unknown-linux-gnu \
+  --report-out:"$WORK/provider_multi_missing.writer.report.txt" \
+  > "$WORK/provider_multi_missing.writer.stdout" 2>&1 &&
+   "$COLD" system-link-exec \
+  --csg-in:"$multi_missing_facts" \
+  --provider-archive:"$multi_archive" \
+  --emit:exe --target:riscv64-unknown-linux-gnu \
+  --out:"$WORK/provider_multi_missing_linked" \
+  --report-out:"$multi_missing_report" \
+  > "$WORK/provider_multi_missing_link.stdout" 2>&1; then
+  echo "FAIL csg_in_provider_archive_missing_export_hard_fail"
+  fail=$((fail + 1))
+elif grep -q '^unresolved_symbol_count=1$' "$multi_missing_report" &&
+     grep -q '^first_unresolved_symbol=provider_multi_missing$' "$multi_missing_report"; then
+  echo "PASS csg_in_provider_archive_missing_export_hard_fail"
+  pass=$((pass + 1))
+else
+  echo "FAIL csg_in_provider_archive_missing_export_hard_fail"
+  fail=$((fail + 1))
+fi
+
 # Reader fixed-point: two exe runs from same facts are bit-identical
 echo "  - reader_fixedpoint_exe"
 rm -f "$WORK/fp_exe_a" "$WORK/fp_exe_b"
@@ -444,6 +591,112 @@ else
     echo "FAIL cross_stage_functional_arm64 (driver=$driver_code cold=$cold_code)"
     fail=$((fail + 1))
   fi
+fi
+
+# CSG v2 fixed-point: read facts, codegen (DSE), re-emit, verify convergence
+echo "  - csg_v2_fixedpoint_ordinary"
+csg_fp_a="$WORK/fixedpoint.ordinary.a.facts"
+csg_fp_b="$WORK/fixedpoint.ordinary.b.facts"
+if "$COLD" system-link-exec \
+    --csg-in:"$WORK/ordinary.facts" \
+    --emit:csg-v2 \
+    --target:"$TARGET" \
+    --out:"$csg_fp_a" \
+    --report-out:"$WORK/fixedpoint.ordinary.a.report.txt" >/dev/null 2>&1 &&
+   "$COLD" system-link-exec \
+    --csg-in:"$csg_fp_a" \
+    --emit:csg-v2 \
+    --target:"$TARGET" \
+    --out:"$csg_fp_b" \
+    --report-out:"$WORK/fixedpoint.ordinary.b.report.txt" >/dev/null 2>&1; then
+  if cmp -s "$csg_fp_a" "$csg_fp_b" 2>/dev/null; then
+    echo "PASS csg_v2_fixedpoint_ordinary"
+    pass=$((pass + 1))
+  else
+    echo "FAIL csg_v2_fixedpoint_ordinary (iterations differ)"
+    fail=$((fail + 1))
+  fi
+else
+  echo "FAIL csg_v2_fixedpoint_ordinary (roundtrip command failed)"
+  fail=$((fail + 1))
+fi
+
+echo "  - csg_v2_fixedpoint_return_let"
+csg_fp_a="$WORK/fixedpoint.return_let.a.facts"
+csg_fp_b="$WORK/fixedpoint.return_let.b.facts"
+if "$COLD" system-link-exec \
+    --csg-in:"$WORK/return_let.facts" \
+    --emit:csg-v2 \
+    --target:"$TARGET" \
+    --out:"$csg_fp_a" \
+    --report-out:"$WORK/fixedpoint.return_let.a.report.txt" >/dev/null 2>&1 &&
+   "$COLD" system-link-exec \
+    --csg-in:"$csg_fp_a" \
+    --emit:csg-v2 \
+    --target:"$TARGET" \
+    --out:"$csg_fp_b" \
+    --report-out:"$WORK/fixedpoint.return_let.b.report.txt" >/dev/null 2>&1; then
+  if cmp -s "$csg_fp_a" "$csg_fp_b" 2>/dev/null; then
+    echo "PASS csg_v2_fixedpoint_return_let"
+    pass=$((pass + 1))
+  else
+    echo "FAIL csg_v2_fixedpoint_return_let (iterations differ)"
+    fail=$((fail + 1))
+  fi
+else
+  echo "FAIL csg_v2_fixedpoint_return_let (roundtrip command failed)"
+  fail=$((fail + 1))
+fi
+
+echo "  - csg_v2_fixedpoint_unused_binding"
+# Dead-store fixture: unused binding produces dead const
+csg_unused="$WORK/unused_binding.cheng"
+csg_unused_facts="$WORK/unused_binding.facts"
+csg_unused_fp_a="$WORK/fixedpoint.unused.a.facts"
+csg_unused_fp_b="$WORK/fixedpoint.unused.b.facts"
+cat > "$csg_unused" <<'CHENG'
+fn main(): int32 =
+    let unused: int32 = 42
+    return 0
+CHENG
+if "$DRIVER" emit-cold-csg-v2 \
+    --root:"$ROOT" \
+    --in:"$csg_unused" \
+    --out:"$csg_unused_facts" \
+    --target:"$TARGET" \
+    --report-out:"$WORK/unused_binding.writer.report.txt" >/dev/null 2>&1 &&
+   "$COLD" system-link-exec \
+    --csg-in:"$csg_unused_facts" \
+    --emit:csg-v2 \
+    --target:"$TARGET" \
+    --out:"$csg_unused_fp_a" \
+    --report-out:"$WORK/fixedpoint.unused.a.report.txt" >/dev/null 2>&1 &&
+   "$COLD" system-link-exec \
+    --csg-in:"$csg_unused_fp_a" \
+    --emit:csg-v2 \
+    --target:"$TARGET" \
+    --out:"$csg_unused_fp_b" \
+    --report-out:"$WORK/fixedpoint.unused.b.report.txt" >/dev/null 2>&1; then
+  # Check that DSE actually removed the dead store (fp_a < initial)
+  init_bytes=$(wc -c < "$csg_unused_facts" | tr -d ' ')
+  fp_bytes=$(wc -c < "$csg_unused_fp_a" | tr -d ' ')
+  if cmp -s "$csg_unused_fp_a" "$csg_unused_fp_b" 2>/dev/null; then
+    echo "PASS csg_v2_fixedpoint_unused_binding"
+    pass=$((pass + 1))
+    if ! cmp -s "$csg_unused_facts" "$csg_unused_fp_a" 2>/dev/null; then
+      echo "  - csg_v2_dse_effect (DSE modified body: $init_bytes bytes)"
+      pass=$((pass + 1))
+    else
+      echo "  - csg_v2_dse_noop (DSE: $init_bytes bytes unchanged)"
+      pass=$((pass + 1))
+    fi
+  else
+    echo "FAIL csg_v2_fixedpoint_unused_binding (iterations differ)"
+    fail=$((fail + 1))
+  fi
+else
+  echo "FAIL csg_v2_fixedpoint_unused_binding (roundtrip command failed)"
+  fail=$((fail + 1))
 fi
 
 echo "=== $pass passed, $fail failed ==="

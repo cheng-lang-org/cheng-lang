@@ -81,7 +81,7 @@
 - provider export roots 必须按模块所有权和 primary undefined symbols 精确选择；线程 root 只在真实引用时加入，CPU bridge 属于 `runtime/core_runtime`，provider 自身生成代码引用的 `cheng_bounds_check` 必须由 `runtime/program_support` 导出。
 - cold CSG v2 路线只维护 `docs/cold_csg_v2_plan.md` 一个方案文档；必须先写 Phase 0 最小 facts 往返、facts 大小/load 时间预算和 provider archive/facts 策略，禁止拆成多份重复计划。
 - cold CSG v2 Phase 0 不能要求 Cheng direct `.o` 与 cold `.o` bit-identical；两边 ARM64 编码器独立。正确卡口是同一 facts 经 cold reader/codegen 两次产出 `.o` bit-identical，并链接同一 provider archive 后运行 exit/marker 一致。
-- 当前没有 provider archive、`--link-object`、`--provider-archive` 主线；Phase 0 只能验 facts->cold `.o` 确定性，运行验证必须等显式 archive/linkerless 命令落地，禁止借 `cc` 或 `--link-providers` 代替。
+- provider archive、`--link-object`、`--provider-archive` 已有最小 ELF 主线；当前门禁覆盖多 member/export 和 `--csg-in --provider-archive`。不要把它外推成 runtime roots 或 Darwin runtime provider 已闭合。
 - `CHENGCSG` 二进制 BodyIR 快照只是 cold 内部 fast path 自检；canonical CSG v2 facts 必须用 `CHENG_CSG_V2` record 格式从 `PrimaryObjectPlan` 导出。刷新 `emit-cold-csg-v2` 前若旧 backend driver 重编超时，先取样 type layout 热点，不把它算成 cold reader 失败。
 - `CHENGCSG` BodyIR reader 必须读 writer 保存的参数 ABI 三元组 `slot_kind/slot_size/param_slot`；禁止用 `param_slot[i]=i` 或缺省参数 kind 重建参数槽，否则 cold_subset_coverage 这类 slot 顺序变化会让 CSG 路径和 direct 路径代码漂移。
 - `CHENGCSG` BodyIR reader 必须读 writer 保存的 `block_term`；禁止用 `block i -> term i` 猜 CFG，否则多 block 函数会生成错误分支并 hang。
@@ -91,6 +91,9 @@
 - cold `build-backend-driver` 的 entry semantics 合同必须随 `backend_driver_dispatch_min.cheng` 命令面同步更新；新增命令要同步 dispatch case 数、command string table 和生成版 status marker。
 - Cheng `str` builder 写单字节必须走 `RawmemWriteI8/StrDataPtr`；`out[i] = Char(x)` 会按 `char` 宽度写入，破坏按字节计长的字符串缓冲区。
 - cold codegen 禁止用 BodyIR canonical hash 做函数去重；不同零参字符串返回函数会被合并到同一地址，`compiler_runtime_smoke` 会读到错误 target。E-Graph rewrite/dedup 必须先有等价证明再进 codegen。
+- cold DSE 活跃性根必须包含 terminator、`call_arg` side table、以及会读写容器/引用的 dst slot；否则 `while` 条件、call 参数、sequence/object 初始化会被当作死写删除。
+- BodyIR slot 是可变非 SSA；CSE、hash dedup、跨 slot 等价替换必须等 SSA/等价证明后再启用。当前只允许 DSE 和可证明代数恒等式，不允许靠相似 op 做值复用。
+- `build-backend-driver` 候选门禁必须保留 source-direct `while` 运行测试；禁止把真实控制流 smoke 改成 `for`、compile-only 或其它绕路。
 
 ## Resolved
 

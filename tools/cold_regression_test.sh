@@ -393,7 +393,74 @@ else
 fi
 assert "emit_obj_cross" 3 "$ACT"
 
-# 7: language subset coverage
+# 7: multi-member provider archive (RISC-V ELF cross-target)
+mkdir -p /tmp/ct_providers
+cat > /tmp/ct_providers/prov_a.cheng << 'PROVEOF'
+@exportc("ct_prov_a_val")
+fn ct_prov_a_val(): int32 = return 42
+PROVEOF
+cat > /tmp/ct_providers/prov_b.cheng << 'PROVEOF'
+@exportc("ct_prov_b_val")
+fn ct_prov_b_val(): int32 = return 99
+PROVEOF
+cat > /tmp/ct_providers/primary.cheng << 'PROVEOF'
+@importc("ct_prov_a_val")
+fn ct_prov_a_val(): int32
+@importc("ct_prov_b_val")
+fn ct_prov_b_val(): int32
+fn main(): int32 = return ct_prov_a_val() + ct_prov_b_val()
+PROVEOF
+
+quiet $COLD system-link-exec --in:/tmp/ct_providers/prov_a.cheng \
+    --emit:obj --target:riscv64-unknown-linux-gnu \
+    --out:/tmp/ct_providers/prov_a.o \
+    --report-out:/tmp/ct_providers/prov_a.report.txt
+quiet $COLD system-link-exec --in:/tmp/ct_providers/prov_b.cheng \
+    --emit:obj --target:riscv64-unknown-linux-gnu \
+    --out:/tmp/ct_providers/prov_b.o \
+    --report-out:/tmp/ct_providers/prov_b.report.txt
+quiet $COLD system-link-exec --in:/tmp/ct_providers/primary.cheng \
+    --emit:obj --target:riscv64-unknown-linux-gnu \
+    --out:/tmp/ct_providers/primary.o \
+    --report-out:/tmp/ct_providers/primary.report.txt
+
+quiet $COLD provider-archive-pack \
+    --target:riscv64-unknown-linux-gnu \
+    --object:/tmp/ct_providers/prov_a.o \
+    --object:/tmp/ct_providers/prov_b.o \
+    --export:ct_prov_a_val \
+    --export:ct_prov_b_val \
+    --module:ct_providers \
+    --source:/tmp/ct_providers \
+    --out:/tmp/ct_providers/multi.chenga \
+    --report-out:/tmp/ct_providers/multi.pack.report.txt
+if [ -f /tmp/ct_providers/multi.chenga ]; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "provider_archive_multi_pack" 1 "$ACT"
+
+quiet $COLD system-link-exec \
+    --link-object:/tmp/ct_providers/primary.o \
+    --provider-archive:/tmp/ct_providers/multi.chenga \
+    --emit:exe --target:riscv64-unknown-linux-gnu \
+    --out:/tmp/ct_providers/multi_linked \
+    --report-out:/tmp/ct_providers/multi_link.report.txt
+if grep -q '^provider_archive_member_count=2$' /tmp/ct_providers/multi_link.report.txt 2>/dev/null &&
+   grep -q '^provider_export_count=2$' /tmp/ct_providers/multi_link.report.txt 2>/dev/null &&
+   grep -q '^provider_resolved_symbol_count=2$' /tmp/ct_providers/multi_link.report.txt 2>/dev/null &&
+   grep -q '^unresolved_symbol_count=0$' /tmp/ct_providers/multi_link.report.txt 2>/dev/null &&
+   grep -q '^system_link=0$' /tmp/ct_providers/multi_link.report.txt 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "provider_archive_multi_link" 1 "$ACT"
+
+rm -rf /tmp/ct_providers
+
+# 8: language subset coverage
 ACT=$(compile_run src/tests/cold_subset_coverage.cheng /tmp/ct_cov)
 assert "subset_coverage" 0 "$ACT"
 
