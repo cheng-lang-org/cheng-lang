@@ -11684,9 +11684,14 @@ static bool cold_is_same_block_as(BodyIR *body, int32_t idx_a, int32_t idx_b) {
    These are safe because the rewrites are mathematically provable algebraic
    identities, independent of BodyIR slot mutability:
      ADD/SUB(x, 0) -> COPY(x)
+     SUB(0, SUB(0, x)) -> COPY(x)   (double negation)
      MUL(x, 0) -> CONST 0
      MUL(x, 1) -> COPY(x)
      DIV(x, 1) -> COPY(x)
+     AND(x, 0) -> CONST 0
+     AND(x, -1) -> COPY(x)
+     OR/XOR/SHL/ASR(x, 0) -> COPY(x)
+     XOR(XOR(x, -1), -1) -> COPY(x)  (double bitwise NOT via XOR)
    Must run AFTER DSE so writer_count reflects only live ops. */
 static void cold_apply_identity_rewrites(BodyIR *body) {
     if (!body || body->slot_count <= 0 || body->op_count <= 0) return;
@@ -11729,6 +11734,16 @@ static void cold_apply_identity_rewrites(BodyIR *body) {
             }
         }
 
+        /* Same-block safety for operand a, needed by double-NEG/NOT patterns
+           that check whether the first operand of SUB/XOR is a constant. */
+        bool a_safe = false;
+        if (a >= 0 && a < slot_count) {
+            int32_t a_def = cur_writer[a];
+            if (a_def >= 0) {
+                a_safe = cold_is_same_block_as(body, a_def, i);
+            }
+        }
+
         if (dst >= 0 && dst < slot_count && writer_count[dst] == 1 && b_safe) {
             int32_t def = cur_writer[b];
 
@@ -11741,6 +11756,25 @@ static void cold_apply_identity_rewrites(BodyIR *body) {
                         body->op_a[i] = a;
                         body->op_b[i] = 0;
                         __atomic_add_fetch(&cold_egraph_rewrite_count, 1, __ATOMIC_RELAXED);
+                    }
+                    /* Double NEG: SUB(0, SUB(0, y)) -> COPY(y) for I32 */
+                    if (kind == BODY_OP_I32_SUB && a_safe &&
+                        def >= 0 && body->op_kind[def] == BODY_OP_I32_SUB) {
+                        int32_t a_def = cur_writer[a];
+                        if (a_def >= 0 && body->op_kind[a_def] == BODY_OP_I32_CONST &&
+                            body->op_a[a_def] == 0) {
+                            int32_t inner_a = body->op_a[def];
+                            if (inner_a >= 0 && inner_a < slot_count) {
+                                int32_t inner_a_def = cur_writer[inner_a];
+                                if (inner_a_def >= 0 && body->op_kind[inner_a_def] == BODY_OP_I32_CONST &&
+                                    body->op_a[inner_a_def] == 0) {
+                                    body->op_kind[i] = BODY_OP_COPY_I32;
+                                    body->op_a[i] = body->op_b[def];
+                                    body->op_b[i] = 0;
+                                    __atomic_add_fetch(&cold_egraph_rewrite_count, 1, __ATOMIC_RELAXED);
+                                }
+                            }
+                        }
                     }
                     break;
 
@@ -11781,6 +11815,25 @@ static void cold_apply_identity_rewrites(BodyIR *body) {
                         body->op_a[i] = a;
                         body->op_b[i] = 0;
                         __atomic_add_fetch(&cold_egraph_rewrite_count, 1, __ATOMIC_RELAXED);
+                    }
+                    /* Double NEG: SUB(0, SUB(0, y)) -> COPY(y) for I64 */
+                    if (kind == BODY_OP_I64_SUB && a_safe &&
+                        def >= 0 && body->op_kind[def] == BODY_OP_I64_SUB) {
+                        int32_t a_def = cur_writer[a];
+                        if (a_def >= 0 && body->op_kind[a_def] == BODY_OP_I64_CONST &&
+                            body->op_a[a_def] == 0 && body->op_b[a_def] == 0) {
+                            int32_t inner_a = body->op_a[def];
+                            if (inner_a >= 0 && inner_a < slot_count) {
+                                int32_t inner_a_def = cur_writer[inner_a];
+                                if (inner_a_def >= 0 && body->op_kind[inner_a_def] == BODY_OP_I64_CONST &&
+                                    body->op_a[inner_a_def] == 0 && body->op_b[inner_a_def] == 0) {
+                                    body->op_kind[i] = BODY_OP_COPY_I64;
+                                    body->op_a[i] = body->op_b[def];
+                                    body->op_b[i] = 0;
+                                    __atomic_add_fetch(&cold_egraph_rewrite_count, 1, __ATOMIC_RELAXED);
+                                }
+                            }
+                        }
                     }
                     break;
 
@@ -11841,6 +11894,25 @@ static void cold_apply_identity_rewrites(BodyIR *body) {
                         body->op_b[i] = 0;
                         __atomic_add_fetch(&cold_egraph_rewrite_count, 1, __ATOMIC_RELAXED);
                     }
+                    /* Double NOT: XOR(XOR(y, -1), -1) -> COPY(y) for I32 */
+                    if (kind == BODY_OP_I32_XOR && a_safe &&
+                        def >= 0 && body->op_kind[def] == BODY_OP_I32_CONST &&
+                        body->op_a[def] == -1) {
+                        int32_t a_def = cur_writer[a];
+                        if (a_def >= 0 && body->op_kind[a_def] == BODY_OP_I32_XOR) {
+                            int32_t inner_b = body->op_b[a_def];
+                            if (inner_b >= 0 && inner_b < slot_count) {
+                                int32_t inner_b_def = cur_writer[inner_b];
+                                if (inner_b_def >= 0 && body->op_kind[inner_b_def] == BODY_OP_I32_CONST &&
+                                    body->op_a[inner_b_def] == -1) {
+                                    body->op_kind[i] = BODY_OP_COPY_I32;
+                                    body->op_a[i] = body->op_a[a_def];
+                                    body->op_b[i] = 0;
+                                    __atomic_add_fetch(&cold_egraph_rewrite_count, 1, __ATOMIC_RELAXED);
+                                }
+                            }
+                        }
+                    }
                     break;
 
                 case BODY_OP_I64_AND:
@@ -11870,6 +11942,25 @@ static void cold_apply_identity_rewrites(BodyIR *body) {
                         body->op_a[i] = a;
                         body->op_b[i] = 0;
                         __atomic_add_fetch(&cold_egraph_rewrite_count, 1, __ATOMIC_RELAXED);
+                    }
+                    /* Double NOT: XOR(XOR(y, -1), -1) -> COPY(y) for I64 */
+                    if (kind == BODY_OP_I64_XOR && a_safe &&
+                        def >= 0 && body->op_kind[def] == BODY_OP_I64_CONST &&
+                        body->op_a[def] == -1 && body->op_b[def] == -1) {
+                        int32_t a_def = cur_writer[a];
+                        if (a_def >= 0 && body->op_kind[a_def] == BODY_OP_I64_XOR) {
+                            int32_t inner_b = body->op_b[a_def];
+                            if (inner_b >= 0 && inner_b < slot_count) {
+                                int32_t inner_b_def = cur_writer[inner_b];
+                                if (inner_b_def >= 0 && body->op_kind[inner_b_def] == BODY_OP_I64_CONST &&
+                                    body->op_a[inner_b_def] == -1 && body->op_b[inner_b_def] == -1) {
+                                    body->op_kind[i] = BODY_OP_COPY_I64;
+                                    body->op_a[i] = body->op_a[a_def];
+                                    body->op_b[i] = 0;
+                                    __atomic_add_fetch(&cold_egraph_rewrite_count, 1, __ATOMIC_RELAXED);
+                                }
+                            }
+                        }
                     }
                     break;
 

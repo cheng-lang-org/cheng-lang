@@ -716,6 +716,31 @@ else
 fi
 assert "runtime_provider_autolink_af_inet" 1 "$ACT"
 
+rm -f /tmp/ct_runtime/autolink_constants \
+    /tmp/ct_runtime/autolink_constants.report.txt
+quiet $COLD system-link-exec \
+    --in:testdata/runtime_provider_autolink_constants.cheng \
+    --target:aarch64-unknown-linux-gnu \
+    --out:/tmp/ct_runtime/autolink_constants \
+    --report-out:/tmp/ct_runtime/autolink_constants.report.txt \
+    --link-providers
+if [ -s /tmp/ct_runtime/autolink_constants ] &&
+   file /tmp/ct_runtime/autolink_constants 2>/dev/null | grep -q 'ELF 64-bit.*executable.*aarch64' &&
+   grep -q '^system_link_exec=1$' /tmp/ct_runtime/autolink_constants.report.txt 2>/dev/null &&
+   grep -q '^system_link_exec_scope=cold_runtime_provider_archive$' /tmp/ct_runtime/autolink_constants.report.txt 2>/dev/null &&
+   grep -q '^provider_archive=1$' /tmp/ct_runtime/autolink_constants.report.txt 2>/dev/null &&
+   grep -q '^provider_object_count=1$' /tmp/ct_runtime/autolink_constants.report.txt 2>/dev/null &&
+   grep -q '^provider_archive_member_count=1$' /tmp/ct_runtime/autolink_constants.report.txt 2>/dev/null &&
+   grep -q '^provider_export_count=10$' /tmp/ct_runtime/autolink_constants.report.txt 2>/dev/null &&
+   grep -q '^provider_resolved_symbol_count=10$' /tmp/ct_runtime/autolink_constants.report.txt 2>/dev/null &&
+   grep -q '^unresolved_symbol_count=0$' /tmp/ct_runtime/autolink_constants.report.txt 2>/dev/null &&
+   grep -q '^system_link=0$' /tmp/ct_runtime/autolink_constants.report.txt 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "runtime_provider_autolink_constants" 1 "$ACT"
+
 rm -rf /tmp/ct_runtime
 
 # 11: ownership proof driver report fields
@@ -1052,6 +1077,23 @@ rm -f /tmp/ct_gen_multi
 ACT=$(compile_run_timed /tmp/cheng_cold testdata/generic_arithmetic_smoke.cheng /tmp/ct_gen_arith 30)
 assert "generic_arithmetic_smoke" 0 "$ACT"
 rm -f /tmp/ct_gen_arith
+
+# --- for_range_inclusive_leq ---
+cat > /tmp/ct_range_leq.cheng << 'CHENG'
+fn main(): int32 =
+    var s: int32
+    for i in 1..<=5:
+        s = s + i
+    return s
+CHENG
+ACT=$(compile_run /tmp/ct_range_leq.cheng /tmp/ct_range_leq_out)
+assert "for_range_inclusive_leq" 15 "$ACT"
+rm -f /tmp/ct_range_leq.cheng /tmp/ct_range_leq_out
+
+# --- double_neg_not_identity ---
+ACT=$(compile_run testdata/double_neg_not_identity.cheng /tmp/ct_dneg_not)
+assert "double_neg_not_identity" 0 "$ACT"
+rm -f /tmp/ct_dneg_not
 
 echo ""
 echo "=== $PASS passed, $FAIL failed ==="

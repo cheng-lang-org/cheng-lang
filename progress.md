@@ -19,10 +19,10 @@
 ## 最新通过基线（2026-05-14）
 
 - `cc -std=c11 -O2 -o /tmp/cheng_cold bootstrap/cheng_cold.c` 通过，仍有 4 个既有 warning。
-- `tools/cold_regression_test.sh`：75/75 PASS。
+- `tools/cold_regression_test.sh`：77/77 PASS。
 - `tools/cold_csg_v2_roundtrip_test.sh`：716/716 PASS。
 - `generic_arithmetic_smoke` 已纳入冷回归并运行 exit 0。
-- `runtime_provider_autolink_af_inet` 已纳入冷回归：`--link-providers` 从 primary undefined symbol 自动选择 `cheng_native_af_inet_bridge`，生成真实 Linux runtime provider archive 后 cold linkerless 产出 AArch64 ELF executable，`provider_resolved_symbol_count=1`、`unresolved_symbol_count=0`、`system_link=0`。
+- `runtime_provider_autolink_constants` 已纳入冷回归：`--link-providers` 从 primary undefined symbols 自动选择 10 个 Linux runtime 纯常量 roots，生成真实 provider archive 后 cold linkerless 产出 AArch64 ELF executable；该门禁锁链接报告，不声明目标 ELF 运行语义，`provider_export_count=10`、`provider_resolved_symbol_count=10`、`unresolved_symbol_count=0`、`system_link=0`。
 - E-Graph 主线只保留 DSE 和已证明的局部恒等式 rewrite；LICM 变换未进入当前 codegen 主线。
 
 ## 当前进行中
@@ -65,6 +65,6 @@
 - 距离完全体还差：真实 CSG source closure、真实 lowering plan、真实 primary object plan、direct object/exe/linkerless image、完整 ARM64 编码与重定位、每次编译稳定 phase/report sidecar、mmap span/phase arena/SoA/int32 index/单扫 facts、lock-free work-stealing 并行、10万-30万行核心 30-80ms 冷自举验证。
 - source->CSG 仍未同步本轮能力：`cold_bootstrap_backend_dispatch_type_surface --csg-out` 当前失败，原因是旧 statement scanner 仍会把多行函数签名续行当成 statement；下一步修 CSG writer 必须按 `ColdFunctionSymbol.body` 边界跳过签名续行。
 - 本轮修正 Darwin 入栈参数 ABI：callee prologue 保存 `x19/x20` 与 `fp/lr` 后，stack 参数从 `FP+32+offset` 读取；`cold_stack_arg_abi` 锁住第 9/10 个参数不再错读前一组字符串。`RunSystemLinkExecFromCmdline` cold self-exec 短路已移除，生成版 `backend_driver_dispatch_min` 现在可真实执行 `system-link-exec ordinary_zero_exit_fixture`，生成 Mach-O 运行 exit 0。
-- 历史回归曾为 `28/28 PASS`，新增 `stack_arg_abi`；同时移除 `symbols_add_fn` 的 bare/qualified name 合并和 direct emit 的最小占位产物，失败路径改为 hard-fail。当前基线为 75/75。
+- 历史回归曾为 `28/28 PASS`，新增 `stack_arg_abi`；同时移除 `symbols_add_fn` 的 bare/qualified name 合并和 direct emit 的最小占位产物，失败路径改为 hard-fail。当前基线为 77/77。
 - 下一步继续把 expr token facts 接到 statement payload 并向 3000 行推进，同时保持 `cold_compile_elapsed_ms` 三路径一致。
 - 每轮继续记录 `cold_compile_elapsed_ms`，并保持 source-direct、source->CSG、facts direct 三路径一致。

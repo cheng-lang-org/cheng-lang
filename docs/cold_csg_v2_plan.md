@@ -126,7 +126,7 @@ provider 有自举循环风险：provider 是 Cheng 源码编出来的，若 `--
 | 预编译 provider archive | 第一条主线 | `provider_input` 写 archive 路径、hash、导出符号表；cold 只链接 archive 中已存在 `.o` |
 | provider facts | 后续扩展 | provider 也由 Cheng full compiler 预先导出 facts；cold 分别 materialize provider `.o` 后再 link |
 
-当前已验证入口采用预编译 provider archive。这样 `--csg-in` 不依赖现场 Cheng provider 编译，也不需要 system linker 才能证明 archive 链路；`--link-providers` 已能从 primary undefined symbol 自动选择 `cheng_native_af_inet_bridge` 并生成真实 Linux runtime provider archive，剩余 runtime roots 仍需逐个纳入。
+当前已验证入口采用预编译 provider archive。这样 `--csg-in` 不依赖现场 Cheng provider 编译，也不需要 system linker 才能证明 archive 链路；`--link-providers` 已能从 primary undefined symbols 自动选择 10 个 Linux runtime 纯常量 roots 并生成真实 provider archive。该门禁锁链接报告，不声明目标 ELF 运行语义；剩余非纯常量 runtime roots 仍需逐个纳入。
 
 link 输入模型：
 
@@ -148,8 +148,8 @@ reloc -> cold linkerless/object linker applies reloc
 | 阶段 2：writer 扩展 | `src/core/backend/primary_object_plan.cheng` | 从 canonical PrimaryObjectPlan 导出 function/slot/block/op/term/call/data/reloc | 同一输入重复导出 hash 一致；record 数与 plan/report 一致 | facts 覆盖 `.o` 所需全部信息 |
 | 阶段 3：reader 结构化 | `bootstrap/cheng_cold.c` | `--csg-in` reader 直接构造 dense sections，不做文本查找 | `facts_mmap_ms/facts_verify_ms/facts_decode_ms` 写 report；预算不过直接失败 | load 成本可见 |
 | 阶段 4：object 合同验证 | `bootstrap/cheng_cold.c`、`src/core/backend/primary_object_plan.cheng` | `--csg-in --emit:obj` 覆盖更多 fixture，验证 cold 自身确定性和运行语义 | 同一 facts 多次生成 `.o` bit-identical；导出符号、未解析外部符号、reloc 目标集合稳定；链接同一 provider archive 后运行 marker 正确 | 不要求 Cheng direct `.o` 与 cold `.o` 字节一致 |
-| 阶段 5：provider archive 生成 | `bootstrap/cheng_cold.c` | `provider-archive-pack` 支持多个预编译 provider `.o` 和多个 export 写入 `.chenga` | archive hash、member count、导出表写 report；缺 export hard-fail | 多 ELF member/export 已入门禁；`cheng_native_af_inet_bridge` 已走 root-selective runtime provider archive |
-| 阶段 6：provider archive link | `bootstrap/cheng_cold.c` | `--link-object`、`--csg-in` 和 `--provider-archive` 组合在 cold 内部读取 object/archive 并生成 exe；`--link-providers` 从 primary undefined symbols 自动选择已支持 runtime roots | `system_link=0`、`linkerless_image=1`、`unresolved_symbol_count=0`、`provider_resolved_symbol_count>0`；坏 magic/缺导出/未知 runtime root hard-fail | AArch64/RISC-V ELF 最小链路闭合，不调用 `cc`；runtime roots 已闭合首个纯常量 root，完整 root 集继续扩展 |
+| 阶段 5：provider archive 生成 | `bootstrap/cheng_cold.c` | `provider-archive-pack` 支持多个预编译 provider `.o` 和多个 export 写入 `.chenga` | archive hash、member count、导出表写 report；缺 export hard-fail | 多 ELF member/export 已入门禁；10 个 Linux runtime 纯常量 roots 已走 root-selective runtime provider archive link-report smoke |
+| 阶段 6：provider archive link | `bootstrap/cheng_cold.c` | `--link-object`、`--csg-in` 和 `--provider-archive` 组合在 cold 内部读取 object/archive 并生成 exe；`--link-providers` 从 primary undefined symbols 自动选择已支持 runtime roots | `system_link=0`、`linkerless_image=1`、`unresolved_symbol_count=0`、`provider_resolved_symbol_count>0`；坏 magic/缺导出/未知 runtime root hard-fail | AArch64/RISC-V ELF 最小链路闭合，不调用 `cc`；runtime 纯常量 root 集已锁链接报告，非纯常量 root 继续扩展 |
 | 阶段 7：linkerless exe | `bootstrap/cheng_cold.c` | `--csg-in --emit:exe` 写 Mach-O/ELF/COFF 可执行布局 | ordinary、import_use、cold_subset、combined kernel 真实运行 marker | 不依赖系统 linker |
 | 阶段 8：backend driver fixed-point | `artifacts/bootstrap/cheng.stage3`、`artifacts/backend_driver/cheng` | A 产 facts，cold 编 B；B 再产 facts，cold 编 C | B/C report 关键字段一致，facts hash 或等价 hash 稳定，smoke 全过 | 可替代对应 seed/link 路径 |
 | 阶段 9：删除 cold 前端 | `bootstrap/cheng_cold.c` | 删除 parser/type/import source-direct 模块 | `--csg-in` fixed-point 和运行回归连续稳定 | 删除后无 source-direct 依赖 |
@@ -196,7 +196,7 @@ cmp /tmp/cheng_csg_v2_zero.cold.1.o /tmp/cheng_csg_v2_zero.cold.2.o
 
 这组命令要求 `artifacts/backend_driver/cheng` 已由包含 `emit-cold-csg-v2` 的源码刷新。刷新前只运行 cold reader/object writer 的最小 facts smoke。
 
-当前最小 provider archive 链路已允许运行验证；runtime provider 已闭合 `cheng_native_af_inet_bridge` 首个纯常量 root，完整 root 集继续扩展。真实 runtime roots 验证命令：
+当前最小 provider archive 链路已允许运行验证；runtime provider 10 个纯常量 roots 已锁链接报告，非纯常量 roots 继续扩展。真实 runtime roots 验证命令：
 
 ```sh
 bootstrap/cheng_cold --link-object:/tmp/cheng_csg_v2_zero.cold.1.o --provider-archive:/tmp/cheng_provider_runtime.chenga --emit:exe --out:/tmp/cheng_csg_v2_zero.1 --target:arm64-apple-darwin
@@ -218,8 +218,8 @@ bootstrap/cheng_cold --csg-in:/tmp/cheng_csg_v2_zero.facts --emit:exe --out:/tmp
 - 阶段 0 的 cold `.o` 重复生成确定性对拍通过。
 - facts 文件大小和 load/verify 时间在 report 中可见。
 - `--csg-in` 不触发源码 parser、typed_expr、semantic lowering。
-- provider/runtime 必须通过显式 archive 或 provider facts 输入闭合；当前已闭合多 member/export ELF fixture，并闭合 `cheng_native_af_inet_bridge` runtime root。
-- provider archive/link 命令已存在；Darwin runtime marker hard-fail 已锁；Linux runtime provider 首个 root 已自动归档链接，完整 root 集继续扩展。
+- provider/runtime 必须通过显式 archive 或 provider facts 输入闭合；当前已闭合多 member/export ELF fixture，并锁住 10 个 Linux runtime 纯常量 roots 的链接报告。
+- provider archive/link 命令已存在；Darwin runtime marker hard-fail 已锁；Linux runtime provider 纯常量 root 集已自动归档链接，非纯常量 root 和目标运行 marker 继续扩展。
 - 未解析外部符号直接失败。
 - 真实可执行文件运行通过，不接受 compile-only。
 - fixed-point 通过后才允许删除 cold 前端。

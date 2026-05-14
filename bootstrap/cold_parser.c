@@ -7763,6 +7763,9 @@ int32_t parse_for(Parser *parser, BodyIR *body, Locals *locals,
     if (span_eq(parser_peek(parser), "<")) {
         parser_take(parser, "<");
         cond = COND_LT;
+    } else if (span_eq(parser_peek(parser), "<=")) {
+        parser_take(parser, "<=");
+        /* <= same as default inclusive (COND_LE), consume token */
     }
     int32_t end_kind = SLOT_I32;
     Span end_expr = parser_take_until_top_level_char(parser, ':', "expected : after for range");
