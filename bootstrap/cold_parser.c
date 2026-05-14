@@ -2318,17 +2318,20 @@ int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *locals,
               return sl;
           }
         }
-        /* Try bare-name resolution via import aliases */
+        /* Resolve against modules explicitly imported by the current source. */
         if (parser->import_source_count > 0 && parser->import_sources) {
             for (int32_t isi = 0; isi < parser->import_source_count; isi++) {
                 Span qualified = cold_arena_join3(parser->arena, parser->import_sources[isi].alias, ".", stripped_name);
                 int32_t resolved = symbols_find_fn_for_call(parser->symbols, qualified, body, arg_start, arg_count);
                 if (resolved >= 0) {
                     fn_index = resolved;
+                    lookup_name = qualified;
                     break;
                 }
             }
         }
+    }
+    if (fn_index < 0) {
         { int32_t param_kinds[COLD_MAX_I32_PARAMS];
           int32_t param_sizes[COLD_MAX_I32_PARAMS];
           for (int32_t ai = 0; ai < arg_count && ai < COLD_MAX_I32_PARAMS; ai++) {
@@ -2545,17 +2548,20 @@ int32_t parse_call_from_args_span(Parser *owner, BodyIR *body, Locals *locals,
         }
     }
     if (fn_index < 0) {
-        /* Try bare-name resolution via import aliases */
+        /* Resolve against modules explicitly imported by the current source. */
         if (owner->import_source_count > 0 && owner->import_sources) {
             for (int32_t isi = 0; isi < owner->import_source_count; isi++) {
                 Span qualified = cold_arena_join3(owner->arena, owner->import_sources[isi].alias, ".", stripped_name);
                 int32_t resolved = symbols_find_fn_for_call(owner->symbols, qualified, body, arg_start, arg_count);
                 if (resolved >= 0) {
                     fn_index = resolved;
+                    lookup_name = qualified;
                     break;
                 }
             }
         }
+    }
+    if (fn_index < 0) {
         /* External function, will be registered below */
         { int32_t param_kinds[COLD_MAX_I32_PARAMS];
           int32_t param_sizes[COLD_MAX_I32_PARAMS];
