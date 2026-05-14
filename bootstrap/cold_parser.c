@@ -1414,8 +1414,12 @@ void parse_type(Parser *parser) {
         while (fp_pos < fields_span.len) {
             int32_t ln_start = fp_pos;
             if (is_tuple_inline || is_inline_paren) {
+                int32_t bracket_depth = 0;
                 while (fp_pos < fields_span.len) {
-                    if (fields_span.ptr[fp_pos] == ',' || fields_span.ptr[fp_pos] == ';') break;
+                    uint8_t ch = fields_span.ptr[fp_pos];
+                    if (ch == '[' || ch == '(' || ch == '{') bracket_depth++;
+                    if (ch == ']' || ch == ')' || ch == '}') bracket_depth--;
+                    if (bracket_depth == 0 && (ch == ',' || ch == ';')) break;
                     fp_pos++;
                 }
             } else {

@@ -164,6 +164,44 @@ else
     ok "truncated_hard_fail"
 fi
 
+darwin_runtime_provider_source="$ROOT/src/core/runtime/core_runtime_provider_darwin.cheng"
+darwin_runtime_provider_obj="$WORK/core_runtime_provider_darwin.o"
+darwin_runtime_provider_report="$WORK/core_runtime_provider_darwin.report.txt"
+if "$COLD" system-link-exec \
+    --root:"$ROOT" \
+    --in:"$darwin_runtime_provider_source" \
+    --emit:obj \
+    --target:arm64-apple-darwin \
+    --out:"$darwin_runtime_provider_obj" \
+    --report-out:"$darwin_runtime_provider_report" >/dev/null 2>&1 &&
+   [ -s "$darwin_runtime_provider_obj" ] &&
+   grep -q '^direct_macho=1$' "$darwin_runtime_provider_report" &&
+   grep -q '^system_link=0$' "$darwin_runtime_provider_report" &&
+   grep -q '^linkerless_image=1$' "$darwin_runtime_provider_report" &&
+   nm -g "$darwin_runtime_provider_obj" 2>/dev/null | grep -q '_core_runtime_stub_trace_export$'; then
+    ok "darwin_runtime_provider_marker_object"
+else
+    bad "darwin_runtime_provider_marker_object"
+fi
+
+darwin_archive_report="$WORK/darwin_provider_archive_hard_fail.report.txt"
+if "$COLD" system-link-exec \
+    --csg-in:"$WORK/ordinary.facts" \
+    --provider-archive:"$WORK/missing_darwin_runtime.chenga" \
+    --emit:exe \
+    --target:arm64-apple-darwin \
+    --out:"$WORK/darwin_provider_archive_should_not_exist" \
+    --report-out:"$darwin_archive_report" >/dev/null 2>&1; then
+    bad "darwin_provider_archive_hard_fail_no_fallback"
+elif grep -q '^provider_archive=1$' "$darwin_archive_report" &&
+     grep -q '^provider_object_count=0$' "$darwin_archive_report" &&
+     grep -q '^system_link=0$' "$darwin_archive_report" &&
+     grep -q '^error=--provider-archive with --csg-in requires ELF target$' "$darwin_archive_report"; then
+    ok "darwin_provider_archive_hard_fail_no_fallback"
+else
+    bad "darwin_provider_archive_hard_fail_no_fallback"
+fi
+
 
 # Built-in linker: ELF .o should also produce .linked executable
 echo "  - builtin_linker_elf"

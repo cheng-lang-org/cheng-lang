@@ -467,6 +467,108 @@ assert "subset_coverage" 0 "$ACT"
 ACT=$(compile_run src/tests/cold_stack_arg_abi.cheng /tmp/ct_stack_arg_abi)
 assert "stack_arg_abi" 0 "$ACT"
 
+# 9: inline tuple field bracket-depth (commas inside brackets in default values)
+cat > /tmp/ct_tuple_default_bracket.cheng << 'TUPLEEOF'
+# Regression: inline tuple field splitting must track bracket depth
+# so that commas inside [default, values] don't cause incorrect splits.
+
+type Pair = tuple[a: int32 = 6, b: int32[], c: int32[2] = [8, 9], d: str[] = ["pair"]]
+
+type Triple = tuple[
+    x: int32[] = [10, 20, 30],
+    y: int32 = 42,
+]
+
+fn UseTriple(t: Triple): int32 =
+    return t.y
+
+fn main(): int32 =
+    var tp: Triple
+    tp.x = [1, 2, 3]
+    tp.y = 7
+    let result = UseTriple(tp)
+    if result != 7:
+        return 1
+    var pp: Pair
+    pp.d = ["hello", "world"]
+    pp.c = [8, 9]
+    if pp.c[0] != 8:
+        return 2
+    if pp.d[1] != "world":
+        return 3
+    return 0
+TUPLEEOF
+ACT=$(compile_run_timed "$COLD" /tmp/ct_tuple_default_bracket.cheng /tmp/ct_tuple_default_bracket 10)
+assert "tuple_default_bracket" 0 "$ACT"
+
+# 10: runtime provider archive (AArch64 ELF)
+rm -rf /tmp/ct_runtime
+mkdir -p /tmp/ct_runtime
+quiet as -target aarch64-unknown-linux-gnu -o /tmp/ct_runtime/runtime_stubs.o \
+    src/core/runtime/linux_runtime_stubs_aarch64.S
+if [ -f /tmp/ct_runtime/runtime_stubs.o ]; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "runtime_stubs_assemble" 1 "$ACT"
+
+quiet $COLD provider-archive-pack \
+    --target:aarch64-unknown-linux-gnu \
+    --object:/tmp/ct_runtime/runtime_stubs.o \
+    --export:atomicCasRaw \
+    --export:atomicStoreRaw \
+    --export:atomicLoadRaw \
+    --export:_start \
+    --export:__cheng_setCmdLine \
+    --export:cheng_host_malloc \
+    --export:cheng_host_free \
+    --export:cheng_host_realloc \
+    --export:cheng_host_exit_runtime \
+    --export:cheng_host_exit_immediate_runtime \
+    --export:cheng_panic_cstring_and_exit \
+    --export:cheng_program_argv_entry \
+    --export:cheng_malloc \
+    --export:cheng_free \
+    --export:cheng_cstrlen \
+    --module:runtime \
+    --source:src/core/runtime \
+    --out:/tmp/ct_runtime/runtime.chenga
+if [ -f /tmp/ct_runtime/runtime.chenga ]; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "runtime_provider_archive_pack" 1 "$ACT"
+
+quiet $COLD system-link-exec --in:src/tests/atomic_i32_direct_runtime_smoke.cheng \
+    --emit:obj --target:aarch64-unknown-linux-gnu \
+    --out:/tmp/ct_runtime/atomic.o
+if [ -f /tmp/ct_runtime/atomic.o ]; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "runtime_atomic_obj" 1 "$ACT"
+
+rm -f /tmp/ct_runtime/linked /tmp/ct_runtime/link.report.txt
+quiet $COLD system-link-exec \
+    --link-object:/tmp/ct_runtime/atomic.o \
+    --provider-archive:/tmp/ct_runtime/runtime.chenga \
+    --emit:exe --target:aarch64-unknown-linux-gnu \
+    --out:/tmp/ct_runtime/linked \
+    --report-out:/tmp/ct_runtime/link.report.txt
+if grep -q '^provider_resolved_symbol_count=6$' /tmp/ct_runtime/link.report.txt 2>/dev/null &&
+   grep -q '^unresolved_symbol_count=0$' /tmp/ct_runtime/link.report.txt 2>/dev/null &&
+   grep -q '^system_link=0$' /tmp/ct_runtime/link.report.txt 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "runtime_provider_archive_link" 1 "$ACT"
+
+rm -rf /tmp/ct_runtime
+
 echo ""
 echo "=== $PASS passed, $FAIL failed ==="
 [ "$FAIL" -eq 0 ]

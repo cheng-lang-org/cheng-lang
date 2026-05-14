@@ -3837,6 +3837,12 @@ static uint64_t cold_body_ir_canonical_hash_normalized(BodyIR *body) {
             kind == BODY_OP_I32_XOR) {
             if (a > b) { int32_t t = a; a = b; b = t; }
         }
+            if (a > b) { int32_t t = a; a = b; b = t; }
+        }
++        if (kind == BODY_OP_F32_ADD || kind == BODY_OP_F32_MUL ||
++            kind == BODY_OP_F64_ADD || kind == BODY_OP_F64_MUL) {
++            if (a > b) { int32_t t = a; a = b; b = t; }
++        }
 
         /* SHL(x,0)/ASR(x,0) -> COPY(x) for hash normalization */
         if ((kind == BODY_OP_I32_SHL || kind == BODY_OP_I32_ASR) &&
@@ -11460,12 +11466,14 @@ static void cold_apply_identity_rewrites(BodyIR *body) {
                     break;
 
                 case BODY_OP_I32_DIV:
-                    if (def >= 0 && body->op_kind[def] == BODY_OP_I32_CONST &&
-                        body->op_a[def] == 1) {
-                        body->op_kind[i] = BODY_OP_COPY_I32;
-                        body->op_a[i] = a;
-                        body->op_b[i] = 0;
-                        __atomic_add_fetch(&cold_egraph_rewrite_count, 1, __ATOMIC_RELAXED);
+                    if (def >= 0 && body->op_kind[def] == BODY_OP_I32_CONST) {
+                        int32_t val = body->op_a[def];
+                        if (val == 1) {
+                            body->op_kind[i] = BODY_OP_COPY_I32;
+                            body->op_a[i] = a;
+                            body->op_b[i] = 0;
+                            __atomic_add_fetch(&cold_egraph_rewrite_count, 1, __ATOMIC_RELAXED);
+                        }
                     }
                     break;
 
@@ -11498,12 +11506,14 @@ static void cold_apply_identity_rewrites(BodyIR *body) {
                     break;
 
                 case BODY_OP_I64_DIV:
-                    if (def >= 0 && body->op_kind[def] == BODY_OP_I64_CONST &&
-                        body->op_a[def] == 1 && body->op_b[def] == 0) {
-                        body->op_kind[i] = BODY_OP_COPY_I64;
-                        body->op_a[i] = a;
-                        body->op_b[i] = 0;
-                        __atomic_add_fetch(&cold_egraph_rewrite_count, 1, __ATOMIC_RELAXED);
+                    if (def >= 0 && body->op_kind[def] == BODY_OP_I64_CONST) {
+                        int32_t av = body->op_a[def], bv = body->op_b[def];
+                        if (av == 1 && bv == 0) {
+                            body->op_kind[i] = BODY_OP_COPY_I64;
+                            body->op_a[i] = a;
+                            body->op_b[i] = 0;
+                            __atomic_add_fetch(&cold_egraph_rewrite_count, 1, __ATOMIC_RELAXED);
+                        }
                     }
                     break;
             }
