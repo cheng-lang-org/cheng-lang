@@ -8685,6 +8685,12 @@ BodyIR *parse_fn(Parser *parser, int32_t *symbol_index_out) {
         Span param = parser_token(parser);
         if (param.len == 0) die("unterminated params");
         if (arity >= COLD_MAX_I32_PARAMS) die("cold prototype supports at most sixteen params");
+        /* Handle 'var' prefix for mutable parameters (var name: Type) */
+        bool is_var_param = span_eq(param, "var");
+        if (is_var_param) {
+            param = parser_token(parser);
+            if (param.len == 0) die("expected param name after var");
+        }
         param_names[arity] = param;
         param_types[arity] = (Span){0};
         param_kinds[arity] = SLOT_I32;
@@ -8692,6 +8698,9 @@ BodyIR *parse_fn(Parser *parser, int32_t *symbol_index_out) {
         if (span_eq(parser_peek(parser), ":")) {
             (void)parser_token(parser);
             Span param_type = parser_scope_type(parser, parser_take_type_span(parser));
+            if (is_var_param) {
+                param_type = cold_arena_join3(parser->arena, cold_cstr_span("var "), "", param_type);
+            }
             param_types[arity] = param_type;
             param_kinds[arity] = cold_slot_kind_from_type_with_symbols(parser->symbols, param_type);
             param_sizes[arity] = cold_param_size_from_type(parser->symbols, param_type, param_kinds[arity]);
