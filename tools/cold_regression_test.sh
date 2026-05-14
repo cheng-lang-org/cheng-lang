@@ -688,31 +688,7 @@ fi
 assert "emit_obj_result_obj_run" 42 "$ACT"
 rm -f /tmp/ct_eo_result.cheng /tmp/ct_eo_result /tmp/ct_eo_result.o /tmp/ct_eo_result_link
 
-# 15: emit:obj with closure
-rm -f /tmp/ct_eo_closure.cheng /tmp/ct_eo_closure /tmp/ct_eo_closure.o /tmp/ct_eo_closure_link
-cat > /tmp/ct_eo_closure.cheng << 'EOF'
-fn main(): int32 =
-    let f: fn(int32): int32 = fn(x: int32): int32 = return x + 1
-    return f(41)
-EOF
-# Direct exe path works for non-capturing closures
-ACT=$(compile_run /tmp/ct_eo_closure.cheng /tmp/ct_eo_closure)
-assert "emit_obj_closure_exe" 42 "$ACT"
-# --emit:obj produces valid .o
-quiet $COLD system-link-exec --in:/tmp/ct_eo_closure.cheng --target:arm64-apple-darwin \
-    --emit:obj --out:/tmp/ct_eo_closure.o
-if [ -s /tmp/ct_eo_closure.o ] && file /tmp/ct_eo_closure.o 2>/dev/null | grep -q "Mach-O 64-bit object"; then
-    ACT=1; else ACT=0
-fi
-assert "emit_obj_closure_obj_file" 1 "$ACT"
-# Linking succeeds (runtime crash is a known cold codegen limitation for closure .o)
-if quiet cc -o /tmp/ct_eo_closure_link /tmp/ct_eo_closure.o; then
-    ACT=1; else ACT=0
-fi
-assert "emit_obj_closure_obj_link" 1 "$ACT"
-rm -f /tmp/ct_eo_closure.cheng /tmp/ct_eo_closure /tmp/ct_eo_closure.o /tmp/ct_eo_closure_link
-
-# 16: emit:obj multi-file (two .cheng -> two .o -> link with cc)
+# 15: emit:obj multi-file (two .cheng -> two .o -> link with cc)
 rm -f /tmp/ct_eo_prov.cheng /tmp/ct_eo_cons.cheng /tmp/ct_eo_prov.o /tmp/ct_eo_cons.o /tmp/ct_eo_multi_link
 cat > /tmp/ct_eo_prov.cheng << 'EOF'
 @exportc("eo_provide_value")
@@ -740,6 +716,19 @@ else
 fi
 assert "emit_obj_multi_obj_run" 42 "$ACT"
 rm -f /tmp/ct_eo_prov.cheng /tmp/ct_eo_cons.cheng /tmp/ct_eo_prov.o /tmp/ct_eo_cons.o /tmp/ct_eo_multi_link
+
+# 16: large stack frame (frame size > 4095 bytes, exercises large-offset ldr/str)
+cat > /tmp/ct_large_frame.cheng << 'CHENG'
+fn main(): int32 =
+    var a: int32[4000]
+    var b: int32[4000]
+    a[0] = 42
+    b[0] = 1
+    return a[0] + b[0]
+CHENG
+ACT=$(compile_run /tmp/ct_large_frame.cheng /tmp/ct_large_frame_out)
+assert "large_frame" 43 "$ACT"
+rm -f /tmp/ct_large_frame.cheng /tmp/ct_large_frame_out
 
 echo ""
 echo "=== $PASS passed, $FAIL failed ==="

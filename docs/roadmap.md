@@ -7,7 +7,7 @@
 | 模块 | 进度 | 判断 |
 |---|---|---|
 | 冷编译器基础 codegen | 86% | 133 BodyIR ops 覆盖，三架构 ARM64/x86_64/RISC-V，direct Mach-O 可运行；DSE 活跃性根已修复 |
-| CSG v2 facts 往返 | 81% | roundtrip 332/332 PASS，object/exe 确定性成立 |
+| CSG v2 facts 往返 | 82% | roundtrip 393/393 PASS，object/exe 确定性成立 |
 | PrimaryObjectPlan → facts | 62% | writer/reader 已闭合到 backend driver CSG 事实，仍需扩大 canonical facts 覆盖 |
 | cold --csg-in --emit:obj | 72% | 最小 fixture、cold subset、provider archive smoke 稳定，完整 runtime provider 仍未闭合 |
 | cold linkerless exe | 68% | provider-free 可行；A/B witness 通过；多 provider archive ELF 链路和 `--csg-in --provider-archive` 已闭环 |
@@ -27,7 +27,7 @@
 
 - **冷编译器三架构 codegen**：ARM64/x86_64/RISC-V 全 133 BodyIR ops 覆盖
 - **ordinary provider-free direct Mach-O**：`ordinary_zero_exit_fixture` 直接编译运行 exit 0
-- **CSG v2 facts 往返**：`tools/cold_csg_v2_roundtrip_test.sh` 332/332 PASS
+- **CSG v2 facts 往返**：`tools/cold_csg_v2_roundtrip_test.sh` 393/393 PASS
   - Cheng writer → facts → cold reader → .o → cmp（确定性验证）
   - 错误输入 hard-fail（unknown record、truncated）
   - report 字段全输出（facts_bytes/mmap_ms/verify_ms/decode_ms/total_ms）
@@ -55,20 +55,20 @@
 ### 本次会话（2026-05-14）：CSG v2/provider 门禁收敛 + E-Graph 边界锁定
 
 **门禁全通**：
-- 45/45 冷回归 PASS，332/332 CSG v2 roundtrip PASS ✅
+- 56/56 冷回归 PASS，393/393 CSG v2 roundtrip PASS ✅
 - `ordinary_zero_exit_fixture` provider-backed 编译运行 exit 0 ✅
 - `atomic_i32_runtime_smoke` / `compiler_runtime_smoke` 全部通过 ✅
 
 **本轮有效推进**：
-- `tools/cold_regression_test.sh` 45/45 PASS，`tools/cold_csg_v2_roundtrip_test.sh` 332/332 PASS。
+- `tools/cold_regression_test.sh` 56/56 PASS，`tools/cold_csg_v2_roundtrip_test.sh` 393/393 PASS。
 - `compiler_csg_egraph_active_contract_smoke` 已接入 cold `run-host-smokes`，刷新后的 `artifacts/backend_driver/cheng` 可直接运行该 smoke。
 - fake runtime stubs 已删除；原子 provider smoke 只证明 atomic 外部符号解析，不外推成 runtime roots。
-- `host_smoke_gate_contract_smoke` 通过 stage3_new 可运行，但用当前 backend_driver 生成物运行会 hang，原因是 os 文件函数未被 cold linkerless 正确闭合，不能计入完成。
+- `host_smoke_gate_contract_smoke` 用当前 stage3/backend_driver 生成物运行均 timeout，原因是 os 文件函数未被 cold linkerless 正确闭合，不能计入完成。
 
 ### 历史记录（2026-05-14）：provider archive 最小闭环 + mutable-slot CSE 禁用
 
 - **provider archive 最小闭环已落地**：`provider-archive-pack` 接受 `--target/--object/--export/--module/--source/--out/--report-out`，写 `.chenga` archive、member count、export count、hash 和 report。`system-link-exec --link-object:<primary.o> --provider-archive:<provider.chenga> --emit:exe` 在 cold 内部读取 ELF relocatable object 和 archive，解析 undefined symbol，应用 call relocation，生成 ELF executable。
-- **门禁已更新**：`tools/cold_csg_v2_roundtrip_test.sh` 覆盖正向 provider archive、坏 magic、缺 export、双 provider member/export、`--csg-in --provider-archive`、CSG v2 fixed-point、DSE noop、Darwin runtime marker object、Mach-O provider archive pack/link 硬失败。当前结果为 **332/332 PASS**。
+- **门禁已更新**：`tools/cold_csg_v2_roundtrip_test.sh` 覆盖正向 provider archive、坏 magic、缺 export、双 provider member/export、`--csg-in --provider-archive`、CSG v2 fixed-point、DSE noop、Darwin runtime marker object、Mach-O provider archive pack/link 硬失败。当前结果为 **393/393 PASS**。
 - **当前边界**：archive 已支持多 ELF member/export，目标限定在当前 cold ELF reloc linker 支持的 AArch64/RISC-V；runtime provider root 精确选择仍未完成，Darwin Mach-O provider archive reader/linker 不支持并已硬失败锁定。
 - **mutable-slot CSE 与 hash-only dedup 已禁用**：原先的 mutating rewrite 会把 build-backend-driver 的 system-link smoke 编错；hash-only 函数去重会把不同零参函数合并到同一地址，导致 `compiler_runtime_smoke` 读到错误字符串。当前只保留 DSE 和可证明代数恒等式；后续 E-Graph 必须先做只读等价证明和运行门禁，再允许 rewrite。
 - **函数参数 no_alias 标记已撤销**：参数参与跨 block/call 后的值流，直接标记为 no_alias 会污染寄存器缓存假设。No-Alias 当前只对明确局部标量 slot 生效。
@@ -298,6 +298,13 @@
 - 缺失：函数级泛型绑定、调用点类型推断、函数特化/单态化、类型别名泛型、递归类型参数规范化
 - cheng_seed.c 有 ~2000 行泛型实现（`cheng_seed_normalize_type_text_with_params` 等 8 个核心函数）
 - 预计冷编译器需增加 **~2000-3000 行**才能达到 seed 的泛型覆盖度
+
+**函数特化实现计划**（2026-05-14 子代理审计）：
+- cheng_seed.c 有完整的特化引擎：`cheng_seed_ensure_specialized_function`（行25630）、`cheng_seed_specialized_function_name`（行25605）
+- 模式：重载决议 → 累积泛型绑定(T→int32) → 克隆模板函数 → 类型替换
+- cheng_cold.c 有 5 个清晰的 hook 插入点：`symbols_find_fn_for_call`（cold_parser.c:1869）、`parse_call_after_name`（cold_parser.c:1919）、codegen 函数 patch 阶段
+- src/ 目录无任何特化基础设施，需从零构建 `TypedExprSubstituteTypeParams` + 特化函数生成
+- 预估工作量：~1500 行（冷编译器 ~800行 + Cheng编译器 ~700行）
 
 **阻断原因**：冷编译器子集不完整，不足以编译整个 `src/` 目录。C seed 退役的前提是冷编译器可以编译全部自举链，包括泛型完整实例化、代数类型 lowering。
 
@@ -595,7 +602,7 @@ fn LoweringBuildPrimaryObjectIr(...): PrimaryObjectIr =
 4. ✅ **E-Graph 边界已锁**：UIR E-Graph unavailable、rewrite=0 已由 smoke 锁定。CSE 已移除（BodyIR 可变 slot 不安全）。Ownership report 字段已激活。No-Alias 局部标量仍活跃；函数参数 no_alias 已撤销；mutating rewrite 仍禁用。
 5. ✅ **函数级并行 + lock-free work-stealing**：pthread + `__atomic_fetch_add` + 确定性 merge。`COLD_NO_SIGN=1` 下任意 `BACKEND_JOBS` 值产物 SHA 一致。
 6. ✅ **30-80ms 架构合规**：6 个 report 字段全部输出，冷进程内微秒级计时。实测 135 函数/5293 ops 编译 total=22.5ms。
-7. ✅ **回归测试**：`tools/cold_regression_test.sh` 45/45 PASS，`tools/cold_csg_v2_roundtrip_test.sh` 332/332 PASS。
+7. ✅ **回归测试**：`tools/cold_regression_test.sh` 56/56 PASS，`tools/cold_csg_v2_roundtrip_test.sh` 393/393 PASS。
 8. ✅ **cold source-direct runtime smoke 通过**：`atomic_i32_runtime_smoke`、`thread_atomic_orc_runtime_smoke`、`compiler_runtime_smoke`、source-direct `while` 均通过；runtime provider roots 仍是下一步。
 9. 若目标切到 `30-80ms` 冷自举的下一阶段，工作重心转移到 Ownership/E-Graph（阶段 5）、C seed 最小化（阶段 6）、跨端（阶段 7）。
 
