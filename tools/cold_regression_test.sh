@@ -586,6 +586,25 @@ else
 fi
 assert "ownership_report_fields" 1 "$ACT"
 
+# Phase-off: same driver WITHOUT --ownership-on — report fields must be 0
+rm -f /tmp/ct_ownership_off /tmp/ct_ownership_off.report /tmp/ct_ownership_off.stdout
+quiet $COLD system-link-exec --in:src/tests/ownership_proof_driver_cold.cheng \
+    --target:arm64-apple-darwin --out:/tmp/ct_ownership_off \
+    --report-out:/tmp/ct_ownership_off.report
+if [ -x /tmp/ct_ownership_off ]; then
+    /tmp/ct_ownership_off >/tmp/ct_ownership_off.stdout 2>/dev/null; ACT=$?
+else
+    ACT="COMPILE_FAILED"
+fi
+assert "ownership_proof_off_exit" 0 "$ACT"
+if grep -q '^ownership_compile_entry=0$' /tmp/ct_ownership_off.report 2>/dev/null &&
+   grep -q '^ownership_runtime_witness=0$' /tmp/ct_ownership_off.report 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "ownership_report_off_fields" 1 "$ACT"
+
 echo ""
 echo "=== $PASS passed, $FAIL failed ==="
 [ "$FAIL" -eq 0 ]
