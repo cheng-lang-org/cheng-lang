@@ -17302,6 +17302,7 @@ static bool cold_runtime_provider_linux_root_supported(const char *symbol) {
         "cheng_native_so_broadcast_bridge",
         "cheng_native_msg_waitall_bridge",
         "cheng_native_sockaddr_use_len_field_bridge",
+        "cheng_native_system_cpu_logical_cores_value_bridge",
     };
     if (!symbol || symbol[0] == '\0') return false;
     for (size_t i = 0; i < sizeof(roots) / sizeof(roots[0]); i++) {

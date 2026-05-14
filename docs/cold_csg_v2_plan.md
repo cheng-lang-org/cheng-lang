@@ -149,7 +149,7 @@ reloc -> cold linkerless/object linker applies reloc
 | 阶段 3：reader 结构化 | `bootstrap/cheng_cold.c` | `--csg-in` reader 直接构造 dense sections，不做文本查找 | `facts_mmap_ms/facts_verify_ms/facts_decode_ms` 写 report；预算不过直接失败 | load 成本可见 |
 | 阶段 4：object 合同验证 | `bootstrap/cheng_cold.c`、`src/core/backend/primary_object_plan.cheng` | `--csg-in --emit:obj` 覆盖更多 fixture，验证 cold 自身确定性和运行语义 | 同一 facts 多次生成 `.o` bit-identical；导出符号、未解析外部符号、reloc 目标集合稳定；链接同一 provider archive 后运行 marker 正确 | 不要求 Cheng direct `.o` 与 cold `.o` 字节一致 |
 | 阶段 5：provider archive 生成 | `bootstrap/cheng_cold.c` | `provider-archive-pack` 支持多个预编译 provider `.o` 和多个 export 写入 `.chenga` | archive hash、member count、导出表写 report；缺 export hard-fail | 多 ELF member/export 已入门禁；10 个 Linux runtime 纯常量 roots 已走 root-selective runtime provider archive link-report smoke |
-| 阶段 6：provider archive link | `bootstrap/cheng_cold.c` | `--link-object`、`--csg-in` 和 `--provider-archive` 组合在 cold 内部读取 object/archive 并生成 exe；`--link-providers` 从 primary undefined symbols 自动选择已支持 runtime roots | `system_link=0`、`linkerless_image=1`、`unresolved_symbol_count=0`、`provider_resolved_symbol_count>0`；坏 magic/缺导出/未知 runtime root hard-fail | AArch64/RISC-V ELF 最小链路闭合，不调用 `cc`；runtime 纯常量 root 集已锁链接报告，非纯常量 root 继续扩展 |
+| 阶段 6：provider archive link | `bootstrap/cheng_cold.c` | `--link-object`、`--csg-in` 和 `--provider-archive` 组合在 cold 内部读取 object/archive 并生成 exe；`--link-providers` 从 primary undefined symbols 自动选择已支持 runtime roots | `system_link=0`、`linkerless_image=1`、`unresolved_symbol_count=0`、`provider_resolved_symbol_count>0`；坏 magic/缺导出/未知 runtime root hard-fail | AArch64/RISC-V ELF 最小链路闭合，不调用 `cc`；runtime 纯常量 root 集已锁链接报告；首个非纯常量 root 已锁 `get_nprocs` 未解析 hard-fail |
 | 阶段 7：linkerless exe | `bootstrap/cheng_cold.c` | `--csg-in --emit:exe` 写 Mach-O/ELF/COFF 可执行布局 | ordinary、import_use、cold_subset、combined kernel 真实运行 marker | 不依赖系统 linker |
 | 阶段 8：backend driver fixed-point | `artifacts/bootstrap/cheng.stage3`、`artifacts/backend_driver/cheng` | A 产 facts，cold 编 B；B 再产 facts，cold 编 C | B/C report 关键字段一致，facts hash 或等价 hash 稳定，smoke 全过 | 可替代对应 seed/link 路径 |
 | 阶段 9：删除 cold 前端 | `bootstrap/cheng_cold.c` | 删除 parser/type/import source-direct 模块 | `--csg-in` fixed-point 和运行回归连续稳定 | 删除后无 source-direct 依赖 |
@@ -157,9 +157,9 @@ reloc -> cold linkerless/object linker applies reloc
 ## 当前实测
 
 - `bootstrap/cheng_cold.c` 已实现完整 CSG v2 reader/writer，支持 `--emit:csg-v2`（独立命令）和 `--csg-in`（BodyIR + 指令字两种格式）。
-- 当前自动卡口是 `tools/cold_csg_v2_roundtrip_test.sh`：backend driver 产 `CHENGCSG` section-binary facts，cold reader 连续两次产 `.o`，`cmp` 确定性通过，并验证 writer/reader report、facts 预算、unknown/truncated hard-fail、provider archive 多 member/export、`--csg-in --provider-archive`。本地实跑结果为 716/716 PASS。
-- `CHENG_CSG_V2` text object facts reader 仍保留；它是 PrimaryObjectPlan 指令字 object facts 入口。当前 280B smoke 主线使用 `CHENGCSG` section-binary，不能把两者的验证结论混写。
-- **fixed-point 验证通过**：C writer（`cheng_cold.c`）和 Cheng writer（`primary_object_plan.cheng`）对同一输入产出 **bit-identical** 的 facts 文件（MD5 一致），cold reader 分别消费后产出 **bit-identical** 的可执行文件。
+- 当前自动卡口是 `tools/cold_csg_v2_roundtrip_test.sh`：backend driver 产 `CHENGCSG` section-binary facts，cold reader 连续两次产 `.o`，`cmp` 确定性通过，并验证 writer/reader report、facts 预算、unknown/truncated hard-fail、provider archive 多 member/export、`--csg-in --provider-archive`。本地实跑结果为 724/724 PASS。
+- `CHENG_CSG_V2` text object facts reader 已有最小 object smoke：`_main` 两条 ARM64 instruction word 连续两次读入生成 `.o` bit-identical，`cc` 链接后运行 exit 0。它是 PrimaryObjectPlan 指令字 object facts 入口；当前主体 smoke 仍使用 `CHENGCSG` section-binary，不能把两者的验证结论混写。
+- **internal fixed-point 验证通过**：当前自动门禁主体验证的是 `CHENGCSG` section-binary facts 的 writer/reader 确定性；canonical `CHENG_CSG_V2` writer 已在 `primary_object_plan.cheng` 中存在，但当前 `artifacts/backend_driver/cheng emit-cold-csg-v2` 仍产 `CHENGCSG`，不能把 724/724 结论外推为 canonical writer 完成。
 - `ordinary_zero_exit_fixture`: facts 280 bytes, exe 0.13-0.19ms, exit 0（codesign 后）。
 - `cold_subset_coverage`: facts 19,666 bytes (23 函数/411+ ops), exe 0.15-0.22ms, MD5 一致。
 - `--csg-in --emit:obj`: 两次产出 bit-identical, `_main` 全局符号, cc 链接后运行 exit 0。
@@ -167,7 +167,7 @@ reloc -> cold linkerless/object linker applies reloc
 - report 字段：`facts_bytes`, `facts_mmap_ms`, `facts_verify_ms`, `facts_decode_ms`, `facts_total_ms`, `facts_function_count` 全部输出。
 - 三架构 codegen 100% op 覆盖（ARM64/x86_64/RISC-V），全部通过自检。
 - `build-backend-driver` 已完成，产出 `artifacts/backend_driver/cheng`，contract hash `41cf6b574eae643f`。
-- `tools/cold_csg_v2_roundtrip_test.sh` 本地实跑 716/716 PASS。
+- `tools/cold_csg_v2_roundtrip_test.sh` 本地实跑 724/724 PASS，其中主体是 internal `CHENGCSG`，新增 canonical `CHENG_CSG_V2` reader/object/link 最小 smoke。
 
 ## 验收命令
 
@@ -196,7 +196,7 @@ cmp /tmp/cheng_csg_v2_zero.cold.1.o /tmp/cheng_csg_v2_zero.cold.2.o
 
 这组命令要求 `artifacts/backend_driver/cheng` 已由包含 `emit-cold-csg-v2` 的源码刷新。刷新前只运行 cold reader/object writer 的最小 facts smoke。
 
-当前最小 provider archive 链路已允许运行验证；runtime provider 10 个纯常量 roots 已锁链接报告，非纯常量 roots 继续扩展。真实 runtime roots 验证命令：
+当前最小 provider archive 链路已允许运行验证；runtime provider 10 个纯常量 roots 已锁链接报告，首个非纯常量 root 已锁 `get_nprocs` 未解析 hard-fail。真实 runtime roots 验证命令：
 
 ```sh
 bootstrap/cheng_cold --link-object:/tmp/cheng_csg_v2_zero.cold.1.o --provider-archive:/tmp/cheng_provider_runtime.chenga --emit:exe --out:/tmp/cheng_csg_v2_zero.1 --target:arm64-apple-darwin

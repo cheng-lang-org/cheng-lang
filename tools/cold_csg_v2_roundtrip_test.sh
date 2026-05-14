@@ -70,6 +70,65 @@ facts_magic_kind() {
     fi
 }
 
+canonical_reader_smoke() {
+    if [ "$TARGET" != "arm64-apple-darwin" ]; then
+        ok "canonical_minimal_skipped_non_arm64"
+        return
+    fi
+    local facts="$WORK/canonical_minimal.facts"
+    local obj1="$WORK/canonical_minimal.1.o"
+    local obj2="$WORK/canonical_minimal.2.o"
+    local bin="$WORK/canonical_minimal"
+    local report1="$WORK/canonical_minimal.1.report.txt"
+    local report2="$WORK/canonical_minimal.2.report.txt"
+    cat > "$facts" <<'CSG'
+CHENG_CSG_V2
+R0001000000161200000061726d36342d6170706c652d64617277696e
+R000200000009050000006d6163686f
+R000300000008040000006d61696e
+R000400000024010000000000000002000000040000006d61696e0c000000656e7472795f627269646765
+R00050000000400008052
+R000500000004c0035fd6
+CSG
+    if [ "$(facts_magic_kind "$facts")" = "canonical" ]; then
+        ok "canonical_minimal_magic"
+    else
+        bad "canonical_minimal_magic"
+    fi
+    if "$COLD" system-link-exec \
+        --csg-in:"$facts" \
+        --emit:obj \
+        --target:"$TARGET" \
+        --out:"$obj1" \
+        --report-out:"$report1" >/dev/null &&
+       "$COLD" system-link-exec \
+        --csg-in:"$facts" \
+        --emit:obj \
+        --target:"$TARGET" \
+        --out:"$obj2" \
+        --report-out:"$report2" >/dev/null; then
+        ok "canonical_minimal_reader"
+    else
+        bad "canonical_minimal_reader"
+    fi
+    if cmp -s "$obj1" "$obj2"; then
+        ok "canonical_minimal_deterministic_obj"
+    else
+        bad "canonical_minimal_deterministic_obj"
+    fi
+    require_grep "canonical_minimal_report_function_count" '^facts_function_count=1$' "$report1"
+    require_grep "canonical_minimal_report_word_count" '^facts_word_count=2$' "$report1"
+    require_grep "canonical_minimal_report_reloc_count" '^facts_reloc_count=0$' "$report1"
+    if cc -o "$bin" "$obj1" >/dev/null 2>&1 &&
+       "$bin" >/dev/null 2>&1; then
+        ok "canonical_minimal_link_run"
+    else
+        bad "canonical_minimal_link_run"
+    fi
+}
+
+canonical_reader_smoke
+
 roundtrip_fixture() {
     local name="$1"
     local source="$2"
@@ -177,6 +236,10 @@ cross_version_opt_test() {
         fi
     else
         bad "${name}_xver_obj (cold run failed)"
+    fi
+
+    if [ "$(facts_magic_kind "$facts")" = "canonical" ]; then
+        return
     fi
 
     echo "  - ${name}_xver_csg"
@@ -312,6 +375,9 @@ roundtrip_fixture import_chain_a tests/cheng/backend/fixtures/import_chain_a.che
 echo "  - roundtrip_stability"
 for f in "$WORK"/*.facts; do
     base="$(basename "$f" .facts)"
+    if [ "$(facts_magic_kind "$f")" = "canonical" ]; then
+        continue
+    fi
     roundtrip_stability_fixture "$base" "$f"
 done
 
