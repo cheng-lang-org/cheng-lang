@@ -388,6 +388,64 @@ else
   fail=$((fail + 1))
 fi
 
+# Cross-stage fixed-point: backend_driver vs cold compiler
+# Same facts should produce same .text section (codegen equivalence)
+echo "  - cross_stage_text_arm64"
+if ! "$DRIVER" system-link-exec \
+    --csg-in:"$WORK/ordinary.facts" \
+    --emit:obj --target:"$TARGET" \
+    --out:"$WORK/stage_driver.o" >/dev/null 2>&1; then
+  echo "FAIL cross_stage_text_arm64 (driver obj failed)"
+  fail=$((fail + 1))
+elif ! "$COLD" system-link-exec \
+    --csg-in:"$WORK/ordinary.facts" \
+    --emit:obj --target:"$TARGET" \
+    --out:"$WORK/stage_cold.o" >/dev/null 2>&1; then
+  echo "FAIL cross_stage_text_arm64 (cold obj failed)"
+  fail=$((fail + 1))
+else
+  driver_hex=$(otool -X -t "$WORK/stage_driver.o" 2>/dev/null | tail -n +2 | tr -d '[:space:]')
+  cold_hex=$(otool -X -t "$WORK/stage_cold.o" 2>/dev/null | tail -n +2 | tr -d '[:space:]')
+  if [ -z "$driver_hex" ] || [ -z "$cold_hex" ]; then
+    echo "FAIL cross_stage_text_arm64 (empty .text section)"
+    fail=$((fail + 1))
+  elif [ "$driver_hex" = "$cold_hex" ]; then
+    echo "PASS cross_stage_text_arm64"
+    pass=$((pass + 1))
+  else
+    echo "FAIL cross_stage_text_arm64 (.text mismatch)"
+    fail=$((fail + 1))
+  fi
+fi
+
+# Cross-stage functional equivalence: both produce executables with same behavior
+echo "  - cross_stage_functional_arm64"
+if ! "$DRIVER" system-link-exec \
+    --csg-in:"$WORK/ordinary.facts" \
+    --emit:exe --target:"$TARGET" \
+    --out:"$WORK/stage_driver_exe" >/dev/null 2>&1; then
+  echo "FAIL cross_stage_functional_arm64 (driver exe failed)"
+  fail=$((fail + 1))
+elif ! "$COLD" system-link-exec \
+    --csg-in:"$WORK/ordinary.facts" \
+    --emit:exe --target:"$TARGET" \
+    --out:"$WORK/stage_cold_exe" >/dev/null 2>&1; then
+  echo "FAIL cross_stage_functional_arm64 (cold exe failed)"
+  fail=$((fail + 1))
+else
+  driver_code=0
+  "$WORK/stage_driver_exe" 2>/dev/null || driver_code=$?
+  cold_code=0
+  "$WORK/stage_cold_exe" 2>/dev/null || cold_code=$?
+  if [ "$driver_code" = "$cold_code" ]; then
+    echo "PASS cross_stage_functional_arm64"
+    pass=$((pass + 1))
+  else
+    echo "FAIL cross_stage_functional_arm64 (driver=$driver_code cold=$cold_code)"
+    fail=$((fail + 1))
+  fi
+fi
+
 echo "=== $pass passed, $fail failed ==="
 if [ "$fail" -ne 0 ]; then
     exit 1
