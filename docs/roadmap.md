@@ -14,7 +14,7 @@
 | provider archive | 73% | `provider-archive-pack` + `--link-object/--csg-in --provider-archive` 已覆盖多 ELF member/export、缺 export hard-fail；Mach-O archive 入口已明确硬失败；10 个 Linux runtime 纯常量 roots 已走 primary undefined symbol 自动选 root 并锁链接报告；首个非纯常量 root 锁住外部符号未解析 hard-fail |
 | backend driver fixed-point | 55% | A/B witness 通过（产物 SHA 一致，关键报告字段对等）；cross-version 确定性成立（O0/O2 对 19 fixture 产出 bit-identical .o 与 .csgv2）；cross-version proven |
 | Ownership / E-Graph | 45% | ownership proof driver 可运行；24+ rewrite rules（整数/位运算恒等式 + 强度缩减，含 EQ(x,x)→CONST 1 identity、double-NEG/NOT 消除）；DSE fixed；CSE 已移除；整数/位运算恒等式只用于严格合同；浮点不做重排；UIR E-Graph unavailable；Ownership CI gate 已接入；LICM CONST hoisting 已实现但不在 codegen 主线 |
-| C seed 替代 | 58% | 8 blockers fixed；**33/39 源文件可冷编译**（`--emit:obj`）：含 dispatch_min(4.9MB)、system_link_exec(696KB)、lowering_plan 的依赖模块等均通过；6 个失败文件：gate_main、lowering_plan、primary_object_plan、system_link_exec_runtime、parser、typed_expr——失败原因为 "unknown qualified identifier" 和变量作用域；函数级泛型/完整单态化未闭合，cheng_seed.c 仍在链中 |
+| C seed 替代 | 58% | 8 blockers fixed；**33/39 源文件可冷编译**（`--emit:obj`）：含 dispatch_min(4.9MB)、system_link_exec(696KB)、lowering_plan 的依赖模块等均通过；6 个失败：gate_main、lowering_plan、primary_object_plan、system_link_exec_runtime、parser、typed_expr。根因：(1) 导入模块的 enum variant 未注册到 variant 表——`creq.EmitExe`、`std.strutils.Contains` 等 qualified identifier 无法解析；(2) 循环内变量作用域——`j = j - 1` 找不到局部变量。函数级泛型/完整单态化未闭合，cheng_seed.c 仍在链中 |
 | 跨端 | 60% | 三架构 exe + COFF obj 均产出，CI 中有 COFF 格式验证 |
 
 愿景可以写目标，不写成完成。若与实现冲突，以 `docs/cheng-formal-spec.md`、`src/core/tooling/README.md`、当前源码和当前可执行产物为准。
