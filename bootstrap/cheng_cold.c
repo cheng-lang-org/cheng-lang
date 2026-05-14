@@ -11360,7 +11360,7 @@ static void cold_optimize_body(BodyIR *body) {
             if (ext_reads <= 0 && !cold_op_has_side_effect(kind)) {
                 /* Dead store: remove this op */
                 body->op_kind[i] = 0;
-                cold_egraph_rewrite_count++;
+                __atomic_add_fetch(&cold_egraph_rewrite_count, 1, __ATOMIC_RELAXED);
                 /* Decrement read_count for source operands (cascade) */
                 if (a >= 0 && a < slot_count && a != dst) read_count[a]--;
                 if (b >= 0 && b < slot_count && b != dst) read_count[b]--;
@@ -11422,7 +11422,7 @@ static void cold_optimize_body(BodyIR *body) {
                     body->op_kind[i] = BODY_OP_COPY_COMPOSITE;
                 body->op_a[i] = found_dst;
                 body->op_b[i] = 0;
-                cold_egraph_rewrite_count++;
+                __atomic_add_fetch(&cold_egraph_rewrite_count, 1, __ATOMIC_RELAXED);
             } else {
                 /* Add to cache */
                 if (cse_count >= cse_cap) {
