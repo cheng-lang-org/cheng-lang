@@ -96,6 +96,11 @@
 - `build-backend-driver` 候选门禁必须保留 source-direct `while` 运行测试；禁止把真实控制流 smoke 改成 `for`、compile-only 或其它绕路。
 - runtime provider archive 门禁禁止用 allocator/entry/panic stub 冒充闭合；只允许导出真实实现的符号。原子 provider smoke 只能证明 atomic 外部符号解析，不能外推成 runtime roots 完成。
 
+- 冷编译器强度折减修改常量原地时，必须校验 op_read_count==1 排他使用，防止共享常量槽被 SHL/ASR 错误读取 op_b 作为 slot index。
+- 内联 tuple field 切分必须追踪括号深度；`[default, values]` 内的逗号不能错误分割字段。
+- LICM 必须先做只读分析（不变量计数，不移动 op），验证收敛后再启用 loop 变换。back-edge 检测是正确识别 natural loop 的前提。
+- 冷编译器 exe 路径中未解析的 codegen patch 必须在 exe 链接阶段解析到 provider 符号表；patch 需携带 unresolved 标记。
+
 ## Resolved
 
 - `BackendDriverDispatchMinRunCommand` `cfg_no_top_if`：路由到BodyKindStatementSequence。

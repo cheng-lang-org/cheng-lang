@@ -167,7 +167,7 @@ reloc -> cold linkerless/object linker applies reloc
 - report 字段：`facts_bytes`, `facts_mmap_ms`, `facts_verify_ms`, `facts_decode_ms`, `facts_total_ms`, `facts_function_count` 全部输出。
 - 三架构 codegen 100% op 覆盖（ARM64/x86_64/RISC-V），全部通过自检。
 - `build-backend-driver` 已完成，产出 `artifacts/backend_driver/cheng`，contract hash `41cf6b574eae643f`。
-- `tools/cold_regression_test.sh` 35/35 PASS；`tools/cold_csg_v2_roundtrip_test.sh` 51/51 PASS。
+- `tools/cold_regression_test.sh` 43/43 PASS；`tools/cold_csg_v2_roundtrip_test.sh` 53/53 PASS。
 
 ## 验收命令
 
@@ -219,7 +219,7 @@ bootstrap/cheng_cold --csg-in:/tmp/cheng_csg_v2_zero.facts --emit:exe --out:/tmp
 - facts 文件大小和 load/verify 时间在 report 中可见。
 - `--csg-in` 不触发源码 parser、typed_expr、semantic lowering。
 - provider/runtime 必须通过显式 archive 或 provider facts 输入闭合；当前已闭合多 member/export ELF fixture。
-- provider archive/link 命令已存在；runtime provider roots 和 Darwin runtime marker 还未完成。
+- provider archive/link 命令已存在；Darwin runtime marker hard-fail 已锁；runtime provider roots 还未完成。
 - 未解析外部符号直接失败。
 - 真实可执行文件运行通过，不接受 compile-only。
 - fixed-point 通过后才允许删除 cold 前端。

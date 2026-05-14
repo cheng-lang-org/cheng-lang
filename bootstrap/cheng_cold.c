@@ -3904,6 +3904,52 @@ static uint64_t cold_body_ir_canonical_hash_normalized(BodyIR *body) {
             }
         }
 
+        /* SUB(0, SUB(0, x)) -> COPY(x) for hash normalization (double-negation) */
+        if (kind == BODY_OP_I32_SUB && slot_def &&
+            a >= 0 && a < body->slot_count && b >= 0 && b < body->slot_count) {
+            int32_t a_def = slot_def[a];
+            int32_t b_def = slot_def[b];
+            if (a_def >= 0 && a_def < body->op_count &&
+                body->op_kind[a_def] == BODY_OP_I32_CONST &&
+                body->op_a[a_def] == 0 &&
+                b_def >= 0 && b_def < body->op_count &&
+                body->op_kind[b_def] == BODY_OP_I32_SUB) {
+                int32_t inner_a = body->op_a[b_def];
+                if (inner_a >= 0 && inner_a < body->slot_count) {
+                    int32_t inner_a_def = slot_def[inner_a];
+                    if (inner_a_def >= 0 && inner_a_def < body->op_count &&
+                        body->op_kind[inner_a_def] == BODY_OP_I32_CONST &&
+                        body->op_a[inner_a_def] == 0) {
+                        kind = BODY_OP_COPY_I32;
+                        a = body->op_b[b_def];
+                        b = 0;
+                    }
+                }
+            }
+        }
+        if (kind == BODY_OP_I64_SUB && slot_def &&
+            a >= 0 && a < body->slot_count && b >= 0 && b < body->slot_count) {
+            int32_t a_def = slot_def[a];
+            int32_t b_def = slot_def[b];
+            if (a_def >= 0 && a_def < body->op_count &&
+                body->op_kind[a_def] == BODY_OP_I64_CONST &&
+                body->op_a[a_def] == 0 && body->op_b[a_def] == 0 &&
+                b_def >= 0 && b_def < body->op_count &&
+                body->op_kind[b_def] == BODY_OP_I64_SUB) {
+                int32_t inner_a = body->op_a[b_def];
+                if (inner_a >= 0 && inner_a < body->slot_count) {
+                    int32_t inner_a_def = slot_def[inner_a];
+                    if (inner_a_def >= 0 && inner_a_def < body->op_count &&
+                        body->op_kind[inner_a_def] == BODY_OP_I64_CONST &&
+                        body->op_a[inner_a_def] == 0 && body->op_b[inner_a_def] == 0) {
+                        kind = BODY_OP_COPY_I64;
+                        a = body->op_b[b_def];
+                        b = 0;
+                    }
+                }
+            }
+        }
+
         h ^= ((uint64_t)kind * 0xc6a4a7935bd1e995ull);
         h = (h << 7) | (h >> 57);
         h ^= ((uint64_t)a * 0xc6a4a7935bd1e995ull);
@@ -11554,6 +11600,66 @@ static void cold_apply_identity_rewrites(BodyIR *body) {
                         }
                     }
                     break;
+
+                case BODY_OP_I32_AND:
+                    if (def >= 0 && body->op_kind[def] == BODY_OP_I32_CONST) {
+                        int32_t val = body->op_a[def];
+                        if (val == 0) {
+                            body->op_kind[i] = BODY_OP_I32_CONST;
+                            body->op_a[i] = 0;
+                            body->op_b[i] = 0;
+                            __atomic_add_fetch(&cold_egraph_rewrite_count, 1, __ATOMIC_RELAXED);
+                        } else if (val == -1) {
+                            body->op_kind[i] = BODY_OP_COPY_I32;
+                            body->op_a[i] = a;
+                            body->op_b[i] = 0;
+                            __atomic_add_fetch(&cold_egraph_rewrite_count, 1, __ATOMIC_RELAXED);
+                        }
+                    }
+                    break;
+
+                case BODY_OP_I32_OR:
+                case BODY_OP_I32_XOR:
+                case BODY_OP_I32_SHL:
+                case BODY_OP_I32_ASR:
+                    if (def >= 0 && body->op_kind[def] == BODY_OP_I32_CONST &&
+                        body->op_a[def] == 0) {
+                        body->op_kind[i] = BODY_OP_COPY_I32;
+                        body->op_a[i] = a;
+                        body->op_b[i] = 0;
+                        __atomic_add_fetch(&cold_egraph_rewrite_count, 1, __ATOMIC_RELAXED);
+                    }
+                    break;
+
+                case BODY_OP_I64_AND:
+                    if (def >= 0 && body->op_kind[def] == BODY_OP_I64_CONST) {
+                        int32_t av = body->op_a[def], bv = body->op_b[def];
+                        if (av == 0 && bv == 0) {
+                            body->op_kind[i] = BODY_OP_I64_CONST;
+                            body->op_a[i] = 0;
+                            body->op_b[i] = 0;
+                            __atomic_add_fetch(&cold_egraph_rewrite_count, 1, __ATOMIC_RELAXED);
+                        } else if (av == -1 && bv == -1) {
+                            body->op_kind[i] = BODY_OP_COPY_I64;
+                            body->op_a[i] = a;
+                            body->op_b[i] = 0;
+                            __atomic_add_fetch(&cold_egraph_rewrite_count, 1, __ATOMIC_RELAXED);
+                        }
+                    }
+                    break;
+
+                case BODY_OP_I64_OR:
+                case BODY_OP_I64_XOR:
+                case BODY_OP_I64_SHL:
+                case BODY_OP_I64_ASR:
+                    if (def >= 0 && body->op_kind[def] == BODY_OP_I64_CONST &&
+                        body->op_a[def] == 0 && body->op_b[def] == 0) {
+                        body->op_kind[i] = BODY_OP_COPY_I64;
+                        body->op_a[i] = a;
+                        body->op_b[i] = 0;
+                        __atomic_add_fetch(&cold_egraph_rewrite_count, 1, __ATOMIC_RELAXED);
+                    }
+                    break;
             }
         }
 
@@ -11827,7 +11933,6 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
                                   entry_function, reachable_functions);
 
     cold_egraph_rewrite_count = 0;
-    cold_egraph_licm_count = 0;
     FunctionPatchList function_patches = {0};
     function_patches.arena = code->arena;
 
