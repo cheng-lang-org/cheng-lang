@@ -3369,6 +3369,7 @@ enum {
     BODY_OP_COPY_RAW = 136,
     BODY_OP_PATH_IS_ABSOLUTE = 137,
     BODY_OP_THREAD_YIELD = 138,
+    BODY_OP_SET_RAW = 139,
 };
 
 enum {
@@ -10531,6 +10532,30 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         a64_patch_bcond(code, copy_done, code->count);
         code_emit(code, a64_movz(R0, 0, 0));
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
+    } else if (kind == BODY_OP_SET_RAW) {
+        a64_emit_ldr_sp_off(code, R3, body->slot_offset[a], true);
+        if (body->slot_kind[b] == SLOT_I32) {
+            a64_emit_ldr_sp_off(code, R4, body->slot_offset[b], false);
+        } else {
+            a64_emit_ldr_sp_off(code, R4, body->slot_offset[b], true);
+        }
+        if (body->slot_kind[c] == SLOT_I32) {
+            a64_emit_ldr_sp_off(code, R5, body->slot_offset[c], false);
+            code_emit(code, a64_sxtw(R5, R5));
+        } else {
+            a64_emit_ldr_sp_off(code, R5, body->slot_offset[c], true);
+        }
+        int32_t set_loop = code->count;
+        code_emit(code, a64_cmp_imm(R5, 0));
+        int32_t set_done = code->count;
+        code_emit(code, a64_bcond(0, COND_LE));
+        code_emit(code, a64_strb_imm(R4, R3, 0));
+        code_emit(code, a64_add_imm(R3, R3, 1, true));
+        code_emit(code, a64_sub_imm(R5, R5, 1, true));
+        code_emit(code, a64_b(set_loop - code->count));
+        a64_patch_bcond(code, set_done, code->count);
+        code_emit(code, a64_movz(R0, 0, 0));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
     } else if (kind == BODY_OP_WRITE_RAW) {
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
         a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], true);
@@ -11798,6 +11823,7 @@ static bool cold_op_has_side_effect(int32_t kind) {
         case BODY_OP_PATH_WRITE_TEXT:
         case BODY_OP_PATH_WRITE_BYTES:
         case BODY_OP_COPY_RAW:
+        case BODY_OP_SET_RAW:
         case BODY_OP_MKDIR_ONE:
         case BODY_OP_OPEN:
         case BODY_OP_READ:
@@ -11822,6 +11848,7 @@ static bool cold_op_reads_c_slot(int32_t kind) {
         case BODY_OP_WRITE_BYTES:
         case BODY_OP_PATH_WRITE_BYTES:
         case BODY_OP_COPY_RAW:
+        case BODY_OP_SET_RAW:
             return true;
         default:
             return false;
@@ -12625,7 +12652,11 @@ static void cold_diag_dump_target_body(Symbols *symbols, int32_t fn_index, BodyI
     if (!cold_diag_dump_slots || !symbols || !body ||
         fn_index < 0 || fn_index >= symbols->function_count) return;
     if (!span_same(symbols->functions[fn_index].name,
-                   cold_cstr_span("os.processResourceGuardConfiguredMaxRssBytesOnce"))) return;
+                   cold_cstr_span("layout.byteBufToBytes")) &&
+        !span_same(symbols->functions[fn_index].name,
+                   cold_cstr_span("layout.fixedBytes32FromBytes")) &&
+        !span_same(symbols->functions[fn_index].name,
+                   cold_cstr_span("rawbytes.BytesAlloc"))) return;
     fprintf(stderr, "[diag-body] fn[%d] ", fn_index);
     cold_diag_fn_name(symbols->functions[fn_index].name);
     fprintf(stderr, " slots=%d ops=%d blocks=%d terms=%d frame=%d\n",
@@ -15818,6 +15849,14 @@ static int32_t cold_compile_one_import_direct(Symbols *symbols, const char *path
                 parser.pos = cold_next_top_level_decl(parser.source, parser.pos);
                 body = 0;
                 symbol_index = -1;
+                /* Mark skipped function as external so CSG v2 emit can produce
+                   relocations referencing it without failing. */
+                if (saved_fn_pos < COLD_IMPORT_FN_MAP_CAP &&
+                    qual_indices[saved_fn_pos] >= 0) {
+                    int32_t qi = qual_indices[saved_fn_pos];
+                    if (qi < symbols->function_count)
+                        symbols->functions[qi].is_external = true;
+                }
             }
             ColdErrorRecoveryEnabled = false;
             if (!body) continue;
@@ -15853,7 +15892,11 @@ static int32_t cold_compile_one_import_direct(Symbols *symbols, const char *path
                     }
                 }
             }
-            if (skip_body) { continue; /* keep stub */ }
+            if (skip_body) {
+                if (symbol_index >= 0 && symbol_index < symbols->function_count)
+                    symbols->functions[symbol_index].is_external = true;
+                continue; /* keep stub */
+            }
             function_bodies[(int32_t)symbol_index] = (BodyIR *)body;
             compiled++;
             /* Map to qualified index if available */

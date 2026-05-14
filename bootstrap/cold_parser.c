@@ -3539,6 +3539,8 @@ bool cold_try_os_intrinsic(Parser *parser, BodyIR *body, Span name,
         return true;
     }
     if (span_eq(name, "BackendDriverDispatchMinGetrusageBridge") ||
+        span_eq(name, "os.os_getrusage_bridge") ||
+        span_eq(name, "os_getrusage_bridge") ||
         span_eq(name, "getrusage")) {
         if (arg_count != 2) die("getrusage intrinsic arity mismatch");
         int32_t who = body->call_arg_slot[arg_start];
@@ -3555,12 +3557,99 @@ bool cold_try_os_intrinsic(Parser *parser, BodyIR *body, Span name,
         return true;
     }
     if (span_eq(name, "BackendDriverDispatchMinExitBridge") ||
+        span_eq(name, "os.os_exit_bridge") ||
+        span_eq(name, "os_exit_bridge") ||
         span_eq(name, "exit")) {
         if (arg_count != 1) die("exit intrinsic arity mismatch");
         int32_t code_slot = body->call_arg_slot[arg_start];
         if (body->slot_kind[code_slot] != SLOT_I32) die("exit code must be int32");
         int32_t slot = body_slot(body, SLOT_I32, 4);
         body_op(body, BODY_OP_EXIT, slot, code_slot, 0);
+        if (kind_out) *kind_out = SLOT_I32;
+        *slot_out = slot;
+        return true;
+    }
+    if (span_eq(name, "system.HeapNewCompat") ||
+        span_eq(name, "HeapNewCompat") ||
+        span_eq(name, "heapNewCompat")) {
+        if (arg_count != 1) die("HeapNewCompat intrinsic arity mismatch");
+        int32_t len = body->call_arg_slot[arg_start];
+        if (body->slot_kind[len] != SLOT_I32 && body->slot_kind[len] != SLOT_I64)
+            die("HeapNewCompat len must be int");
+        int32_t slot = body_slot(body, SLOT_PTR, 8);
+        body_slot_set_type(body, slot, cold_cstr_span("ptr"));
+        body_op(body, BODY_OP_MMAP, slot, len, 0);
+        if (kind_out) *kind_out = SLOT_PTR;
+        *slot_out = slot;
+        return true;
+    }
+    if (span_eq(name, "rawmem_support.rawmemPtrAdd") ||
+        span_eq(name, "rawmem_support.RawmemPtrAdd") ||
+        span_eq(name, "rawmemPtrAdd") ||
+        span_eq(name, "RawmemPtrAdd")) {
+        if (arg_count != 2) die("RawmemPtrAdd intrinsic arity mismatch");
+        int32_t ptr_slot = body->call_arg_slot[arg_start];
+        int32_t off_slot = body->call_arg_slot[arg_start + 1];
+        int32_t ptr_kind = body->slot_kind[ptr_slot];
+        int32_t off_kind = body->slot_kind[off_slot];
+        if (ptr_kind != SLOT_PTR && ptr_kind != SLOT_OPAQUE) die("RawmemPtrAdd ptr must be ptr");
+        if (off_kind != SLOT_I32 && off_kind != SLOT_I64) die("RawmemPtrAdd offset must be int");
+        int32_t slot = body_slot(body, SLOT_PTR, 8);
+        body_slot_set_type(body, slot, cold_cstr_span("ptr"));
+        body_op(body, BODY_OP_PTR_ADD, slot, ptr_slot, off_slot);
+        if (kind_out) *kind_out = SLOT_PTR;
+        *slot_out = slot;
+        return true;
+    }
+    if (span_eq(name, "rawmem_support.rawmemCopyRaw") ||
+        span_eq(name, "rawmem_support.rawmemCopy") ||
+        span_eq(name, "rawmem_support.RawmemCopyRaw") ||
+        span_eq(name, "rawmem_support.RawmemCopy") ||
+        span_eq(name, "rawmemCopyRaw") ||
+        span_eq(name, "rawmemCopy") ||
+        span_eq(name, "RawmemCopyRaw") ||
+        span_eq(name, "RawmemCopy")) {
+        if (arg_count != 3) die("RawmemCopy intrinsic arity mismatch");
+        int32_t dst_ptr = body->call_arg_slot[arg_start];
+        int32_t src_ptr = body->call_arg_slot[arg_start + 1];
+        int32_t len_slot = body->call_arg_slot[arg_start + 2];
+        int32_t dst_kind = body->slot_kind[dst_ptr];
+        int32_t src_kind = body->slot_kind[src_ptr];
+        int32_t len_kind = body->slot_kind[len_slot];
+        if (dst_kind != SLOT_PTR && dst_kind != SLOT_OPAQUE) die("RawmemCopy dst must be ptr");
+        if (src_kind != SLOT_PTR && src_kind != SLOT_OPAQUE) die("RawmemCopy src must be ptr");
+        if (len_kind != SLOT_I32 && len_kind != SLOT_I64) die("RawmemCopy len must be int");
+        int32_t slot = body_slot(body, SLOT_I32, 4);
+        body_op3(body, BODY_OP_COPY_RAW, slot, dst_ptr, src_ptr, len_slot);
+        if (kind_out) *kind_out = SLOT_I32;
+        *slot_out = slot;
+        return true;
+    }
+    if (span_eq(name, "rawmem_support.rawmemSet") ||
+        span_eq(name, "rawmem_support.RawmemSet") ||
+        span_eq(name, "rawmemSet") ||
+        span_eq(name, "RawmemSet")) {
+        if (arg_count != 3) die("RawmemSet intrinsic arity mismatch");
+        int32_t dst_ptr = body->call_arg_slot[arg_start];
+        int32_t byte_slot = body->call_arg_slot[arg_start + 1];
+        int32_t len_slot = body->call_arg_slot[arg_start + 2];
+        int32_t dst_kind = body->slot_kind[dst_ptr];
+        int32_t byte_kind = body->slot_kind[byte_slot];
+        int32_t len_kind = body->slot_kind[len_slot];
+        if (dst_kind != SLOT_PTR && dst_kind != SLOT_OPAQUE) die("RawmemSet dst must be ptr");
+        if (byte_kind != SLOT_I32 && byte_kind != SLOT_I64) die("RawmemSet byte must be int");
+        if (len_kind != SLOT_I32 && len_kind != SLOT_I64) die("RawmemSet len must be int");
+        int32_t slot = body_slot(body, SLOT_I32, 4);
+        body_op3(body, BODY_OP_SET_RAW, slot, dst_ptr, byte_slot, len_slot);
+        if (kind_out) *kind_out = SLOT_I32;
+        *slot_out = slot;
+        return true;
+    }
+    if (span_eq(name, "thread.thread_yield_raw") ||
+        span_eq(name, "thread_yield_raw")) {
+        if (arg_count != 0) die("thread_yield_raw intrinsic arity mismatch");
+        int32_t slot = body_slot(body, SLOT_I32, 4);
+        body_op(body, BODY_OP_THREAD_YIELD, slot, 0, 0);
         if (kind_out) *kind_out = SLOT_I32;
         *slot_out = slot;
         return true;
@@ -4044,6 +4133,17 @@ bool cold_try_path_intrinsic(Parser *parser, BodyIR *body, Span name,
         int32_t slot = cold_make_str_result_slot(body);
         body_op(body, BODY_OP_PATH_ABSOLUTE, slot, root, raw);
         if (kind_out) *kind_out = SLOT_STR;
+        *slot_out = slot;
+        return true;
+    }
+    if (span_eq(name, "chengpath.PathIsAbsolute") ||
+        span_eq(name, "PathIsAbsolute")) {
+        if (arg_count != 1) die("PathIsAbsolute arity mismatch");
+        int32_t raw = body->call_arg_slot[arg_start];
+        raw = cold_require_str_value(body, raw, "PathIsAbsolute raw");
+        int32_t slot = body_slot(body, SLOT_I32, 4);
+        body_op(body, BODY_OP_PATH_IS_ABSOLUTE, slot, raw, 0);
+        if (kind_out) *kind_out = SLOT_I32;
         *slot_out = slot;
         return true;
     }
@@ -6151,16 +6251,40 @@ int32_t cold_materialize_i32_ref(BodyIR *body, int32_t slot, int32_t *kind) {
 
 int32_t cold_materialize_i64_value(BodyIR *body, int32_t slot, int32_t *kind) {
     if (*kind == SLOT_I64 || *kind == SLOT_PTR) return slot;
+    if (*kind == SLOT_I64_REF) {
+        int32_t dst = body_slot(body, SLOT_I64, 8);
+        body_op(body, BODY_OP_PTR_LOAD_I64, dst, slot, 0);
+        *kind = SLOT_I64;
+        return dst;
+    }
+    if (*kind == SLOT_OPAQUE && slot >= 0 && body->slot_size[slot] == 8) {
+        int32_t dst = body_slot(body, SLOT_I64, 8);
+        body_op(body, BODY_OP_COPY_I64, dst, slot, 0);
+        *kind = SLOT_I64;
+        return dst;
+    }
+    if (*kind == SLOT_OPAQUE_REF) {
+        int32_t dst = body_slot(body, SLOT_I64, 8);
+        body_op(body, BODY_OP_PTR_LOAD_I64, dst, slot, 0);
+        *kind = SLOT_I64;
+        return dst;
+    }
+    if ((*kind == SLOT_OBJECT_REF || *kind == SLOT_STR_REF ||
+         *kind == SLOT_SEQ_I32_REF || *kind == SLOT_SEQ_STR_REF ||
+         *kind == SLOT_SEQ_OPAQUE_REF) &&
+        slot >= 0 && body->slot_size[slot] == 8) {
+        int32_t dst = body_slot(body, SLOT_I64, 8);
+        body_op(body, BODY_OP_COPY_I64, dst, slot, 0);
+        *kind = SLOT_I64;
+        return dst;
+    }
     if (*kind == SLOT_I32) {
         int32_t dst = body_slot(body, SLOT_I64, 8);
         body_op(body, BODY_OP_I64_FROM_I32, dst, slot, 0);
         *kind = SLOT_I64;
         return dst;
     }
-    /* Non-int64 value: return 0 */
-    int32_t zero = body_slot(body, SLOT_I64, 8);
-    *kind = SLOT_I64;
-    return zero;
+    die("cold cannot materialize int64 value");
     return slot;
 }
 
@@ -6536,7 +6660,8 @@ void parse_return(Parser *parser, BodyIR *body, Locals *locals, int32_t block) {
     }
     if (body->return_kind == SLOT_I32) {
         slot = cold_materialize_i32_ref(body, slot, &kind);
-    } else if (body->return_kind == SLOT_I64 && kind == SLOT_I32) {
+    } else if (body->return_kind == SLOT_I64 &&
+               (kind == SLOT_I32 || kind == SLOT_I64_REF)) {
         slot = cold_materialize_i64_value(body, slot, &kind);
     }
     if (kind != body->return_kind && !(body->return_kind == SLOT_I32 && kind == SLOT_VARIANT &&
@@ -6731,6 +6856,13 @@ void parse_assign(Parser *parser, BodyIR *body, Locals *locals, Span name) {
         if (kind == SLOT_I32) slot = cold_materialize_i64_value(body, slot, &kind);
         if (kind != SLOT_I64) die("cold assignment value must be int64");
         body_op(body, BODY_OP_COPY_I64, local->slot, slot, 0);
+        return;
+    }
+    if (local->kind == SLOT_I64_REF) {
+        if (kind == SLOT_I32 || kind == SLOT_I64_REF)
+            slot = cold_materialize_i64_value(body, slot, &kind);
+        if (kind != SLOT_I64) die("cold assignment value must be int64");
+        body_op(body, BODY_OP_PTR_STORE_I64, local->slot, slot, 0);
         return;
     }
     if (local->kind == SLOT_STR_REF) {
@@ -7787,6 +7919,7 @@ void parse_condition_span(Parser *owner, BodyIR *body, Locals *locals,
     int32_t left_end = leaf.pos;
     parser_ws(&leaf);
     if (leaf.pos == leaf.source.len) {
+        left = cold_materialize_i32_ref(body, left, &left_kind);
         if (left_kind != SLOT_I32) {
             /* Non-int32 boolean: treat as true */
         }
@@ -8089,13 +8222,16 @@ int32_t parse_if(Parser *parser, BodyIR *body, Locals *locals,
     int32_t false_end = false_block;
     int32_t branch_indent = parser_next_indent(parser);
     Span branch_token = parser_peek(parser);
+    bool has_false_suite = false;
     if (branch_indent == stmt_indent && span_eq(branch_token, "elif")) {
         parser_take(parser, "elif");
+        has_false_suite = true;
         false_end = parse_if(parser, body, locals, false_block, stmt_indent, loop);
     } else {
         if (branch_indent == stmt_indent && span_eq(branch_token, "else")) {
             parser_take(parser, "else");
             if (!parser_take(parser, ":")) return block; /* skip malformed else */;
+            has_false_suite = true;
             bool else_inline = cold_same_line_has_content(parser);
             if (else_inline) {
                 false_end = parse_inline_statements(parser, body, locals, false_block, loop);
@@ -8108,6 +8244,9 @@ int32_t parse_if(Parser *parser, BodyIR *body, Locals *locals,
     }
     locals->count = saved_local_count;
 
+    if (!has_false_suite && join_block < 0) {
+        return false_block;
+    }
     if (body->block_term[false_end] < 0) {
         if (join_block < 0) join_block = body_block(body);
         body_branch_to(body, false_end, join_block);
