@@ -3881,10 +3881,6 @@ static uint64_t cold_body_ir_canonical_hash_normalized(BodyIR *body) {
             kind == BODY_OP_I64_XOR) {
             if (a > b) { int32_t t = a; a = b; b = t; }
         }
-        if (kind == BODY_OP_F32_ADD || kind == BODY_OP_F32_MUL ||
-            kind == BODY_OP_F64_ADD || kind == BODY_OP_F64_MUL) {
-            if (a > b) { int32_t t = a; a = b; b = t; }
-        }
 
         /* SHL(x,0)/ASR(x,0) -> COPY(x) for hash normalization */
         if ((kind == BODY_OP_I32_SHL || kind == BODY_OP_I32_ASR) &&
@@ -11831,6 +11827,7 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
                                   entry_function, reachable_functions);
 
     cold_egraph_rewrite_count = 0;
+    cold_egraph_licm_count = 0;
     FunctionPatchList function_patches = {0};
     function_patches.arena = code->arena;
 
@@ -18318,6 +18315,61 @@ static int cold_run_host_smoke_skill_docs(const char *root) {
     return 0;
 }
 
+static int cold_run_host_smoke_egraph_contract(int argc, char **argv, const char *root) {
+    (void)argc;
+    char out_dir[PATH_MAX];
+    char source_path[PATH_MAX];
+    char out_path[PATH_MAX];
+    char report_path[PATH_MAX];
+    cold_join_path(out_dir, sizeof(out_dir), root, "artifacts/hostrun/cold_builtin");
+    if (!cold_mkdir_p(out_dir)) {
+        fprintf(stderr, "[cheng_cold] run-host-smokes: failed to create %s\n", out_dir);
+        return 1;
+    }
+    cold_join_path(source_path, sizeof(source_path), root, "src/tests/compiler_csg_egraph_active_contract_smoke.cheng");
+    cold_join_path(out_path, sizeof(out_path), out_dir, "compiler_csg_egraph_active_contract_smoke");
+    snprintf(report_path, sizeof(report_path), "%s.report.txt", out_path);
+    unlink(out_path);
+    unlink(report_path);
+    if (!cold_file_exists_nonempty(source_path)) {
+        fprintf(stderr, "[cheng_cold] run-host-smokes: missing source %s\n", source_path);
+        return 1;
+    }
+    char root_arg[PATH_MAX + 16];
+    char in_arg[PATH_MAX + 16];
+    char out_arg[PATH_MAX + 16];
+    char report_arg[PATH_MAX + 32];
+    snprintf(root_arg, sizeof(root_arg), "--root:%s", root);
+    snprintf(in_arg, sizeof(in_arg), "--in:%s", source_path);
+    snprintf(out_arg, sizeof(out_arg), "--out:%s", out_path);
+    snprintf(report_arg, sizeof(report_arg), "--report-out:%s", report_path);
+    char *compile_argv[] = {
+        argv[0],
+        "system-link-exec",
+        root_arg,
+        in_arg,
+        "--emit:exe",
+        "--target:arm64-apple-darwin",
+        out_arg,
+        report_arg,
+    };
+    int rc = cold_cmd_system_link_exec(8, compile_argv);
+    if (rc != 0) return rc;
+    if (!cold_run_executable_expect(out_path, 0, 0,
+                                    " compiler_csg_egraph_active_contract_smoke ok")) {
+        fprintf(stderr, "[cheng_cold] run-host-smokes: egraph contract executable mismatch: %s\n", out_path);
+        return 1;
+    }
+    if (!cold_file_contains_text(report_path, "direct_macho=1\n") ||
+        !cold_file_contains_text(report_path, "system_link=0\n") ||
+        !cold_file_contains_text(report_path, "linkerless_image=1\n")) {
+        fprintf(stderr, "[cheng_cold] run-host-smokes: egraph contract report mismatch: %s\n", report_path);
+        return 1;
+    }
+    printf("  PASS compiler_csg_egraph_active_contract_smoke\n");
+    return 0;
+}
+
 static int cold_cmd_run_host_smokes(int argc, char **argv, const char *self_path) {
     const char *root_arg = cold_flag_value(argc, argv, "--root");
     char root[PATH_MAX];
@@ -18336,9 +18388,11 @@ static int cold_cmd_run_host_smokes(int argc, char **argv, const char *self_path
             rc = cold_run_host_smoke_csg_v2_roundtrip(self_path, root);
         } else if (strcmp(arg, "cheng_skill_consistency_smoke") == 0) {
             rc = cold_run_host_smoke_skill_docs(root);
+        } else if (strcmp(arg, "compiler_csg_egraph_active_contract_smoke") == 0) {
+            rc = cold_run_host_smoke_egraph_contract(argc, argv, root);
         } else {
             fprintf(stderr, "[cheng_cold] run-host-smokes unsupported smoke: %s\n", arg);
-            fprintf(stderr, "[cheng_cold] supported: ordinary_zero_exit_fixture, cold_csg_sidecar_smoke, cheng_skill_consistency_smoke\n");
+            fprintf(stderr, "[cheng_cold] supported: ordinary_zero_exit_fixture, cold_csg_sidecar_smoke, cheng_skill_consistency_smoke, compiler_csg_egraph_active_contract_smoke\n");
             return 2;
         }
         if (rc != 0) return rc;
@@ -18346,7 +18400,7 @@ static int cold_cmd_run_host_smokes(int argc, char **argv, const char *self_path
     }
     if (!ran) {
         fprintf(stderr, "[cheng_cold] run-host-smokes requires explicit smoke name\n");
-        fprintf(stderr, "[cheng_cold] supported: ordinary_zero_exit_fixture, cold_csg_sidecar_smoke, cheng_skill_consistency_smoke\n");
+        fprintf(stderr, "[cheng_cold] supported: ordinary_zero_exit_fixture, cold_csg_sidecar_smoke, cheng_skill_consistency_smoke, compiler_csg_egraph_active_contract_smoke\n");
         return 2;
     }
     printf("cheng_cold run-host-smokes ok\n");
