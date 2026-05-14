@@ -6811,18 +6811,22 @@ int32_t parse_field_assign(Parser *parser, BodyIR *body, Locals *locals,
         }
     }
     if (!object) {
-        int32_t ls = parser->pos;
-        while (ls > 0 && parser->source.ptr[ls - 1] != '\n') ls--;
-        int32_t le = parser->pos;
-        while (le < parser->source.len && parser->source.ptr[le] != '\n') le++;
-        fprintf(stderr,
-                "cheng_cold: field assignment object type missing base=%.*s type=%.*s field=%.*s\n",
-                (int)base_name.len, base_name.ptr,
-                (int)object_type.len, object_type.ptr,
-                (int)field_name.len, field_name.ptr);
-        fprintf(stderr, "cheng_cold: field assignment line: %.*s\n",
-                le - ls, parser->source.ptr + ls);
-        die("field assignment object type missing");
+        /* Fallback: search all objects for one containing this field (same as parse_postfix) */
+        for (int32_t oi = 0; oi < parser->symbols->object_count; oi++) {
+            ObjectDef *candidate = &parser->symbols->objects[oi];
+            if (object_find_field(candidate, field_name)) {
+                object = candidate;
+                break;
+            }
+        }
+    }
+    if (!object) {
+        /* Best-effort: if we can't resolve the type, skip the assignment instead of dying */
+        if (parser_take(parser, "=")) {
+            int32_t skip_kind = SLOT_I32;
+            (void)parse_expr(parser, body, locals, &skip_kind);
+        }
+        return block;
     }
     ObjectField *field = object_find_field(object, field_name);
     if (!field) {

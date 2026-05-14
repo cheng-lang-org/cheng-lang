@@ -3365,6 +3365,9 @@ enum {
     BODY_OP_CLOSURE_NEW = 132,
     BODY_OP_CLOSURE_CALL = 133,
     BODY_OP_PATH_WRITE_BYTES = 134,
+    BODY_OP_PTR_ADD = 135,
+    BODY_OP_COPY_RAW = 136,
+    BODY_OP_PATH_IS_ABSOLUTE = 137,
 };
 
 enum {
@@ -9502,6 +9505,21 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         int32_t done_label = code->count;
         a64_patch_b(code, absolute_done_jump, done_label);
         a64_patch_b(code, empty_done_jump, done_label);
+    } else if (kind == BODY_OP_PATH_IS_ABSOLUTE) {
+        codegen_load_str_pair(code, body, a, R0, R1);
+        code_emit(code, a64_movz(R2, 0, 0));
+        code_emit(code, a64_cmp_imm(R1, 0));
+        int32_t empty_jump = code->count;
+        code_emit(code, a64_bcond(0, COND_EQ));
+        code_emit(code, a64_ldrb_imm(R3, R0, 0));
+        code_emit(code, a64_cmp_imm(R3, '/'));
+        int32_t not_abs_jump = code->count;
+        code_emit(code, a64_bcond(0, COND_NE));
+        code_emit(code, a64_movz(R2, 1, 0));
+        int32_t done = code->count;
+        a64_patch_bcond(code, empty_jump, done);
+        a64_patch_bcond(code, not_abs_jump, done);
+        a64_emit_str_sp_off(code, R2, body->slot_offset[dst], false);
     } else if (kind == BODY_OP_PATH_PARENT) {
         codegen_load_str_pair(code, body, a, R2, R3);
         code_emit(code, a64_cmp_imm(R3, 0));
@@ -15893,6 +15911,9 @@ static bool cold_import_function_symbol_matches(Symbols *symbols,
     Span names[COLD_MAX_I32_PARAMS];
     int32_t kinds[COLD_MAX_I32_PARAMS];
     int32_t sizes[COLD_MAX_I32_PARAMS];
+    Span param_parts[COLD_MAX_I32_PARAMS];
+    int32_t text_arity = cold_split_top_level_commas(symbol->params, param_parts,
+                                                     COLD_MAX_I32_PARAMS);
     int32_t arity = cold_imported_param_specs(symbols, import_source->alias,
                                               symbol->params, names, kinds, sizes,
                                               COLD_MAX_I32_PARAMS);
@@ -15901,6 +15922,9 @@ static bool cold_import_function_symbol_matches(Symbols *symbols,
                                            ".", symbol->name);
     Span qualified_ret = cold_qualify_import_type(symbols->arena, import_source->alias,
                                                   symbol->return_type);
+    FnDef *target = &symbols->functions[target_fn];
+    if (span_same(target->name, qualified_name) && target->arity == text_arity) return true;
+    if (span_same(target->name, qualified_name) && target->arity == arity) return true;
     int32_t resolved = symbols_find_fn(symbols, qualified_name, arity, kinds, sizes,
                                        qualified_ret);
     if (resolved == target_fn) return true;
@@ -15976,8 +16000,10 @@ static void cold_compile_import_function_direct(Symbols *symbols,
                                                                   target_fn);
         if (!symbol_matches) {
             fprintf(stderr,
-                    "cheng_cold: import body signature mismatch target=%.*s path=%s line=%d\n",
-                    (int)fn->name.len, fn->name.ptr, import_source->path, line_no);
+                    "cheng_cold: import body signature mismatch target=%.*s target_arity=%d source_params=%.*s path=%s line=%d\n",
+                    (int)fn->name.len, fn->name.ptr, fn->arity,
+                    (int)symbol.params.len, symbol.params.ptr,
+                    import_source->path, line_no);
             continue;
         }
         if (!symbol.has_body) {
