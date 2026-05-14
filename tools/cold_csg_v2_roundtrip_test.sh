@@ -150,7 +150,7 @@ canonical_writer_smoke() {
     local bin="$WORK/canonical_writer_ordinary"
     local report="$WORK/canonical_writer_ordinary.writer.report.txt"
     local reader_report="$WORK/canonical_writer_ordinary.reader.report.txt"
-    if "$DRIVER" emit-cold-csg-v2 \
+    if "$COLD" emit-cold-csg-v2 \
         --root:"$ROOT" \
         --in:src/tests/ordinary_zero_exit_fixture.cheng \
         --out:"$facts" \
