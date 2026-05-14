@@ -883,6 +883,9 @@ void cold_collect_import_module_consts(Symbols *symbols, Span alias, Span source
             int32_t ceq = cold_span_find_char(ct, '=');
             if (ceq <= 0) continue;
             Span cname = span_trim(span_sub(ct, 0, ceq));
+            /* Strip type annotation (e.g. "Name: Type = Value" → "Name") */
+            int32_t colon = cold_span_find_char(cname, ':');
+            if (colon > 0) cname = span_trim(span_sub(cname, 0, colon));
             Span cval = span_trim(span_sub(ct, ceq + 1, ct.len));
             if (cname.len <= 0) continue;
             Span aliased = cold_arena_join3(symbols->arena, alias, ".", cname);

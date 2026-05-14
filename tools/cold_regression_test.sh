@@ -129,6 +129,16 @@ else
 fi
 assert "import_bare_helper_linkerless" 1 "$ACT"
 
+rm -f /tmp/ct_typed_const
+quiet $COLD system-link-exec --in:src/tests/cold_import_typed_const_main.cheng \
+    --target:arm64-apple-darwin --out:/tmp/ct_typed_const
+if [ -x /tmp/ct_typed_const ]; then
+    /tmp/ct_typed_const 2>/dev/null; ACT=$?
+else
+    ACT="COMPILE_FAILED"
+fi
+assert "import_typed_const" 0 "$ACT"
+
 rm -f /tmp/ct_deep_import
 quiet $COLD system-link-exec --in:src/tests/cold_import_deep_main.cheng \
     --target:arm64-apple-darwin --out:/tmp/ct_deep_import
@@ -986,6 +996,11 @@ rm -f /tmp/ct_gen_pass
 ACT=$(compile_run_timed /tmp/cheng_cold testdata/generic_multi_smoke.cheng /tmp/ct_gen_multi 30)
 assert "generic_multi_smoke" 0 "$ACT"
 rm -f /tmp/ct_gen_multi
+
+# --- generic_arithmetic_smoke ---
+ACT=$(compile_run_timed /tmp/cheng_cold testdata/generic_arithmetic_smoke.cheng /tmp/ct_gen_arith 30)
+assert "generic_arithmetic_smoke" 0 "$ACT"
+rm -f /tmp/ct_gen_arith
 
 echo ""
 echo "=== $PASS passed, $FAIL failed ==="
