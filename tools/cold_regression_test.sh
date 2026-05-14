@@ -41,6 +41,29 @@ compile_run() {
     fi
 }
 
+compile_run_timed() {
+    local compiler="$1" src="$2" out="$3" limit="$4"
+    rm -f "$out"
+    timeout "$limit" bash -c '
+        compiler="$1"
+        src="$2"
+        out="$3"
+        "$compiler" system-link-exec --in:"$src" --target:arm64-apple-darwin --out:"$out" >/dev/null 2>&1
+        if [ ! -x "$out" ]; then
+            exit 126
+        fi
+        "$out" >/dev/null 2>&1
+    ' sh "$compiler" "$src" "$out"
+    local status=$?
+    if [ "$status" -eq 124 ]; then
+        echo "TIMED_OUT"
+    elif [ "$status" -eq 126 ]; then
+        echo "COMPILE_FAILED"
+    else
+        echo "$status"
+    fi
+}
+
 # 1-3: Core tests
 ACT=$(compile_run src/tests/ordinary_zero_exit_fixture.cheng /tmp/ct_oz)
 assert "ordinary_zero" 0 "$ACT"
@@ -231,6 +254,48 @@ else
 fi
 assert "dispatch_min_self_dispatch_status_marker" 1 "$ACT"
 
+cat > /tmp/ct_while_only.cheng << 'EOF'
+fn main(): int32 =
+    var x = 60
+    var guard = 0
+    while guard < 2:
+        x = x + 1
+        guard = guard + 1
+    return x
+EOF
+ACT=$(compile_run_timed "$COLD" /tmp/ct_while_only.cheng /tmp/ct_while_only 10)
+assert "while_only" 62 "$ACT"
+
+cat > /tmp/ct_while_and.cheng << 'EOF'
+fn touch(x: int32): int32 =
+    return x
+
+fn value(seed: int32): int32 =
+    var x = seed
+    touch(x)
+    var guard = 0
+    while guard < 2 && x < 70:
+        x = x + 1
+        guard = guard + 1
+    for i in 0..<5:
+        if i == 1:
+            continue
+        if i == 4:
+            break
+        x = x + i
+    x = x + 5
+    if !(x < 0) && x > 70:
+        x = x + 5
+        return x
+    else:
+        return 1
+
+fn main(): int32 =
+    return value(60)
+EOF
+ACT=$(compile_run_timed "$COLD" /tmp/ct_while_and.cheng /tmp/ct_while_and 10)
+assert "while_and_system_link_shape" 77 "$ACT"
+
 rm -rf /tmp/ct_bd
 mkdir -p /tmp/ct_bd
 $COLD build-backend-driver --out:/tmp/ct_bd/cheng \
@@ -263,6 +328,12 @@ else
     ACT=0
 fi
 assert "build_backend_driver_status_marker" 1 "$ACT"
+if [ -x /tmp/ct_bd/cheng ]; then
+    ACT=$(compile_run_timed /tmp/ct_bd/cheng /tmp/ct_while_only.cheng /tmp/ct_bd/while_only 10)
+else
+    ACT="COMPILE_FAILED"
+fi
+assert "build_backend_driver_system_link_while_only" 62 "$ACT"
 
 rm -f /tmp/ct_compiler_runtime_smoke /tmp/ct_compiler_runtime_smoke.report \
     /tmp/ct_compiler_runtime_smoke.stdout /tmp/ct_compiler_runtime_smoke.stderr

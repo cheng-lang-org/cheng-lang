@@ -11321,8 +11321,32 @@ static bool cold_op_has_side_effect(int32_t kind) {
     }
 }
 
-/* Optimize a BodyIR function: dead store elimination + common subexpression elimination.
-   Modifies op_kind/op_a/op_b in place. Called before code emission. */
+static bool cold_op_reads_dst_slot(int32_t kind) {
+    switch (kind) {
+        case BODY_OP_I32_REF_STORE:
+        case BODY_OP_STR_REF_STORE:
+        case BODY_OP_PAYLOAD_STORE:
+        case BODY_OP_ARRAY_I32_INDEX_STORE:
+        case BODY_OP_SEQ_I32_INDEX_STORE:
+        case BODY_OP_SEQ_OPAQUE_INDEX_STORE:
+        case BODY_OP_ATOMIC_STORE_I32:
+        case BODY_OP_PTR_STORE_I32:
+        case BODY_OP_PTR_STORE_I64:
+        case BODY_OP_SLOT_STORE_I32:
+        case BODY_OP_SLOT_STORE_I64:
+        case BODY_OP_SEQ_I32_ADD:
+        case BODY_OP_SEQ_STR_ADD:
+        case BODY_OP_SEQ_OPAQUE_ADD:
+        case BODY_OP_SEQ_OPAQUE_REMOVE:
+        case BODY_OP_TEXT_SET_INSERT:
+            return true;
+        default:
+            return false;
+    }
+}
+
+/* Optimize a BodyIR function with dead store elimination.
+   BodyIR slots are mutable, so CSE belongs after SSA/equivalence proof. */
 static void cold_optimize_body(BodyIR *body) {
     if (!body || body->slot_count <= 0 || body->op_count <= 0) return;
 
@@ -11339,6 +11363,28 @@ static void cold_optimize_body(BodyIR *body) {
         int32_t b = body->op_b[i];
         if (a >= 0 && a < slot_count) read_count[a]++;
         if (b >= 0 && b < slot_count) read_count[b]++;
+        if (cold_op_reads_dst_slot(body->op_kind[i])) {
+            int32_t dst = body->op_dst[i];
+            if (dst >= 0 && dst < slot_count) read_count[dst]++;
+        }
+    }
+    for (int32_t block = 0; block < body->block_count; block++) {
+        int32_t term = body->block_term[block];
+        if (term < 0 || term >= body->term_count) continue;
+        int32_t kind = body->term_kind[term];
+        if (kind == BODY_TERM_RET || kind == BODY_TERM_SWITCH) {
+            int32_t value = body->term_value[term];
+            if (value >= 0 && value < slot_count) read_count[value]++;
+        } else if (kind == BODY_TERM_CBR) {
+            int32_t left = body->term_value[term];
+            int32_t right = body->term_case_count[term];
+            if (left >= 0 && left < slot_count) read_count[left]++;
+            if (right >= 0 && right < slot_count) read_count[right]++;
+        }
+    }
+    for (int32_t i = 0; i < body->call_arg_count; i++) {
+        int32_t slot = body->call_arg_slot[i];
+        if (slot >= 0 && slot < slot_count) read_count[slot]++;
     }
 
     /* Reverse walk: eliminate dead stores and cascade.
@@ -11367,79 +11413,6 @@ static void cold_optimize_body(BodyIR *body) {
                 continue;
             }
         }
-    }
-
-    /* ---- Common Subexpression Elimination (per-block) ---- */
-    /* Use a simple array and linear scan (the number of ops per block is small). */
-    for (int32_t bi = 0; bi < body->block_count; bi++) {
-        int32_t start = body->block_op_start[bi];
-        int32_t end = start + body->block_op_count[bi];
-        if (start < 0 || start >= op_count) continue;
-        if (end > op_count) end = op_count;
-
-        int32_t cse_cap = 64;
-        int32_t cse_count = 0;
-        int32_t (*cse_cache)[4] = (int32_t (*)[4])calloc((size_t)cse_cap, sizeof(int32_t[4]));
-        if (!cse_cache) continue;
-        /* cse_cache[j][0]=kind, [1]=a, [2]=b, [3]=dst */
-
-        for (int32_t i = start; i < end; i++) {
-            int32_t kind = body->op_kind[i];
-            if (kind <= 0 || cold_op_has_side_effect(kind)) continue;
-            /* Skip ops that implicitly read from their dst slot (not expressible
-               via the (kind, a, b) key). For these, two ops with the same kind, a, b
-               but different dsts would produce different results. */
-            if (kind == BODY_OP_LOAD_I32) continue;
-
-            int32_t dst = body->op_dst[i];
-            int32_t a = body->op_a[i];
-            int32_t b = body->op_b[i];
-            if (dst < 0 || dst >= slot_count) continue;
-
-            /* Search for a matching op in the cache */
-            int32_t found_dst = -1;
-            for (int32_t j = 0; j < cse_count; j++) {
-                if (cse_cache[j][0] == kind &&
-                    cse_cache[j][1] == a &&
-                    cse_cache[j][2] == b) {
-                    found_dst = cse_cache[j][3];
-                    break;
-                }
-            }
-
-            if (found_dst >= 0) {
-                /* Replace this op with a COPY from the earlier result */
-                int32_t sz;
-                if (dst >= 0 && dst < slot_count && body->slot_size)
-                    sz = body->slot_size[dst];
-                else
-                    continue;
-                if (sz <= 4)
-                    body->op_kind[i] = BODY_OP_COPY_I32;
-                else if (sz <= 8)
-                    body->op_kind[i] = BODY_OP_COPY_I64;
-                else
-                    body->op_kind[i] = BODY_OP_COPY_COMPOSITE;
-                body->op_a[i] = found_dst;
-                body->op_b[i] = 0;
-                __atomic_add_fetch(&cold_egraph_rewrite_count, 1, __ATOMIC_RELAXED);
-            } else {
-                /* Add to cache */
-                if (cse_count >= cse_cap) {
-                    cse_cap *= 2;
-                    int32_t (*tmp)[4] = (int32_t (*)[4])realloc(cse_cache,
-                        (size_t)cse_cap * sizeof(int32_t[4]));
-                    if (!tmp) break;
-                    cse_cache = tmp;
-                }
-                cse_cache[cse_count][0] = kind;
-                cse_cache[cse_count][1] = a;
-                cse_cache[cse_count][2] = b;
-                cse_cache[cse_count][3] = dst;
-                cse_count++;
-            }
-        }
-        free(cse_cache);
     }
 
     free(read_count);
@@ -11614,7 +11587,10 @@ static void cold_mark_reachable_functions(Symbols *symbols,
 
 static void codegen_program(Code *code, BodyIR **function_bodies,
                             int32_t function_count, int32_t entry_function,
-                            Symbols *symbols, const char *target) {
+                            Symbols *symbols, const char *target,
+                            int32_t *out_unresolved_pos,
+                            int32_t *out_unresolved_fn,
+                            int32_t *out_unresolved_count) {
     if (entry_function < 0 || entry_function >= function_count ||
         !function_bodies[entry_function]) die("missing entry function body");
 
@@ -11835,7 +11811,10 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
             else
                 codegen_func(code, body, symbols, &function_patches);
             if (cold_diag_dump_per_fn || cold_diag_dump_slots) {
-                fprintf(stderr, "[diag] fn[%d] end at word=%d (count=%d)\n", i, code->count, code->count - function_pos[i]);
+                fprintf(stderr, "[diag] fn[%d] ", i);
+                cold_diag_fn_name(symbols->functions[i].name);
+                fprintf(stderr, " end at word=%d (count=%d)\n",
+                        code->count, code->count - function_pos[i]);
                 if (cold_diag_dump_per_fn) {
                     for (int32_t w = function_pos[i]; w < code->count; w++)
                         fprintf(stderr, "  %08x\n", code->words[w]);
@@ -11849,6 +11828,14 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
         if (patch.target_function < 0 || patch.target_function >= function_count ||
             function_pos[patch.target_function] < 0) {
             if (patch.target_function >= 0 && patch.target_function < symbols->function_count) {
+                /* Save unresolved patch info for provider resolution */
+                if (out_unresolved_pos && out_unresolved_fn && out_unresolved_count &&
+                    *out_unresolved_count < function_count * 8) {
+                    int32_t idx = *out_unresolved_count;
+                    out_unresolved_pos[idx] = patch.pos;
+                    out_unresolved_fn[idx] = patch.target_function;
+                    (*out_unresolved_count)++;
+                }
                 fprintf(stderr, "cheng_cold: unresolved function patch target: ");
                 cold_diag_fn_name(symbols->functions[patch.target_function].name);
                 fputc('\n', stderr);
@@ -14182,7 +14169,17 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
                 cold_collect_body_stats(symbols, function_bodies, symbols->function_count, stats); }
         } else {
             Code *code = code_new(arena, 256);
-            codegen_program(code, function_bodies, symbols->function_count, entry_function, symbols, target);
+            /* Pre-allocate unresolved patch tracking arrays for provider resolution */
+            int32_t *unresolved_pos = NULL;
+            int32_t *unresolved_fn = NULL;
+            int32_t unresolved_count = 0;
+            if (provider_objects && provider_objects[0]) {
+                int32_t cap = symbols->function_count * 8;
+                unresolved_pos = arena_alloc(arena, (size_t)cap * sizeof(int32_t));
+                unresolved_fn = arena_alloc(arena, (size_t)cap * sizeof(int32_t));
+            }
+            codegen_program(code, function_bodies, symbols->function_count, entry_function, symbols, target,
+                            unresolved_pos, unresolved_fn, &unresolved_count);
             {
                 bool is_elf = target && strstr(target, "linux") != 0;
                 bool is_coff = target && strstr(target, "windows") != 0;
@@ -14295,6 +14292,41 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
                                     exe_provider_resolved++;
                                 }
                             }
+                        }
+                    }
+
+                    /* Resolve codegen_program's unresolved patches against provider symbols */
+                    for (int32_t ui = 0; ui < unresolved_count; ui++) {
+                        int32_t patch_pos = unresolved_pos[ui];
+                        int32_t target_fn = unresolved_fn[ui];
+                        if (target_fn < 0 || target_fn >= symbols->function_count) continue;
+                        Span nm = symbols->functions[target_fn].name;
+                        if (nm.len <= 0) continue;
+                        char name_buf[1024];
+                        int32_t nlen = nm.len < 1023 ? nm.len : 1023;
+                        memcpy(name_buf, nm.ptr, (size_t)nlen);
+                        name_buf[nlen] = '\0';
+                        const char *short_name = name_buf;
+                        for (int32_t k = nlen - 1; k > 0; k--)
+                            if (name_buf[k] == '.') { short_name = name_buf + k + 1; break; }
+                        int32_t target_word = -1;
+                        for (int32_t pi = 0; pi < exe_provider_count && target_word < 0; pi++) {
+                            for (int32_t ni = 0; ni < ep_nc[pi]; ni++) {
+                                if (strcmp(name_buf, ep_names[pi][ni]) == 0 ||
+                                    strcmp(short_name, ep_names[pi][ni]) == 0) {
+                                    target_word = ep_provider_start[pi] + ep_offsets[pi][ni];
+                                    break;
+                                }
+                            }
+                        }
+                        if (target_word >= 0) {
+                            int32_t delta = target_word - patch_pos;
+                            if (provider_is_rv)
+                                code->words[patch_pos] = rv_jal(RV_RA, delta);
+                            else
+                                code->words[patch_pos] = (code->words[patch_pos] & 0xFC000000u) |
+                                                         ((uint32_t)delta & 0x03FFFFFFu);
+                            exe_provider_resolved++;
                         }
                     }
 
@@ -14511,7 +14543,8 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
     if (entry_function < 0) return false;
 
     Code *code = code_new(arena, 256);
-    codegen_program(code, function_bodies, symbols->function_count, entry_function, symbols, 0);
+    codegen_program(code, function_bodies, symbols->function_count, entry_function, symbols, 0,
+                    NULL, NULL, NULL);
     if (output_direct_macho(out_path, code) != 0) return false;
 
     if (stats) {
@@ -15141,7 +15174,8 @@ bool cold_compile_source_path_to_macho(const char *out_path,
         cold_compile_reachable_import_bodies(symbols, function_bodies, body_cap,
                                              main_function, import_sources,
                                              import_source_count);
-        codegen_program(code, function_bodies, symbols->function_count, main_function, symbols, 0);
+        codegen_program(code, function_bodies, symbols->function_count, main_function, symbols, 0,
+                        NULL, NULL, NULL);
     }
 
     uint64_t codegen_end_us = cold_now_us();

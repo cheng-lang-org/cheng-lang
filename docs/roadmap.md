@@ -260,17 +260,17 @@
 
 | 语言特性 | cheng_seed 引用数 | 冷编译器状态 |
 |---|---|---|
-| Generics | 356 | 基础泛型 variant 构造已实现 |
-| Closures | 68 | 函数指针 + 闭包表达式已实现 |
+| Generics | ~2000行（seed 行3400-9900） | 冷编译器：generic substitution 在 type/object/function def 中（行4241-4272） |
+| Closures | 0（seed 无闭包 body IR） | **冷编译器已实现**：BODY_OP_CLOSURE_NEW(132)/CALL(133)，AArch64/x86_64/RISC-V codegen |
 | Pattern matching | 131 | match/switch 已支持 |
-| Async | 70 | 未实现 |
+| Async | 0（seed 无 async body IR） | 冷编译器识别 `async fn` 关键字，无 BODY_OP_ASYNC codegen |
 | Algebraic types | 67 | variant/enum 基本支持 |
 | Import/Module | 2209 | direct import + transitive 已支持 |
 | String interpolation | 5 | Fmt 基础路径可用，复杂插值仍需结构化 lowering |
 | Error handling (?/Result) | 39 | `let/call expr?` 可用；`return expr?` 按语言规范非法 |
 
-冷编译器总行数：17,397 行。cheng_seed.c：66,725 行 (3.1MB)。
-核心差距：async/await（70处）、错误处理（39处）、泛型完整实例化（356处中部分已覆盖）。
+冷编译器总行数：18,161 行。cheng_seed.c：66,725 行 (3.1MB)。
+核心差距：async/await（冷编译器只识别关键字）、泛型完整实例化（seed 有 ~2000行实现，冷编译器只有基础 substitution）。闭包已在冷编译器中实现。
 
 
 ## 剩余 gap 详细评估
@@ -297,13 +297,22 @@
 
 | 特性 | C seed 支持证据 | 冷编译器覆盖 |
 |---|---|---|
-| 泛型（generic） | 337 处引用（`generic_instantiate` 等） | 仅 basic CSG type params |
-| 闭包（closure/lambda） | 68 处引用（`closure`、`capture_env`、`trampoline`） | 无（仅 `&fnName` 函数指针） |
-| 代数类型 + match | 语法在 formal spec §1.2 定义，C seed 含类型解析 | 冷原型含 OP_TAG/TM_SWITCH，但 typed_expr 层未完整实现 |
-| async/await | parser 语法已定义（`async`/`await`/`spawn`） | 无（codegen 不支持函数体内并发原语） |
+| 泛型（generic） | ~2000行实现（`generic_*` 函数族，行3400-9900） | 基础 generic substitution（行4241-4272） |
+| 闭包（closure/lambda） | 无 body IR 实现 | ✅ **已实现**：BODY_OP_CLOSURE_NEW(132)/CALL(133) |
+| 代数类型 + match | 语法在 formal spec §1.2 定义，C seed 含类型解析 | 冷原型含 OP_TAG/TM_SWITCH，typed_expr 层未完整 |
+| async/await | 无 body IR 实现 | 只识别 `async fn` 关键字，无 codegen |
 | 完整的 provider/infra | 全部 42 个 manifest 源文件和 6+ 条命令路径 | 仅 bootstrap 必需命令 + CSG 管线 |
 
-**阻断原因**：冷编译器子集不完整，不足以编译整个 `src/` 目录。C seed 退役的前提是冷编译器可以编译全部自举链，包括泛型实例化、闭包环境捕获、代数类型 lowering。
+**泛型 gap 详情**（2026-05-14 审计）：
+- 冷编译器 TypeDef/ObjectDef 有 `generic_names[COLD_MAX_VARIANT_FIELDS]`/`generic_count` 字段
+- 冷编译器 FnDef 声明了 `generic_names[4]`/`generic_count` 但从未设置（dead fields）
+- 有基础 `cold_type_parse_generic_instance()` 和 `cold_substitute_generic_span()`
+- CSG 格式（`ColdCsgFunction`）不携带函数泛型信息
+- 缺失：函数级泛型绑定、调用点类型推断、函数特化/单态化、类型别名泛型、递归类型参数规范化
+- cheng_seed.c 有 ~2000 行泛型实现（`cheng_seed_normalize_type_text_with_params` 等 8 个核心函数）
+- 预计冷编译器需增加 **~2000-3000 行**才能达到 seed 的泛型覆盖度
+
+**阻断原因**：冷编译器子集不完整，不足以编译整个 `src/` 目录。C seed 退役的前提是冷编译器可以编译全部自举链，包括泛型完整实例化、代数类型 lowering。
 
 **完成条件**：
 1. 冷编译器能编译所有 manifest 源文件（42 个），不依赖 C seed 的旧生产路径
