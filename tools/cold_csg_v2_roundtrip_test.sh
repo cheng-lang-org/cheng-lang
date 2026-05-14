@@ -127,7 +127,52 @@ CSG
     fi
 }
 
-canonical_reader_smoke
+canonical_writer_smoke() {
+    if [ "$TARGET" != "arm64-apple-darwin" ]; then
+        ok "canonical_writer_skipped_non_arm64"
+        return
+    fi
+    local facts="$WORK/canonical_writer_ordinary.facts"
+    local obj="$WORK/canonical_writer_ordinary.o"
+    local bin="$WORK/canonical_writer_ordinary"
+    local report="$WORK/canonical_writer_ordinary.writer.report.txt"
+    local reader_report="$WORK/canonical_writer_ordinary.reader.report.txt"
+    if "$DRIVER" emit-cold-csg-v2 \
+        --root:"$ROOT" \
+        --in:src/tests/ordinary_zero_exit_fixture.cheng \
+        --out:"$facts" \
+        --target:"$TARGET" \
+        --report-out:"$report" >/dev/null; then
+        ok "canonical_writer_ordinary_command"
+    else
+        bad "canonical_writer_ordinary_command"
+        return
+    fi
+    if [ "$(facts_magic_kind "$facts")" = "canonical" ]; then
+        ok "canonical_writer_ordinary_magic"
+    else
+        bad "canonical_writer_ordinary_magic"
+    fi
+    require_grep "canonical_writer_ordinary_report_emit" '^emit=csg-v2-primary$' "$report"
+    require_grep "canonical_writer_ordinary_report_status" '^cold_csg_v2_writer_status=ok$' "$report"
+    if "$COLD" system-link-exec \
+        --csg-in:"$facts" \
+        --emit:obj \
+        --target:"$TARGET" \
+        --out:"$obj" \
+        --report-out:"$reader_report" >/dev/null; then
+        ok "canonical_writer_ordinary_reader"
+    else
+        bad "canonical_writer_ordinary_reader"
+    fi
+    require_grep "canonical_writer_ordinary_report_function_count" '^facts_function_count=1$' "$reader_report"
+    if cc -o "$bin" "$obj" >/dev/null 2>&1 &&
+       "$bin" >/dev/null 2>&1; then
+        ok "canonical_writer_ordinary_link_run"
+    else
+        bad "canonical_writer_ordinary_link_run"
+    fi
+}
 
 roundtrip_fixture() {
     local name="$1"
@@ -140,9 +185,10 @@ roundtrip_fixture() {
     local reader1="$WORK/$name.reader.1.report.txt"
     local reader2="$WORK/$name.reader.2.report.txt"
 
-    if "$DRIVER" emit-cold-csg-v2 \
+    if "$COLD" system-link-exec \
         --root:"$ROOT" \
         --in:"$source" \
+        --emit:csg-v2 \
         --out:"$facts" \
         --target:"$TARGET" \
         --report-out:"$writer_report" >/dev/null; then
@@ -154,12 +200,10 @@ roundtrip_fixture() {
 
     local facts_kind
     facts_kind="$(facts_magic_kind "$facts")"
-    if [ "$facts_kind" = "canonical" ]; then
-        ok "$name canonical_cheng_csg_v2_magic"
-    elif [ "$facts_kind" = "internal" ]; then
+    if [ "$facts_kind" = "internal" ]; then
         ok "$name internal_chengcsg_magic"
     else
-        bad "$name csg_v2_magic actual=$facts_kind"
+        bad "$name internal_chengcsg_magic actual=$facts_kind"
     fi
 
     local bytes
@@ -286,6 +330,8 @@ roundtrip_stability_fixture() {
 }
 
 echo "=== CSG v2 Roundtrip ==="
+canonical_reader_smoke
+canonical_writer_smoke
 
 # Baseline: minimal smoke tests
 roundtrip_fixture ordinary src/tests/ordinary_zero_exit_fixture.cheng 32768
@@ -781,9 +827,10 @@ echo "  - csg_in_emit_exe_provider_archive"
 if [ ! -s "$multi_archive" ]; then
   echo "FAIL csg_in_emit_exe_provider_archive (missing archive)"
   fail=$((fail + 1))
-elif "$DRIVER" emit-cold-csg-v2 \
+elif "$COLD" system-link-exec \
   --root:"$ROOT" \
   --in:"$multi_primary_source" \
+  --emit:csg-v2 \
   --out:"$multi_facts" \
   --target:riscv64-unknown-linux-gnu \
   --report-out:"$WORK/provider_multi.writer.report.txt" \
@@ -812,9 +859,10 @@ echo "  - csg_in_provider_archive_missing_export_hard_fail"
 if [ ! -s "$multi_archive" ]; then
   echo "FAIL csg_in_provider_archive_missing_export_hard_fail (missing archive)"
   fail=$((fail + 1))
-elif "$DRIVER" emit-cold-csg-v2 \
+elif "$COLD" system-link-exec \
   --root:"$ROOT" \
   --in:"$multi_missing_source" \
+  --emit:csg-v2 \
   --out:"$multi_missing_facts" \
   --target:riscv64-unknown-linux-gnu \
   --report-out:"$WORK/provider_multi_missing.writer.report.txt" \
@@ -1008,9 +1056,10 @@ fn main(): int32 =
     let unused: int32 = 42
     return 0
 CHENG
-if "$DRIVER" emit-cold-csg-v2 \
+if "$COLD" system-link-exec \
     --root:"$ROOT" \
     --in:"$csg_unused" \
+    --emit:csg-v2 \
     --out:"$csg_unused_facts" \
     --target:"$TARGET" \
     --report-out:"$WORK/unused_binding.writer.report.txt" >/dev/null 2>&1 &&
