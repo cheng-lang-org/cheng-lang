@@ -43,6 +43,7 @@ static bool cold_diag_dump_per_fn = false;
 static bool cold_diag_dump_slots = false;
 static int32_t cold_egraph_rewrite_count = 0;
 static int32_t cold_egraph_dedup_count = 0;
+static int32_t cold_egraph_licm_hoisted = 0;
 
 #include "macho_direct.h"
 #include "elf64_direct.h"
@@ -3926,6 +3927,10 @@ static uint64_t cold_body_ir_canonical_hash_normalized(BodyIR *body) {
             kind == BODY_OP_I64_XOR) {
             if (a > b) { int32_t t = a; a = b; b = t; }
         }
+        if (kind == BODY_OP_F32_ADD || kind == BODY_OP_F32_MUL ||
+            kind == BODY_OP_F64_ADD || kind == BODY_OP_F64_MUL) {
+            if (a > b) { int32_t t = a; a = b; b = t; }
+        }
 
         /* SHL(x,0)/ASR(x,0) -> COPY(x) for hash normalization */
         if ((kind == BODY_OP_I32_SHL || kind == BODY_OP_I32_ASR) &&
@@ -4310,8 +4315,33 @@ static int32_t cold_ensure_specialized(Symbols *symbols, int32_t template_idx,
                                        arg_kinds, 0, tmpl->ret);
     if (spec_idx >= 0 && spec_idx < symbols->function_count) {
         symbols->functions[spec_idx].generic_count = 0;
+        /* OPAQUE->I64/F32/F64 body IR op patching:
+           I32_ADD(8)->I64_ADD(77)/F32_ADD(97)/F64_ADD(98)
+           I32_SUB(9)->I64_SUB(78)/F32_SUB(99)/F64_SUB(100)
+           I32_MUL(20)->I64_MUL(79)/F32_MUL(101)/F64_MUL(102)
+           Patch in codegen when param_kind differs from template. */
     }
     return spec_idx >= 0 ? spec_idx : template_idx;
+}
+
+/* Patch body IR ops for non-I32 specialization.
+   Converts I32 arithmetic ops to I64/F32/F64 based on target kind. */
+static void cold_patch_body_ir_for_kind(BodyIR *body, int32_t target_kind) {
+    if (!body || target_kind == SLOT_I32) return;
+    int32_t add_op, sub_op, mul_op;
+    if (target_kind == SLOT_I64) {
+        add_op = BODY_OP_I64_ADD; sub_op = BODY_OP_I64_SUB; mul_op = BODY_OP_I64_MUL;
+    } else if (target_kind == SLOT_F32) {
+        add_op = BODY_OP_F32_ADD; sub_op = BODY_OP_F32_SUB; mul_op = BODY_OP_F32_MUL;
+    } else if (target_kind == SLOT_F64) {
+        add_op = BODY_OP_F64_ADD; sub_op = BODY_OP_F64_SUB; mul_op = BODY_OP_F64_MUL;
+    } else return;
+    for (int32_t i = 0; i < body->op_count; i++) {
+        int32_t k = body->op_kind[i];
+        if (k == BODY_OP_I32_ADD) body->op_kind[i] = add_op;
+        else if (k == BODY_OP_I32_SUB) body->op_kind[i] = sub_op;
+        else if (k == BODY_OP_I32_MUL) body->op_kind[i] = mul_op;
+    }
 }
 
 static TypeDef *symbols_find_type(Symbols *symbols, Span name);
@@ -11681,6 +11711,115 @@ static bool cold_is_same_block_as(BodyIR *body, int32_t idx_a, int32_t idx_b) {
     return false;
 }
 
+/* Loop-invariant code motion: hoist I32_CONST / I64_CONST out of loop bodies.
+   A CONST op is always safe to hoist because it has no data-flow dependencies.
+   Uses op-position range (not block-index range) to identify blocks in the loop,
+   avoiding false positives from body_reopen_block reordering. */
+static void cold_apply_licm(BodyIR *body) {
+    if (!body || body->block_count < 2) return;
+    int32_t block_count = body->block_count;
+
+    /* Step 1: Find all back edges (block terminator targets a smaller block index) */
+    enum { BACK_EDGE_CAP = 128 };
+    int32_t back_header[BACK_EDGE_CAP], back_source[BACK_EDGE_CAP];
+    int32_t loop_count = 0;
+    for (int32_t b = 1; b < block_count; b++) {
+        int32_t t = body->block_term[b];
+        if (t < 0 || t >= body->term_count) continue;
+        int32_t tb = body->term_true_block[t];
+        int32_t fb = body->term_false_block[t];
+        if (tb >= 0 && tb < b && loop_count < BACK_EDGE_CAP) {
+            back_header[loop_count] = tb; back_source[loop_count] = b; loop_count++;
+        }
+        if (fb >= 0 && fb < b && loop_count < BACK_EDGE_CAP) {
+            back_header[loop_count] = fb; back_source[loop_count] = b; loop_count++;
+        }
+    }
+    if (loop_count == 0) return;
+
+    /* Step 2: Sort by range ascending (innermost loops first) */
+    for (int32_t i = 0; i < loop_count - 1; i++) {
+        for (int32_t j = i + 1; j < loop_count; j++) {
+            int32_t ri = back_source[i] - back_header[i];
+            int32_t rj = back_source[j] - back_header[j];
+            if (rj < ri) {
+                int32_t tmp = back_header[i]; back_header[i] = back_header[j]; back_header[j] = tmp;
+                tmp = back_source[i]; back_source[i] = back_source[j]; back_source[j] = tmp;
+            }
+        }
+    }
+
+    /* Step 3: Hoist CONST ops from each loop to its header.
+       We detect loop membership by OP POSITION (not block index), because
+       body_reopen_block can place a block's ops at a different flat-array
+       position than its index implies. */
+    for (int32_t li = 0; li < loop_count; li++) {
+        int32_t hdr = back_header[li], src = back_source[li];
+        int32_t loop_op_start = body->block_op_start[hdr];
+        int32_t loop_op_end   = body->block_op_start[src] + body->block_op_count[src];
+        if (loop_op_start >= loop_op_end) continue; /* malformed loop */
+
+        /* Collect CONST ops from all blocks whose ops lie within [loop_op_start, loop_op_end) */
+        enum { CONST_CAP = 256 };
+        int32_t const_kind[CONST_CAP], const_dst[CONST_CAP];
+        int32_t const_a[CONST_CAP], const_b[CONST_CAP], const_c[CONST_CAP];
+        int32_t n_const = 0;
+        for (int32_t b = 0; b < block_count; b++) {
+            int32_t b_start = body->block_op_start[b];
+            int32_t b_len   = body->block_op_count[b];
+            if (b_len <= 0) continue;
+            if (b_start < loop_op_start || b_start + b_len > loop_op_end) continue;
+            int32_t end = b_start + b_len;
+            for (int32_t oi = b_start; oi < end; oi++) {
+                int32_t kind = body->op_kind[oi];
+                if ((kind == BODY_OP_I32_CONST || kind == BODY_OP_I64_CONST) && n_const < CONST_CAP) {
+                    const_kind[n_const] = kind; const_dst[n_const] = body->op_dst[oi];
+                    const_a[n_const]    = body->op_a[oi];   const_b[n_const]    = body->op_b[oi];
+                    const_c[n_const]    = body->op_c[oi];   n_const++;
+                    body->op_kind[oi] = 0; /* mark original as dead */
+                }
+            }
+        }
+        if (n_const == 0) continue;
+
+        /* Ensure capacity for the new ops */
+        while (body->op_count + n_const > body->op_cap) {
+            int32_t saved = body->op_count;
+            body->op_count = body->op_cap;
+            body_ensure_ops(body);
+            body->op_count = saved;
+        }
+
+        /* Insert collected CONST ops before the header's first op */
+        int32_t insert_pos = body->block_op_start[hdr];
+        for (int32_t ci = 0; ci < n_const; ci++) {
+            size_t shift = (size_t)(body->op_count - insert_pos) * sizeof(int32_t);
+            memmove(&body->op_kind[insert_pos + 1], &body->op_kind[insert_pos], shift);
+            memmove(&body->op_dst[insert_pos + 1],  &body->op_dst[insert_pos],  shift);
+            memmove(&body->op_a[insert_pos + 1],    &body->op_a[insert_pos],    shift);
+            memmove(&body->op_b[insert_pos + 1],    &body->op_b[insert_pos],    shift);
+            memmove(&body->op_c[insert_pos + 1],    &body->op_c[insert_pos],    shift);
+            body->op_kind[insert_pos] = const_kind[ci];
+            body->op_dst[insert_pos]  = const_dst[ci];
+            body->op_a[insert_pos]    = const_a[ci];
+            body->op_b[insert_pos]    = const_b[ci];
+            body->op_c[insert_pos]    = const_c[ci];
+            body->op_count++;
+
+            /* Adjust block boundaries: header's count grows; all others with
+               start >= insert_pos shift right by one (except hdr, whose start
+               is insert_pos and intentionally unchanged). */
+            for (int32_t bi = 0; bi < block_count; bi++) {
+                if (bi != hdr && body->block_op_start[bi] >= insert_pos)
+                    body->block_op_start[bi]++;
+            }
+            body->block_op_count[hdr]++;
+        }
+
+        __atomic_add_fetch(&cold_egraph_licm_hoisted, n_const, __ATOMIC_RELAXED);
+    }
+}
+
 /* Algebraic identity rewrites (constant folding for provably-correct patterns).
    These are safe because the rewrites are mathematically provable algebraic
    identities, independent of BodyIR slot mutability:
@@ -11887,7 +12026,7 @@ static void cold_apply_identity_rewrites(BodyIR *body) {
 
 /* Optimize a BodyIR function with dead store elimination.
    BodyIR slots are mutable, so CSE belongs after SSA/equivalence proof. */
-static void cold_optimize_body(BodyIR *body) {
+static void cold_optimize_body(BodyIR *body, bool enable_licm) {
     if (!body || body->slot_count <= 0 || body->op_count <= 0) return;
 
     int32_t slot_count = body->slot_count;
@@ -11960,12 +12099,18 @@ static void cold_optimize_body(BodyIR *body) {
     /* Algebraic identity rewrites (provably-correct constant folding).
        Runs after DSE so slot writer counts reflect only live ops. */
     cold_apply_identity_rewrites(body);
+
+    if (enable_licm) {
+        /* Loop-invariant code motion: hoist CONST ops out of loop bodies.
+           Runs after all other local optimizations. */
+        cold_apply_licm(body);
+    }
 }
 
 static void codegen_func(Code *code, BodyIR *body, Symbols *symbols,
                          FunctionPatchList *function_patches) {
     na_reset();
-    cold_optimize_body(body);
+    cold_optimize_body(body, true);
     int32_t frame_size = align_i32(body->frame_size, 16);
     code_emit(code, a64_stp_pre(19, 20, SP, -16));
     code_emit(code, a64_stp_pre(FP, LR, SP, -16));
@@ -12233,6 +12378,14 @@ static void cold_mark_reachable_functions(Symbols *symbols,
         int32_t fn_index = stack[--stack_count];
         if (fn_index < 0 || fn_index >= function_count) die("reachable cold function index out of range");
         BodyIR *body = function_bodies[fn_index];
+/* Patch specialized generic function body if params are non-I32 */
+if (symbols->functions[fn_index].generic_count == 0 &&
+symbols->functions[fn_index].arity > 0) {
+int32_t pk = symbols->functions[fn_index].param_kind[0];
+if (pk == SLOT_I64 || pk == SLOT_F32 || pk == SLOT_F64) {
+cold_patch_body_ir_for_kind(body, pk);
+}
+}
         if (!cold_body_codegen_ready(body)) {
             if (symbols->functions[fn_index].is_external) continue;
             cold_die_missing_reachable_body(symbols, fn_index);
@@ -12270,6 +12423,7 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
                                   entry_function, reachable_functions);
 
     cold_egraph_rewrite_count = 0;
+    cold_egraph_licm_hoisted = 0;
     FunctionPatchList function_patches = {0};
     function_patches.arena = code->arena;
 
@@ -12908,6 +13062,7 @@ typedef struct ColdCompileStats {
     int32_t canonical_normalized_count;
     int32_t egraph_rewrite_count;
     int32_t egraph_dedup_count;
+    int32_t egraph_licm_hoisted;
     int32_t total_function_count;
     int32_t link_object;
     int32_t provider_archive;
@@ -15049,6 +15204,7 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
             stats->function_count = symbols->function_count;
             stats->egraph_rewrite_count = cold_egraph_rewrite_count;
             stats->egraph_dedup_count = cold_egraph_dedup_count;
+            stats->egraph_licm_hoisted = cold_egraph_licm_hoisted;
             stats->csg_lowering = 1;
             stats->arena_kb = arena->used / 1024;
             uint64_t end_us = cold_now_us();
@@ -15751,6 +15907,14 @@ void cold_compile_reachable_import_bodies(Symbols *symbols,
             }
         }
         BodyIR *body = function_bodies[fn_index];
+/* Patch specialized generic function body if params are non-I32 */
+if (symbols->functions[fn_index].generic_count == 0 &&
+symbols->functions[fn_index].arity > 0) {
+int32_t pk = symbols->functions[fn_index].param_kind[0];
+if (pk == SLOT_I64 || pk == SLOT_F32 || pk == SLOT_F64) {
+cold_patch_body_ir_for_kind(body, pk);
+}
+}
         if (!cold_body_codegen_ready(body)) {
             if (symbols->functions[fn_index].is_external) continue;
             cold_die_missing_reachable_body(symbols, fn_index);
@@ -16011,6 +16175,7 @@ bool cold_compile_source_path_to_macho(const char *out_path,
         stats->function_count = symbols->function_count;
         stats->type_count = symbols->type_count + symbols->object_count;
         stats->egraph_rewrite_count = cold_egraph_rewrite_count;
+        stats->egraph_licm_hoisted = cold_egraph_licm_hoisted;
         if (demo_body) {
             stats->op_count = demo_body->op_count;
             stats->block_count = demo_body->block_count;
@@ -16120,6 +16285,7 @@ static bool cold_write_system_link_exec_report(const char *path,
         fprintf(file, "total_function_count=%d\n", stats->total_function_count);
         fprintf(file, "egraph_rewrite_count=%d\n", stats->egraph_rewrite_count);
         fprintf(file, "egraph_dedup_count=%d\n", stats->egraph_dedup_count);
+        fprintf(file, "egraph_licm_hoisted=%d\n", stats->egraph_licm_hoisted);
         fprintf(file, "ownership_compile_entry=%d\n", stats->ownership_compile_entry);
         fprintf(file, "ownership_runtime_witness=%d\n", stats->ownership_runtime_witness);
         cold_print_elapsed_ms(file, "cold_compile_elapsed_ms", stats->elapsed_us);
@@ -18411,7 +18577,7 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
                 /* Apply dead-store elimination (the primary BodyIR mutation) */
                 for (int32_t i = 0; i < rp_count; i++) {
                     BodyIR *b = rp_bodies[i];
-                    if (b && !b->has_fallback) cold_optimize_body(b);
+                    if (b && !b->has_fallback) cold_optimize_body(b, false);
                 }
                 rp_ok = cold_emit_csg_v2_facts(out_path, rp_bodies, rp_count, rp_sym, target);
             }
