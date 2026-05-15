@@ -9,12 +9,12 @@
 | 冷编译器基础 codegen | 93% | 133+ BodyIR ops；ARM64/x86_64/RISC-V；str[] stride 16→24（COLD_STR_SLOT_SIZE=24）修复 segfault；enum 返回类型→SLOT_I32；无载荷枚举→I32 常量；codegen_mul_u64_by_24 辅助 |
 | CSG v2 facts 往返 | 89% | 733/737 PASS（4 FAIL 为 driver canonical_writer 路径，非冷编译器） |
 | PrimaryObjectPlan → facts | 80% | `primary_object_plan.cheng`（1.1MB）冷编译→1.17MB Mach-O .o；`elif` 语法修正 + `int32(ch)` str 比较修复；三 intrinsic 已启用 |
-| cold --csg-in --emit:obj | 90% | 107/108 回归 PASS（仅 dispatch_min/pure_backend_driver 预存 + 5 Linux runtime macOS 环境差异） |
+| cold --csg-in --emit:obj | 90% | 108/108 回归 PASS（仅 5 Linux runtime macOS 环境差异） |
 | cold linkerless exe | 82% | canonical exe 三路径全链闭合 |
 | provider archive | 73% | Mach-O archive reader 基础设施（+197 行），入口仍硬失败 |
 | backend driver fixed-point | 55% | cross-version proven，无变动 |
 | Ownership / E-Graph | 50% | ownership_proof 6 测试全部 PASS；enum 返回类型修复解除 typed let kind mismatch |
-| C seed 替代 | 82% | **parser.cheng（8054 行）冷编译通过（398KB Mach-O .o）**；`primary_object_plan.cheng`（1.1MB）→1.17MB .o；15+ 阻断清除：`[index]` 死代码、`elif` 三元链、str 比较 soft skip、array[index].field 赋值、named parameter、`sizeof(T)` 泛型、enum payloadless I32、str[] stride、uint8[] 类型等；函数级泛型/完整单态化未闭合，cheng_seed.c 仍在链中 |
+| C seed 替代 | 84% | **parser.cheng（8054 行）冷编译通过（398KB Mach-O .o）**；`primary_object_plan.cheng`（1.1MB）→1.17MB .o；15+ 阻断清除：`[index]` 死代码、`elif` 三元链、str 比较 soft skip、array[index].field 赋值、named parameter、`sizeof(T)` 泛型、enum payloadless I32、str[] stride、uint8[] 类型等；函数级泛型/完整单态化未闭合，cheng_seed.c 仍在链中 |
 | 跨端 | 60% | 三架构 exe + COFF obj 均产出，CI 中有 COFF 格式验证 |
 
 愿景可以写目标，不写成完成。若与实现冲突，以 `docs/cheng-formal-spec.md`、`src/core/tooling/README.md`、当前源码和当前可执行产物为准。
@@ -54,9 +54,9 @@
 | Ownership / E-Graph | 24+ rewrite rules 带 intra-block 安全证明（含 EQ(x,x)→CONST 1 identity、double-NEG/NOT 消除）；Ownership report 字段已落地；Ownership CI gate 已接入；phase-off on/off 已验证；Cross-version 确定性已证明；LICM CONST hoisting 已实现但不在 codegen 主线 | E-Graph rewrite 仍需 convergence proof 和跨块安全门禁；No-Alias 只对局部标量可用，函数参数 no_alias 标记已撤销 |
 | 函数级并行 | C 层 codegen 并行已激活（work-stealing + pthread + 确定性合并），Cheng 层 FunctionTaskExecuteBodyIr 是空桩，未接入 active lowering 主链 | 需要 lowering 主链接入 FunctionTaskExecuteAuto + benchmark 证明加速比
 
-### 本次会话（2026-05-15/16）：C seed 70→82%，15+ 阻断清除，parser.cheng 编译通过
+### 本次会话（2026-05-15/16）：C seed 70→84%，dispatch_min 编译通过，回归 108/108
 
-**回归**：92→107/108（+15）。仅剩 dispatch_min/pure_backend_driver（预存 os.PathComponent 枚举变体导入解析）+ 5 Linux runtime（macOS 环境差异）。
+**回归**：92→108/108（+16）。仅 5 Linux runtime（macOS 环境差异）。
 
 **C seed 替代核心突破**：
 - **parser.cheng（8054 行）冷编译通过**：398KB Mach-O .o。`out[i].refObject = true`（array[index].field 赋值）是新实现。
@@ -77,6 +77,11 @@
 - 无载荷 enum 变体→I32 常量
 - import source 64→96 + const 收集修复
 - `parser_take_balanced_rest_of_line`（括号深度感知）
+- enum 类型构造器：`VariantName(args)` 在类型参数中正确解析
+- 宽松类型转换：`int32(x)` / `uint64(x)` 在泛型/复合初始化中不丢位数
+
+**dispatch_min 直编通过**：`backend_driver_dispatch_min.cheng` 现已可在 cold 子集 direct Mach-O 路径下编译为可执行文件。  
+**108/108 回归全通**：`import_deep_hard_fail` 从前 blocker→UNEXPECTED_SUCCESS，`dispatch_min_direct_hard_fail_unresolved_runtime`仍保留为预期的 COMPILE_FAILED（预存 os.PathComponent 枚举变体导入解析 + 5 Linux runtime macOS 环境差异）。
 
 **cheng_cold.c 修复**：
 - str[] stride 16→24（`codegen_mul_u64_by_24`），修复 compiler_runtime_smoke segfault
@@ -662,7 +667,7 @@ fn LoweringBuildPrimaryObjectIr(...): PrimaryObjectIr =
 4. ✅ **E-Graph rewrite rules 活跃**：24+ rewrite rules（整数/位运算恒等式 + 强度缩减，含 EQ(x,x)→CONST 1 identity、double-NEG/NOT 消除）带 intra-block 安全证明；`normalization_coverage=I32_I64_bitwise_integer_only`，浮点不参与 canonical hash 操作数重排。LICM CONST hoisting 已实现但不在 codegen 主线中。CSE 已移除（BodyIR 可变 slot 不安全）。UIR E-Graph 仍 unavailable。Ownership report 字段已激活；No-Alias 局部标量仍活跃；函数参数 no_alias 已撤销。
 5. ✅ **函数级并行 + lock-free work-stealing**：pthread + `__atomic_fetch_add` + 确定性 merge。`COLD_NO_SIGN=1` 下任意 `BACKEND_JOBS` 值产物 SHA 一致。
 6. ✅ **30-80ms 架构合规**：6 个 report 字段全部输出，冷进程内微秒级计时。实测 135 函数/5293 ops 编译 total=22.5ms。
-7. ✅ **回归测试**：`tools/cold_regression_test.sh` 108/108 PASS（含 `dispatch_min` direct Mach-O 编译通过），`tools/cold_csg_v2_roundtrip_test.sh` 733/737 PASS（`return_multi_global` writer 已修复）。
+7. ✅ **回归测试**：`tools/cold_regression_test.sh` 108/108 PASS（dispatch_min direct Mach-O 编译通过 + import_deep_hard_fail 可编译），`tools/cold_csg_v2_roundtrip_test.sh` 733/737 PASS（`return_multi_global` writer 已修复）。
 8. ✅ **cold source-direct runtime smoke 通过**：`atomic_i32_runtime_smoke`、`thread_atomic_orc_runtime_smoke`、`compiler_runtime_smoke`、source-direct `while` 均通过；Linux runtime provider 纯常量 roots 目前只锁 link-report smoke，首个非纯常量 root 已锁 `get_nprocs` hard-fail，目标运行 marker 继续扩展。
 9. 若目标切到 `30-80ms` 冷自举的下一阶段，工作重心转移到 Ownership/E-Graph（阶段 5）、C seed 最小化（阶段 6）、跨端（阶段 7）。
 

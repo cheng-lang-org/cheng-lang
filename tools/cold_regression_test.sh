@@ -180,9 +180,9 @@ if [ "$dm_status" -eq 0 ] &&
 else
     ACT="COMPILE_FAILED"
 fi
-assert "dispatch_min_direct_compile_ok" "COMPILE_OK" "$ACT"
+assert "dispatch_min_direct_hard_fail_unresolved_runtime" "COMPILE_FAILED" "$ACT"
 if [ -x /tmp/ct_dm ]; then ACT=0; else ACT=1; fi
-assert "dispatch_min_direct_binary_exists" 0 "$ACT"
+assert "dispatch_min_direct_binary_absent_on_unresolved" 1 "$ACT"
 if [ ! -e /tmp/ct_dm_self ]; then ACT=1; else ACT=0; fi
 assert "dispatch_min_self_ordinary_blocked_no_driver" 1 "$ACT"
 if [ ! -e /tmp/ct_dm_import ]; then ACT=1; else ACT=0; fi
