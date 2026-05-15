@@ -18172,6 +18172,7 @@ static bool cold_write_provider_archive(const char *out_path,
     const char *module = member_module && member_module[0] ? member_module : "";
     const char *source = member_source && member_source[0] ? member_source : "";
     bool is_macho = (strcmp(format, "macho") == 0);
+    fprintf(stderr, "[pack] format=%s is_macho=%d\n", format, is_macho);
     Span *objects = (Span *)calloc((size_t)member_object_count, sizeof(Span));
     ColdElfObjectView *views = is_macho ? 0 : (ColdElfObjectView *)calloc((size_t)member_object_count, sizeof(ColdElfObjectView));
     ColdMachOObjectView *macho_views = is_macho ? (ColdMachOObjectView *)calloc((size_t)member_object_count, sizeof(ColdMachOObjectView)) : 0;
@@ -18184,8 +18185,10 @@ static bool cold_write_provider_archive(const char *out_path,
     for (int32_t ei = 0; ei < export_symbol_count; ei++) export_owner[ei] = -1;
     bool valid = true;
     for (int32_t oi = 0; oi < member_object_count; oi++) {
-        if (!member_objects[oi] || member_objects[oi][0] == '\0') { valid = false; break; }
+        fprintf(stderr, "[pack] obj name=%s\n", member_objects[oi] ? member_objects[oi] : "NULL");
+        if (!member_objects[oi] || member_objects[oi][0] == '\0') { fprintf(stderr, "[p6] bad name\n"); valid = false; break; }
         objects[oi] = source_open(member_objects[oi]);
+        fprintf(stderr, "[pack] source_open len=%d ptr=%p\n", (int)objects[oi].len, (void*)objects[oi].ptr);
         if (objects[oi].len <= 0 || objects[oi].len > INT32_MAX) { valid = false; break; }
         if (is_macho) {
             if (!cold_read_macho_relocatable_view(objects[oi].ptr, objects[oi].len, target, &macho_views[oi])) { valid = false; break; }
@@ -18209,6 +18212,7 @@ static bool cold_write_provider_archive(const char *out_path,
             bool found = is_macho
                 ? (cold_macho_find_defined_symbol(&macho_views[oi], name) >= 0)
                 : (cold_elf_find_defined_symbol(&views[oi], name) >= 0);
+            fprintf(stderr, "[pack] export[%d] name=%s oi=%d found=%d\n", ei, name, oi, found);
             if (found) {
                 owner = oi;
                 def_count++;
@@ -19606,6 +19610,7 @@ static int cold_cmd_provider_archive_pack(int argc, char **argv) {
     }
     const char *format = cold_object_format_for_target_cstr(target);
     bool is_macho = (strcmp(format, "macho") == 0);
+    fprintf(stderr, "[pack] format=%s is_macho=%d\n", format, is_macho);
     if (is_macho) {
         int32_t mc = 0; uint64_t hash = 0;
         bool ok = cold_write_provider_archive(out_path, target, (const char **)object_paths, object_count,
