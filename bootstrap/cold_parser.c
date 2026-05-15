@@ -2537,6 +2537,7 @@ static bool cold_result_constructor_type(Parser *parser, Span call_name,
                                          Span *base_out, Span *result_type_out) {
     Span base = call_name;
     Span arg_type = {0};
+    bool has_generic_args = false;
     if (call_name.len > 0 && call_name.ptr[call_name.len - 1] == ']') {
         int32_t bracket = -1;
         for (int32_t i = 0; i < call_name.len; i++) {
@@ -2544,14 +2545,21 @@ static bool cold_result_constructor_type(Parser *parser, Span call_name,
         }
         if (bracket <= 0) die("Result constructor generic syntax invalid");
         base = span_sub(call_name, 0, bracket);
+        has_generic_args = true;
+    }
+    Span short_base = cold_last_qualified_component(base);
+    if (!span_eq(short_base, "Ok") && !span_eq(short_base, "Err")) return false;
+    if (has_generic_args) {
+        int32_t bracket = -1;
+        for (int32_t i = 0; i < call_name.len; i++) {
+            if (call_name.ptr[i] == '[') { bracket = i; break; }
+        }
         Span args_span = span_trim(span_sub(call_name, bracket + 1, call_name.len - 1));
         Span args[COLD_MAX_VARIANT_FIELDS];
         int32_t arg_count = cold_split_top_level_commas(args_span, args, COLD_MAX_VARIANT_FIELDS);
         if (arg_count != 1) die("Result constructor requires exactly one type argument");
         arg_type = parser_scope_type(parser, args[0]);
     }
-    Span short_base = cold_last_qualified_component(base);
-    if (!span_eq(short_base, "Ok") && !span_eq(short_base, "Err")) return false;
     if (arg_type.len <= 0) die("Result constructor requires explicit type argument");
     Span result_args[1] = {arg_type};
     if (base_out) *base_out = short_base;

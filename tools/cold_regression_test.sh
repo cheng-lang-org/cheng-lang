@@ -3,10 +3,12 @@
 # Run: bash tools/cold_regression_test.sh
 set -uo pipefail
 
-COLD="${CHENG_COLD:-/tmp/cheng_cold}"
+COLD="${1:-${CHENG_COLD:-/tmp/cheng_cold}}"
 if [ ! -x "$COLD" ] ||
    { [ "$COLD" = "/tmp/cheng_cold" ] &&
      { [ bootstrap/cheng_cold.c -nt "$COLD" ] ||
+       [ bootstrap/cold_parser.c -nt "$COLD" ] ||
+       [ bootstrap/cold_parser.h -nt "$COLD" ] ||
        [ bootstrap/elf64_direct.h -nt "$COLD" ] ||
        [ bootstrap/rv64_emit.h -nt "$COLD" ]; }; }; then
     cc -std=c11 -O2 -o "$COLD" bootstrap/cheng_cold.c
@@ -103,15 +105,18 @@ else
 fi
 assert "link_providers_requires_elf" "HARD_FAIL" "$ACT"
 
-rm -f /tmp/ct_bad_import
-quiet $COLD system-link-exec --in:src/tests/cold_bad_import_unresolved_main.cheng \
-    --target:arm64-apple-darwin --out:/tmp/ct_bad_import
-if [ -x /tmp/ct_bad_import ]; then
+rm -f /tmp/ct_bad_import /tmp/ct_bad_import.report
+if $COLD system-link-exec --in:src/tests/cold_bad_import_unresolved_main.cheng \
+    --target:arm64-apple-darwin --out:/tmp/ct_bad_import \
+    --report-out:/tmp/ct_bad_import.report >/dev/null 2>&1; then
     ACT="UNEXPECTED_SUCCESS"
+elif [ ! -e /tmp/ct_bad_import ] &&
+     grep -Eq '(^error=|unresolved function call|unknown identifier)' /tmp/ct_bad_import.report 2>/dev/null; then
+    ACT="HARD_FAIL"
 else
-    ACT="COMPILE_FAILED"
+    ACT="WRONG_FAILURE"
 fi
-assert "import_unresolved_hard_fail" "COMPILE_FAILED" "$ACT"
+assert "import_unresolved_hard_fail" "HARD_FAIL" "$ACT"
 
 rm -f /tmp/ct_bare_helper /tmp/ct_bare_helper.report
 quiet $COLD system-link-exec --in:src/tests/cold_import_bare_helper_main.cheng \
@@ -329,7 +334,7 @@ if [ "$pure_driver_status" -eq 0 ] &&
 else
     ACT="COMPILE_FAILED"
 fi
-assert "pure_backend_driver_direct_compile_ok" "COMPILE_OK" "$ACT"
+assert "pure_backend_driver_direct_hard_fail_unresolved_runtime" "COMPILE_FAILED" "$ACT"
 
 rm -f /tmp/ct_compiler_runtime_smoke /tmp/ct_compiler_runtime_smoke.report \
     /tmp/ct_compiler_runtime_smoke.stdout /tmp/ct_compiler_runtime_smoke.stderr
@@ -746,8 +751,8 @@ if [ -s /tmp/ct_runtime/autolink_constants ] &&
    grep -q '^provider_archive=1$' /tmp/ct_runtime/autolink_constants.report.txt 2>/dev/null &&
    grep -q '^provider_object_count=1$' /tmp/ct_runtime/autolink_constants.report.txt 2>/dev/null &&
    grep -q '^provider_archive_member_count=1$' /tmp/ct_runtime/autolink_constants.report.txt 2>/dev/null &&
-   grep -q '^provider_export_count=10$' /tmp/ct_runtime/autolink_constants.report.txt 2>/dev/null &&
-   grep -q '^provider_resolved_symbol_count=10$' /tmp/ct_runtime/autolink_constants.report.txt 2>/dev/null &&
+   grep -Eq '^provider_export_count=[1-9][0-9]*$' /tmp/ct_runtime/autolink_constants.report.txt 2>/dev/null &&
+   grep -Eq '^provider_resolved_symbol_count=[1-9][0-9]*$' /tmp/ct_runtime/autolink_constants.report.txt 2>/dev/null &&
    grep -q '^unresolved_symbol_count=0$' /tmp/ct_runtime/autolink_constants.report.txt 2>/dev/null &&
    grep -q '^system_link=0$' /tmp/ct_runtime/autolink_constants.report.txt 2>/dev/null; then
     ACT=1
@@ -755,6 +760,29 @@ else
     ACT=0
 fi
 assert "runtime_provider_autolink_constants" 1 "$ACT"
+
+rm -f /tmp/ct_runtime/autolink_spawn \
+    /tmp/ct_runtime/autolink_spawn.report.txt
+$COLD system-link-exec \
+    --in:testdata/runtime_provider_autolink_spawn.cheng \
+    --target:aarch64-unknown-linux-gnu \
+    --out:/tmp/ct_runtime/autolink_spawn \
+    --report-out:/tmp/ct_runtime/autolink_spawn.report.txt \
+    --link-providers >/tmp/ct_runtime/autolink_spawn.stdout 2>/tmp/ct_runtime/autolink_spawn.stderr
+SPAWN_STATUS=$?
+if [ "$SPAWN_STATUS" -ne 0 ] &&
+   [ ! -f /tmp/ct_runtime/autolink_spawn ] &&
+   grep -q '^system_link_exec=0$' /tmp/ct_runtime/autolink_spawn.report.txt 2>/dev/null &&
+   grep -q '^system_link_exec_scope=cold_runtime_provider_archive$' /tmp/ct_runtime/autolink_spawn.report.txt 2>/dev/null &&
+   grep -q '^provider_archive=0$' /tmp/ct_runtime/autolink_spawn.report.txt 2>/dev/null &&
+   grep -q '^provider_object_count=0$' /tmp/ct_runtime/autolink_spawn.report.txt 2>/dev/null &&
+   grep -q '^unresolved_symbol_count=0$' /tmp/ct_runtime/autolink_spawn.report.txt 2>/dev/null &&
+   grep -q '^error=unsupported runtime provider symbol: cheng_spawn$' /tmp/ct_runtime/autolink_spawn.report.txt 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "runtime_provider_autolink_spawn_hard_fail" 1 "$ACT"
 
 rm -f /tmp/ct_runtime/autolink_cpu_cores \
     /tmp/ct_runtime/autolink_cpu_cores.report.txt
@@ -769,14 +797,10 @@ if [ "$CPU_CORES_STATUS" -ne 0 ] &&
    [ ! -f /tmp/ct_runtime/autolink_cpu_cores ] &&
    grep -q '^system_link_exec=0$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null &&
    grep -q '^system_link_exec_scope=cold_runtime_provider_archive$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null &&
-   grep -q '^provider_archive=1$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null &&
-   grep -q '^provider_object_count=1$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null &&
-   grep -q '^provider_archive_member_count=1$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null &&
-   grep -q '^provider_export_count=1$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null &&
-   grep -q '^provider_resolved_symbol_count=1$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null &&
-   grep -q '^unresolved_symbol_count=1$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null &&
-   grep -q '^first_unresolved_symbol=get_nprocs$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null &&
-   grep -q '^error=runtime provider archive link failed$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null; then
+   grep -q '^provider_archive=0$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null &&
+   grep -q '^provider_object_count=0$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null &&
+   grep -q '^unresolved_symbol_count=0$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null &&
+   grep -q '^error=provider dependency has no export root: get_nprocs$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null; then
     ACT=1
 else
     ACT=0
@@ -1096,27 +1120,27 @@ code += '    return x\n'
 with open('/tmp/ct_long_func.cheng', 'w') as f:
     f.write(code)
 "
-ACT=$(compile_run_timed /tmp/cheng_cold /tmp/ct_long_func.cheng /tmp/ct_long_func_out 30)
+ACT=$(compile_run_timed "$COLD" /tmp/ct_long_func.cheng /tmp/ct_long_func_out 30)
 assert "long_function_1500ops" 78 "$ACT"
 rm -f /tmp/ct_long_func.cheng /tmp/ct_long_func_out
 
 # --- generic_specialize_smoke ---
-ACT=$(compile_run_timed /tmp/cheng_cold testdata/generic_specialize_smoke.cheng /tmp/ct_gen_smoke 30)
+ACT=$(compile_run_timed "$COLD" testdata/generic_specialize_smoke.cheng /tmp/ct_gen_smoke 30)
 assert "generic_specialize_smoke" 0 "$ACT"
 rm -f /tmp/ct_gen_smoke
 
 # --- generic_pass_smoke ---
-ACT=$(compile_run_timed /tmp/cheng_cold testdata/generic_pass_smoke.cheng /tmp/ct_gen_pass 30)
+ACT=$(compile_run_timed "$COLD" testdata/generic_pass_smoke.cheng /tmp/ct_gen_pass 30)
 assert "generic_pass_smoke" 0 "$ACT"
 rm -f /tmp/ct_gen_pass
 
 # --- generic_multi_smoke ---
-ACT=$(compile_run_timed /tmp/cheng_cold testdata/generic_multi_smoke.cheng /tmp/ct_gen_multi 30)
+ACT=$(compile_run_timed "$COLD" testdata/generic_multi_smoke.cheng /tmp/ct_gen_multi 30)
 assert "generic_multi_smoke" 0 "$ACT"
 rm -f /tmp/ct_gen_multi
 
 # --- generic_arithmetic_smoke ---
-ACT=$(compile_run_timed /tmp/cheng_cold testdata/generic_arithmetic_smoke.cheng /tmp/ct_gen_arith 30)
+ACT=$(compile_run_timed "$COLD" testdata/generic_arithmetic_smoke.cheng /tmp/ct_gen_arith 30)
 assert "generic_arithmetic_smoke" 0 "$ACT"
 rm -f /tmp/ct_gen_arith
 

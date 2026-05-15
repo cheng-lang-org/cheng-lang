@@ -94,20 +94,34 @@ static bool elf64_write_object(const char *path,
                                const int32_t *reloc_symbols,
                                int32_t reloc_count,
                                uint16_t machine) {
+    if (!path || code_words < 0 || name_count < 0 || local_count < 0 ||
+        local_count > name_count || reloc_count < 0) {
+        return false;
+    }
     int32_t code_sz = code_words * 4;
 
     /* Build string table */
-    char strtab[65536];
+    size_t strtab_size = 1; /* first byte is \0 */
+    for (int32_t i = 0; i < name_count; i++) {
+        if (!names || !names[i]) return false;
+        size_t nl = strlen(names[i]);
+        if (nl > (size_t)INT32_MAX || strtab_size > (size_t)INT32_MAX - nl - 1) {
+            return false;
+        }
+        strtab_size += nl + 1;
+    }
+    char *strtab = (char *)calloc(strtab_size, 1);
+    if (!strtab) return false;
     int32_t str_off = 1; /* first byte is \0 */
-    int32_t name_stroff[512];
-    for (int32_t i = 0; i < name_count && i < 512; i++) {
+    int32_t name_stroff_count = name_count > 0 ? name_count : 1;
+    int32_t *name_stroff = (int32_t *)calloc((size_t)name_stroff_count, sizeof(int32_t));
+    if (!name_stroff) { free(strtab); return false; }
+    for (int32_t i = 0; i < name_count; i++) {
         name_stroff[i] = str_off;
         int32_t nl = (int32_t)strlen(names[i]);
-        if (str_off + nl + 1 < (int32_t)sizeof(strtab)) {
-            memcpy(strtab + str_off, names[i], nl);
-            str_off += nl;
-            strtab[str_off++] = '\0';
-        }
+        memcpy(strtab + str_off, names[i], (size_t)nl);
+        str_off += nl;
+        strtab[str_off++] = '\0';
     }
     /* Build section name string table */
     char shstrtab[128];
@@ -115,7 +129,7 @@ static bool elf64_write_object(const char *path,
     int32_t shstr_text = shstr_off;
     memcpy(shstrtab + shstr_off, ".text", 6); shstr_off += 6;
     int32_t shstr_rela = shstr_off;
-    memcpy(shstrtab + shstr_off, ".rela.text", 10); shstr_off += 10;
+    memcpy(shstrtab + shstr_off, ".rela.text", 11); shstr_off += 11;
     int32_t shstr_symtab = shstr_off;
     memcpy(shstrtab + shstr_off, ".symtab", 8); shstr_off += 8;
     int32_t shstr_strtab = shstr_off;
@@ -151,7 +165,21 @@ static bool elf64_write_object(const char *path,
     /* Build relocation table */
     int32_t nreloc = reloc_count > 0 ? reloc_count : 0;
     Elf64_Rela *relas = (Elf64_Rela *)calloc(nreloc, sizeof(Elf64_Rela));
+    if (nreloc > 0 && !relas) {
+        free(name_stroff);
+        free(strtab);
+        free(syms);
+        return false;
+    }
     for (int32_t i = 0; i < nreloc; i++) {
+        if (!reloc_offsets || !reloc_symbols ||
+            reloc_symbols[i] < 0 || reloc_symbols[i] >= name_count) {
+            free(name_stroff);
+            free(strtab);
+            free(syms);
+            free(relas);
+            return false;
+        }
         relas[i].r_offset = (uint64_t)reloc_offsets[i];
         uint32_t sym = (uint32_t)(reloc_symbols[i] + 1); /* +1 for NULL sym[0] */
         uint32_t type = (machine == EM_AARCH64) ? R_AARCH64_CALL26 :
@@ -177,7 +205,13 @@ static bool elf64_write_object(const char *path,
     int32_t total_sz = shstr_off_file + shstr_off;
 
     uint8_t *buf = (uint8_t *)calloc(1, total_sz);
-    if (!buf) return false;
+    if (!buf) {
+        free(strtab);
+        free(name_stroff);
+        free(syms);
+        free(relas);
+        return false;
+    }
     uint32_t *w = (uint32_t *)buf;
 
     /* ELF Header */
@@ -277,11 +311,13 @@ static bool elf64_write_object(const char *path,
     memcpy(buf + code_off, code, code_sz);
     memcpy(buf + rela_off, relas, rela_size);
     memcpy(buf + sym_off, syms, sym_size);
-    memcpy(buf + str_off_file, strtab, str_off);
+    memcpy(buf + str_off_file, strtab, (size_t)str_off);
     memcpy(buf + shstr_off_file, shstrtab, shstr_off);
 
+    free(strtab);
     free(syms);
     free(relas);
+    free(name_stroff);
 
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) { free(buf); return false; }

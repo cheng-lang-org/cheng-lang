@@ -594,8 +594,20 @@ roundtrip_fixture return_nested_control tests/cheng/backend/fixtures/return_nest
 # Boolean logical expressions: && and ||
 roundtrip_fixture return_logical_expr tests/cheng/backend/fixtures/return_logical_expr.cheng 8192
 
-# Import chain: file A imports B imports C (transitive import compilation)
-roundtrip_fixture import_chain_a tests/cheng/backend/fixtures/import_chain_a.cheng 4096
+# Import chain with unqualified cross-module bare call must hard-fail in cold.
+echo "  - import_chain_bare_hard_fail"
+import_chain_report="$WORK/import_chain_a.writer.report.txt"
+if "$COLD" system-link-exec \
+    --root:"$ROOT" \
+    --in:tests/cheng/backend/fixtures/import_chain_a.cheng \
+    --emit:csg-v2 \
+    --out:"$WORK/import_chain_a.facts" \
+    --target:"$TARGET" \
+    --report-out:"$import_chain_report" >/dev/null 2>&1; then
+    bad "import_chain_bare_hard_fail"
+else
+    require_grep "import_chain_bare_hard_fail" '^error=unresolved function call$' "$import_chain_report"
+fi
 
 # Roundtrip stability: all fixtures must converge in 1 csg-v2 step
 echo "  - roundtrip_stability"
@@ -731,51 +743,80 @@ else
 fi
 
 
-# Built-in linker: ELF .o should also produce .linked executable
-echo "  - builtin_linker_elf"
-"$COLD" system-link-exec \
+# ELF object emission is pure: linking must go through the explicit link-object entry.
+echo "  - link_object_elf"
+rm -f "$WORK/ordinary_link.o" "$WORK/ordinary_link.o.linked" "$WORK/ordinary_link_exec"
+if "$COLD" system-link-exec \
   --csg-in:"$WORK/ordinary.facts" \
   --emit:obj --target:riscv64-unknown-linux-gnu \
   --out:"$WORK/ordinary_link.o" \
-  > "$WORK/ordinary_link.report.txt" 2>&1 || true
-if [ -f "$WORK/ordinary_link.o.linked" ]; then
-  if file "$WORK/ordinary_link.o.linked" | grep -q "ELF.*executable"; then
-    echo "PASS builtin_linker_elf"
-    pass=$((pass + 1))
-  else
-    echo "FAIL builtin_linker_elf"
-    fail=$((fail + 1))
-  fi
+  --report-out:"$WORK/ordinary_link.report.txt" \
+  > "$WORK/ordinary_link.stdout" 2>&1 &&
+   "$COLD" system-link-exec \
+  --link-object:"$WORK/ordinary_link.o" \
+  --emit:exe --target:riscv64-unknown-linux-gnu \
+  --out:"$WORK/ordinary_link_exec" \
+  --report-out:"$WORK/ordinary_link_exec.report.txt" \
+  > "$WORK/ordinary_link_exec.stdout" 2>&1 &&
+   [ -s "$WORK/ordinary_link.o" ] &&
+   [ ! -e "$WORK/ordinary_link.o.linked" ] &&
+   file "$WORK/ordinary_link.o" | grep -q "ELF.*relocatable" &&
+   file "$WORK/ordinary_link_exec" | grep -q "ELF.*executable" &&
+   grep -q '^emit=obj$' "$WORK/ordinary_link.report.txt" &&
+   grep -q '^link_object=0$' "$WORK/ordinary_link.report.txt" &&
+   grep -q '^system_link=0$' "$WORK/ordinary_link.report.txt" &&
+   grep -q '^link_object=1$' "$WORK/ordinary_link_exec.report.txt" &&
+   grep -q '^unresolved_symbol_count=0$' "$WORK/ordinary_link_exec.report.txt" &&
+   grep -q '^system_link=0$' "$WORK/ordinary_link_exec.report.txt"; then
+  echo "PASS link_object_elf"
+  pass=$((pass + 1))
 else
-  echo "FAIL builtin_linker_elf (no .linked file)"
+  echo "FAIL link_object_elf"
   fail=$((fail + 1))
 fi
 
 
-# Built-in linker determinism: two runs produce bit-identical linked executables
-echo "  - builtin_linker_determinism"
-rm -f "$WORK/ordinary_link_d1.o" "$WORK/ordinary_link_d1.o.linked"
-rm -f "$WORK/ordinary_link_d2.o" "$WORK/ordinary_link_d2.o.linked"
-"$COLD" system-link-exec \
+# Explicit linker determinism: two link-object runs produce bit-identical executables.
+echo "  - link_object_determinism"
+rm -f "$WORK/ordinary_link_d1.o" "$WORK/ordinary_link_d1.o.linked" "$WORK/ordinary_link_d1.exe"
+rm -f "$WORK/ordinary_link_d2.o" "$WORK/ordinary_link_d2.o.linked" "$WORK/ordinary_link_d2.exe"
+if "$COLD" system-link-exec \
   --csg-in:"$WORK/ordinary.facts" \
   --emit:obj --target:riscv64-unknown-linux-gnu \
   --out:"$WORK/ordinary_link_d1.o" \
-  > "$WORK/ordinary_link_d1.report.txt" 2>&1 || true
-"$COLD" system-link-exec \
+  --report-out:"$WORK/ordinary_link_d1.report.txt" \
+  > "$WORK/ordinary_link_d1.stdout" 2>&1 &&
+   "$COLD" system-link-exec \
   --csg-in:"$WORK/ordinary.facts" \
   --emit:obj --target:riscv64-unknown-linux-gnu \
   --out:"$WORK/ordinary_link_d2.o" \
-  > "$WORK/ordinary_link_d2.report.txt" 2>&1 || true
-if [ -f "$WORK/ordinary_link_d1.o.linked" ] && [ -f "$WORK/ordinary_link_d2.o.linked" ]; then
-  if cmp -s "$WORK/ordinary_link_d1.o.linked" "$WORK/ordinary_link_d2.o.linked"; then
-    echo "PASS builtin_linker_determinism"
-    pass=$((pass + 1))
-  else
-    echo "FAIL builtin_linker_determinism (linked exes differ)"
-    fail=$((fail + 1))
-  fi
+  --report-out:"$WORK/ordinary_link_d2.report.txt" \
+  > "$WORK/ordinary_link_d2.stdout" 2>&1 &&
+   "$COLD" system-link-exec \
+  --link-object:"$WORK/ordinary_link_d1.o" \
+  --emit:exe --target:riscv64-unknown-linux-gnu \
+  --out:"$WORK/ordinary_link_d1.exe" \
+  --report-out:"$WORK/ordinary_link_d1.exe.report.txt" \
+  > "$WORK/ordinary_link_d1.exe.stdout" 2>&1 &&
+   "$COLD" system-link-exec \
+  --link-object:"$WORK/ordinary_link_d2.o" \
+  --emit:exe --target:riscv64-unknown-linux-gnu \
+  --out:"$WORK/ordinary_link_d2.exe" \
+  --report-out:"$WORK/ordinary_link_d2.exe.report.txt" \
+  > "$WORK/ordinary_link_d2.exe.stdout" 2>&1 &&
+   [ ! -e "$WORK/ordinary_link_d1.o.linked" ] &&
+   [ ! -e "$WORK/ordinary_link_d2.o.linked" ] &&
+   grep -q '^link_object=1$' "$WORK/ordinary_link_d1.exe.report.txt" &&
+   grep -q '^link_object=1$' "$WORK/ordinary_link_d2.exe.report.txt" &&
+   grep -q '^unresolved_symbol_count=0$' "$WORK/ordinary_link_d1.exe.report.txt" &&
+   grep -q '^unresolved_symbol_count=0$' "$WORK/ordinary_link_d2.exe.report.txt" &&
+   grep -q '^system_link=0$' "$WORK/ordinary_link_d1.exe.report.txt" &&
+   grep -q '^system_link=0$' "$WORK/ordinary_link_d2.exe.report.txt" &&
+   cmp -s "$WORK/ordinary_link_d1.exe" "$WORK/ordinary_link_d2.exe"; then
+  echo "PASS link_object_determinism"
+  pass=$((pass + 1))
 else
-  echo "FAIL builtin_linker_determinism (missing linked files)"
+  echo "FAIL link_object_determinism"
   fail=$((fail + 1))
 fi
 
@@ -788,10 +829,13 @@ if "$COLD" system-link-exec \
   --out:"$WORK/ordinary_link_explicit" \
   --report-out:"$WORK/ordinary_link_explicit.report.txt" \
   > "$WORK/ordinary_link_explicit.stdout" 2>&1; then
-  if cmp -s "$WORK/ordinary_link_d1.o.linked" "$WORK/ordinary_link_explicit" &&
+  if cmp -s "$WORK/ordinary_link_d1.exe" "$WORK/ordinary_link_explicit" &&
+     [ ! -e "$WORK/ordinary_link_d1.o.linked" ] &&
+     file "$WORK/ordinary_link_explicit" | grep -q "ELF.*executable" &&
      grep -q '^link_object=1$' "$WORK/ordinary_link_explicit.report.txt" &&
      grep -q '^unresolved_symbol_count=0$' "$WORK/ordinary_link_explicit.report.txt" &&
-     grep -q '^system_link=0$' "$WORK/ordinary_link_explicit.report.txt"; then
+     grep -q '^system_link=0$' "$WORK/ordinary_link_explicit.report.txt" &&
+     grep -q '^linkerless_image=1$' "$WORK/ordinary_link_explicit.report.txt"; then
     echo "PASS link_object_explicit"
     pass=$((pass + 1))
   else

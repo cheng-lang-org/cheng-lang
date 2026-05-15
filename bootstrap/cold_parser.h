@@ -82,7 +82,7 @@ int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *locals,
 int32_t parse_call_from_args_span(Parser *owner, BodyIR *body, Locals *locals,
                                   Span name, Span args, int32_t *kind);
 int32_t parse_let_binding(Parser *parser, BodyIR *body, Locals *locals,
-                          int32_t block, bool is_var);
+                          int32_t block, bool is_var, int32_t stmt_indent);
 int32_t parse_arith_expr(Parser *parser, BodyIR *body, Locals *locals, int32_t *kind);
 int32_t parse_compare_expr(Parser *parser, BodyIR *body, Locals *locals, int32_t *kind);
 int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32_t *kind);
