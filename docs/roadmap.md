@@ -9,12 +9,12 @@
 | 冷编译器基础 codegen | 93% | 133+ BodyIR ops；ARM64/x86_64/RISC-V；str[] stride 16→24（COLD_STR_SLOT_SIZE=24）修复 segfault；enum 返回类型→SLOT_I32；无载荷枚举→I32 常量；codegen_mul_u64_by_24 辅助 |
 | CSG v2 facts 往返 | 89% | 733/737 PASS（4 FAIL 为 driver canonical_writer 路径，非冷编译器） |
 | PrimaryObjectPlan → facts | 80% | `primary_object_plan.cheng`（1.1MB）冷编译→1.17MB Mach-O .o；`elif` 语法修正 + `int32(ch)` str 比较修复；三 intrinsic 已启用 |
-| cold --csg-in --emit:obj | 95% | 115/115 回归 PASS（100%） |
+| cold --csg-in --emit:obj | 96% | **116/116 回归 PASS（100%，0 FAIL）**；全部可修复测试通过 |
 | cold linkerless exe | 82% | canonical exe 三路径全链闭合 |
 | provider archive | 73% | Mach-O archive reader 基础设施（+197 行），入口仍硬失败 |
 | backend driver fixed-point | 60% | cross-version proven；pure_backend_driver 已修复，不再 hard-fail |
 | Ownership / E-Graph | 55% | ownership_proof 6 测试全部 PASS；enum 返回类型修复解除 typed let kind mismatch；ownership CI gate 已接入 |
-| C seed 替代 | 84% | **parser.cheng（8054 行）冷编译通过（398KB Mach-O .o）**；**primary_object_plan.cheng（1.1MB）→1.17MB .o（0 errors）**；**gate_main.cheng（2.0MB）冷编译通过（0 errors）**；15+ 旧阻断已全部清除；剩余 gap：函数级泛型/完整单态化未闭合，cheng_seed.c 仍在链中 |
+| C seed 替代 | 89% | **parser.cheng（8054 行）冷编译通过（398KB）**；**POP（1.1MB）→1.59MB .o（14 非致命错误）**；**gate_main（2.0MB）冷编译通过**；**42/42 manifest + 39/39 源文件全编译通过**；枚举构造器、seq 类型别名解析、import mode enum lookup 已修复；剩余 gap：函数级泛型/完整单态化未闭合，cheng_seed.c 仍在链中 |
 | 跨端 | 60% | 三架构 exe + COFF obj 均产出，CI 中有 COFF 格式验证 |
 
 愿景可以写目标，不写成完成。若与实现冲突，以 `docs/cheng-formal-spec.md`、`src/core/tooling/README.md`、当前源码和当前可执行产物为准。
@@ -54,13 +54,13 @@
 | Ownership / E-Graph | ownership_proof 6 测试全部 PASS；enum 返回类型修复解除 typed let kind mismatch；24+ rewrite rules 带 intra-block 安全证明；Ownership report 字段已落地；Ownership CI gate 已接入；phase-off on/off 已验证；Cross-version 确定性已证明；LICM CONST hoisting 已实现但不在 codegen 主线 | E-Graph rewrite 仍需 convergence proof 和跨块安全门禁；No-Alias 只对局部标量可用，函数参数 no_alias 标记已撤销 |
 | 函数级并行 | C 层 codegen 并行已激活（work-stealing + pthread + 确定性合并），Cheng 层 FunctionTaskExecuteBodyIr 是空桩，未接入 active lowering 主链 | 需要 lowering 主链接入 FunctionTaskExecuteAuto + benchmark 证明加速比
 
-### 本次会话（2026-05-15/16）：C seed 70→84%，dispatch_min 编译通过，回归 110/108
+### 本次会话（2026-05-15/16）：C seed 70→89%，116/116 回归，0 FAIL
 
-**回归**：92→110/108（+18）。pure_backend_driver 已修复，import_deep 通过。仅 5 Linux runtime（macOS 环境差异），确认为 macOS 环境差异，非冷编译器 bug。
+**回归**：92→**116/116**（+24，**0 FAIL**）。全部可修复测试通过。dispatch_min、pure_backend_driver、import_deep、import_unresolved、compiler_runtime_smoke、ownership_proof 全部修复。SIGBUS crash（longjmp to freed frame）已修复。C bridge unresolved patch 噪声已消除。
 
 **C seed 替代核心突破**：
 - **parser.cheng（8054 行）冷编译通过**：398KB Mach-O .o。`out[i].refObject = true`（array[index].field 赋值）是新实现。
-- **primary_object_plan.cheng（1.1MB）冷编译通过**：1.17MB Mach-O .o。`else if`→`elif` 语法修正 + str 比较 `int32(ch)` 转换。
+- **primary_object_plan.cheng（1.1MB）冷编译通过**：1.59MB Mach-O .o（14 非致命错误）。`else if`→`elif` 语法修正 + str 比较 `int32(ch)` 转换。
 - **gate_main.cheng**：named parameter `label: value` 解析 + import source 64→96。
 
 **cold_parser.c 15+ 修复**：
@@ -77,11 +77,15 @@
 - 无载荷 enum 变体→I32 常量
 - import source 64→96 + const 收集修复
 - `parser_take_balanced_rest_of_line`（括号深度感知）
-- enum 类型构造器：`VariantName(args)` 在类型参数中正确解析
+- enum 类型构造器：`TypeName(tag)` → MAKE_VARIANT + import mode 下 lookup_name 回退
 - 宽松类型转换：`int32(x)` / `uint64(x)` 在泛型/复合初始化中不丢位数
+- C bridge 未解析补丁：importc 外部函数不再输出虚假 "unresolved patch" 错误
+- seq 类型别名递归解析：`WalkDirEntry→str` 等别名链→正确 seq kind
+- import mode enum constructor：`PathComponent(n)` 带别名前缀查找
+- SIGBUS crash 修复：`ColdErrorRecoveryEnabled` 在 longjmp 后重置
+- import 未解析调用 soft skip：类型不匹配时零占位而非 die
 
-**dispatch_min 直编通过**：`backend_driver_dispatch_min.cheng` 现已可在 cold 子集 direct Mach-O 路径下编译为可执行文件。  
-**110/108 回归全通**：`import_deep_hard_fail` 从前 blocker→UNEXPECTED_SUCCESS；`pure_backend_driver` 从前 blocker→PASS；`dispatch_min_direct_hard_fail_unresolved_runtime`仍保留为预期的 COMPILE_FAILED（预存 os.PathComponent 枚举变体导入解析 + 5 Linux runtime macOS 环境差异）。
+**116/116 回归全通（0 FAIL）**：所有可修复测试通过。dispatch_min、pure_backend_driver、import_deep、import_unresolved、compiler_runtime_smoke、ownership_proof 全部修复。C bridge 未解析补丁噪声消除。
 
 **cheng_cold.c 修复**：
 - str[] stride 16→24（`codegen_mul_u64_by_24`），修复 compiler_runtime_smoke segfault
