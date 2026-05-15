@@ -7354,7 +7354,14 @@ static int32_t codegen_load_call_args(Code *code, BodyIR *body, FnDef *fn, int32
             continue;
         }
         if (fn->param_kind[i] == SLOT_PTR) {
-            a64_emit_ldr_sp_off(code, R9, local_offset, true);
+            if (arg_kind == SLOT_OPAQUE_REF &&
+                fn->param_type[i].len > 0 &&
+                span_same(fn->param_type[i], body->slot_type[arg_slot])) {
+                a64_emit_ldr_sp_off(code, R9, local_offset, true);
+                code_emit(code, a64_ldr_imm(R9, R9, 0, true));
+            } else {
+                a64_emit_ldr_sp_off(code, R9, local_offset, true);
+            }
             codegen_place_x_arg(code, in_regs, base_reg, stack_offset, R9);
             continue;
         }
