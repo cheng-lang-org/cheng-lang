@@ -165,9 +165,9 @@ fn PrimarySanitizeSymbolPart(text: str): str =
     var out = ""
     for i in 0..<len(text):
         let ch = text[i]
-        let digit = ch >= '0' && ch <= '9'
-        let upper = ch >= 'A' && ch <= 'Z'
-        let lower = ch >= 'a' && ch <= 'z'
+        let digit = int32(ch) >= '0' && int32(ch) <= '9'
+        let upper = int32(ch) >= 'A' && int32(ch) <= 'Z'
+        let lower = int32(ch) >= 'a' && int32(ch) <= 'z'
         if digit || upper || lower || ch == '_':
             out = Fmt"{out}{strings.SliceBytes(text, i, 1)}"
         else:
@@ -368,6 +368,87 @@ fn PrimaryBodyIrIsCallSequenceReturnInt32(bodyIR: coreir.BodyIR): bool =
     if lastOp.operands[0] == PrimaryStatementReturnModeI32Const():
         return true
     return false
+
+fn PrimaryBodyIrIsI32TwoCallGuardFirstReturn(bodyIR: coreir.BodyIR): bool =
+    if bodyIR.ops.len != 4 || bodyIR.callSequence.len != 2:
+        return false
+    if bodyIR.ops[0].kind != coreir.BodyOpCallTag ||
+       bodyIR.ops[1].kind != coreir.BodyOpCallTag ||
+       bodyIR.ops[2].kind != coreir.BodyOpBranchTag ||
+       bodyIR.ops[3].kind != coreir.BodyOpReturnTag:
+        return false
+    if bodyIR.ops[0].operands.len < 1 ||
+       bodyIR.ops[1].operands.len < 1 ||
+       bodyIR.ops[2].operands.len < 3 ||
+       bodyIR.ops[3].operands.len < 1:
+        return false
+    if bodyIR.ops[0].operands[0] != 0 ||
+       bodyIR.ops[1].operands[0] != 1:
+        return false
+    if bodyIR.ops[2].operands[0] != coreir.BodyBranchIfLocalLeZeroReturnI32ConstTag:
+        return false
+    return bodyIR.ops[3].operands[0] == coreir.LocalI32Tag
+
+fn PrimaryBodyIrIsI32GuardThenCommandReturn(bodyIR: coreir.BodyIR): bool =
+    if bodyIR.ops.len != 4 || bodyIR.callSequence.len != 2:
+        return false
+    if bodyIR.ops[0].kind != coreir.BodyOpCallTag ||
+       bodyIR.ops[1].kind != coreir.BodyOpBranchTag ||
+       bodyIR.ops[2].kind != coreir.BodyOpCallTag ||
+       bodyIR.ops[3].kind != coreir.BodyOpReturnTag:
+        return false
+    if bodyIR.ops[0].operands.len < 1 ||
+       bodyIR.ops[1].operands.len < 3 ||
+       bodyIR.ops[2].operands.len < 1 ||
+       bodyIR.ops[3].operands.len < 1:
+        return false
+    if bodyIR.ops[0].operands[0] != 0 ||
+       bodyIR.ops[2].operands[0] != 1:
+        return false
+    if bodyIR.ops[1].operands[0] != coreir.BodyBranchIfLocalLeZeroReturnI32ConstTag:
+        return false
+    return bodyIR.ops[3].operands[0] == coreir.LocalI32Tag
+
+fn PrimaryBodyIrIsI32GuardHelpThenCommandReturn(bodyIR: coreir.BodyIR): bool =
+    if bodyIR.ops.len != 4 || bodyIR.callSequence.len != 3:
+        return false
+    if bodyIR.ops[0].kind != coreir.BodyOpCallTag ||
+       bodyIR.ops[1].kind != coreir.BodyOpBranchTag ||
+       bodyIR.ops[2].kind != coreir.BodyOpCallTag ||
+       bodyIR.ops[3].kind != coreir.BodyOpReturnTag:
+        return false
+    if bodyIR.ops[0].operands.len < 1 ||
+       bodyIR.ops[1].operands.len < 3 ||
+       bodyIR.ops[2].operands.len < 1 ||
+       bodyIR.ops[3].operands.len < 1:
+        return false
+    if bodyIR.ops[0].operands[0] != 0 ||
+       bodyIR.ops[2].operands[0] != 2:
+        return false
+    if bodyIR.ops[1].operands[0] != coreir.BodyBranchIfLocalLeZeroReturnCallNoargTag:
+        return false
+    return bodyIR.ops[3].operands[0] == coreir.LocalI32Tag
+
+fn PrimaryBodyIrIsStrCallConstThenCallArg0ReturnI32(bodyIR: coreir.BodyIR): bool =
+    if bodyIR.ops.len != 3 || bodyIR.callSequence.len != 2:
+        return false
+    if bodyIR.ops[0].kind != coreir.BodyOpCallTag ||
+       bodyIR.ops[1].kind != coreir.BodyOpCallTag ||
+       bodyIR.ops[2].kind != coreir.BodyOpReturnTag:
+        return false
+    if bodyIR.ops[0].operands.len < 1 ||
+       bodyIR.ops[1].operands.len < 1 ||
+       bodyIR.ops[2].operands.len < 1:
+        return false
+    if bodyIR.ops[0].operands[0] != 0 ||
+       bodyIR.ops[1].operands[0] != 1:
+        return false
+    if bodyIR.ops[0].target < 0 ||
+       bodyIR.ops[0].target >= bodyIR.localSlots.len:
+        return false
+    if bodyIR.localSlots[bodyIR.ops[0].target].typeKind != coreir.LocalStrTag:
+        return false
+    return bodyIR.ops[2].operands[0] == coreir.LocalI32Tag
 
 fn PrimaryStatementReturnModeCallResultI32(): int32 =
     return 2
@@ -8949,6 +9030,170 @@ fn PrimaryObjectPlanColdCsgV2StringPayload(text: str): str =
         out = Fmt"{out}{PrimaryObjectPlanColdCsgV2ByteHex(int32(text[i]))}"
     return out
 
+fn PrimaryObjectPlanColdCsgV2ParseNonNegativeI32(text: str): int32 =
+    if len(text) <= 0:
+        return -1
+    var value: int32
+    for i in 0..<len(text):
+        let ch = text[i]
+        if ch < '0' || ch > '9':
+            return -1
+        let digit = int32(ch) - int32('0')
+        if value > 214748364 || (value == 214748364 && digit > 7):
+            return -1
+        value = value * 10 + digit
+    return value
+
+fn PrimaryObjectPlanColdCsgV2CStringPayloadByte(raw: str,
+                                                 index: int32): int32 =
+    if index < 0 || index >= len(raw):
+        return 0
+    let ch = raw[index]
+    if ch == 'n':
+        return 10
+    if ch == 'r':
+        return 13
+    if ch == 't':
+        return 9
+    if ch == '0':
+        return 0
+    return int32(ch)
+
+fn PrimaryObjectPlanColdCsgV2PayloadByteCount(payloadText: str): int32 =
+    let zeroPrefix = "zero:"
+    if strutil.StartsWith(payloadText, zeroPrefix):
+        let raw = strings.SliceBytes(payloadText, len(zeroPrefix), len(payloadText) - len(zeroPrefix))
+        return PrimaryObjectPlanColdCsgV2ParseNonNegativeI32(raw)
+    let cstringPrefix = "cstring:"
+    if strutil.StartsWith(payloadText, cstringPrefix):
+        let raw = strings.SliceBytes(payloadText, len(cstringPrefix), len(payloadText) - len(cstringPrefix))
+        var count: int32 = 1
+        var escaped = false
+        for i in 0..<len(raw):
+            if escaped:
+                escaped = false
+                count = count + 1
+            elif raw[i] == char(92):
+                escaped = true
+            else:
+                count = count + 1
+        if escaped:
+            count = count + 1
+        return count
+    return -1
+
+fn PrimaryObjectPlanColdCsgV2PayloadAlign(payloadText: str): int32 =
+    let zeroPrefix = "zero:"
+    if strutil.StartsWith(payloadText, zeroPrefix):
+        let raw = strings.SliceBytes(payloadText, len(zeroPrefix), len(payloadText) - len(zeroPrefix))
+        let count = PrimaryObjectPlanColdCsgV2ParseNonNegativeI32(raw)
+        if count >= 8:
+            return 8
+        if count >= 4:
+            return 4
+    return 1
+
+fn PrimaryObjectPlanColdCsgV2PayloadHex(payloadText: str,
+                                         err: var str): str =
+    let zeroPrefix = "zero:"
+    if strutil.StartsWith(payloadText, zeroPrefix):
+        let raw = strings.SliceBytes(payloadText, len(zeroPrefix), len(payloadText) - len(zeroPrefix))
+        let count = PrimaryObjectPlanColdCsgV2ParseNonNegativeI32(raw)
+        if count < 0:
+            err = Fmt"cold csg v2 facts: invalid zero data payload: {payloadText}"
+            return ""
+        var out = ""
+        for _ in 0..<count:
+            out = Fmt"{out}00"
+        return out
+    let cstringPrefix = "cstring:"
+    if strutil.StartsWith(payloadText, cstringPrefix):
+        let raw = strings.SliceBytes(payloadText, len(cstringPrefix), len(payloadText) - len(cstringPrefix))
+        var out = ""
+        var escaped = false
+        for i in 0..<len(raw):
+            if escaped:
+                out = Fmt"{out}{PrimaryObjectPlanColdCsgV2ByteHex(PrimaryObjectPlanColdCsgV2CStringPayloadByte(raw, i))}"
+                escaped = false
+            elif raw[i] == char(92):
+                escaped = true
+            else:
+                out = Fmt"{out}{PrimaryObjectPlanColdCsgV2ByteHex(int32(raw[i]))}"
+        if escaped:
+            out = Fmt"{out}{PrimaryObjectPlanColdCsgV2ByteHex(int32(char(92)))}"
+        return Fmt"{out}00"
+    err = Fmt"cold csg v2 facts: unsupported data payload: {payloadText}"
+    return ""
+
+fn PrimaryObjectPlanColdCsgV2DataRawOffset(plan: PrimaryObjectPlan,
+                                            index: int32): int32 =
+    var out: int32
+    for i in 0..<index:
+        if i < plan.dataPayloadRawByteCounts.len:
+            out = out + plan.dataPayloadRawByteCounts[i]
+    return out
+
+fn PrimaryObjectPlanColdCsgV2DataRecordPayload(plan: PrimaryObjectPlan,
+                                                index: int32,
+                                                err: var str): str =
+    if index < 0 || index >= plan.dataLabels.len:
+        err = "cold csg v2 facts: data index out of range"
+        return ""
+    let label = plan.dataLabels[index]
+    var rawCount: int32
+    if index < plan.dataPayloadRawByteCounts.len:
+        rawCount = plan.dataPayloadRawByteCounts[index]
+    if rawCount < 0:
+        err = Fmt"cold csg v2 facts: negative raw data byte count at data index {strings.IntToStr(index)}"
+        return ""
+    var align = 1
+    var byteCount = rawCount
+    var payloadHex = ""
+    if rawCount > 0:
+        let rawOffset = PrimaryObjectPlanColdCsgV2DataRawOffset(plan, index)
+        if rawOffset < 0 || rawOffset + rawCount > plan.dataPayloadRawBytes.len:
+            err = Fmt"cold csg v2 facts: raw data payload truncated at data index {strings.IntToStr(index)}"
+            return ""
+        for bi in 0..<rawCount:
+            let byteValue = plan.dataPayloadRawBytes[rawOffset + bi]
+            if byteValue < 0 || byteValue > 255:
+                err = Fmt"cold csg v2 facts: raw data byte out of range at data index {strings.IntToStr(index)}"
+                return ""
+            payloadHex = Fmt"{payloadHex}{PrimaryObjectPlanColdCsgV2ByteHex(byteValue)}"
+    else:
+        if index >= plan.dataPayloadTexts.len:
+            err = Fmt"cold csg v2 facts: missing data payload text at data index {strings.IntToStr(index)}"
+            return ""
+        let payloadText = plan.dataPayloadTexts[index]
+        byteCount = PrimaryObjectPlanColdCsgV2PayloadByteCount(payloadText)
+        if byteCount < 0:
+            err = Fmt"cold csg v2 facts: unsupported data payload at data index {strings.IntToStr(index)}"
+            return ""
+        align = PrimaryObjectPlanColdCsgV2PayloadAlign(payloadText)
+        payloadHex = PrimaryObjectPlanColdCsgV2PayloadHex(payloadText, err)
+        if len(err) > 0:
+            return ""
+    return Fmt"{PrimaryObjectPlanColdCsgV2U32LeHex(index)}{PrimaryObjectPlanColdCsgV2StringPayload(label)}{PrimaryObjectPlanColdCsgV2U32LeHex(align)}{PrimaryObjectPlanColdCsgV2U32LeHex(byteCount)}{payloadHex}"
+
+fn PrimaryObjectPlanColdCsgV2FindItem(plan: PrimaryObjectPlan,
+                                       itemId: int32): int32 =
+    for i in 0..<plan.itemIds.len:
+        if plan.itemIds[i] == itemId:
+            return i
+    return -1
+
+fn PrimaryObjectPlanColdCsgV2FindSymbol(plan: PrimaryObjectPlan,
+                                         symbolName: str): int32 =
+    for i in 0..<plan.symbolNames.len:
+        if plan.symbolNames[i] == symbolName:
+            return i
+    return -1
+
+fn PrimaryObjectPlanColdCsgV2HasDefinedSymbol(plan: PrimaryObjectPlan,
+                                               symbolName: str): bool =
+    return PrimaryObjectPlanColdCsgV2FindSymbol(plan, symbolName) >= 0 ||
+           PrimaryObjectDataLabelIndex(plan.dataLabels, symbolName) >= 0
+
 fn PrimaryObjectPlanColdCsgV2AppendRecord(parts: var str[],
                                            kind: int32,
                                            payloadHex: str,
@@ -8994,16 +9239,13 @@ fn PrimaryObjectPlanColdCsgV2Validate(plan: PrimaryObjectPlan,
        plan.relocSourceItemIds.len != plan.relocTargetSymbols.len:
         err = "cold csg v2 facts: primary object reloc arrays length mismatch"
         return false
-    if plan.dataLabels.len > 0 ||
-       plan.dataPayloadTexts.len > 0 ||
-       plan.dataPayloadRawBytes.len > 0 ||
-       plan.dataPayloadRawByteCounts.len > 0:
-        err = "cold csg v2 facts: primary object data records unsupported"
+    if plan.dataRelocSourceItemIds.len != plan.dataRelocWordOffsets.len ||
+       plan.dataRelocSourceItemIds.len != plan.dataRelocTargetSymbols.len:
+        err = "cold csg v2 facts: primary object data reloc arrays length mismatch"
         return false
-    if plan.dataRelocSourceItemIds.len > 0 ||
-       plan.dataRelocWordOffsets.len > 0 ||
-       plan.dataRelocTargetSymbols.len > 0:
-        err = "cold csg v2 facts: primary object data reloc records unsupported"
+    if plan.dataPayloadTexts.len > plan.dataLabels.len ||
+       plan.dataPayloadRawByteCounts.len > plan.dataLabels.len:
+        err = "cold csg v2 facts: primary object data payload arrays length mismatch"
         return false
     for i in 0..<functionCount:
         let wordOffset = plan.functionWordOffsets[i]
@@ -9026,6 +9268,65 @@ fn PrimaryObjectPlanColdCsgV2Validate(plan: PrimaryObjectPlan,
             return false
         if plan.relocTargetSymbols[i] == "":
             err = Fmt"cold csg v2 facts: empty reloc target symbol at reloc index {strings.IntToStr(i)}"
+            return false
+    var rawTotal: int32
+    for i in 0..<plan.dataLabels.len:
+        if plan.dataLabels[i] == "":
+            err = Fmt"cold csg v2 facts: empty data label at data index {strings.IntToStr(i)}"
+            return false
+        if PrimaryObjectPlanColdCsgV2FindSymbol(plan, plan.dataLabels[i]) >= 0:
+            err = Fmt"cold csg v2 facts: data label conflicts with function symbol: {plan.dataLabels[i]}"
+            return false
+        for j in i + 1..<plan.dataLabels.len:
+            if plan.dataLabels[i] == plan.dataLabels[j]:
+                err = Fmt"cold csg v2 facts: duplicate data label: {plan.dataLabels[i]}"
+                return false
+        var rawCount: int32
+        if i < plan.dataPayloadRawByteCounts.len:
+            rawCount = plan.dataPayloadRawByteCounts[i]
+        if rawCount < 0:
+            err = Fmt"cold csg v2 facts: negative raw data byte count at data index {strings.IntToStr(i)}"
+            return false
+        if rawCount > 0:
+            let rawOffset = rawTotal
+            rawTotal = rawTotal + rawCount
+            if rawOffset < 0 || rawTotal > plan.dataPayloadRawBytes.len:
+                err = Fmt"cold csg v2 facts: raw data payload truncated at data index {strings.IntToStr(i)}"
+                return false
+            for bi in rawOffset..<rawTotal:
+                if plan.dataPayloadRawBytes[bi] < 0 || plan.dataPayloadRawBytes[bi] > 255:
+                    err = Fmt"cold csg v2 facts: raw data byte out of range at data index {strings.IntToStr(i)}"
+                    return false
+        else:
+            if i >= plan.dataPayloadTexts.len:
+                err = Fmt"cold csg v2 facts: missing data payload text at data index {strings.IntToStr(i)}"
+                return false
+            if PrimaryObjectPlanColdCsgV2PayloadByteCount(plan.dataPayloadTexts[i]) < 0:
+                err = Fmt"cold csg v2 facts: unsupported data payload at data index {strings.IntToStr(i)}"
+                return false
+    if rawTotal != plan.dataPayloadRawBytes.len:
+        err = "cold csg v2 facts: unused raw data payload bytes"
+        return false
+    for i in 0..<plan.dataRelocSourceItemIds.len:
+        let sourceItemId = plan.dataRelocSourceItemIds[i]
+        if sourceItemId < 0:
+            err = Fmt"cold csg v2 facts: negative data reloc source item id at reloc index {strings.IntToStr(i)}"
+            return false
+        let sourceIndex = PrimaryObjectPlanColdCsgV2FindItem(plan, sourceItemId)
+        if sourceIndex < 0:
+            err = Fmt"cold csg v2 facts: data reloc source item missing at reloc index {strings.IntToStr(i)}"
+            return false
+        let wordOffset = plan.dataRelocWordOffsets[i]
+        if wordOffset < plan.functionWordOffsets[sourceIndex] ||
+           wordOffset + 1 >= plan.functionWordOffsets[sourceIndex] + plan.functionWordCounts[sourceIndex]:
+            err = Fmt"cold csg v2 facts: data reloc word offset outside source function at reloc index {strings.IntToStr(i)}"
+            return false
+        let targetSymbol = plan.dataRelocTargetSymbols[i]
+        if targetSymbol == "":
+            err = Fmt"cold csg v2 facts: empty data reloc target symbol at reloc index {strings.IntToStr(i)}"
+            return false
+        if !PrimaryObjectPlanColdCsgV2HasDefinedSymbol(plan, targetSymbol):
+            err = Fmt"cold csg v2 facts: data reloc target symbol missing: {targetSymbol}"
             return false
     return true
 
@@ -9054,6 +9355,16 @@ fn PrimaryObjectPlanColdCsgV2FactsInto(plan: PrimaryObjectPlan,
     for i in 0..<plan.relocSourceItemIds.len:
         let payload = Fmt"{PrimaryObjectPlanColdCsgV2U32LeHex(plan.relocSourceItemIds[i])}{PrimaryObjectPlanColdCsgV2U32LeHex(plan.relocWordOffsets[i])}{PrimaryObjectPlanColdCsgV2StringPayload(plan.relocTargetSymbols[i])}"
         if !PrimaryObjectPlanColdCsgV2AppendRecord(parts, 6, payload, err):
+            return false
+    for i in 0..<plan.dataLabels.len:
+        let payload = PrimaryObjectPlanColdCsgV2DataRecordPayload(plan, i, err)
+        if len(err) > 0:
+            return false
+        if !PrimaryObjectPlanColdCsgV2AppendRecord(parts, 7, payload, err):
+            return false
+    for i in 0..<plan.dataRelocSourceItemIds.len:
+        let payload = Fmt"{PrimaryObjectPlanColdCsgV2U32LeHex(plan.dataRelocSourceItemIds[i])}{PrimaryObjectPlanColdCsgV2U32LeHex(plan.dataRelocWordOffsets[i])}{PrimaryObjectPlanColdCsgV2U32LeHex(1)}{PrimaryObjectPlanColdCsgV2U32LeHex(0)}{PrimaryObjectPlanColdCsgV2StringPayload(plan.dataRelocTargetSymbols[i])}"
+        if !PrimaryObjectPlanColdCsgV2AppendRecord(parts, 8, payload, err):
             return false
     out = strutil.Join(parts, "")
     return true
@@ -9374,7 +9685,7 @@ fn PrimaryBodyIrEmitCsgV2BinaryFacts(
         PrimaryBodyIrEmitCsgV2BinaryU32(buf, term.kind)
         # value: Return -> resultSlot, else first operand
         let termValue = if term.kind == coreir.BodyTermReturnTag: term.resultSlot
-                        else if term.operands.len > 0: term.operands[0]
+                        elif term.operands.len > 0: term.operands[0]
                         else: 0
         PrimaryBodyIrEmitCsgV2BinaryU32(buf, termValue)
         PrimaryBodyIrEmitCsgV2BinaryU32(buf, 0)   # case_start

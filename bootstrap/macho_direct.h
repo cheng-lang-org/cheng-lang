@@ -277,7 +277,10 @@ static bool macho_write_exec(const char *path, const uint32_t *code, int32_t cod
 #define N_UNDF 0x00
 #define N_SECT 0x0E
 #define N_EXT  0x01
+#define ARM64_RELOC_UNSIGNED 0
 #define ARM64_RELOC_BRANCH26 2
+#define ARM64_RELOC_PAGE21 3
+#define ARM64_RELOC_PAGEOFF12 4
 
 typedef struct {
     uint32_t n_strx;
@@ -432,6 +435,200 @@ static bool macho_write_object(const char *path,
     memcpy(buf + reloc_off, relocs, reloc_size);
     memcpy(buf + sym_off, syms, sym_size);
     memcpy(buf + str_off_file, strtab, str_off);
+
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        free(buf); free(strtab); free(name_stroff); free(syms); free(relocs);
+        return false;
+    }
+    size_t written = 0;
+    while (written < (size_t)total_sz) {
+        ssize_t n = write(fd, buf + written, (size_t)total_sz - written);
+        if (n <= 0) {
+            close(fd);
+            free(buf); free(strtab); free(name_stroff); free(syms); free(relocs);
+            return false;
+        }
+        written += (size_t)n;
+    }
+    if (close(fd) != 0) {
+        free(buf); free(strtab); free(name_stroff); free(syms); free(relocs);
+        return false;
+    }
+    free(buf); free(strtab); free(name_stroff); free(syms); free(relocs);
+    return true;
+}
+
+static bool macho_write_text_data_object(const char *path,
+                                         const uint32_t *code, int32_t code_words,
+                                         const uint8_t *data, int32_t data_size,
+                                         const char **names,
+                                         const uint64_t *symbol_values,
+                                         const uint8_t *symbol_sections,
+                                         int32_t name_count,
+                                         int32_t local_count,
+                                         const int32_t *reloc_offsets,
+                                         const int32_t *reloc_symbols,
+                                         const uint8_t *reloc_types,
+                                         const uint8_t *reloc_pcrel,
+                                         int32_t reloc_count) {
+    if (code_words < 0 || data_size <= 0 || name_count <= 0 ||
+        local_count < 0 || local_count > name_count || reloc_count < 0) return false;
+    if ((int64_t)code_words * 4 > INT32_MAX) return false;
+    int32_t code_sz = code_words * 4;
+    if (code_sz > 0 && !code) return false;
+    if (!data || !names || !symbol_values || !symbol_sections) return false;
+    if (reloc_count > 0 &&
+        (!reloc_offsets || !reloc_symbols || !reloc_types || !reloc_pcrel)) return false;
+
+    size_t str_cap = 2;
+    for (int32_t i = 0; i < name_count; i++) {
+        if (!names[i]) return false;
+        size_t nl = strlen(names[i]);
+        size_t add = nl + 1 + (names[i][0] != '_' ? 1 : 0);
+        if (str_cap > SIZE_MAX - add) return false;
+        str_cap += add;
+    }
+    if (str_cap > INT32_MAX) return false;
+
+    char *strtab = (char *)calloc(1, str_cap);
+    int32_t *name_stroff = (int32_t *)calloc((size_t)name_count, sizeof(int32_t));
+    nlist_64_t *syms = (nlist_64_t *)calloc((size_t)name_count, sizeof(nlist_64_t));
+    relocation_info_t *relocs =
+        (relocation_info_t *)calloc(reloc_count > 0 ? (size_t)reloc_count : 1u,
+                                    sizeof(relocation_info_t));
+    if (!strtab || !name_stroff || !syms || !relocs) {
+        free(strtab); free(name_stroff); free(syms); free(relocs);
+        return false;
+    }
+
+    int32_t str_off = 1;
+    for (int32_t i = 0; i < name_count; i++) {
+        name_stroff[i] = str_off;
+        int32_t nl = (int32_t)strlen(names[i]);
+        if (names[i][0] != '_') strtab[str_off++] = '_';
+        memcpy(strtab + str_off, names[i], (size_t)nl);
+        str_off += nl;
+        strtab[str_off++] = '\0';
+    }
+    strtab[str_off++] = '\0';
+
+    for (int32_t i = 0; i < name_count; i++) {
+        syms[i].n_strx = (uint32_t)name_stroff[i];
+        uint8_t section = symbol_sections[i];
+        if (section == 0) {
+            syms[i].n_type = N_UNDF | N_EXT;
+            syms[i].n_sect = 0;
+            syms[i].n_value = 0;
+        } else {
+            if (section != 1 && section != 2) {
+                free(strtab); free(name_stroff); free(syms); free(relocs);
+                return false;
+            }
+            syms[i].n_type = (uint8_t)(N_SECT | (i < local_count ? 0 : N_EXT));
+            syms[i].n_sect = section;
+            syms[i].n_value = symbol_values[i];
+        }
+        syms[i].n_desc = 0;
+    }
+    if ((int64_t)name_count * (int64_t)sizeof(nlist_64_t) > INT32_MAX) {
+        free(strtab); free(name_stroff); free(syms); free(relocs);
+        return false;
+    }
+    int32_t sym_size = name_count * (int32_t)sizeof(nlist_64_t);
+
+    for (int32_t i = 0; i < reloc_count; i++) {
+        uint8_t reloc_type = reloc_types[i];
+        if (reloc_offsets[i] < 0 || reloc_offsets[i] >= code_sz ||
+            reloc_symbols[i] < 0 || reloc_symbols[i] >= name_count ||
+            (reloc_type != ARM64_RELOC_BRANCH26 &&
+             reloc_type != ARM64_RELOC_PAGE21 &&
+             reloc_type != ARM64_RELOC_PAGEOFF12 &&
+             reloc_type != ARM64_RELOC_UNSIGNED)) {
+            free(strtab); free(name_stroff); free(syms); free(relocs);
+            return false;
+        }
+        relocs[i].r_address = reloc_offsets[i];
+        relocs[i].r_symbolnum = (uint32_t)reloc_symbols[i];
+        relocs[i].r_pcrel = reloc_pcrel[i] ? 1u : 0u;
+        relocs[i].r_length = 2;
+        relocs[i].r_extern = 1;
+        relocs[i].r_type = reloc_type;
+    }
+    if ((int64_t)reloc_count * (int64_t)sizeof(relocation_info_t) > INT32_MAX) {
+        free(strtab); free(name_stroff); free(syms); free(relocs);
+        return false;
+    }
+    int32_t reloc_size = reloc_count * (int32_t)sizeof(relocation_info_t);
+
+    int32_t hdr_sz = 32, seg_cmd_sz = 72 + 80 * 2;
+    int32_t build_ver_cmd_sz = 24, symtab_cmd_sz = 24;
+    int32_t cmd_sz = seg_cmd_sz + build_ver_cmd_sz + symtab_cmd_sz;
+    int32_t text_off = hdr_sz + cmd_sz;
+    int32_t data_addr = macho_align_i32(code_sz, 8);
+    int32_t data_off = text_off + data_addr;
+    int32_t reloc_off = macho_align_i32(data_off + data_size, 8);
+    int32_t sym_off = macho_align_i32(reloc_off + reloc_size, 8);
+    int32_t str_off_file = sym_off + sym_size;
+    int64_t total_sz64 = (int64_t)str_off_file + str_off;
+    if (total_sz64 > INT32_MAX) {
+        free(strtab); free(name_stroff); free(syms); free(relocs);
+        return false;
+    }
+    int32_t total_sz = (int32_t)total_sz64;
+    uint8_t *buf = (uint8_t *)calloc(1, (size_t)total_sz);
+    if (!buf) {
+        free(strtab); free(name_stroff); free(syms); free(relocs);
+        return false;
+    }
+
+    uint32_t *w = (uint32_t *)buf;
+    w[0] = MH_MAGIC_64; w[1] = CPU_TYPE_ARM64; w[2] = CPU_SUBTYPE_ARM64_ALL; w[3] = MH_OBJECT;
+    w[4] = 3; w[5] = cmd_sz; w[6] = 0; w[7] = 0;
+    int32_t pos = hdr_sz;
+
+    uint32_t *seg = (uint32_t *)(buf + pos);
+    seg[0] = LC_SEGMENT64; seg[1] = seg_cmd_sz;
+    macho_segname(buf + pos + 8, "");
+    seg[6] = 0; seg[7] = 0;
+    seg[8] = (uint32_t)(data_addr + data_size); seg[9] = 0;
+    seg[10] = (uint32_t)text_off; seg[11] = 0;
+    seg[12] = (uint32_t)(data_addr + data_size); seg[13] = 0;
+    seg[14] = 7; seg[15] = 7; seg[16] = 2; seg[17] = 0;
+
+    uint32_t *text_sec = (uint32_t *)(buf + pos + 72);
+    macho_segname(buf + pos + 72, "__text");
+    macho_segname(buf + pos + 88, "__TEXT");
+    text_sec[8] = 0; text_sec[9] = 0;
+    text_sec[10] = (uint32_t)code_sz; text_sec[11] = 0;
+    text_sec[12] = (uint32_t)text_off; text_sec[13] = 2;
+    text_sec[14] = (uint32_t)reloc_off; text_sec[15] = reloc_count;
+    text_sec[16] = 0x80000400; text_sec[17] = 0; text_sec[18] = 0; text_sec[19] = 0;
+
+    uint32_t *data_sec = (uint32_t *)(buf + pos + 72 + 80);
+    macho_segname(buf + pos + 72 + 80, "__data");
+    macho_segname(buf + pos + 72 + 80 + 16, "__DATA");
+    data_sec[8] = (uint32_t)data_addr; data_sec[9] = 0;
+    data_sec[10] = (uint32_t)data_size; data_sec[11] = 0;
+    data_sec[12] = (uint32_t)data_off; data_sec[13] = 3;
+    data_sec[14] = 0; data_sec[15] = 0;
+    data_sec[16] = 0; data_sec[17] = 0; data_sec[18] = 0; data_sec[19] = 0;
+    pos += seg_cmd_sz;
+
+    uint32_t *bv = (uint32_t *)(buf + pos);
+    bv[0] = 0x32; bv[1] = build_ver_cmd_sz; bv[2] = 1; bv[3] = 0x000e0000; bv[4] = 0x000e0000; bv[5] = 0;
+    pos += build_ver_cmd_sz;
+
+    uint32_t *st = (uint32_t *)(buf + pos);
+    st[0] = LC_SYMTAB; st[1] = symtab_cmd_sz;
+    st[2] = (uint32_t)sym_off; st[3] = name_count;
+    st[4] = (uint32_t)str_off_file; st[5] = (uint32_t)str_off;
+
+    if (code_sz > 0) memcpy(buf + text_off, code, (size_t)code_sz);
+    memcpy(buf + data_off, data, (size_t)data_size);
+    memcpy(buf + reloc_off, relocs, (size_t)reloc_size);
+    memcpy(buf + sym_off, syms, (size_t)sym_size);
+    memcpy(buf + str_off_file, strtab, (size_t)str_off);
 
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {

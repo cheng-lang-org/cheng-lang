@@ -197,6 +197,7 @@ typedef struct ColdFunctionSymbol {
  * SoA BodyIR
  * ================================================================ */
 enum {
+    BODY_OP_NOP = 0,
     BODY_OP_I32_CONST = 1,
     BODY_OP_LOAD_I32 = 2,
     BODY_OP_MAKE_VARIANT = 3,
@@ -337,6 +338,17 @@ enum {
     BODY_OP_THREAD_YIELD = 138,
     BODY_OP_SET_RAW = 139,
     BODY_OP_BYTES_ALLOC = 140,
+    BODY_OP_SELECT = 141,
+    BODY_OP_SEQ_SET_LEN = 142,
+    BODY_OP_PTR_LOAD_U8 = 143,
+    BODY_OP_PTR_STORE_U8 = 144,
+    BODY_OP_SEQ_OPAQUE_INDEX_REF_DYNAMIC = 145,
+    BODY_OP_HEAP_ALLOC = 146,
+    BODY_OP_HEAP_FREE = 147,
+    BODY_OP_BYTES_TO_HEX = 148,
+    BODY_OP_BYTES_GET = 149,
+    BODY_OP_BYTES_SET = 150,
+    BODY_OP_ATOMIC_ADD_I32 = 151,
 };
 
 enum {
@@ -473,6 +485,7 @@ typedef struct TypeDef {
     int32_t max_field_count;
     int32_t max_slot_size;
     bool is_enum;
+    Span alias_type;
 } TypeDef;
 
 typedef struct ObjectField {
@@ -499,10 +512,12 @@ typedef struct FnDef {
     int32_t arity;
     int32_t param_kind[COLD_MAX_I32_PARAMS];
     int32_t param_size[COLD_MAX_I32_PARAMS];
+    Span param_type[COLD_MAX_I32_PARAMS];
     bool param_has_default[COLD_MAX_I32_PARAMS];
     int32_t param_default_value[COLD_MAX_I32_PARAMS];
     Span ret;
     bool is_external;
+    int32_t template_index;
     Span generic_names[4];
     int32_t generic_count;
 } FnDef;
@@ -676,6 +691,8 @@ typedef struct ColdCompileStats {
     int32_t facts_function_count;
     int32_t facts_word_count;
     int32_t facts_reloc_count;
+    int32_t facts_data_count;
+    int32_t facts_data_reloc_count;
 } ColdCompileStats;
 
 /* ================================================================

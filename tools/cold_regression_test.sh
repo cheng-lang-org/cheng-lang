@@ -111,7 +111,7 @@ if [ -x /tmp/ct_bad_import ]; then
 else
     ACT="COMPILE_FAILED"
 fi
-assert "import_unresolved_hard_fail" "UNEXPECTED_SUCCESS" "$ACT"
+assert "import_unresolved_hard_fail" "COMPILE_FAILED" "$ACT"
 
 rm -f /tmp/ct_bare_helper /tmp/ct_bare_helper.report
 quiet $COLD system-link-exec --in:src/tests/cold_import_bare_helper_main.cheng \
@@ -141,6 +141,18 @@ else
     ACT="COMPILE_FAILED"
 fi
 assert "import_typed_const" 0 "$ACT"
+
+ACT=$(compile_run src/tests/cold_fixed_bytes_to_bytes_len_probe.cheng /tmp/ct_fixed_bytes_len)
+assert "fixed_bytes32_to_bytes_len" 0 "$ACT"
+
+ACT=$(compile_run src/tests/cold_fixed32_known_probe.cheng /tmp/ct_fixed32_known)
+assert "fixed32_known_roundtrip" 0 "$ACT"
+
+ACT=$(compile_run src/tests/cold_result_fixed32_probe.cheng /tmp/ct_result_fixed32)
+assert "result_fixed32_roundtrip" 0 "$ACT"
+
+ACT=$(compile_run src/tests/cold_sha256_fixed_probe.cheng /tmp/ct_sha256_fixed)
+assert "sha256_fixed_abc" 0 "$ACT"
 
 rm -f /tmp/ct_deep_import
 quiet $COLD system-link-exec --in:src/tests/cold_import_deep_main.cheng \
@@ -505,6 +517,65 @@ assert "subset_coverage" 0 "$ACT"
 
 ACT=$(compile_run src/tests/cold_stack_arg_abi.cheng /tmp/ct_stack_arg_abi)
 assert "stack_arg_abi" 0 "$ACT"
+
+rm -f /tmp/ct_str_to_ptr_importc_abi.o \
+    /tmp/ct_str_to_ptr_importc_abi_link \
+    /tmp/ct_str_to_ptr_importc_abi.c \
+    /tmp/ct_str_to_ptr_importc_abi.report \
+    /tmp/ct_str_to_ptr_importc_abi.nm
+cat > /tmp/ct_str_to_ptr_importc_abi.c << 'EOF'
+int ct_str_ptr_check(const unsigned char *p, int tag) {
+    const char *want = 0;
+    int n = 0;
+    if (tag == 1) {
+        want = "literal-data";
+        n = 12;
+    } else if (tag == 2) {
+        want = "cold-str-ptr";
+        n = 12;
+    } else {
+        return 50;
+    }
+    if (!p) return 1;
+    for (int i = 0; i < n; i++) {
+        if (p[i] != (unsigned char)want[i]) return 2 + i;
+    }
+    return 0;
+}
+EOF
+quiet $COLD system-link-exec --in:src/tests/cold_str_to_ptr_importc_abi.cheng \
+    --target:arm64-apple-darwin --emit:obj \
+    --out:/tmp/ct_str_to_ptr_importc_abi.o \
+    --report-out:/tmp/ct_str_to_ptr_importc_abi.report
+if [ -s /tmp/ct_str_to_ptr_importc_abi.o ] &&
+   file /tmp/ct_str_to_ptr_importc_abi.o 2>/dev/null | grep -q "Mach-O 64-bit object" &&
+   grep -q '^emit=obj$' /tmp/ct_str_to_ptr_importc_abi.report 2>/dev/null &&
+   grep -q '^direct_macho=1$' /tmp/ct_str_to_ptr_importc_abi.report 2>/dev/null &&
+   grep -q '^system_link=0$' /tmp/ct_str_to_ptr_importc_abi.report 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "str_to_ptr_importc_obj" 1 "$ACT"
+if nm -u /tmp/ct_str_to_ptr_importc_abi.o > /tmp/ct_str_to_ptr_importc_abi.nm 2>&1 &&
+   grep -Eq '_?ct_str_ptr_check' /tmp/ct_str_to_ptr_importc_abi.nm; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "str_to_ptr_importc_nm" 1 "$ACT"
+if quiet cc -std=c11 -Werror -o /tmp/ct_str_to_ptr_importc_abi_link \
+    /tmp/ct_str_to_ptr_importc_abi.o /tmp/ct_str_to_ptr_importc_abi.c; then
+    /tmp/ct_str_to_ptr_importc_abi_link 2>/dev/null; ACT=$?
+else
+    ACT="LINK_FAILED"
+fi
+assert "str_to_ptr_importc_run" 0 "$ACT"
+rm -f /tmp/ct_str_to_ptr_importc_abi.o \
+    /tmp/ct_str_to_ptr_importc_abi_link \
+    /tmp/ct_str_to_ptr_importc_abi.c \
+    /tmp/ct_str_to_ptr_importc_abi.report \
+    /tmp/ct_str_to_ptr_importc_abi.nm
 
 # 9: inline tuple field bracket-depth (commas inside brackets in default values)
 cat > /tmp/ct_tuple_default_bracket.cheng << 'TUPLEEOF'

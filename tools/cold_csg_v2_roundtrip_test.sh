@@ -13,6 +13,7 @@ WORK="${CHENG_CSG_V2_WORK:-/tmp/cheng_csg_v2_roundtrip}"
 
 if [ ! -x "$COLD" ] ||
    [ bootstrap/cheng_cold.c -nt "$COLD" ] ||
+   [ bootstrap/macho_direct.h -nt "$COLD" ] ||
    [ bootstrap/elf64_direct.h -nt "$COLD" ] ||
    [ bootstrap/rv64_emit.h -nt "$COLD" ]; then
     cc -std=c11 -O2 -o "$COLD" bootstrap/cheng_cold.c
@@ -21,6 +22,7 @@ fi
 COLD_O0="${CHENG_COLD_O0:-/tmp/cheng_cold_O0}"
 if [ ! -x "$COLD_O0" ] ||
    [ bootstrap/cheng_cold.c -nt "$COLD_O0" ] ||
+   [ bootstrap/macho_direct.h -nt "$COLD_O0" ] ||
    [ bootstrap/elf64_direct.h -nt "$COLD_O0" ] ||
    [ bootstrap/rv64_emit.h -nt "$COLD_O0" ]; then
     cc -std=c11 -O0 -o "$COLD_O0" bootstrap/cheng_cold.c
@@ -140,6 +142,110 @@ CSG
     fi
 }
 
+canonical_data_reader_smoke() {
+    if [ "$TARGET" != "arm64-apple-darwin" ]; then
+        ok "canonical_data_skipped_non_arm64"
+        return
+    fi
+    local facts="$WORK/canonical_data.facts"
+    local obj1="$WORK/canonical_data.1.o"
+    local obj2="$WORK/canonical_data.2.o"
+    local bin="$WORK/canonical_data"
+    local report1="$WORK/canonical_data.1.report.txt"
+    local report2="$WORK/canonical_data.2.report.txt"
+    local exe="$WORK/canonical_data.direct"
+    local exe_report="$WORK/canonical_data.direct.report.txt"
+    local bad_pair="$WORK/canonical_data.bad_pair.badfacts"
+    local bad_pair_obj="$WORK/canonical_data.bad_pair.o"
+    local bad_pair_report="$WORK/canonical_data.bad_pair.report.txt"
+    cat > "$facts" <<'CSG'
+CHENG_CSG_V2
+R0001000000161200000061726d36342d6170706c652d64617277696e
+R000200000009050000006d6163686f
+R000300000008040000006d61696e
+R000400000024010000000000000005000000040000006d61696e0c000000656e7472795f627269646765
+R00050000000400000090
+R00050000000400000091
+R00050000000400004039
+R00050000000400040151
+R000500000004c0035fd6
+R00070000001500000000030000006d736701000000020000004100
+R00080000001701000000000000000100000000000000030000006d7367
+CSG
+    if [ "$(facts_magic_kind "$facts")" = "canonical" ]; then
+        ok "canonical_data_magic"
+    else
+        bad "canonical_data_magic"
+    fi
+    if "$COLD" system-link-exec \
+        --csg-in:"$facts" \
+        --emit:obj \
+        --target:"$TARGET" \
+        --out:"$obj1" \
+        --report-out:"$report1" >/dev/null &&
+       "$COLD" system-link-exec \
+        --csg-in:"$facts" \
+        --emit:obj \
+        --target:"$TARGET" \
+        --out:"$obj2" \
+        --report-out:"$report2" >/dev/null; then
+        ok "canonical_data_reader"
+    else
+        bad "canonical_data_reader"
+    fi
+    if cmp -s "$obj1" "$obj2"; then
+        ok "canonical_data_deterministic_obj"
+    else
+        bad "canonical_data_deterministic_obj"
+    fi
+    require_grep "canonical_data_report_function_count" '^facts_function_count=1$' "$report1"
+    require_grep "canonical_data_report_word_count" '^facts_word_count=5$' "$report1"
+    require_grep "canonical_data_report_reloc_count" '^facts_reloc_count=0$' "$report1"
+    require_grep "canonical_data_report_data_count" '^facts_data_count=1$' "$report1"
+    require_grep "canonical_data_report_data_reloc_count" '^facts_data_reloc_count=1$' "$report1"
+    if cc -o "$bin" "$obj1" >/dev/null 2>&1 &&
+       "$bin" >/dev/null 2>&1; then
+        ok "canonical_data_link_run"
+    else
+        bad "canonical_data_link_run"
+    fi
+    rm -f "$exe" "$exe_report"
+    if "$COLD" system-link-exec \
+        --csg-in:"$facts" \
+        --emit:exe \
+        --target:"$TARGET" \
+        --out:"$exe" \
+        --report-out:"$exe_report" >/dev/null 2>&1; then
+        bad "canonical_data_direct_exe_hard_fail"
+    elif [ -e "$exe" ]; then
+        bad "canonical_data_direct_exe_no_output"
+    elif grep -q '^system_link=0$' "$exe_report" 2>/dev/null &&
+         grep -q '^error=cold subset compile failed$' "$exe_report" 2>/dev/null; then
+        ok "canonical_data_direct_exe_hard_fail"
+        ok "canonical_data_direct_exe_no_output"
+    else
+        bad "canonical_data_direct_exe_hard_fail"
+        bad "canonical_data_direct_exe_no_output"
+    fi
+    sed 's/R00050000000400000091/R00050000000401000091/' "$facts" > "$bad_pair"
+    rm -f "$bad_pair_obj" "$bad_pair_report"
+    if "$COLD" system-link-exec \
+        --csg-in:"$bad_pair" \
+        --emit:obj \
+        --target:"$TARGET" \
+        --out:"$bad_pair_obj" \
+        --report-out:"$bad_pair_report" >/dev/null 2>&1; then
+        bad "canonical_data_reloc_pair_hard_fail"
+    elif [ -e "$bad_pair_obj" ]; then
+        bad "canonical_data_reloc_pair_no_output"
+    else
+        ok "canonical_data_reloc_pair_hard_fail"
+        ok "canonical_data_reloc_pair_no_output"
+        require_grep "canonical_data_reloc_pair_report_direct_macho" '^direct_macho=0$' "$bad_pair_report"
+        require_grep "canonical_data_reloc_pair_report_error" '^error=cold csg v2 object emit failed$' "$bad_pair_report"
+    fi
+}
+
 canonical_writer_smoke() {
     if [ "$TARGET" != "arm64-apple-darwin" ]; then
         ok "canonical_writer_skipped_non_arm64"
@@ -150,7 +256,7 @@ canonical_writer_smoke() {
     local bin="$WORK/canonical_writer_ordinary"
     local report="$WORK/canonical_writer_ordinary.writer.report.txt"
     local reader_report="$WORK/canonical_writer_ordinary.reader.report.txt"
-    if "$COLD" emit-cold-csg-v2 \
+    if "$DRIVER" emit-cold-csg-v2 \
         --root:"$ROOT" \
         --in:src/tests/ordinary_zero_exit_fixture.cheng \
         --out:"$facts" \
@@ -187,6 +293,62 @@ canonical_writer_smoke() {
         ok "canonical_writer_ordinary_link_run"
     else
         bad "canonical_writer_ordinary_link_run"
+    fi
+}
+
+canonical_driver_writer_str_smoke() {
+    if [ "$TARGET" != "arm64-apple-darwin" ]; then
+        ok "canonical_writer_str_skipped_non_arm64"
+        return
+    fi
+    local facts="$WORK/canonical_writer_str_call.facts"
+    local obj="$WORK/canonical_writer_str_call.o"
+    local bin="$WORK/canonical_writer_str_call"
+    local report="$WORK/canonical_writer_str_call.writer.report.txt"
+    local reader_report="$WORK/canonical_writer_str_call.reader.report.txt"
+    if "$DRIVER" emit-cold-csg-v2 \
+        --root:"$ROOT" \
+        --in:src/tests/str_call_const_then_call_arg0_return_i32_direct_object_smoke.cheng \
+        --out:"$facts" \
+        --target:"$TARGET" \
+        --report-out:"$report" >/dev/null; then
+        ok "canonical_writer_str_command"
+    else
+        bad "canonical_writer_str_command"
+        return
+    fi
+    if [ "$(facts_magic_kind "$facts")" = "canonical" ]; then
+        ok "canonical_writer_str_magic"
+    else
+        bad "canonical_writer_str_magic"
+    fi
+    require_grep "canonical_writer_str_report_emit" '^emit=csg-v2-primary$' "$report"
+    require_grep "canonical_writer_str_report_status" '^cold_csg_v2_writer_status=ok$' "$report"
+    require_report_positive "canonical_writer_str_report_facts_bytes" "facts_bytes" "$report"
+    require_grep "canonical_writer_str_report_writer_function_count" '^facts_function_count=3$' "$report"
+    require_report_positive "canonical_writer_str_report_writer_word_count" "facts_word_count" "$report"
+    if "$COLD" system-link-exec \
+        --csg-in:"$facts" \
+        --emit:obj \
+        --target:"$TARGET" \
+        --out:"$obj" \
+        --report-out:"$reader_report" >/dev/null; then
+        ok "canonical_writer_str_reader"
+    else
+        bad "canonical_writer_str_reader"
+    fi
+    require_grep "canonical_writer_str_report_function_count" '^facts_function_count=3$' "$reader_report"
+    require_report_positive "canonical_writer_str_report_word_count" "facts_word_count" "$reader_report"
+    if cc -o "$bin" "$obj" >/dev/null 2>&1; then
+        local run_rc=0
+        "$bin" >/dev/null 2>&1 || run_rc=$?
+        if [ "$run_rc" -eq 7 ]; then
+            ok "canonical_writer_str_link_run"
+        else
+            bad "canonical_writer_str_link_run"
+        fi
+    else
+        bad "canonical_writer_str_link_run"
     fi
 }
 
@@ -347,7 +509,9 @@ roundtrip_stability_fixture() {
 
 echo "=== CSG v2 Roundtrip ==="
 canonical_reader_smoke
+canonical_data_reader_smoke
 canonical_writer_smoke
+canonical_driver_writer_str_smoke
 
 # Baseline: minimal smoke tests
 roundtrip_fixture ordinary src/tests/ordinary_zero_exit_fixture.cheng 32768

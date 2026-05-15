@@ -72,6 +72,9 @@ BodyIR *parse_fn(Parser *parser, int32_t *symbol_index_out);
 
 int32_t parse_expr(Parser *parser, BodyIR *body, Locals *locals, int32_t *kind);
 int32_t parse_term(Parser *parser, BodyIR *body, Locals *locals, int32_t *kind);
+int32_t cold_materialize_fmt_str(BodyIR *body, int32_t slot, int32_t kind);
+int32_t cold_materialize_i32_ref(BodyIR *body, int32_t slot, int32_t *kind);
+int32_t cold_materialize_i64_value(BodyIR *body, int32_t slot, int32_t *kind);
 int32_t parse_statement(Parser *parser, BodyIR *body, Locals *locals,
                         int32_t block, LoopCtx *loop);
 int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *locals,
@@ -123,7 +126,7 @@ void loop_add_break(LoopCtx *loop, int32_t term);
 void loop_add_continue(LoopCtx *loop, int32_t term);
 int32_t cold_imported_param_specs(Symbols *symbols, Span alias, Span params,
                                   Span *names, int32_t *kinds,
-                                  int32_t *sizes, int32_t cap);
+                                  int32_t *sizes, Span *types, int32_t cap);
 Span cold_arena_join3(Arena *arena, Span a, const char *mid, Span b);
 int32_t cold_make_str_literal_cstr_slot(BodyIR *body, const char *text);
 

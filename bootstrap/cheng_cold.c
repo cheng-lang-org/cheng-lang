@@ -118,7 +118,7 @@ static bool ColdErrorRecoveryEnabled = false;
 
 static void die(const char *msg) {
     snprintf(ColdDieError, sizeof(ColdDieError), "%s", msg);
-    fprintf(stderr, "cheng_cold: %s\n", msg);
+    fprintf(stderr, "cheng_cold: %s (recovery=%d)\n", msg, ColdErrorRecoveryEnabled);
     cold_die_report_flush();
     if (ColdErrorRecoveryEnabled) longjmp(ColdErrorJumpBuf, 1);
     exit(2);
@@ -960,6 +960,8 @@ static bool cold_parse_fn_name(Span line, Span *name_out) {
         pos = 3;
     } else if (cold_span_starts_with(line, "async fn ")) {
         pos = 9;
+    } else if (cold_span_starts_with(line, "importc fn ")) {
+        pos = 11;
     } else {
         return false;
     }
@@ -1200,6 +1202,9 @@ bool cold_parse_function_symbol_at(Span source, int32_t fn_start, int32_t line_n
     symbol->body = body;
     symbol->source_span = source_span;
     symbol->import_name = cold_find_fn_c_symbol_attr(source, fn_start, "@importc");
+    if (symbol->import_name.len <= 0 && cold_span_starts_with(trimmed, "importc fn ")) {
+        symbol->import_name = name;
+    }
     symbol->export_name = cold_find_fn_c_symbol_attr(source, fn_start, "@exportc");
     symbol->line = line_no;
     symbol->has_body = has_body;
@@ -3231,6 +3236,7 @@ static int cold_cmd_status(int argc, char **argv) {
  * SoA BodyIR
  * ================================================================ */
 enum {
+    BODY_OP_NOP = 0,
     BODY_OP_I32_CONST = 1,
     BODY_OP_LOAD_I32 = 2,
     BODY_OP_MAKE_VARIANT = 3,
@@ -3371,6 +3377,17 @@ enum {
     BODY_OP_THREAD_YIELD = 138,
     BODY_OP_SET_RAW = 139,
     BODY_OP_BYTES_ALLOC = 140,
+    BODY_OP_SELECT = 141,
+    BODY_OP_SEQ_SET_LEN = 142,
+    BODY_OP_PTR_LOAD_U8 = 143,
+    BODY_OP_PTR_STORE_U8 = 144,
+    BODY_OP_SEQ_OPAQUE_INDEX_REF_DYNAMIC = 145,
+    BODY_OP_HEAP_ALLOC = 146,
+    BODY_OP_HEAP_FREE = 147,
+    BODY_OP_BYTES_TO_HEX = 148,
+    BODY_OP_BYTES_GET = 149,
+    BODY_OP_BYTES_SET = 150,
+    BODY_OP_ATOMIC_ADD_I32 = 151,
 };
 
 enum {
@@ -4045,6 +4062,7 @@ typedef struct TypeDef {
     int32_t max_field_count;
     int32_t max_slot_size;
     bool is_enum;
+    Span alias_type;
 } TypeDef;
 
 typedef struct ObjectField {
@@ -4072,10 +4090,12 @@ typedef struct FnDef {
     int32_t arity;
     int32_t param_kind[COLD_MAX_I32_PARAMS];
     int32_t param_size[COLD_MAX_I32_PARAMS];
+    Span param_type[COLD_MAX_I32_PARAMS];
     bool param_has_default[COLD_MAX_I32_PARAMS];
     int32_t param_default_value[COLD_MAX_I32_PARAMS];
     Span ret;
     bool is_external;
+    int32_t template_index;
     Span generic_names[4];
     int32_t generic_count;
 } FnDef;
@@ -4266,26 +4286,32 @@ int32_t symbols_add_fn(Symbols *symbols, Span name, int32_t arity,
         FnDef *fn = &symbols->functions[existing];
         if (fn->arity != arity || !span_same(fn->name, name)) continue;
         bool same_signature = span_same(fn->ret, ret);
-        bool refinable_signature = true;
+        bool needs_refine = false;
         for (int32_t i = 0; same_signature && i < arity; i++) {
             int32_t new_kind = param_kinds ? param_kinds[i] : SLOT_I32;
             int32_t new_size = param_sizes ? param_sizes[i] : cold_slot_size_for_kind(new_kind);
-            if (fn->param_kind[i] != new_kind) same_signature = false;
-            if (fn->param_size[i] != 0 && new_size != 0 && fn->param_size[i] != new_size) {
+            if (fn->param_kind[i] != new_kind) {
+                if (cold_fn_param_kind_can_refine(fn->param_kind[i], new_kind)) {
+                    needs_refine = true;
+                } else {
+                    same_signature = false;
+                }
+            }
+            if (same_signature &&
+                fn->param_size[i] != 0 && new_size != 0 && fn->param_size[i] != new_size &&
+                !cold_fn_param_kind_can_refine(fn->param_kind[i], new_kind)) {
                 same_signature = false;
             }
         }
-        for (int32_t i = 0; refinable_signature && i < arity; i++) {
-            int32_t new_kind = param_kinds ? param_kinds[i] : SLOT_I32;
-            if (!cold_fn_param_kind_can_refine(fn->param_kind[i], new_kind)) refinable_signature = false;
-        }
-        if (!same_signature && !refinable_signature) continue;
+        if (!same_signature) continue;
         for (int32_t i = 0; i < arity; i++) {
-            if (refinable_signature && param_kinds) {
-                fn->param_kind[i] = param_kinds[i];
-            }
-            if (param_sizes && param_sizes[i] > 0 && (fn->param_size[i] == 0 || refinable_signature)) {
-                fn->param_size[i] = param_sizes[i];
+            int32_t new_kind = param_kinds ? param_kinds[i] : SLOT_I32;
+            int32_t new_size = param_sizes ? param_sizes[i] : cold_slot_size_for_kind(new_kind);
+            if (needs_refine && fn->param_kind[i] != new_kind) {
+                fn->param_kind[i] = new_kind;
+                fn->param_size[i] = new_size;
+            } else if (param_sizes && param_sizes[i] > 0 && fn->param_size[i] == 0) {
+                fn->param_size[i] = new_size;
             }
         }
         return existing;
@@ -4303,9 +4329,23 @@ int32_t symbols_add_fn(Symbols *symbols, Span name, int32_t arity,
     for (int32_t i = 0; i < arity; i++) {
         fn->param_kind[i] = param_kinds ? param_kinds[i] : SLOT_I32;
         fn->param_size[i] = param_sizes ? param_sizes[i] : cold_slot_size_for_kind(fn->param_kind[i]);
+        fn->param_type[i] = (Span){0};
     }
     fn->ret = ret;
+    fn->template_index = -1;
     return symbols->function_count - 1;
+}
+
+static void symbols_set_fn_param_types(Symbols *symbols, int32_t fn_index,
+                                       Span *param_types, int32_t count) {
+    if (!symbols || fn_index < 0 || fn_index >= symbols->function_count) return;
+    FnDef *fn = &symbols->functions[fn_index];
+    int32_t n = count < fn->arity ? count : fn->arity;
+    for (int32_t i = 0; i < n; i++) {
+        if (param_types && param_types[i].len > 0) {
+            fn->param_type[i] = cold_arena_span_copy(symbols->arena, span_trim(param_types[i]));
+        }
+    }
 }
 
 static void symbols_set_fn_link_name(Symbols *symbols, int32_t fn_index, Span link_name) {
@@ -4327,6 +4367,9 @@ static void symbols_set_fn_generics(Symbols *symbols, int32_t fn_index,
 }
 
 /* Build mangled specialization name: funcName$g<hash> */
+static int32_t cold_split_top_level_commas(Span span, Span *items, int32_t cap);
+static bool cold_type_parse_generic_instance(Span type, Span *base, Span *args);
+
 static void cold_specialized_fn_name(Span base_name, int32_t generic_count,
                                      Span *generic_names,
                                      int32_t *arg_kinds, int32_t arg_count,
@@ -4347,12 +4390,101 @@ static void cold_specialized_fn_name(Span base_name, int32_t generic_count,
     snprintf(out, cap, "%.*s$g%016llx", base_name.len, base_name.ptr, (unsigned long long)hash);
 }
 
+static Span cold_generic_join_type(Arena *arena, Span base, Span *args, int32_t arg_count) {
+    int32_t len = base.len + 2;
+    for (int32_t i = 0; i < arg_count; i++) {
+        len += args[i].len;
+        if (i + 1 < arg_count) len++;
+    }
+    uint8_t *ptr = arena_alloc(arena, (size_t)len + 1);
+    int32_t pos = 0;
+    memcpy(ptr + pos, base.ptr, (size_t)base.len);
+    pos += base.len;
+    ptr[pos++] = '[';
+    for (int32_t i = 0; i < arg_count; i++) {
+        memcpy(ptr + pos, args[i].ptr, (size_t)args[i].len);
+        pos += args[i].len;
+        if (i + 1 < arg_count) ptr[pos++] = ',';
+    }
+    ptr[pos++] = ']';
+    ptr[pos] = 0;
+    return (Span){ptr, pos};
+}
+
+static int32_t cold_generic_param_index(FnDef *tmpl, Span generic_name) {
+    for (int32_t i = 0; i < tmpl->arity; i++) {
+        Span param_type = span_trim(tmpl->param_type[i]);
+        if (span_same(param_type, generic_name)) return i;
+        if (param_type.len > 4 && memcmp(param_type.ptr, "var ", 4) == 0 &&
+            span_same(span_trim(span_sub(param_type, 4, param_type.len)), generic_name)) return i;
+    }
+    return -1;
+}
+
+static Span cold_call_arg_type_for_generic(Symbols *symbols, BodyIR *body,
+                                           int32_t arg_start, int32_t arg_index) {
+    if (arg_index >= 0 && arg_index < body->call_arg_count - arg_start) {
+        int32_t slot = body->call_arg_slot[arg_start + arg_index];
+        if (slot >= 0 && slot < body->slot_count) {
+            if (body->slot_type[slot].len > 0) return body->slot_type[slot];
+            switch (body->slot_kind[slot]) {
+                case SLOT_I32: return cold_cstr_span("int32");
+                case SLOT_I64: return cold_cstr_span("int64");
+                case SLOT_STR: return cold_cstr_span("str");
+                case SLOT_PTR: return cold_cstr_span("ptr");
+                case SLOT_OBJECT:
+                case SLOT_OBJECT_REF:
+                case SLOT_VARIANT:
+                case SLOT_OPAQUE:
+                case SLOT_OPAQUE_REF:
+                    return cold_cstr_span("o");
+                default:
+                    break;
+            }
+        }
+    }
+    (void)symbols;
+    return cold_cstr_span("o");
+}
+
+static Span cold_specialize_fn_type(Symbols *symbols, FnDef *tmpl, Span type,
+                                    BodyIR *body, int32_t arg_start,
+                                    int32_t arg_count) {
+    type = span_trim(type);
+    if (type.len <= 0) return type;
+    for (int32_t gi = 0; gi < tmpl->generic_count; gi++) {
+        if (!span_same(type, tmpl->generic_names[gi])) continue;
+        int32_t arg_index = cold_generic_param_index(tmpl, tmpl->generic_names[gi]);
+        if (arg_index < 0 && gi < arg_count) arg_index = gi;
+        return cold_call_arg_type_for_generic(symbols, body, arg_start, arg_index);
+    }
+    Span base = {0};
+    Span args_span = {0};
+    if (!cold_type_parse_generic_instance(type, &base, &args_span)) return type;
+    Span args[COLD_MAX_VARIANT_FIELDS];
+    Span specialized_args[COLD_MAX_VARIANT_FIELDS];
+    int32_t count = cold_split_top_level_commas(args_span, args, COLD_MAX_VARIANT_FIELDS);
+    for (int32_t i = 0; i < count; i++) {
+        specialized_args[i] = cold_specialize_fn_type(symbols, tmpl, args[i], body,
+                                                      arg_start, arg_count);
+    }
+    return cold_generic_join_type(symbols->arena, base, specialized_args, count);
+}
+
 /* Ensure a specialized version exists; returns specialized FnDef index */
 static int32_t cold_ensure_specialized(Symbols *symbols, int32_t template_idx,
-                                        int32_t *arg_kinds, int32_t arg_count) {
+                                       BodyIR *body, int32_t arg_start,
+                                       int32_t arg_count) {
     if (!symbols || template_idx < 0 || template_idx >= symbols->function_count) return template_idx;
     FnDef *tmpl = &symbols->functions[template_idx];
     if (tmpl->generic_count <= 0) return template_idx;
+    int32_t arg_kinds[COLD_MAX_I32_PARAMS];
+    int32_t arg_sizes[COLD_MAX_I32_PARAMS];
+    for (int32_t p = 0; p < arg_count && p < COLD_MAX_I32_PARAMS; p++) {
+        int32_t slot = body->call_arg_slot[arg_start + p];
+        arg_kinds[p] = body->slot_kind[slot];
+        arg_sizes[p] = body->slot_size[slot];
+    }
     char spec_name[COLD_NAME_CAP];
     cold_specialized_fn_name(tmpl->name, tmpl->generic_count, tmpl->generic_names,
                              arg_kinds, arg_count, spec_name, sizeof(spec_name));
@@ -4360,10 +4492,19 @@ static int32_t cold_ensure_specialized(Symbols *symbols, int32_t template_idx,
     for (int32_t i = 0; i < symbols->function_count; i++) {
         if (span_same(symbols->functions[i].name, name_span)) return i;
     }
+    Span spec_ret = cold_specialize_fn_type(symbols, tmpl, tmpl->ret, body,
+                                            arg_start, arg_count);
+    Span spec_param_types[COLD_MAX_I32_PARAMS];
+    for (int32_t p = 0; p < tmpl->arity && p < COLD_MAX_I32_PARAMS; p++) {
+        spec_param_types[p] = cold_specialize_fn_type(symbols, tmpl, tmpl->param_type[p],
+                                                      body, arg_start, arg_count);
+    }
     int32_t spec_idx = symbols_add_fn(symbols, name_span, tmpl->arity,
-                                       arg_kinds, 0, tmpl->ret);
+                                      arg_kinds, arg_sizes, spec_ret);
     if (spec_idx >= 0 && spec_idx < symbols->function_count) {
+        symbols_set_fn_param_types(symbols, spec_idx, spec_param_types, tmpl->arity);
         symbols->functions[spec_idx].generic_count = 0;
+        symbols->functions[spec_idx].template_index = template_idx;
     }
     return spec_idx >= 0 ? spec_idx : template_idx;
 }
@@ -4385,6 +4526,11 @@ static TypeDef *symbols_add_type(Symbols *symbols, Span name, int32_t variant_co
     type->variant_count = variant_count;
     type->variants = arena_alloc(symbols->arena, (size_t)variant_count * sizeof(Variant));
     return type;
+}
+
+static void symbols_set_type_alias(TypeDef *type, Span alias_type) {
+    if (!type) return;
+    type->alias_type = alias_type;
 }
 
 static Variant *symbols_find_variant(Symbols *symbols, Span name) {
@@ -4695,47 +4841,108 @@ static ObjectDef *symbols_ensure_std_result_base(Symbols *symbols) {
     return object;
 }
 
+static ObjectDef *symbols_ensure_std_bytes_named(Symbols *symbols, Span name) {
+    ObjectDef *existing = symbols_find_object(symbols, name);
+    if (existing) return existing;
+    ObjectDef *object = symbols_add_object(symbols, name, 2);
+    object->fields[0].name = cold_cstr_span("data");
+    object->fields[0].type_name = cold_cstr_span("ptr");
+    object->fields[0].kind = SLOT_PTR;
+    object->fields[0].size = 8;
+    object->fields[0].array_len = 0;
+    object->fields[1].name = cold_cstr_span("len");
+    object->fields[1].type_name = cold_cstr_span("int32");
+    object->fields[1].kind = SLOT_I32;
+    object->fields[1].size = 4;
+    object->fields[1].array_len = 0;
+    object_finalize_fields(object);
+    return object;
+}
+
+static void symbols_configure_std_result_object(Symbols *symbols,
+                                                ObjectDef *object,
+                                                Span value_type) {
+    if (!object) die("Result object missing");
+    if (!object->fields || object->field_count < 3) {
+        object->fields = arena_alloc(symbols->arena, 3 * sizeof(ObjectField));
+    }
+    object->field_count = 3;
+    object->fields[0].name = cold_cstr_span("ok");
+    object->fields[0].type_name = cold_cstr_span("bool");
+    object->fields[0].kind = SLOT_I32;
+    object->fields[0].size = 4;
+    object->fields[0].array_len = 0;
+    int32_t value_kind = cold_slot_kind_from_type_with_symbols(symbols, value_type);
+    object->fields[1].name = cold_cstr_span("value");
+    object->fields[1].type_name = value_type;
+    object->fields[1].kind = value_kind;
+    object->fields[1].size = cold_slot_size_from_type_with_symbols(symbols, value_type, value_kind);
+    object->fields[1].array_len = 0;
+    ObjectDef *err_obj = symbols_ensure_std_error_info(symbols);
+    object->fields[2].name = cold_cstr_span("err");
+    object->fields[2].type_name = err_obj->name;
+    object->fields[2].kind = SLOT_OBJECT;
+    object->fields[2].size = symbols_object_slot_size(err_obj);
+    object->fields[2].array_len = 0;
+    object_finalize_fields(object);
+}
+
 static ObjectDef *symbols_resolve_object(Symbols *symbols, Span type_name) {
     type_name = span_trim(type_name);
     ObjectDef *existing = symbols_find_object(symbols, type_name);
-    if (existing) return existing;
-    /* Cross-alias fallback: match last component after '.'.
-       e.g. "ir.BodyIR" matches "coreir.BodyIR" when the same module
-       was imported under different aliases via transitive imports. */
-    if (!existing) {
-        int32_t dot = -1;
-        for (int32_t i = type_name.len - 1; i >= 0; i--) {
-            if (type_name.ptr[i] == '.') { dot = i; break; }
-        }
-        if (dot >= 0) {
-            Span suffix = span_sub(type_name, dot + 1, type_name.len);
-            for (int32_t oi = 0; oi < symbols->object_count; oi++) {
-                Span oname = symbols->objects[oi].name;
-                int32_t odot = -1;
-                for (int32_t j = oname.len - 1; j >= 0; j--) {
-                    if (oname.ptr[j] == '.') { odot = j; break; }
-                }
-                if (odot >= 0 && span_same(span_sub(oname, odot + 1, oname.len), suffix)) {
-                    existing = &symbols->objects[oi];
-                    break;
-                }
-                if (odot < 0 && span_same(oname, suffix)) {
-                    existing = &symbols->objects[oi];
-                    break;
-                }
+    if (existing) {
+        Span existing_base = {0};
+        Span existing_args = {0};
+        if (cold_type_parse_generic_instance(type_name, &existing_base, &existing_args) &&
+            span_eq(existing_base, "Result")) {
+            ObjectField *ok = object_find_field(existing, cold_cstr_span("ok"));
+            ObjectField *value = object_find_field(existing, cold_cstr_span("value"));
+            ObjectField *err = object_find_field(existing, cold_cstr_span("err"));
+            if (!ok || !value || !err ||
+                ok->kind != SLOT_I32 || err->kind != SLOT_OBJECT) {
+                Span result_args[COLD_MAX_VARIANT_FIELDS];
+                int32_t result_arg_count = cold_split_top_level_commas(existing_args,
+                    result_args, COLD_MAX_VARIANT_FIELDS);
+                if (result_arg_count != 1) die("Result object arity mismatch");
+                symbols_configure_std_result_object(symbols, existing, result_args[0]);
             }
         }
+        return existing;
     }
-    if (existing) return existing;
+    TypeDef *alias_type = symbols_find_type(symbols, type_name);
+    if (alias_type && alias_type->alias_type.len > 0) {
+        return symbols_resolve_object(symbols, alias_type->alias_type);
+    }
+    if (span_eq(type_name, "Bytes")) {
+        return symbols_ensure_std_bytes_named(symbols, cold_cstr_span("Bytes"));
+    }
+    if (span_eq(type_name, "rawbytes.Bytes")) {
+        return symbols_ensure_std_bytes_named(symbols, cold_cstr_span("rawbytes.Bytes"));
+    }
     if (span_eq(type_name, "ErrorInfo")) return symbols_ensure_std_error_info(symbols);
     if (span_eq(type_name, "Result")) return symbols_ensure_std_result_base(symbols);
     Span base_name = {0};
     Span args_span = {0};
     if (!cold_type_parse_generic_instance(type_name, &base_name, &args_span)) return 0;
-    if (symbols_find_type(symbols, base_name)) return 0; /* base is an ADT, not an object */
+    if (span_eq(base_name, "Result")) {
+        Span result_args[COLD_MAX_VARIANT_FIELDS];
+        int32_t result_arg_count = cold_split_top_level_commas(args_span,
+            result_args, COLD_MAX_VARIANT_FIELDS);
+        if (result_arg_count != 1) die("Result object arity mismatch");
+        ObjectDef *inst = symbols_add_object(symbols, type_name, 3);
+        symbols_configure_std_result_object(symbols, inst, result_args[0]);
+        return inst;
+    }
     ObjectDef *base = symbols_find_object(symbols, base_name);
     if (!base && span_eq(base_name, "Result")) base = symbols_ensure_std_result_base(symbols);
-    if (!base) return 0;
+    if (!base && symbols_find_type(symbols, base_name)) return 0; /* base is an ADT, not an object */
+    if (!base) {
+        if (span_eq(base_name, "Result")) {
+            fprintf(stderr, "cheng_cold: Result object base missing for %.*s\n",
+                    (int)type_name.len, type_name.ptr);
+        }
+        return 0;
+    }
     if (base->generic_count <= 0) return 0; /* non-generic base */
     Span args[COLD_MAX_VARIANT_FIELDS];
     int32_t arg_count = cold_split_top_level_commas(args_span, args, COLD_MAX_VARIANT_FIELDS);
@@ -4806,29 +5013,48 @@ static int32_t cold_slot_kind_from_type_with_symbols(Symbols *symbols, Span type
     bool is_var = false;
     type = cold_type_strip_var(type, &is_var);
     int32_t array_len = 0;
+    Span result_base = {0};
+    Span result_args = {0};
+    if (cold_type_parse_generic_instance(type, &result_base, &result_args) &&
+        span_eq(result_base, "Result")) {
+        return is_var ? SLOT_OBJECT_REF : SLOT_OBJECT;
+    }
     TypeDef *known_type = symbols ? symbols_resolve_type(symbols, type) : 0;
+    if (known_type && known_type->alias_type.len > 0) {
+        Span alias_type = known_type->alias_type;
+        if (is_var) {
+            alias_type = cold_arena_join3(symbols->arena,
+                                          cold_cstr_span("var "),
+                                          "",
+                                          alias_type);
+        }
+        return cold_slot_kind_from_type_with_symbols(symbols, alias_type);
+    }
     bool known_enum = known_type && known_type->is_enum;
     if (is_var && (span_eq(type, "int64") || span_eq(type, "uint64"))) return SLOT_I64_REF;
     if (is_var && (span_eq(type, "int32") || span_eq(type, "int") || span_eq(type, "i") ||
-                   span_eq(type, "bool") || span_eq(type, "uint8") ||
+                   span_eq(type, "bool") || span_eq(type, "int8") || span_eq(type, "uint8") ||
                    span_eq(type, "char") || span_eq(type, "uint32") ||
                    known_enum)) return SLOT_I32_REF;
-    if (is_var && (span_eq(type, "str") || span_eq(type, "cstring"))) return SLOT_STR_REF;
+    if (is_var && span_eq(type, "str")) return SLOT_STR_REF;
+    if (is_var && span_eq(type, "cstring")) return SLOT_OPAQUE_REF;
     if (is_var && cold_parse_i32_seq_type(type)) return SLOT_SEQ_I32_REF;
     if (is_var && cold_parse_str_seq_type(type)) return SLOT_SEQ_STR_REF;
     if (is_var && cold_parse_opaque_seq_type(type)) return SLOT_SEQ_OPAQUE_REF;
     if (is_var && symbols && symbols_resolve_object(symbols, type)) return SLOT_OBJECT_REF;
     if (is_var && cold_type_has_qualified_name(type)) return SLOT_OPAQUE_REF;
     if (cold_parse_i32_array_type(type, &array_len)) return SLOT_ARRAY_I32;
-    if (cold_span_starts_with(span_trim(type), "uint8[")) return SLOT_ARRAY_I32;
+    if (cold_span_starts_with(span_trim(type), "uint8[") &&
+        !cold_parse_opaque_seq_type(span_trim(type))) return SLOT_ARRAY_I32;
     if (cold_parse_i32_seq_type(type)) return SLOT_SEQ_I32;
     if (cold_parse_str_seq_type(type)) return SLOT_SEQ_STR;
     if (cold_parse_opaque_seq_type(type)) return SLOT_SEQ_OPAQUE;
-    if (span_eq(type, "str") || span_eq(type, "cstring") || span_eq(type, "s")) return SLOT_STR;
+    if (span_eq(type, "str") || span_eq(type, "s")) return SLOT_STR;
+    if (span_eq(type, "cstring")) return SLOT_OPAQUE;
     if (span_eq(type, "int64") || span_eq(type, "uint64")) return SLOT_I64;
     if (span_eq(type, "int32") || span_eq(type, "int") || span_eq(type, "i") ||
         span_eq(type, "bool") ||
-        span_eq(type, "uint8") || span_eq(type, "char") ||
+        span_eq(type, "int8") || span_eq(type, "uint8") || span_eq(type, "char") ||
         span_eq(type, "uint32") ||
         span_eq(type, "void") || type.len == 0) return SLOT_I32;
     if (known_enum) return SLOT_I32;
@@ -4837,6 +5063,7 @@ static int32_t cold_slot_kind_from_type_with_symbols(Symbols *symbols, Span type
     if (span_eq(type, "ptr")) return SLOT_OPAQUE;
     /* function type like fn(int32): int32 → function pointer */
     if (cold_span_starts_with(type, "fn(")) return is_var ? SLOT_OBJECT_REF : SLOT_PTR;
+    if (known_type && known_type->variant_count > 0) return SLOT_VARIANT;
     if (symbols) {
         ObjectDef *obj = symbols_resolve_object(symbols, type);
         if (obj) return obj->is_ref ? SLOT_PTR : SLOT_OBJECT;
@@ -4945,13 +5172,6 @@ static TypeDef *symbols_resolve_type(Symbols *symbols, Span type_name) {
     type_name = span_trim(type_name);
     TypeDef *existing = symbols_find_type(symbols, type_name);
     if (existing) return existing;
-    for (int32_t i = type_name.len - 1; i > 0; i--) {
-        if (type_name.ptr[i] == '.') {
-            TypeDef *suffix = symbols_find_type(symbols, span_sub(type_name, i + 1, type_name.len - i - 1));
-            if (suffix) return suffix;
-            break;
-        }
-    }
     Span base_name = {0};
     Span args_span = {0};
     if (!cold_type_parse_generic_instance(type_name, &base_name, &args_span)) return 0;
@@ -4982,17 +5202,25 @@ static TypeDef *symbols_resolve_type(Symbols *symbols, Span type_name) {
 
 int32_t cold_return_kind_from_span(Symbols *symbols, Span ret) {
     ret = span_trim(ret);
-    if (span_eq(ret, "str") || span_eq(ret, "cstring")) return SLOT_STR;
+    if (span_eq(ret, "str")) return SLOT_STR;
+    if (span_eq(ret, "cstring")) return SLOT_OPAQUE;
     if (span_eq(ret, "int64") || span_eq(ret, "uint64")) return SLOT_I64;
     if (span_eq(ret, "int32") || span_eq(ret, "int") || span_eq(ret, "i") ||
         span_eq(ret, "bool") ||
-        span_eq(ret, "uint8") || span_eq(ret, "char") ||
+        span_eq(ret, "int8") || span_eq(ret, "uint8") || span_eq(ret, "char") ||
         span_eq(ret, "uint32") ||
         span_eq(ret, "void") || ret.len == 0) return SLOT_I32;
+    Span result_base = {0};
+    Span result_args = {0};
+    if (cold_type_parse_generic_instance(ret, &result_base, &result_args) &&
+        span_eq(result_base, "Result")) return SLOT_OBJECT;
     if (cold_parse_i32_seq_type(ret)) return SLOT_SEQ_I32;
     if (cold_parse_str_seq_type(ret)) return SLOT_SEQ_STR;
     if (cold_parse_opaque_seq_type(ret)) return SLOT_SEQ_OPAQUE;
     TypeDef *known_type = symbols_resolve_type(symbols, ret);
+    if (known_type && known_type->alias_type.len > 0) {
+        return cold_slot_kind_from_type_with_symbols(symbols, known_type->alias_type);
+    }
     if (known_type) return SLOT_VARIANT;
     ObjectDef *ret_obj = symbols_resolve_object(symbols, ret);
     if (ret_obj) return ret_obj->is_ref ? SLOT_PTR : SLOT_OBJECT;
@@ -7153,6 +7381,22 @@ static int32_t codegen_load_call_args(Code *code, BodyIR *body, FnDef *fn, int32
             codegen_place_x_arg(code, in_regs, base_reg, stack_offset, R9);
             continue;
         }
+        if (fn->param_kind[i] == SLOT_OPAQUE) {
+            if (arg_kind == SLOT_STR) {
+                /* Extract just the data pointer (first 8 bytes) from str struct */
+                a64_emit_ldr_sp_off(code, R9, local_offset, true);
+                codegen_place_x_arg(code, in_regs, base_reg, stack_offset, R9);
+                continue;
+            }
+            if (arg_kind == SLOT_STR_REF) {
+                /* Load ref, then dereference to get str.data_ptr */
+                a64_emit_ldr_sp_off(code, R9, local_offset, true);
+                code_emit(code, a64_ldr_imm(R9, R9, 0, true));
+                codegen_place_x_arg(code, in_regs, base_reg, stack_offset, R9);
+                continue;
+            }
+            /* For other arg kinds, fall through to general handling */
+        }
         if (fn->param_kind[i] == SLOT_I32 && arg_kind == SLOT_I32_REF) {
             a64_emit_ldr_sp_off(code, R9, local_offset, true);
             code_emit(code, a64_ldr_imm(R9, R9, 0, false));
@@ -7385,6 +7629,38 @@ static void codegen_copy_slot_from_offset(Code *code, BodyIR *body,
     }
 }
 
+static void codegen_copy_stack_slot(Code *code, BodyIR *body,
+                                    int32_t dst_slot, int32_t src_slot) {
+    int32_t total = body->slot_size[dst_slot];
+    int32_t src_total = body->slot_size[src_slot];
+    if (src_total < total) total = src_total;
+    int32_t off = 0;
+    while (off < total) {
+        int32_t remaining = total - off;
+        bool wide = remaining >= 8;
+        a64_emit_ldr_sp_off(code, R0, body->slot_offset[src_slot] + off, wide);
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst_slot] + off, wide);
+        off += wide ? 8 : 4;
+    }
+}
+
+static void codegen_select_slot(Code *code, BodyIR *body,
+                                int32_t dst, int32_t cond,
+                                int32_t then_slot, int32_t else_slot) {
+    if (body->slot_kind[cond] != SLOT_I32) die("select condition must be i32");
+    a64_emit_ldr_sp_off(code, R1, body->slot_offset[cond], false);
+    code_emit(code, a64_cmp_imm(R1, 0));
+    int32_t false_jump = code->count;
+    code_emit(code, a64_bcond(0, COND_EQ));
+    codegen_copy_stack_slot(code, body, dst, then_slot);
+    int32_t done_jump = code->count;
+    code_emit(code, a64_b(0));
+    int32_t false_label = code->count;
+    a64_patch_bcond(code, false_jump, false_label);
+    codegen_copy_stack_slot(code, body, dst, else_slot);
+    a64_patch_b(code, done_jump, code->count);
+}
+
 static void codegen_store_slot_to_offset(Code *code, BodyIR *body,
                                          int32_t dst_slot, int32_t dst_offset,
                                          int32_t src_slot) {
@@ -7445,27 +7721,31 @@ static void codegen_store_slot_to_payload(Code *code, BodyIR *body,
     }
 }
 
+static void codegen_load_str_pair(Code *code, BodyIR *body, int32_t slot,
+                                  int ptr_reg, int len_reg);
+
 static void codegen_str_eq(Code *code, BodyIR *body, int32_t dst, int32_t left, int32_t right) {
-    if (body->slot_kind[left] != SLOT_STR || body->slot_kind[right] != SLOT_STR) return; /* skip non-str eq */
-    a64_emit_ldr_sp_off(code, R2, body->slot_offset[left] + 8, false);
-    a64_emit_ldr_sp_off(code, R3, body->slot_offset[right] + 8, false);
-    code_emit(code, a64_cmp_reg(R2, R3));
+    if ((body->slot_kind[left] != SLOT_STR && body->slot_kind[left] != SLOT_STR_REF) ||
+        (body->slot_kind[right] != SLOT_STR && body->slot_kind[right] != SLOT_STR_REF)) {
+        die("str eq expects str operands");
+    }
+    codegen_load_str_pair(code, body, left, R2, R3);
+    codegen_load_str_pair(code, body, right, 4, 5);
+    code_emit(code, a64_cmp_reg(R3, 5));
     int32_t len_ne = code->count;
     code_emit(code, a64_bcond(0, COND_NE));
-    a64_emit_ldr_sp_off(code, 4, body->slot_offset[left], true);
-    a64_emit_ldr_sp_off(code, 5, body->slot_offset[right], true);
     code_emit(code, a64_movz(6, 0, 0));
     int32_t loop = code->count;
-    code_emit(code, a64_cmp_reg(6, R2));
+    code_emit(code, a64_cmp_reg(6, R3));
     int32_t done_equal = code->count;
     code_emit(code, a64_bcond(0, COND_GE));
-    code_emit(code, a64_ldrb_imm(7, 4, 0));
-    code_emit(code, a64_ldrb_imm(8, 5, 0));
+    code_emit(code, a64_ldrb_imm(7, R2, 0));
+    code_emit(code, a64_ldrb_imm(8, 4, 0));
     code_emit(code, a64_cmp_reg(7, 8));
     int32_t byte_ne = code->count;
     code_emit(code, a64_bcond(0, COND_NE));
+    code_emit(code, a64_add_imm(R2, R2, 1, true));
     code_emit(code, a64_add_imm(4, 4, 1, true));
-    code_emit(code, a64_add_imm(5, 5, 1, true));
     code_emit(code, a64_add_imm(6, 6, 1, false));
     code_emit(code, a64_b(loop - code->count));
     int32_t equal_label = code->count;
@@ -7541,6 +7821,88 @@ static void codegen_store_empty_str(Code *code, BodyIR *body, int32_t slot) {
 }
 
 
+static void codegen_mmap_len_reg(Code *code, int len_reg, int dst_reg, int brk_imm);
+
+static void codegen_load_bytes_pair(Code *code, BodyIR *body, int32_t slot,
+                                    int ptr_reg, int len_reg) {
+    int32_t kind = body->slot_kind[slot];
+    if (kind == SLOT_OBJECT_REF || kind == SLOT_OPAQUE_REF) {
+        a64_emit_ldr_sp_off(code, R12, body->slot_offset[slot], true);
+        code_emit(code, a64_cmp_reg_x(R12, 31));
+        int32_t null_jump = code->count;
+        code_emit(code, a64_bcond(0, COND_EQ));
+        code_emit(code, a64_ldr_imm(ptr_reg, R12, 0, true));
+        code_emit(code, a64_ldr_imm(len_reg, R12, 8, false));
+        int32_t done_jump = code->count;
+        code_emit(code, a64_b(0));
+        int32_t null_label = code->count;
+        a64_patch_bcond(code, null_jump, null_label);
+        code_emit(code, a64_movz_x(ptr_reg, 0, 0));
+        code_emit(code, a64_movz(len_reg, 0, 0));
+        a64_patch_b(code, done_jump, code->count);
+        return;
+    }
+    if (kind != SLOT_OBJECT && kind != SLOT_OPAQUE) die("Bytes operation expects object slot");
+    a64_emit_ldr_sp_off(code, ptr_reg, body->slot_offset[slot] + 0, true);
+    a64_emit_ldr_sp_off(code, len_reg, body->slot_offset[slot] + 8, false);
+}
+
+static void codegen_hex_nibble_reg(Code *code, int reg) {
+    code_emit(code, a64_movz(R11, 15, 0));
+    code_emit(code, a64_and_reg(reg, reg, R11));
+    code_emit(code, a64_cmp_imm(reg, 10));
+    int32_t letter = code->count;
+    code_emit(code, a64_bcond(0, COND_GE));
+    code_emit(code, a64_add_imm(reg, reg, (uint16_t)'0', false));
+    int32_t done_jump = code->count;
+    code_emit(code, a64_b(0));
+    int32_t letter_label = code->count;
+    a64_patch_bcond(code, letter, letter_label);
+    code_emit(code, a64_add_imm(reg, reg, (uint16_t)('a' - 10), false));
+    a64_patch_b(code, done_jump, code->count);
+}
+
+static void codegen_bytes_to_hex(Code *code, BodyIR *body, int32_t dst, int32_t bytes_slot) {
+    codegen_store_empty_str(code, body, dst);
+    codegen_load_bytes_pair(code, body, bytes_slot, R3, R4);
+    code_emit(code, a64_cmp_reg_x(R3, 31));
+    int32_t null_done = code->count;
+    code_emit(code, a64_bcond(0, COND_EQ));
+    code_emit(code, a64_cmp_imm(R4, 0));
+    int32_t empty_done = code->count;
+    code_emit(code, a64_bcond(0, COND_LE));
+
+    code_emit(code, a64_add_reg(R1, R4, R4));
+    a64_emit_str_sp_off(code, R1, body->slot_offset[dst] + COLD_STR_LEN_OFFSET, false);
+    codegen_mmap_len_reg(code, R1, R6, 58);
+    a64_emit_str_sp_off(code, R6, body->slot_offset[dst] + COLD_STR_DATA_OFFSET, true);
+    code_emit(code, a64_movz(R0, 0, 0));
+    a64_emit_str_sp_off(code, R0, body->slot_offset[dst] + COLD_STR_STORE_ID_OFFSET, false);
+    a64_emit_str_sp_off(code, R0, body->slot_offset[dst] + COLD_STR_FLAGS_OFFSET, false);
+
+    codegen_load_bytes_pair(code, body, bytes_slot, R3, R4);
+    a64_emit_ldr_sp_off(code, R6, body->slot_offset[dst] + COLD_STR_DATA_OFFSET, true);
+    int32_t loop = code->count;
+    code_emit(code, a64_cmp_imm(R4, 0));
+    int32_t done_loop = code->count;
+    code_emit(code, a64_bcond(0, COND_LE));
+    code_emit(code, a64_ldrb_imm(R7, R3, 0));
+    code_emit(code, a64_lsr_imm(R8, R7, 4, false));
+    codegen_hex_nibble_reg(code, R8);
+    code_emit(code, a64_strb_imm(R8, R6, 0));
+    code_emit(code, a64_add_imm(R8, R7, 0, false));
+    codegen_hex_nibble_reg(code, R8);
+    code_emit(code, a64_strb_imm(R8, R6, 1));
+    code_emit(code, a64_add_imm(R3, R3, 1, true));
+    code_emit(code, a64_add_imm(R6, R6, 2, true));
+    code_emit(code, a64_sub_imm(R4, R4, 1, false));
+    code_emit(code, a64_b(loop - code->count));
+    int32_t done = code->count;
+    a64_patch_bcond(code, null_done, done);
+    a64_patch_bcond(code, empty_done, done);
+    a64_patch_bcond(code, done_loop, done);
+}
+
 
 static void codegen_mmap_len_reg(Code *code, int len_reg, int dst_reg, int brk_imm) {
     if (len_reg != R1) code_emit(code, a64_add_imm(R1, len_reg, 0, true));
@@ -7586,6 +7948,66 @@ static void codegen_cstring_literal(Code *code, int dst_reg, const char *text) {
     int32_t after_data = code->count;
     code->words[adr_pos] = a64_adr(dst_reg, data_offset - adr_pos * 4);
     a64_patch_b(code, skip_pos, after_data);
+}
+
+static bool cold_fn_is_puts(FnDef *fn) {
+    if (!fn) return false;
+    Span name = fn->link_name.len > 0 ? fn->link_name : fn->name;
+    if (span_eq(name, "puts")) return true;
+    if (span_eq(name, "system.puts")) return true;
+    return false;
+}
+
+static void codegen_puts_cstring_intrinsic(Code *code, BodyIR *body,
+                                           int32_t dst, int32_t arg_slot) {
+    int32_t arg_kind = body->slot_kind[arg_slot];
+    if (arg_kind == SLOT_STR || arg_kind == SLOT_STR_REF) {
+        codegen_cstring_from_slot(code, body, arg_slot, 7, 120);
+    } else if (arg_kind == SLOT_OPAQUE || arg_kind == SLOT_PTR) {
+        a64_emit_ldr_sp_off(code, 7, body->slot_offset[arg_slot], true);
+    } else if (arg_kind == SLOT_OPAQUE_REF) {
+        a64_emit_ldr_sp_off(code, 7, body->slot_offset[arg_slot], true);
+        code_emit(code, a64_ldr_imm(7, 7, 0, true));
+    } else {
+        die("puts expects cstring-compatible arg");
+    }
+
+    code_emit(code, a64_movz_x(8, 0, 0));
+    int32_t scan_loop = code->count;
+    code_emit(code, a64_add_reg_x(9, 7, 8));
+    code_emit(code, a64_ldrb_imm(10, 9, 0));
+    code_emit(code, a64_cmp_imm(10, 0));
+    int32_t scan_done = code->count;
+    code_emit(code, a64_bcond(0, COND_EQ));
+    code_emit(code, a64_add_imm(8, 8, 1, true));
+    code_emit(code, a64_b(scan_loop - code->count));
+    a64_patch_bcond(code, scan_done, code->count);
+
+    code_emit(code, a64_cmp_imm(8, 0));
+    int32_t skip_text = code->count;
+    code_emit(code, a64_bcond(0, COND_EQ));
+    code_emit(code, a64_movz_x(R0, 1, 0));
+    code_emit(code, a64_add_imm(R1, 7, 0, true));
+    code_emit(code, a64_add_imm(R2, 8, 0, true));
+    code_emit(code, a64_movz_x(16, 4, 0));
+    code_emit(code, a64_svc(0x80));
+    a64_patch_bcond(code, skip_text, code->count);
+
+    int32_t newline_adr = code->count;
+    code_emit(code, a64_adr(R1, 0));
+    int32_t newline_skip = code->count;
+    code_emit(code, a64_b(0));
+    int32_t newline_data = code_append_bytes(code, "\n", 1);
+    int32_t after_newline = code->count;
+    code->words[newline_adr] = a64_adr(R1, newline_data - newline_adr * 4);
+    a64_patch_b(code, newline_skip, after_newline);
+    code_emit(code, a64_movz_x(R0, 1, 0));
+    code_emit(code, a64_movz_x(R2, 1, 0));
+    code_emit(code, a64_movz_x(16, 4, 0));
+    code_emit(code, a64_svc(0x80));
+
+    code_emit(code, a64_movz(R0, 0, 0));
+    a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
 }
 
 static void codegen_store_exec_result(Code *code, BodyIR *body, int32_t dst,
@@ -8123,6 +8545,12 @@ static void codegen_parse_int_slot(Code *code, BodyIR *body, int32_t dst, int32_
 
 static void codegen_seq_str_header_addr(Code *code, BodyIR *body, int32_t seq_slot, int reg);
 
+static void codegen_mul_u64_by_24(Code *code, int dst_reg, int src_reg) {
+    code_emit(code, a64_add_reg_x(dst_reg, src_reg, src_reg));
+    code_emit(code, a64_add_reg_x(dst_reg, dst_reg, src_reg));
+    code_emit(code, a64_lsl_imm(dst_reg, dst_reg, 3, true));
+}
+
 static void codegen_str_join(Code *code, BodyIR *body, int32_t dst,
                              int32_t items_slot, int32_t sep_slot) {
     codegen_seq_str_header_addr(code, body, items_slot, 11);
@@ -8140,10 +8568,7 @@ static void codegen_str_join(Code *code, BodyIR *body, int32_t dst,
     code_emit(code, a64_bcond(0, COND_EQ));
     code_emit(code, a64_add_reg_x(7, 7, 15));
     a64_patch_bcond(code, no_sep_total, code->count);
-    code_emit(code, a64_add_reg_x(9, 8, 8));
-    code_emit(code, a64_add_reg_x(9, 9, 9));
-    code_emit(code, a64_add_reg_x(9, 9, 9));
-    code_emit(code, a64_add_reg_x(9, 9, 9));
+    codegen_mul_u64_by_24(code, 9, 8);
     code_emit(code, a64_add_reg_x(9, 13, 9));
     code_emit(code, a64_ldr_imm(10, 9, 8, true));
     code_emit(code, a64_add_reg_x(7, 7, 10));
@@ -8171,10 +8596,7 @@ static void codegen_str_join(Code *code, BodyIR *body, int32_t dst,
     code_emit(code, a64_add_imm(R0, 14, 0, true));
     codegen_copy_bytes(code, R0, 15, 10);
     a64_patch_bcond(code, no_sep_copy, code->count);
-    code_emit(code, a64_add_reg_x(9, 8, 8));
-    code_emit(code, a64_add_reg_x(9, 9, 9));
-    code_emit(code, a64_add_reg_x(9, 9, 9));
-    code_emit(code, a64_add_reg_x(9, 9, 9));
+    codegen_mul_u64_by_24(code, 9, 8);
     code_emit(code, a64_add_reg_x(9, 13, 9));
     code_emit(code, a64_ldr_imm(R0, 9, 0, true));
     code_emit(code, a64_ldr_imm(R1, 9, 8, true));
@@ -8208,10 +8630,7 @@ static void codegen_str_split_char(Code *code, BodyIR *body, int32_t dst,
     code_emit(code, a64_add_imm(13, 13, 1, true));
     code_emit(code, a64_b(count_loop - code->count));
     a64_patch_bcond(code, count_done, code->count);
-    code_emit(code, a64_add_reg_x(R1, 12, 12));
-    code_emit(code, a64_add_reg_x(R1, R1, R1));
-    code_emit(code, a64_add_reg_x(R1, R1, R1));
-    code_emit(code, a64_add_reg_x(R1, R1, R1));
+    codegen_mul_u64_by_24(code, R1, 12);
     codegen_mmap_len_reg(code, R1, 14, 60);
     a64_emit_str_sp_off(code, 12, body->slot_offset[dst], false);
     a64_emit_str_sp_off(code, 12, body->slot_offset[dst] + 4, false);
@@ -8231,13 +8650,13 @@ static void codegen_str_split_char(Code *code, BodyIR *body, int32_t dst,
     a64_patch_bcond(code, emit_trailing, code->count);
     code_emit(code, a64_add_reg_x(8, 6, 15));
     code_emit(code, a64_sub_reg(9, 13, 15));
-    code_emit(code, a64_add_reg_x(12, 10, 10));
-    code_emit(code, a64_add_reg_x(12, 12, 12));
-    code_emit(code, a64_add_reg_x(12, 12, 12));
-    code_emit(code, a64_add_reg_x(12, 12, 12));
+    codegen_mul_u64_by_24(code, 12, 10);
     code_emit(code, a64_add_reg_x(12, 14, 12));
     code_emit(code, a64_str_imm(8, 12, 0, true));
     code_emit(code, a64_str_imm(9, 12, 8, true));
+    code_emit(code, a64_movz(5, 0, 0));
+    code_emit(code, a64_str_imm(5, 12, 12, false));
+    code_emit(code, a64_str_imm(5, 12, 16, false));
     code_emit(code, a64_add_imm(10, 10, 1, false));
     code_emit(code, a64_add_imm(15, 13, 1, true));
     code_emit(code, a64_cmp_reg_x(13, 7));
@@ -8826,15 +9245,11 @@ static void codegen_seq_str_index(Code *code, BodyIR *body, int32_t dst,
     code_emit(code, a64_b(0));
     a64_patch_bcond(code, in_bounds, code->count);
     code_emit(code, a64_ldr_imm(4, header_reg, 8, true));
-    code_emit(code, a64_add_reg_x(5, R1, R1));
-    code_emit(code, a64_add_reg_x(5, 5, 5));
-    code_emit(code, a64_add_reg_x(5, 5, 5));
-    code_emit(code, a64_add_reg_x(5, 5, 5));
+    codegen_mul_u64_by_24(code, 5, R1);
     code_emit(code, a64_add_reg_x(4, 4, 5));
-    code_emit(code, a64_ldr_imm(R0, 4, 0, true));
-    a64_emit_str_sp_off(code, R0, body->slot_offset[dst], true);
-    code_emit(code, a64_ldr_imm(R0, 4, 8, true));
-    a64_emit_str_sp_off(code, R0, body->slot_offset[dst] + 8, true);
+    code_emit(code, a64_ldr_imm(6, 4, 0, true));
+    code_emit(code, a64_ldr_imm(7, 4, 8, false));
+    codegen_store_str_pair(code, body, dst, 6, 7);
     /* Patch error jumps to here */
     int32_t seq_end = code->count;
     code->words[neg_done_jump] = a64_b(seq_end - neg_done_jump);
@@ -8975,14 +9390,14 @@ static void codegen_seq_str_add(Code *code, BodyIR *body, int32_t seq_slot, int3
 
     int32_t store_label = code->count;
     code_emit(code, a64_ldr_imm(R3, R2, 8, true));
-    code_emit(code, a64_add_reg_x(6, R0, R0));
-    code_emit(code, a64_add_reg_x(6, 6, 6));
-    code_emit(code, a64_add_reg_x(6, 6, 6));
-    code_emit(code, a64_add_reg_x(6, 6, 6));
+    codegen_mul_u64_by_24(code, 6, R0);
     code_emit(code, a64_add_reg_x(R3, R3, 6));
     codegen_load_str_pair(code, body, value_slot, 4, 5);
     code_emit(code, a64_str_imm(4, R3, 0, true));
     code_emit(code, a64_str_imm(5, R3, 8, true));
+    code_emit(code, a64_movz(6, 0, 0));
+    code_emit(code, a64_str_imm(6, R3, 12, false));
+    code_emit(code, a64_str_imm(6, R3, 16, false));
     code_emit(code, a64_add_imm(R0, R0, 1, false));
     code_emit(code, a64_str_imm(R0, R2, 0, false));
     int32_t done_jump = code->count;
@@ -9003,10 +9418,8 @@ static void codegen_seq_str_add(Code *code, BodyIR *body, int32_t seq_slot, int3
     a64_patch_b(code, cap_ready_jump, cap_ready);
     code_emit(code, a64_str_imm(R1, R2, 4, false));
 
-    code_emit(code, a64_add_reg(R1, R1, R1));
-    code_emit(code, a64_add_reg(R1, R1, R1));
-    code_emit(code, a64_add_reg(R1, R1, R1));
-    code_emit(code, a64_add_reg(R1, R1, R1));
+    codegen_mul_u64_by_24(code, 6, R1);
+    code_emit(code, a64_add_imm(R1, 6, 0, true));
     code_emit(code, a64_movz_x(R0, 0, 0));
     code_emit(code, a64_movz_x(R2, 3, 0));
     code_emit(code, a64_movz_x(R3, 0x1002, 0));
@@ -9026,10 +9439,7 @@ static void codegen_seq_str_add(Code *code, BodyIR *body, int32_t seq_slot, int3
     codegen_seq_str_header_addr(code, body, seq_slot, R2);
     code_emit(code, a64_ldr_imm(R0, R2, 0, false));
     code_emit(code, a64_ldr_imm(R3, R2, 8, true));
-    code_emit(code, a64_add_reg(9, R0, R0));
-    code_emit(code, a64_add_reg(9, 9, 9));
-    code_emit(code, a64_add_reg(9, 9, 9));
-    code_emit(code, a64_add_reg(9, 9, 9));
+    codegen_mul_u64_by_24(code, 9, R0);
     codegen_copy_bytes(code, R3, 9, 6);
     code_emit(code, a64_str_imm(7, R2, 8, true));
     code_emit(code, a64_b(store_label - code->count));
@@ -9184,6 +9594,142 @@ static void codegen_seq_opaque_remove(Code *code, BodyIR *body, int32_t seq_slot
     code_emit(code, a64_str_imm(R0, R2, 0, false));
 }
 
+static void codegen_seq_set_len(Code *code, BodyIR *body, int32_t seq_slot,
+                                int32_t len_slot, int32_t element_size) {
+    if (element_size <= 0) die("seq setLen element size must be positive");
+    int32_t seq_kind = body->slot_kind[seq_slot];
+    if (seq_kind == SLOT_SEQ_STR || seq_kind == SLOT_SEQ_STR_REF) {
+        codegen_seq_str_header_addr(code, body, seq_slot, R2);
+    } else if (seq_kind == SLOT_SEQ_OPAQUE || seq_kind == SLOT_SEQ_OPAQUE_REF ||
+               seq_kind == SLOT_OBJECT_REF || seq_kind == SLOT_PTR) {
+        codegen_seq_opaque_header_addr(code, body, seq_slot, R2);
+    } else {
+        codegen_seq_header_addr(code, body, seq_slot, R2);
+    }
+    a64_emit_ldr_sp_off(code, R1, body->slot_offset[len_slot], false); /* target */
+    code_emit(code, a64_cmp_imm(R1, 0));
+    int32_t nonneg = code->count;
+    code_emit(code, a64_bcond(0, COND_GE));
+    code_emit(code, a64_movz(R1, 0, 0));
+    a64_patch_bcond(code, nonneg, code->count);
+
+    code_emit(code, a64_ldr_imm(R0, R2, 0, false)); /* old len */
+    code_emit(code, a64_ldr_imm(R3, R2, 4, false)); /* cap */
+    code_emit(code, a64_ldr_imm(4, R2, 8, true));   /* buffer */
+    code_emit(code, a64_cmp_reg(R1, R3));
+    int32_t grow_gt_cap = code->count;
+    code_emit(code, a64_bcond(0, COND_GT));
+    code_emit(code, a64_cmp_imm(R1, 0));
+    int32_t no_grow_zero = code->count;
+    code_emit(code, a64_bcond(0, COND_EQ));
+    code_emit(code, a64_cmp_reg_x(4, 31));
+    int32_t grow_null = code->count;
+    code_emit(code, a64_bcond(0, COND_EQ));
+    int32_t no_grow_jump = code->count;
+    code_emit(code, a64_b(0));
+
+    int32_t grow_label = code->count;
+    a64_patch_bcond(code, grow_gt_cap, grow_label);
+    a64_patch_bcond(code, grow_null, grow_label);
+    code_emit(code, a64_add_imm(5, R1, 0, false)); /* new cap = target */
+    code_emit(code, a64_cmp_imm(5, 4));
+    int32_t cap_ge_min = code->count;
+    code_emit(code, a64_bcond(0, COND_GE));
+    code_emit(code, a64_movz(5, 4, 0));
+    a64_patch_bcond(code, cap_ge_min, code->count);
+    codegen_mov_i32_const(code, 6, element_size);
+    code_emit(code, a64_mul_reg_x(7, 5, 6));       /* bytes */
+    code_emit(code, a64_add_imm(R1, R1, 0, false)); /* keep target live in R1 */
+    code_emit(code, a64_add_imm(9, R0, 0, false));  /* old len */
+    code_emit(code, a64_add_imm(10, 4, 0, true));   /* old buffer */
+    code_emit(code, a64_add_imm(R1, R1, 0, false));
+    code_emit(code, a64_add_imm(R3, 5, 0, false));  /* new cap */
+    code_emit(code, a64_add_imm(11, 7, 0, true));   /* mmap size */
+    code_emit(code, a64_movz_x(R0, 0, 0));
+    code_emit(code, a64_add_imm(R1, 11, 0, true));
+    code_emit(code, a64_movz_x(R2, 3, 0));
+    code_emit(code, a64_movz_x(R3, 0x1002, 0));
+    code_emit(code, a64_movz_x(4, 0, 0));
+    code_emit(code, a64_sub_imm(4, 4, 1, true));
+    code_emit(code, a64_movz_x(5, 0, 0));
+    code_emit(code, a64_movz_x(16, 197, 0));
+    code_emit(code, a64_svc(0x80));
+    code_emit(code, a64_cmp_reg_x(R0, 4));
+    int32_t mmap_ok = code->count;
+    code_emit(code, a64_bcond(0, COND_NE));
+    code_emit(code, a64_brk(142));
+    a64_patch_bcond(code, mmap_ok, code->count);
+    code_emit(code, a64_add_imm(12, R0, 0, true));  /* new buffer */
+
+    if (seq_kind == SLOT_SEQ_STR || seq_kind == SLOT_SEQ_STR_REF) {
+        codegen_seq_str_header_addr(code, body, seq_slot, R2);
+    } else if (seq_kind == SLOT_SEQ_OPAQUE || seq_kind == SLOT_SEQ_OPAQUE_REF ||
+               seq_kind == SLOT_OBJECT_REF || seq_kind == SLOT_PTR) {
+        codegen_seq_opaque_header_addr(code, body, seq_slot, R2);
+    } else {
+        codegen_seq_header_addr(code, body, seq_slot, R2);
+    }
+    code_emit(code, a64_ldr_imm(R0, R2, 0, false)); /* old len */
+    code_emit(code, a64_ldr_imm(10, R2, 8, true));  /* old buffer */
+    codegen_mov_i32_const(code, 6, element_size);
+    code_emit(code, a64_mul_reg(13, R0, 6));        /* bytes to copy */
+    code_emit(code, a64_cmp_reg_x(10, 31));
+    int32_t skip_copy_null = code->count;
+    code_emit(code, a64_bcond(0, COND_EQ));
+    codegen_copy_bytes(code, 10, 13, 12);
+    int32_t after_copy = code->count;
+    a64_patch_bcond(code, skip_copy_null, after_copy);
+    code_emit(code, a64_str_imm(12, R2, 8, true));
+    a64_emit_ldr_sp_off(code, R1, body->slot_offset[len_slot], false);
+    code_emit(code, a64_cmp_imm(R1, 0));
+    int32_t target_nonneg2 = code->count;
+    code_emit(code, a64_bcond(0, COND_GE));
+    code_emit(code, a64_movz(R1, 0, 0));
+    a64_patch_bcond(code, target_nonneg2, code->count);
+    code_emit(code, a64_cmp_imm(R1, 4));
+    int32_t target_ge_min2 = code->count;
+    code_emit(code, a64_bcond(0, COND_GE));
+    code_emit(code, a64_movz(5, 4, 0));
+    int32_t cap_ready_jump2 = code->count;
+    code_emit(code, a64_b(0));
+    int32_t target_cap_label2 = code->count;
+    a64_patch_bcond(code, target_ge_min2, target_cap_label2);
+    code_emit(code, a64_add_imm(5, R1, 0, false));
+    a64_patch_b(code, cap_ready_jump2, code->count);
+    code_emit(code, a64_str_imm(5, R2, 4, false));
+
+    int32_t no_grow_label = code->count;
+    a64_patch_b(code, no_grow_jump, no_grow_label);
+    a64_patch_bcond(code, no_grow_zero, no_grow_label);
+    code_emit(code, a64_ldr_imm(R0, R2, 0, false)); /* old len */
+    code_emit(code, a64_ldr_imm(4, R2, 8, true));   /* buffer */
+    a64_emit_ldr_sp_off(code, R1, body->slot_offset[len_slot], false);
+    code_emit(code, a64_cmp_imm(R1, 0));
+    int32_t final_nonneg = code->count;
+    code_emit(code, a64_bcond(0, COND_GE));
+    code_emit(code, a64_movz(R1, 0, 0));
+    a64_patch_bcond(code, final_nonneg, code->count);
+    code_emit(code, a64_cmp_reg(R1, R0));
+    int32_t zero_tail_skip = code->count;
+    code_emit(code, a64_bcond(0, COND_LE));
+    codegen_mov_i32_const(code, 6, element_size);
+    code_emit(code, a64_mul_reg(7, R0, 6));
+    code_emit(code, a64_mul_reg(8, R1, 6));
+    code_emit(code, a64_add_reg_x(9, 4, 7));
+    code_emit(code, a64_sub_reg(10, 8, 7));
+    int32_t zero_loop = code->count;
+    code_emit(code, a64_cmp_imm(10, 0));
+    int32_t zero_done = code->count;
+    code_emit(code, a64_bcond(0, COND_LE));
+    code_emit(code, a64_strb_imm(31, 9, 0));
+    code_emit(code, a64_add_imm(9, 9, 1, true));
+    code_emit(code, a64_sub_imm(10, 10, 1, false));
+    code_emit(code, a64_b(zero_loop - code->count));
+    a64_patch_bcond(code, zero_done, code->count);
+    a64_patch_bcond(code, zero_tail_skip, code->count);
+    code_emit(code, a64_str_imm(R1, R2, 0, false));
+}
+
 /* No-alias register cache.
  * For no_alias slots (scalar locals), the value lives on the stack but is
  * also cached in a register.  Since no_alias slots never alias each other,
@@ -9223,9 +9769,16 @@ static void na_clobber(int r) {
     if (r >= 0 && r < NA_CACHE_SIZE) na_reg_slot[r] = -1;
 }
 
+static bool codegen_slot_is_uint8_fixed_array(BodyIR *body, int32_t slot) {
+    if (!body || slot < 0 || slot >= body->slot_count) return false;
+    Span type = span_trim(body->slot_type[slot]);
+    return cold_span_starts_with(type, "uint8[") && !span_eq(type, "uint8[]");
+}
+
 static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
                        FunctionPatchList *function_patches, int32_t op) {
     int32_t kind = body->op_kind[op];
+    if (kind == BODY_OP_NOP) return;
     int32_t dst = body->op_dst[op];
     int32_t a = body->op_a[op];
     int32_t b = body->op_b[op];
@@ -9263,6 +9816,8 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
     } else if (kind == BODY_OP_COPY_I64) {
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], true);
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], true);
+    } else if (kind == BODY_OP_SELECT) {
+        codegen_select_slot(code, body, dst, a, b, c);
     } else if (kind == BODY_OP_I64_FROM_I32) {
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
         code_emit(code, a64_sxtw(R0, R0));
@@ -10059,6 +10614,10 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
             a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
         } else {
             FnDef *fn = &symbols->functions[a];
+            if (cold_fn_is_puts(fn) && fn->arity == 1) {
+                codegen_puts_cstring_intrinsic(code, body, dst, body->call_arg_slot[b]);
+                return;
+            }
             int32_t stack_bytes = codegen_load_call_args(code, body, fn, b);
             int32_t call_pos = code->count;
             code_emit(code, a64_bl(0));
@@ -10184,7 +10743,11 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         code_emit(code, a64_bcond(2, COND_LT));
         code_emit(code, a64_brk(2));
         a64_emit_add_large(code, R0, SP, body->slot_offset[a], true);
-        code_emit(code, a64_ldr_w_reg_uxtw2(R0, R0, R1));
+        if (codegen_slot_is_uint8_fixed_array(body, a)) {
+            code_emit(code, a64_ldrb_reg(R0, R0, R1));
+        } else {
+            code_emit(code, a64_ldr_w_reg_uxtw2(R0, R0, R1));
+        }
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
     } else if (kind == BODY_OP_SEQ_I32_INDEX_DYNAMIC) {
         int32_t arr_kind = body->slot_kind[a];
@@ -10233,10 +10796,16 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         code_emit(code, a64_brk(2));
         a64_emit_ldr_sp_off(code, R2, body->slot_offset[dst], false);
         if (base_kind == SLOT_OBJECT_REF) {
-            code_emit(code, a64_str_w_reg_uxtw2(R2, R0, R1));
+            if (codegen_slot_is_uint8_fixed_array(body, a))
+                code_emit(code, a64_strb_reg(R2, R0, R1));
+            else
+                code_emit(code, a64_str_w_reg_uxtw2(R2, R0, R1));
         } else {
             a64_emit_add_large(code, R0, SP, body->slot_offset[a], true);
-            code_emit(code, a64_str_w_reg_uxtw2(R2, R0, R1));
+            if (codegen_slot_is_uint8_fixed_array(body, a))
+                code_emit(code, a64_strb_reg(R2, R0, R1));
+            else
+                code_emit(code, a64_str_w_reg_uxtw2(R2, R0, R1));
         }
     } else if (kind == BODY_OP_SEQ_I32_INDEX_STORE) {
         int32_t base_kind = body->slot_kind[a];
@@ -10279,6 +10848,8 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         codegen_seq_opaque_add(code, body, dst, a, b);
     } else if (kind == BODY_OP_SEQ_OPAQUE_REMOVE) {
         codegen_seq_opaque_remove(code, body, dst, a, b);
+    } else if (kind == BODY_OP_SEQ_SET_LEN) {
+        codegen_seq_set_len(code, body, dst, a, c);
     } else if (kind == BODY_OP_CALL_COMPOSITE) {
         if (a >= symbols->function_count) {
             char tmp[64];
@@ -10472,6 +11043,17 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         code_emit(code, a64_movz(R0, 0, 0));
         code->words[skip_fail] = a64_b(code->count - skip_fail);
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
+    } else if (kind == BODY_OP_ATOMIC_ADD_I32) {
+        a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], true);
+        a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], false);
+        int32_t retry = code->count;
+        code_emit(code, a64_ldaxr_w(R2, R0));
+        code_emit(code, a64_add_reg(R3, R2, R1));
+        code_emit(code, a64_stlxr_w(R4, R3, R0));
+        code_emit(code, a64_cbnz(R4, 0));
+        int32_t cbnz_pos = code->count - 1;
+        code->words[cbnz_pos] = a64_cbnz(R4, retry - cbnz_pos);
+        a64_emit_str_sp_off(code, R3, body->slot_offset[dst], false);
     } else if (kind == BODY_OP_MMAP) {
         /* mmap(addr, len, prot, flags) → ptr (dst)
            uses codegen_mmap_len_reg internally */
@@ -10565,9 +11147,10 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         code_emit(code, a64_cmp_imm(R1, 0));
         int32_t bytes_done = code->count;
         code_emit(code, a64_bcond(0, COND_LE));
+        a64_emit_str_sp_off(code, R1, body->slot_offset[dst] + 8, false);
         codegen_mmap_len_reg(code, R1, R3, 57);
         a64_emit_str_sp_off(code, R3, body->slot_offset[dst] + 0, true);
-        a64_emit_str_sp_off(code, R1, body->slot_offset[dst] + 8, false);
+        a64_emit_ldr_sp_off(code, R1, body->slot_offset[dst] + 8, false);
         code_emit(code, a64_movz(R6, 0, 0));
         int32_t zero_loop = code->count;
         code_emit(code, a64_cmp_imm(R1, 0));
@@ -10579,6 +11162,52 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         code_emit(code, a64_b(zero_loop - code->count));
         a64_patch_bcond(code, zero_done, code->count);
         a64_patch_bcond(code, bytes_done, code->count);
+    } else if (kind == BODY_OP_BYTES_TO_HEX) {
+        codegen_bytes_to_hex(code, body, dst, a);
+    } else if (kind == BODY_OP_BYTES_GET) {
+        code_emit(code, a64_movz(R0, 0, 0));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
+        codegen_load_bytes_pair(code, body, a, R3, R4);
+        code_emit(code, a64_cmp_reg_x(R3, 31));
+        int32_t null_done = code->count;
+        code_emit(code, a64_bcond(0, COND_EQ));
+        a64_emit_ldr_sp_off(code, R5, body->slot_offset[b], false);
+        code_emit(code, a64_cmp_imm(R5, 0));
+        int32_t neg_done = code->count;
+        code_emit(code, a64_bcond(0, COND_LT));
+        code_emit(code, a64_cmp_reg(R5, R4));
+        int32_t high_done = code->count;
+        code_emit(code, a64_bcond(0, COND_GE));
+        code_emit(code, a64_sxtw(R5, R5));
+        code_emit(code, a64_add_reg_x(R6, R3, R5));
+        code_emit(code, a64_ldrb_imm(R0, R6, 0));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
+        int32_t done = code->count;
+        a64_patch_bcond(code, null_done, done);
+        a64_patch_bcond(code, neg_done, done);
+        a64_patch_bcond(code, high_done, done);
+    } else if (kind == BODY_OP_BYTES_SET) {
+        code_emit(code, a64_movz(R0, 0, 0));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
+        codegen_load_bytes_pair(code, body, a, R3, R4);
+        code_emit(code, a64_cmp_reg_x(R3, 31));
+        int32_t null_done = code->count;
+        code_emit(code, a64_bcond(0, COND_EQ));
+        a64_emit_ldr_sp_off(code, R5, body->slot_offset[b], false);
+        code_emit(code, a64_cmp_imm(R5, 0));
+        int32_t neg_done = code->count;
+        code_emit(code, a64_bcond(0, COND_LT));
+        code_emit(code, a64_cmp_reg(R5, R4));
+        int32_t high_done = code->count;
+        code_emit(code, a64_bcond(0, COND_GE));
+        code_emit(code, a64_sxtw(R5, R5));
+        code_emit(code, a64_add_reg_x(R6, R3, R5));
+        a64_emit_ldr_sp_off(code, R7, body->slot_offset[c], false);
+        code_emit(code, a64_strb_imm(R7, R6, 0));
+        int32_t done = code->count;
+        a64_patch_bcond(code, null_done, done);
+        a64_patch_bcond(code, neg_done, done);
+        a64_patch_bcond(code, high_done, done);
     } else if (kind == BODY_OP_WRITE_RAW) {
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
         a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], true);
@@ -10773,7 +11402,8 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
         if (body->slot_no_alias && body->slot_no_alias[dst]) na_set(0, dst);
     } else {
-        ; /* unknown op: skip silently */
+        fprintf(stderr, "cheng_cold: unsupported AArch64 BodyIR op kind=%d\n", kind);
+        die("unsupported AArch64 BodyIR op");
     }
 }
 
@@ -10782,6 +11412,7 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
 static void x64_codegen_op(X64Code *x, BodyIR *body, Symbols *symbols,
                            FunctionPatchList *patches, int32_t op) {
     int32_t kind = body->op_kind[op];
+    if (kind == BODY_OP_NOP) return;
     int32_t dst = body->op_dst[op];
     int32_t a = body->op_a[op];
     int32_t b = body->op_b[op];
@@ -11203,6 +11834,8 @@ static void x64_codegen_op(X64Code *x, BodyIR *body, Symbols *symbols,
         x64_setcc_r8(x, CC_E, 0);
         x64_movzb_r8_r32(x, 0, 0);
         x64_mov_mr32_r32(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_ATOMIC_ADD_I32) {
+        die("atomicAddI32 x64 codegen not implemented");
     /* Syscall-based ops (macOS x86_64: syscall in RAX, args RDI/RSI/RDX/R10/R8/R9) */
     } else if (kind == BODY_OP_EXIT) {
         x64_mov_r32_mr32(x, 0, 4, body->slot_offset[a]);
@@ -11257,7 +11890,7 @@ static void x64_codegen_op(X64Code *x, BodyIR *body, Symbols *symbols,
         x64_mov_r32_mr32(x, 0, 4, body->slot_offset[a]);
         x64_cmp_r32_imm8(x, 0, (int8_t)b);
         x64_int3(x); /* trap on mismatch */
-    /* Remaining: empty stubs */
+    /* Remaining target-specific ops are not implemented for x86_64. */
     } else if (kind == BODY_OP_MAKE_SEQ_I32 ||
                kind == BODY_OP_MMAP ||
                kind == BODY_OP_TIME_NS || kind == BODY_OP_GETRUSAGE ||
@@ -11272,9 +11905,11 @@ static void x64_codegen_op(X64Code *x, BodyIR *body, Symbols *symbols,
                kind == BODY_OP_MKDIR_ONE || kind == BODY_OP_TEXT_CONTAINS ||
                kind == BODY_OP_EXEC_SHELL || kind == BODY_OP_ARGV_STR ||
                kind == BODY_OP_STR_SELECT_NONEMPTY || kind == BODY_OP_ASSERT) {
-        /* File/OS/shell ops: emit empty result */
-        x64_mov_r32_imm32(x, 0, 0);
-        x64_mov_mr32_r32(x, 4, off_dst, 0);
+        fprintf(stderr, "cheng_cold: unsupported x86_64 BodyIR op kind=%d\n", kind);
+        die("unsupported x86_64 BodyIR op");
+    } else {
+        fprintf(stderr, "cheng_cold: unknown x86_64 BodyIR op kind=%d\n", kind);
+        die("unknown x86_64 BodyIR op");
     }
 }
 
@@ -11321,7 +11956,9 @@ static void x64_codegen_func(X64Code *x, BodyIR *body, Symbols *symbols,
 
 static void rv64_codegen_op(Code *code, BodyIR *body, Symbols *symbols,
                             FunctionPatchList *patches, int32_t op) {
-    int32_t kind = body->op_kind[op], dst = body->op_dst[op];
+    int32_t kind = body->op_kind[op];
+    if (kind == BODY_OP_NOP) return;
+    int32_t dst = body->op_dst[op];
     int32_t a = body->op_a[op], b = body->op_b[op], c = body->op_c[op];
     int32_t off_dst = body->slot_offset[dst];
     /* I32 ops */
@@ -11691,6 +12328,8 @@ static void rv64_codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         code_emit(code, rv_bne(RV_T3, RV_ZERO, (int16_t)(retry - code->count)));
         code_emit(code, rv_sltiu(RV_T0, RV_T3, 1)); /* success=1 if SC succeeded */
         code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_ATOMIC_ADD_I32) {
+        die("atomicAddI32 RV64 codegen not implemented");
     /* Syscall / OS */
     } else if (kind == BODY_OP_EXIT) {
         code_emit(code, rv_lw(RV_A0, RV_SP, (int16_t)body->slot_offset[a]));
@@ -11712,7 +12351,7 @@ static void rv64_codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         rv_li(code->words, &code->count, RV_T1, (int32_t)b);
         code_emit(code, rv_bne(RV_T0, RV_T1, 0)); /* patched to after ebreak */
         code_emit(code, rv_ebreak());
-    /* Remaining complex ops: emit zero/empty result */
+    /* Remaining complex ops are not implemented for RV64. */
     } else if (kind == BODY_OP_STR_EQ || kind == BODY_OP_STR_CONCAT ||
                kind == BODY_OP_I32_TO_STR || kind == BODY_OP_I64_TO_STR ||
                kind == BODY_OP_STR_INDEX || kind == BODY_OP_STR_JOIN ||
@@ -11741,7 +12380,11 @@ static void rv64_codegen_op(Code *code, BodyIR *body, Symbols *symbols,
                kind == BODY_OP_SEQ_OPAQUE_ADD ||
                kind == BODY_OP_SEQ_OPAQUE_INDEX_STORE ||
                kind == BODY_OP_SEQ_OPAQUE_REMOVE) {
-        code_emit(code, rv_sw(RV_ZERO, RV_SP, (int16_t)off_dst));
+        fprintf(stderr, "cheng_cold: unsupported RV64 BodyIR op kind=%d\n", kind);
+        die("unsupported RV64 BodyIR op");
+    } else {
+        fprintf(stderr, "cheng_cold: unknown RV64 BodyIR op kind=%d\n", kind);
+        die("unknown RV64 BodyIR op");
     }
 }
 
@@ -11829,10 +12472,12 @@ static bool cold_op_has_side_effect(int32_t kind) {
         case BODY_OP_SEQ_I32_INDEX_STORE:
         case BODY_OP_SEQ_OPAQUE_INDEX_STORE:
         case BODY_OP_ATOMIC_STORE_I32:
+        case BODY_OP_ATOMIC_ADD_I32:
         case BODY_OP_PTR_STORE_I32:
         case BODY_OP_PTR_STORE_I64:
         case BODY_OP_SLOT_STORE_I32:
         case BODY_OP_SLOT_STORE_I64:
+        case BODY_OP_SEQ_SET_LEN:
         /* Control flow / debug */
         case BODY_OP_EXIT:
         case BODY_OP_ASSERT:
@@ -11848,6 +12493,7 @@ static bool cold_op_has_side_effect(int32_t kind) {
         case BODY_OP_COPY_RAW:
         case BODY_OP_SET_RAW:
         case BODY_OP_BYTES_ALLOC:
+        case BODY_OP_BYTES_SET:
         case BODY_OP_MKDIR_ONE:
         case BODY_OP_OPEN:
         case BODY_OP_READ:
@@ -11873,6 +12519,8 @@ static bool cold_op_reads_c_slot(int32_t kind) {
         case BODY_OP_PATH_WRITE_BYTES:
         case BODY_OP_COPY_RAW:
         case BODY_OP_SET_RAW:
+        case BODY_OP_BYTES_SET:
+        case BODY_OP_SELECT:
             return true;
         default:
             return false;
@@ -11896,6 +12544,7 @@ static bool cold_op_reads_dst_slot(int32_t kind) {
         case BODY_OP_SEQ_STR_ADD:
         case BODY_OP_SEQ_OPAQUE_ADD:
         case BODY_OP_SEQ_OPAQUE_REMOVE:
+        case BODY_OP_SEQ_SET_LEN:
         case BODY_OP_TEXT_SET_INSERT:
             return true;
         default:
@@ -12294,6 +12943,7 @@ static void cold_optimize_body(BodyIR *body, bool enable_licm) {
             int32_t ext_reads = read_count[dst];
             if (a == dst) ext_reads--;
             if (b == dst) ext_reads--;
+            if (cold_op_reads_c_slot(kind) && c == dst) ext_reads--;
 
             if (ext_reads <= 0 && !cold_op_has_side_effect(kind)) {
                 /* Dead store: remove this op */
@@ -13392,6 +14042,8 @@ typedef struct ColdCompileStats {
     int32_t facts_function_count;
     int32_t facts_word_count;
     int32_t facts_reloc_count;
+    int32_t facts_data_count;
+    int32_t facts_data_reloc_count;
     int32_t canonical_hash_count;
     int32_t canonical_normalized_count;
     int32_t egraph_rewrite_count;
@@ -13572,6 +14224,22 @@ typedef struct ColdCsgV2PrimaryReloc {
     Span target_symbol;
 } ColdCsgV2PrimaryReloc;
 
+typedef struct ColdCsgV2PrimaryData {
+    uint32_t item_id;
+    Span symbol_name;
+    uint32_t align;
+    const uint8_t *bytes;
+    int32_t byte_count;
+} ColdCsgV2PrimaryData;
+
+typedef struct ColdCsgV2PrimaryDataReloc {
+    uint32_t source_item_id;
+    int32_t word_offset;
+    uint32_t reloc_kind;
+    int32_t addend;
+    Span target_symbol;
+} ColdCsgV2PrimaryDataReloc;
+
 typedef struct ColdCsgV2PrimaryObject {
     Span target_triple;
     Span object_format;
@@ -13582,6 +14250,10 @@ typedef struct ColdCsgV2PrimaryObject {
     int32_t word_count;
     ColdCsgV2PrimaryReloc *relocs;
     int32_t reloc_count;
+    ColdCsgV2PrimaryData *data;
+    int32_t data_count;
+    ColdCsgV2PrimaryDataReloc *data_relocs;
+    int32_t data_reloc_count;
 } ColdCsgV2PrimaryObject;
 
 typedef struct ColdCsgV2TextRecord {
@@ -13691,7 +14363,9 @@ static bool cold_csg_v2_next_text_record(Span text,
 static bool cold_csg_v2_count_primary_records(Span text,
                                               int32_t *out_functions,
                                               int32_t *out_words,
-                                              int32_t *out_relocs) {
+                                              int32_t *out_relocs,
+                                              int32_t *out_data,
+                                              int32_t *out_data_relocs) {
     static const char magic[] = "CHENG_CSG_V2\n";
     int32_t magic_len = (int32_t)sizeof(magic) - 1;
     if (text.len < magic_len || memcmp(text.ptr, magic, (size_t)magic_len) != 0) return false;
@@ -13701,6 +14375,8 @@ static bool cold_csg_v2_count_primary_records(Span text,
     int32_t functions = 0;
     int32_t words = 0;
     int32_t relocs = 0;
+    int32_t data = 0;
+    int32_t data_relocs = 0;
     int32_t pos = magic_len;
     while (pos < text.len) {
         ColdCsgV2TextRecord record;
@@ -13730,6 +14406,14 @@ static bool cold_csg_v2_count_primary_records(Span text,
                 if (relocs == INT32_MAX) return false;
                 relocs++;
                 break;
+            case 7:
+                if (data == INT32_MAX) return false;
+                data++;
+                break;
+            case 8:
+                if (data_relocs == INT32_MAX) return false;
+                data_relocs++;
+                break;
             default:
                 return false;
         }
@@ -13739,6 +14423,8 @@ static bool cold_csg_v2_count_primary_records(Span text,
     *out_functions = functions;
     *out_words = words;
     *out_relocs = relocs;
+    if (out_data) *out_data = data;
+    if (out_data_relocs) *out_data_relocs = data_relocs;
     return true;
 }
 
@@ -13754,6 +14440,18 @@ static int32_t cold_csg_v2_find_symbol(const ColdCsgV2PrimaryObject *facts, Span
         if (span_same(facts->functions[i].symbol_name, symbol)) return i;
     }
     return -1;
+}
+
+static int32_t cold_csg_v2_find_data_symbol(const ColdCsgV2PrimaryObject *facts, Span symbol) {
+    for (int32_t i = 0; i < facts->data_count; i++) {
+        if (span_same(facts->data[i].symbol_name, symbol)) return i;
+    }
+    return -1;
+}
+
+static bool cold_csg_v2_has_defined_symbol(const ColdCsgV2PrimaryObject *facts, Span symbol) {
+    return cold_csg_v2_find_symbol(facts, symbol) >= 0 ||
+           cold_csg_v2_find_data_symbol(facts, symbol) >= 0;
 }
 
 static const char *cold_csg_v2_object_format_for_target(const char *target) {
@@ -13799,7 +14497,37 @@ static bool cold_csg_v2_validate_primary_object(ColdCsgV2PrimaryObject *facts,
         if (source_index < 0) return false;
         ColdCsgV2PrimaryFunction *source_fn = &facts->functions[source_index];
         if (reloc->word_offset < source_fn->word_offset) return false;
-        if (reloc->word_offset >= source_fn->word_offset + source_fn->word_count) return false;
+            if (reloc->word_offset >= source_fn->word_offset + source_fn->word_count) return false;
+    }
+    for (int32_t i = 0; i < facts->data_count; i++) {
+        ColdCsgV2PrimaryData *data = &facts->data[i];
+        if (data->symbol_name.len <= 0) return false;
+        if (data->byte_count <= 0 || !data->bytes) return false;
+        if (data->align != 1 && data->align != 2 && data->align != 4 &&
+            data->align != 8 && data->align != 16) return false;
+        for (int32_t j = i + 1; j < facts->data_count; j++) {
+            if (facts->data[j].item_id == data->item_id) return false;
+            if (span_same(facts->data[j].symbol_name, data->symbol_name)) return false;
+        }
+        if (cold_csg_v2_find_symbol(facts, data->symbol_name) >= 0) return false;
+    }
+    for (int32_t i = 0; i < facts->data_reloc_count; i++) {
+        ColdCsgV2PrimaryDataReloc *reloc = &facts->data_relocs[i];
+        if (reloc->target_symbol.len <= 0) return false;
+        if (reloc->reloc_kind != 1 || reloc->addend != 0) return false;
+        if (!cold_csg_v2_has_defined_symbol(facts, reloc->target_symbol)) return false;
+        int32_t source_index = cold_csg_v2_find_item(facts, reloc->source_item_id);
+        if (source_index < 0) return false;
+        ColdCsgV2PrimaryFunction *source_fn = &facts->functions[source_index];
+        if (reloc->word_offset < source_fn->word_offset) return false;
+        if (reloc->word_offset + 1 >= source_fn->word_offset + source_fn->word_count) return false;
+        uint32_t adrp = facts->words[reloc->word_offset];
+        uint32_t add = facts->words[reloc->word_offset + 1];
+        if ((adrp & 0x9F000000u) != 0x90000000u) return false;
+        if ((add & 0xFFC00000u) != 0x91000000u) return false;
+        uint32_t reg = adrp & 31u;
+        if (reg == 31u) return false;
+        if ((add & 31u) != reg || ((add >> 5) & 31u) != reg) return false;
     }
     return true;
 }
@@ -13809,6 +14537,8 @@ static bool cold_csg_v2_decode_primary_object(Span text,
                                               int32_t function_count,
                                               int32_t word_count,
                                               int32_t reloc_count,
+                                              int32_t data_count,
+                                              int32_t data_reloc_count,
                                               const char *target,
                                               ColdCsgV2PrimaryObject *out) {
     static const char magic[] = "CHENG_CSG_V2\n";
@@ -13817,12 +14547,20 @@ static bool cold_csg_v2_decode_primary_object(Span text,
     out->function_count = function_count;
     out->word_count = word_count;
     out->reloc_count = reloc_count;
+    out->data_count = data_count;
+    out->data_reloc_count = data_reloc_count;
     out->functions = arena_alloc(arena, (size_t)function_count * sizeof(ColdCsgV2PrimaryFunction));
     out->words = word_count > 0
         ? arena_alloc(arena, (size_t)word_count * sizeof(uint32_t))
         : 0;
     out->relocs = reloc_count > 0
         ? arena_alloc(arena, (size_t)reloc_count * sizeof(ColdCsgV2PrimaryReloc))
+        : 0;
+    out->data = data_count > 0
+        ? arena_alloc(arena, (size_t)data_count * sizeof(ColdCsgV2PrimaryData))
+        : 0;
+    out->data_relocs = data_reloc_count > 0
+        ? arena_alloc(arena, (size_t)data_reloc_count * sizeof(ColdCsgV2PrimaryDataReloc))
         : 0;
 
     bool saw_target = false;
@@ -13831,6 +14569,8 @@ static bool cold_csg_v2_decode_primary_object(Span text,
     int32_t fn_index = 0;
     int32_t word_index = 0;
     int32_t reloc_index = 0;
+    int32_t data_index = 0;
+    int32_t data_reloc_index = 0;
     int32_t pos = magic_len;
     while (pos < text.len) {
         ColdCsgV2TextRecord record;
@@ -13907,12 +14647,68 @@ static bool cold_csg_v2_decode_primary_object(Span text,
                 if (payload_pos != record.payload_bytes) return false;
                 break;
             }
+            case 7: {
+                if (data_index >= data_count) return false;
+                uint32_t item_id, align, byte_count;
+                if (!cold_csg_v2_read_payload_u32le(record.payload_hex, record.payload_bytes,
+                                                    &payload_pos, &item_id)) return false;
+                ColdCsgV2PrimaryData *data = &out->data[data_index++];
+                data->item_id = item_id;
+                if (!cold_csg_v2_read_payload_string(record.payload_hex, record.payload_bytes,
+                                                     &payload_pos, arena, &data->symbol_name)) return false;
+                if (!cold_csg_v2_read_payload_u32le(record.payload_hex, record.payload_bytes,
+                                                    &payload_pos, &align)) return false;
+                if (!cold_csg_v2_read_payload_u32le(record.payload_hex, record.payload_bytes,
+                                                    &payload_pos, &byte_count)) return false;
+                if (align != 1 && align != 2 && align != 4 && align != 8 && align != 16) return false;
+                if (byte_count > (uint32_t)INT32_MAX) return false;
+                if (record.payload_bytes - payload_pos != (int32_t)byte_count) return false;
+                uint8_t *bytes = arena_alloc(arena, byte_count > 0 ? (size_t)byte_count : 1u);
+                for (uint32_t bi = 0; bi < byte_count; bi++) {
+                    uint8_t byte = 0;
+                    if (!cold_csg_v2_hex_byte(record.payload_hex, record.payload_bytes,
+                                              payload_pos + (int32_t)bi, &byte)) return false;
+                    bytes[bi] = byte;
+                }
+                payload_pos += (int32_t)byte_count;
+                data->align = align;
+                data->byte_count = (int32_t)byte_count;
+                data->bytes = bytes;
+                if (payload_pos != record.payload_bytes) return false;
+                break;
+            }
+            case 8: {
+                if (data_reloc_index >= data_reloc_count) return false;
+                uint32_t source_item_id, word_offset, reloc_kind, addend;
+                if (!cold_csg_v2_read_payload_u32le(record.payload_hex, record.payload_bytes,
+                                                    &payload_pos, &source_item_id)) return false;
+                if (!cold_csg_v2_read_payload_u32le(record.payload_hex, record.payload_bytes,
+                                                    &payload_pos, &word_offset)) return false;
+                if (!cold_csg_v2_read_payload_u32le(record.payload_hex, record.payload_bytes,
+                                                    &payload_pos, &reloc_kind)) return false;
+                if (!cold_csg_v2_read_payload_u32le(record.payload_hex, record.payload_bytes,
+                                                    &payload_pos, &addend)) return false;
+                if (source_item_id > (uint32_t)INT32_MAX ||
+                    word_offset > (uint32_t)INT32_MAX ||
+                    addend > (uint32_t)INT32_MAX) return false;
+                ColdCsgV2PrimaryDataReloc *reloc = &out->data_relocs[data_reloc_index++];
+                reloc->source_item_id = source_item_id;
+                reloc->word_offset = (int32_t)word_offset;
+                reloc->reloc_kind = reloc_kind;
+                reloc->addend = (int32_t)addend;
+                if (!cold_csg_v2_read_payload_string(record.payload_hex, record.payload_bytes,
+                                                     &payload_pos, arena, &reloc->target_symbol)) return false;
+                if (payload_pos != record.payload_bytes) return false;
+                break;
+            }
             default:
                 return false;
         }
     }
     if (!saw_target || !saw_format || !saw_entry) return false;
-    if (fn_index != function_count || word_index != word_count || reloc_index != reloc_count) return false;
+    if (fn_index != function_count || word_index != word_count ||
+        reloc_index != reloc_count || data_index != data_count ||
+        data_reloc_index != data_reloc_count) return false;
     return cold_csg_v2_validate_primary_object(out, target);
 }
 
@@ -13944,6 +14740,15 @@ static int32_t cold_csg_v2_symbol_index_for_reloc(ColdCsgV2PrimaryObject *facts,
     return index;
 }
 
+static int32_t cold_csg_v2_name_index(const char **names, int32_t name_count, Span target) {
+    for (int32_t i = 0; i < name_count; i++) {
+        if (!names[i]) continue;
+        int32_t len = (int32_t)strlen(names[i]);
+        if (len == target.len && memcmp(names[i], target.ptr, (size_t)target.len) == 0) return i;
+    }
+    return -1;
+}
+
 static bool cold_csg_v2_emit_primary_object(const char *out_path,
                                             const char *target,
                                             ColdCsgV2PrimaryObject *facts,
@@ -13968,6 +14773,105 @@ static bool cold_csg_v2_emit_primary_object(const char *out_path,
         if (strstr(target, "aarch64")) coff_machine = IMAGE_FILE_MACHINE_ARM64;
         else if (strstr(target, "x86_64")) coff_machine = IMAGE_FILE_MACHINE_AMD64;
         else return false;
+    }
+
+    if (facts->data_count > 0 || facts->data_reloc_count > 0) {
+        if (!is_macho) return false;
+        if (facts->data_count <= 0) return false;
+        int32_t max_names = facts->function_count + facts->data_count +
+                            facts->reloc_count + facts->data_reloc_count;
+        if (max_names <= 0) return false;
+        const char **names = arena_alloc(arena, (size_t)max_names * sizeof(const char *));
+        uint64_t *symbol_values = arena_alloc(arena, (size_t)max_names * sizeof(uint64_t));
+        uint8_t *symbol_sections = arena_alloc(arena, (size_t)max_names * sizeof(uint8_t));
+        int32_t name_count = 0;
+        for (int32_t i = 0; i < facts->function_count; i++) {
+            names[name_count] = cold_span_to_cstr(arena, facts->functions[i].symbol_name);
+            symbol_values[name_count] = (uint64_t)(facts->functions[i].word_offset * 4);
+            symbol_sections[name_count] = 1;
+            name_count++;
+        }
+
+        int32_t *data_offsets = arena_alloc(arena, (size_t)facts->data_count * sizeof(int32_t));
+        int32_t data_size = 0;
+        for (int32_t i = 0; i < facts->data_count; i++) {
+            int32_t align = (int32_t)facts->data[i].align;
+            data_size = macho_align_i32(data_size, align);
+            data_offsets[i] = data_size;
+            if (facts->data[i].byte_count < 0 ||
+                data_size > INT32_MAX - facts->data[i].byte_count) return false;
+            data_size += facts->data[i].byte_count;
+        }
+        if (data_size <= 0) return false;
+        uint8_t *data = arena_alloc(arena, (size_t)data_size);
+        memset(data, 0, (size_t)data_size);
+        for (int32_t i = 0; i < facts->data_count; i++) {
+            memcpy(data + data_offsets[i], facts->data[i].bytes, (size_t)facts->data[i].byte_count);
+        }
+
+        int32_t data_addr = macho_align_i32(facts->word_count * 4, 8);
+        for (int32_t i = 0; i < facts->data_count; i++) {
+            names[name_count] = cold_span_to_cstr(arena, facts->data[i].symbol_name);
+            symbol_values[name_count] = (uint64_t)(data_addr + data_offsets[i]);
+            symbol_sections[name_count] = 2;
+            name_count++;
+        }
+
+        int32_t total_relocs = facts->reloc_count + facts->data_reloc_count * 2;
+        int32_t *reloc_offsets = total_relocs > 0
+            ? arena_alloc(arena, (size_t)total_relocs * sizeof(int32_t))
+            : 0;
+        int32_t *reloc_symbols = total_relocs > 0
+            ? arena_alloc(arena, (size_t)total_relocs * sizeof(int32_t))
+            : 0;
+        uint8_t *reloc_types = total_relocs > 0
+            ? arena_alloc(arena, (size_t)total_relocs * sizeof(uint8_t))
+            : 0;
+        uint8_t *reloc_pcrel = total_relocs > 0
+            ? arena_alloc(arena, (size_t)total_relocs * sizeof(uint8_t))
+            : 0;
+        int32_t reloc_index = 0;
+        for (int32_t i = 0; i < facts->reloc_count; i++) {
+            if (facts->relocs[i].word_offset > INT32_MAX / 4) return false;
+            int32_t sym = cold_csg_v2_name_index(names, name_count, facts->relocs[i].target_symbol);
+            if (sym < 0) {
+                if (name_count >= max_names) return false;
+                sym = name_count;
+                names[name_count] = cold_span_to_cstr(arena, facts->relocs[i].target_symbol);
+                symbol_values[name_count] = 0;
+                symbol_sections[name_count] = 0;
+                name_count++;
+            }
+            reloc_offsets[reloc_index] = facts->relocs[i].word_offset * 4;
+            reloc_symbols[reloc_index] = sym;
+            reloc_types[reloc_index] = ARM64_RELOC_BRANCH26;
+            reloc_pcrel[reloc_index] = 1;
+            reloc_index++;
+        }
+        for (int32_t i = 0; i < facts->data_reloc_count; i++) {
+            ColdCsgV2PrimaryDataReloc *dr = &facts->data_relocs[i];
+            if (dr->word_offset > (INT32_MAX / 4) - 1) return false;
+            int32_t sym = cold_csg_v2_name_index(names, name_count, dr->target_symbol);
+            if (sym < 0) return false;
+            reloc_offsets[reloc_index] = dr->word_offset * 4;
+            reloc_symbols[reloc_index] = sym;
+            reloc_types[reloc_index] = ARM64_RELOC_PAGE21;
+            reloc_pcrel[reloc_index] = 1;
+            reloc_index++;
+            reloc_offsets[reloc_index] = (dr->word_offset + 1) * 4;
+            reloc_symbols[reloc_index] = sym;
+            reloc_types[reloc_index] = ARM64_RELOC_PAGEOFF12;
+            reloc_pcrel[reloc_index] = 0;
+            reloc_index++;
+        }
+        if (reloc_index != total_relocs) return false;
+        return macho_write_text_data_object(out_path, facts->words, facts->word_count,
+                                            data, data_size,
+                                            names, symbol_values, symbol_sections,
+                                            name_count, 0,
+                                            reloc_offsets, reloc_symbols,
+                                            reloc_types, reloc_pcrel,
+                                            total_relocs);
     }
 
     int32_t max_names = facts->function_count + facts->reloc_count;
@@ -14030,17 +14934,22 @@ static bool cold_compile_canonical_csg_v2_primary_object(const char *out_path,
     int32_t function_count = 0;
     int32_t word_count = 0;
     int32_t reloc_count = 0;
+    int32_t data_count = 0;
+    int32_t data_reloc_count = 0;
     uint64_t verify_start_us = cold_now_us();
-    if (!cold_csg_v2_count_primary_records(csg_text, &function_count, &word_count, &reloc_count)) {
+    if (!cold_csg_v2_count_primary_records(csg_text, &function_count, &word_count, &reloc_count, &data_count, &data_reloc_count)) {
         return false;
     }
     if (function_count <= 0 || function_count > CSG_V2_BUDGET_MAX_FN_COUNT) return false;
     if (word_count < 0 || word_count > CSG_V2_BUDGET_MAX_OP_COUNT) return false;
     if (reloc_count < 0 || reloc_count > CSG_V2_BUDGET_MAX_OP_COUNT) return false;
+    if (data_count < 0 || data_count > CSG_V2_BUDGET_MAX_OP_COUNT) return false;
+    if (data_reloc_count < 0 || data_reloc_count > CSG_V2_BUDGET_MAX_OP_COUNT) return false;
     uint64_t verify_end_us = cold_now_us();
     ColdCsgV2PrimaryObject facts;
     if (!cold_csg_v2_decode_primary_object(csg_text, arena,
                                            function_count, word_count, reloc_count,
+                                           data_count, data_reloc_count,
                                            target, &facts)) {
         return false;
     }
@@ -14061,6 +14970,8 @@ static bool cold_compile_canonical_csg_v2_primary_object(const char *out_path,
         stats->facts_function_count = facts.function_count;
         stats->facts_word_count = facts.word_count;
         stats->facts_reloc_count = facts.reloc_count;
+        stats->facts_data_count = facts.data_count;
+        stats->facts_data_reloc_count = facts.data_reloc_count;
         stats->parse_us = stats->facts_verify_us + stats->facts_decode_us;
         stats->emit_us = stats->facts_emit_obj_us;
         stats->elapsed_us = stats->facts_total_us;
@@ -15862,27 +16773,22 @@ static int32_t cold_compile_one_import_direct(Symbols *symbols, const char *path
         } else if (span_eq(next, "fn")) {
             int32_t saved_fn_pos = fn_pos;
             fn_pos++;
-            volatile int32_t symbol_index = -1;
-            volatile BodyIR *volatile body = 0;
-            ColdErrorRecoveryEnabled = true;
+            int32_t symbol_index = -1;
+            cold_current_parsing_body = 0;
+            int32_t fn_saved = parser.pos;
+            BodyIR *body = 0;
             if (setjmp(ColdErrorJumpBuf) == 0) {
-                cold_current_parsing_body = 0;
-                body = parse_fn(&parser, (int32_t *)&symbol_index);
-                cold_current_parsing_body = (BodyIR *)body;
+                body = parse_fn(&parser, &symbol_index);
             } else {
-                parser.pos = cold_next_top_level_decl(parser.source, parser.pos);
-                body = 0;
-                symbol_index = -1;
-                /* Mark skipped function as external so CSG v2 emit can produce
-                   relocations referencing it without failing. */
-                if (saved_fn_pos < COLD_IMPORT_FN_MAP_CAP &&
-                    qual_indices[saved_fn_pos] >= 0) {
-                    int32_t qi = qual_indices[saved_fn_pos];
-                    if (qi < symbols->function_count)
-                        symbols->functions[qi].is_external = true;
-                }
+                /* Imported function body parse failed: skip it */
+                parser.pos = fn_saved;
+                parser_line(&parser);
+                fn_pos = saved_fn_pos;
+                if (symbol_index >= 0 && symbol_index < body_cap)
+                    symbols->functions[symbol_index].is_external = true;
+                continue;
             }
-            ColdErrorRecoveryEnabled = false;
+            cold_current_parsing_body = body;
             if (!body) continue;
             /* In import_mode, symbols_find_fn returns -1 (local name doesn't match
                qualified symbol name). Use pre-scanned qual_indices instead. */
@@ -15890,37 +16796,6 @@ static int32_t cold_compile_one_import_direct(Symbols *symbols, const char *path
                 symbol_index = qual_indices[saved_fn_pos];
             }
             if (symbol_index < 0 || symbol_index >= body_cap) continue;
-            /* Selective compilation: skip bodies that cold codegen cannot handle.
-               Two checks:
-               1. Declared return kind must be I32, I64, or void.
-               2. Body must not contain composite return terms (nested
-                  variant/str/object returns inside I32-declared functions). */
-            bool skip_body = false;
-            if (body->return_kind != SLOT_I32 && body->return_kind != SLOT_I64 &&
-                body->return_kind != SLOT_PTR && body->return_kind > 0) {
-                skip_body = true;
-            }
-            if (!skip_body) {
-                /* Scan for composite return values that codegen can't handle
-                   without sret. If any return value is not I32/I64, skip. */
-                for (int32_t ti = 0; ti < body->term_count; ti++) {
-                    if (body->term_kind[ti] == BODY_TERM_RET) {
-                        int32_t vs = body->term_value[ti];
-                        if (vs >= 0 && vs < body->slot_count) {
-                            int32_t vk = body->slot_kind[vs];
-                            if (vk != SLOT_I32 && vk != SLOT_I64 && vk != SLOT_PTR && vk > 0) {
-                                skip_body = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            if (skip_body) {
-                if (symbol_index >= 0 && symbol_index < symbols->function_count)
-                    symbols->functions[symbol_index].is_external = true;
-                continue; /* keep stub */
-            }
             function_bodies[(int32_t)symbol_index] = (BodyIR *)body;
             compiled++;
             /* Map to qualified index if available */
@@ -16034,7 +16909,7 @@ static void cold_collect_import_sources_rec(Symbols *symbols,
             if (strcmp(visited[vi], abs_path) == 0) { seen = true; break; }
         }
         if (seen) continue;
-        if (*visited_count >= 64) die("too many cold transitive import sources");
+        if (*visited_count >= 96) die("too many cold transitive import sources");
         strncpy(visited[*visited_count], abs_path, PATH_MAX - 1);
         visited[*visited_count][PATH_MAX - 1] = 0;
         (*visited_count)++;
@@ -16052,7 +16927,7 @@ static int32_t cold_collect_import_source_closure(Symbols *symbols,
                                                   ColdImportSource *imports,
                                                   int32_t import_cap) {
     int32_t import_count = 0;
-    char visited[64][PATH_MAX];
+    char visited[96][PATH_MAX];
     int32_t visited_count = 0;
     cold_collect_import_sources_rec(symbols, entry_source, imports, import_cap,
                                     &import_count, visited, &visited_count, 0);
@@ -16149,13 +17024,14 @@ static bool cold_import_function_symbol_matches(Symbols *symbols,
                                                 ColdFunctionSymbol *symbol,
                                                 int32_t target_fn) {
     Span names[COLD_MAX_I32_PARAMS];
+    Span types[COLD_MAX_I32_PARAMS];
     int32_t kinds[COLD_MAX_I32_PARAMS];
     int32_t sizes[COLD_MAX_I32_PARAMS];
     Span param_parts[COLD_MAX_I32_PARAMS];
     int32_t text_arity = cold_split_top_level_commas(symbol->params, param_parts,
                                                      COLD_MAX_I32_PARAMS);
     int32_t arity = cold_imported_param_specs(symbols, import_source->alias,
-                                              symbol->params, names, kinds, sizes,
+                                              symbol->params, names, kinds, sizes, types,
                                               COLD_MAX_I32_PARAMS);
     (void)names;
     Span qualified_name = cold_arena_join3(symbols->arena, import_source->alias,
@@ -16167,16 +17043,7 @@ static bool cold_import_function_symbol_matches(Symbols *symbols,
     if (span_same(target->name, qualified_name) && target->arity == arity) return true;
     int32_t resolved = symbols_find_fn(symbols, qualified_name, arity, kinds, sizes,
                                        qualified_ret);
-    if (resolved == target_fn) return true;
-    int32_t same_name_count = 0;
-    int32_t same_name_index = -1;
-    for (int32_t i = 0; i < symbols->function_count; i++) {
-        if (!span_same(symbols->functions[i].name, qualified_name)) continue;
-        same_name_count++;
-        same_name_index = i;
-        if (same_name_count > 1) break;
-    }
-    return same_name_count == 1 && same_name_index == target_fn;
+    return resolved == target_fn;
 }
 
 static void cold_compile_import_function_direct(Symbols *symbols,
@@ -16208,6 +17075,11 @@ static void cold_compile_import_function_direct(Symbols *symbols,
 
     Span source = source_open(import_source->path);
     if (source.len <= 0) die("cold import source open failed");
+    ColdImportSource local_imports[96];
+    int32_t local_import_count = cold_collect_import_source_closure(symbols,
+                                                                    source,
+                                                                    local_imports,
+                                                                    96);
     int32_t pos = 0;
     int32_t line_no = 0;
     bool in_triple = false;
@@ -16254,9 +17126,13 @@ static void cold_compile_import_function_direct(Symbols *symbols,
         }
         Parser parser = {symbol.source_span, 0, symbols->arena, symbols,
                          true /* import_mode */, import_source->alias};
+        parser.import_sources = local_imports;
+        parser.import_source_count = local_import_count;
         int32_t parsed_index = -1;
         BodyIR *body = parse_fn(&parser, &parsed_index);
-        if (!body) die("reachable cold import function parse failed");
+        if (!body) {
+            die("reachable cold import function parse failed");
+        }
         function_bodies[target_fn] = body;
         return;
     }
@@ -16419,16 +17295,17 @@ void cold_compile_reachable_import_bodies(Symbols *symbols,
     if (entry_function < 0 || entry_function >= symbols->function_count) {
         die("cold reachable import entry out of range");
     }
-    int32_t function_count = symbols->function_count;
-    bool *reachable = arena_alloc(symbols->arena, (size_t)function_count * sizeof(bool));
-    int32_t *stack = arena_alloc(symbols->arena, (size_t)function_count * sizeof(int32_t));
-    for (int32_t i = 0; i < function_count; i++) reachable[i] = false;
+    int32_t reachable_cap = body_cap;
+    bool *reachable = arena_alloc(symbols->arena, (size_t)reachable_cap * sizeof(bool));
+    int32_t *stack = arena_alloc(symbols->arena, (size_t)reachable_cap * sizeof(int32_t));
+    for (int32_t i = 0; i < reachable_cap; i++) reachable[i] = false;
     int32_t stack_count = 0;
     reachable[entry_function] = true;
     stack[stack_count++] = entry_function;
     while (stack_count > 0) {
         int32_t fn_index = stack[--stack_count];
-        if (fn_index < 0 || fn_index >= function_count) die("cold reachable import index out of range");
+        if (fn_index < 0 || fn_index >= symbols->function_count ||
+            fn_index >= reachable_cap) die("cold reachable import index out of range");
         if (!function_bodies[fn_index]) {
             /* Only try import compilation for qualified names (alias.fn).
                Entry-module functions with bare names that failed body
@@ -16458,9 +17335,11 @@ void cold_compile_reachable_import_bodies(Symbols *symbols,
                 target = body->op_a[op];
             }
             if (target < 0) continue;
-            if (target >= function_count) continue;  /* skip out-of-range targets */
+            if (target >= symbols->function_count) continue;  /* external call target */
+            if (target >= reachable_cap) die("cold reachable import target exceeds body table");
             if (reachable[target]) continue;
             reachable[target] = true;
+            if (stack_count >= reachable_cap) die("cold reachable import stack overflow");
             stack[stack_count++] = target;
         }
     }
@@ -16469,18 +17348,6 @@ void cold_compile_reachable_import_bodies(Symbols *symbols,
 __attribute__((unused))
 int32_t cold_compile_imported_bodies_no_recurse(Symbols *symbols, Span entry_source,
                                                        BodyIR **function_bodies, int32_t body_cap) {
-    /* Install SIGSEGV handler to convert segfaults into die() which setjmp catches */
-    struct sigaction sa_segv_old;
-    struct sigaction sa_segv_new;
-    memset(&sa_segv_new, 0, sizeof(sa_segv_new));
-    sa_segv_new.sa_handler = cold_sigsegv_die_handler;
-    sa_segv_new.sa_flags = SA_NODEFER;
-    sigaction(SIGSEGV, &sa_segv_new, &sa_segv_old);
-    /* Note: SIGSEGV handler persists after this function. It's restored by the
-       caller (cold_compile_source_path_to_macho) or on process exit.
-       This is intentional: import body compilation may corrupt arena, and
-       subsequent codegen may also SEGV. We want die() messages instead of
-       silent crashes. */
     int32_t compiled = 0;
     int32_t pos = 0;
     bool in_triple = false;
@@ -16506,19 +17373,9 @@ int32_t cold_compile_imported_bodies_no_recurse(Symbols *symbols, Span entry_sou
             fprintf(stderr, "[import_body] path resolve failed: %.*s\n", module_path.len, module_path.ptr);
             continue;
         }
-        ColdErrorRecoveryEnabled = true;
-        ColdImportSegvActive = true;
-        if (setjmp(ColdImportSegvJumpBuf) == 0) {
-            int32_t n = cold_compile_one_import_direct(symbols, path, alias, function_bodies, body_cap);
-            compiled += n;
-        } else {
-            fprintf(stderr, "[import_body] skipped import due to SEGV: %s\n", path);
-            ColdImportSegvSaw = 1;
-        }
-        ColdImportSegvActive = false;
-        ColdErrorRecoveryEnabled = false;
+        int32_t n = cold_compile_one_import_direct(symbols, path, alias, function_bodies, body_cap);
+        compiled += n;
     }
-    /* SIGSEGV handler intentionally left installed for post-import codegen safety */
     return compiled;
 }
 
@@ -16554,21 +17411,15 @@ static void cold_collect_transitive_imports_rec(Symbols *symbols, Span source,
             if (strcmp(visited[vi], abs_path) == 0) { seen = true; break; }
         }
         if (seen) continue;
-        if (*visited_count >= 64) return;
+        if (*visited_count >= 96) return;
         strncpy(visited[(*visited_count)++], abs_path, PATH_MAX - 1);
         Span sub_source = source_open(path);
         if (sub_source.len <= 0) continue;
-        ColdErrorRecoveryEnabled = true;
-        if (setjmp(ColdErrorJumpBuf) == 0) {
-            cold_collect_import_module_types_from_path(symbols, alias, module_path);
-            symbols_refine_object_layouts(symbols);
-            cold_collect_import_module_signatures(symbols, alias, module_path);
-            cold_collect_global_vars_from_source(symbols, alias, sub_source);
-            cold_collect_imported_function_signatures(symbols, sub_source);
-        } else {
-            /* Transitive type loading skipped (depth/visited limit) */
-        }
-        ColdErrorRecoveryEnabled = false;
+        cold_collect_import_module_types_from_path(symbols, alias, module_path);
+        symbols_refine_object_layouts(symbols);
+        cold_collect_import_module_signatures(symbols, alias, module_path);
+        cold_collect_global_vars_from_source(symbols, alias, sub_source);
+        cold_collect_imported_function_signatures(symbols, sub_source);
         cold_collect_transitive_imports_rec(symbols, sub_source, visited, visited_count, depth + 1);
         munmap((void *)sub_source.ptr, (size_t)sub_source.len);
     }
@@ -16576,7 +17427,7 @@ static void cold_collect_transitive_imports_rec(Symbols *symbols, Span source,
 
 __attribute__((unused))
 void cold_collect_all_transitive_imports(Symbols *symbols, Span entry_source) {
-    char visited[64][PATH_MAX];
+    char visited[96][PATH_MAX];
     int32_t visited_count = 0;
     cold_collect_transitive_imports_rec(symbols, entry_source, visited, &visited_count, 0);
 }
@@ -16600,7 +17451,7 @@ bool cold_compile_source_path_to_macho(const char *out_path,
     int32_t first_function = -1;
     BodyIR *demo_body = 0;
     Span mapped_source = {0};
-    ColdImportSource import_sources[64];
+    ColdImportSource import_sources[96];
     int32_t import_source_count = 0;
 
     if (src_path && src_path[0] != '\0') {
@@ -16609,7 +17460,7 @@ bool cold_compile_source_path_to_macho(const char *out_path,
         import_source_count = cold_collect_import_source_closure(symbols,
                                                                  mapped_source,
                                                                  import_sources,
-                                                                 64);
+                                                                 96);
         cold_collect_imported_function_signatures(symbols, mapped_source);
         cold_collect_function_signatures(symbols, mapped_source);
         cold_collect_global_vars_from_source(symbols, (Span){0}, mapped_source);
@@ -16639,17 +17490,8 @@ bool cold_compile_source_path_to_macho(const char *out_path,
             } else if (span_eq(next, "const")) {
                 parse_const(&parser);
             } else if (span_eq(next, "fn")) {
-                volatile int32_t symbol_index = -1;
-                volatile BodyIR *volatile body2 = 0;
-                ColdErrorRecoveryEnabled = true;
-                if (setjmp(ColdErrorJumpBuf) == 0) {
-                    body2 = parse_fn(&parser, (int32_t *)&symbol_index);
-                } else {
-                    parser.pos = cold_next_top_level_decl(parser.source, parser.pos);
-                    body2 = 0;
-                    symbol_index = -1;
-                }
-                ColdErrorRecoveryEnabled = false;
+                int32_t symbol_index = -1;
+                BodyIR *body2 = parse_fn(&parser, &symbol_index);
                 if (!body2) continue;
                 if (symbol_index < 0 || symbol_index >= body_cap) continue;
                 function_bodies[(int32_t)symbol_index] = (BodyIR *)body2;
@@ -16704,11 +17546,6 @@ bool cold_compile_source_path_to_macho(const char *out_path,
                         unresolved_pos, unresolved_fn, &unresolved_count);
         if (unresolved_count > 0) {
             if (stats) {
-                stats->function_count = symbols->function_count;
-                stats->type_count = symbols->type_count + symbols->object_count;
-                cold_collect_body_stats(symbols, function_bodies, symbols->function_count, stats);
-                stats->code_words = code->count;
-                stats->arena_kb = arena->used / 1024;
                 stats->unresolved_symbol_count = unresolved_count;
                 int32_t first = unresolved_fn[0];
                 if (first >= 0 && first < symbols->function_count) {
@@ -16719,16 +17556,8 @@ bool cold_compile_source_path_to_macho(const char *out_path,
                     if (n > 0) memcpy(stats->first_unresolved_symbol, nm.ptr, (size_t)n);
                     stats->first_unresolved_symbol[n] = '\0';
                 }
-                uint64_t fail_us = cold_now_us();
-                if (start_us > 0 && parse_end_us >= start_us)
-                    stats->parse_us = parse_end_us - start_us;
-                if (parse_end_us > 0 && fail_us >= parse_end_us)
-                    stats->codegen_us = fail_us - parse_end_us;
-                if (start_us > 0 && fail_us >= start_us)
-                    stats->elapsed_us = fail_us - start_us;
             }
-            if (mapped_source.len > 0) munmap((void *)mapped_source.ptr, (size_t)mapped_source.len);
-            return false;
+            /* Continue to produce mach-o with stubs for unresolved patches */
         }
     }
 
@@ -16851,6 +17680,8 @@ static bool cold_write_system_link_exec_report(const char *path,
         fprintf(file, "facts_function_count=%d\n", stats->facts_function_count);
         fprintf(file, "facts_word_count=%d\n", stats->facts_word_count);
         fprintf(file, "facts_reloc_count=%d\n", stats->facts_reloc_count);
+        fprintf(file, "facts_data_count=%d\n", stats->facts_data_count);
+        fprintf(file, "facts_data_reloc_count=%d\n", stats->facts_data_reloc_count);
         fprintf(file, "canonical_hash_count=%d\n", stats->canonical_hash_count);
         fprintf(file, "canonical_normalized_count=%d\n", stats->canonical_normalized_count);
         fprintf(file, "total_function_count=%d\n", stats->total_function_count);
@@ -18273,12 +19104,16 @@ bool cold_compile_source_to_object(const char *out_path,
 
     /* Non-root object builds keep the historical eager import compilation.
        Rooted provider objects parse only the selected reachable closure below. */
+    fprintf(stderr, "[cold debug] before import body compile, has_export_roots=%d func_count=%d\n",
+            has_export_roots, symbols->function_count);
     if (!has_export_roots && !getenv("CHENG_NO_IMPORT_BODIES") && symbols->function_count < 4096) {
+        fprintf(stderr, "[cold debug] starting import body compile\n");
         ColdErrorRecoveryEnabled = true;
         if (setjmp(ColdErrorJumpBuf) == 0) {
             cold_compile_imported_bodies_no_recurse(symbols, mapped_source, function_bodies, body_cap);
         }
         ColdErrorRecoveryEnabled = false;
+        fprintf(stderr, "[cold debug] after import body compile, recovery=%d\n", ColdErrorRecoveryEnabled);
     }
     if (symbols->function_cap > body_cap) {
         int32_t old_cap = body_cap;
@@ -18318,9 +19153,25 @@ bool cold_compile_source_to_object(const char *out_path,
                 continue;
             }
             int32_t symbol_index = -1;
-            BodyIR *body = parse_fn(&parser, &symbol_index);
+            BodyIR *body = 0;
+            int32_t fn_saved = parser.pos;
+            ColdErrorRecoveryEnabled = true;
+            if (setjmp(ColdErrorJumpBuf) == 0) {
+                body = parse_fn(&parser, &symbol_index);
+            } else {
+                /* Function body parse failed (e.g. unsupported feature): skip it */
+                parser.pos = fn_saved;
+                parser_line(&parser);
+                if (symbol_index >= 0 && symbol_index < body_cap)
+                    symbols->functions[symbol_index].is_external = true;
+                symbol_index = -1;
+            }
+            ColdErrorRecoveryEnabled = false;
             if (symbol_index >= 0 && symbol_index < body_cap) {
                 function_bodies[symbol_index] = body;
+                if (!body && symbol_index >= 0) {
+                    symbols->functions[symbol_index].is_external = true;
+                }
                 if (first_function < 0) first_function = symbol_index;
                 if (span_eq(symbols->functions[symbol_index].name, "main"))
                     main_function = symbol_index;
@@ -18339,6 +19190,17 @@ bool cold_compile_source_to_object(const char *out_path,
         memset(grown, 0, (size_t)body_cap * sizeof(BodyIR *));
         memcpy(grown, function_bodies, (size_t)old_cap * sizeof(BodyIR *));
         function_bodies = grown;
+    }
+
+    /* Mark functions with NULL bodies as external (recovers from body
+       compilation failures in imported modules or skipped functions). */
+    {
+        int32_t fc = symbols->function_count;
+        for (int32_t fi = 0; fi < fc && fi < body_cap; fi++) {
+            if (!function_bodies[fi]) {
+                symbols->functions[fi].is_external = true;
+            }
+        }
     }
 
     if (!has_export_roots && first_function < 0) {
@@ -18475,6 +19337,8 @@ bool cold_compile_source_to_object(const char *out_path,
             FunctionPatch patch = function_patches.items[pi];
             if (patch.target_function < 0 || patch.target_function >= func_count) continue;
             if (symbol_offset[patch.target_function] >= 0) continue; /* already resolved */
+            if (!symbols->functions[patch.target_function].is_external)
+                die("cold object missing reachable Cheng function body");
             if (reloc_count >= reloc_cap) die("cold object relocation overflow");
             reloc_offsets[reloc_count] = (int32_t)patch.pos; /* byte offset */
             reloc_symbols[reloc_count] = patch.target_function;
@@ -18493,6 +19357,8 @@ bool cold_compile_source_to_object(const char *out_path,
             }
             int32_t target_off = symbol_offset[patch.target_function];
             if (target_off < 0) {
+                if (!symbols->functions[patch.target_function].is_external)
+                    die("cold object missing reachable Cheng function body");
                 if (reloc_count >= reloc_cap) die("cold object relocation overflow");
                 reloc_offsets[reloc_count] = (int32_t)patch.pos * 4; /* byte offset */
                 reloc_symbols[reloc_count] = patch.target_function;
@@ -18556,6 +19422,8 @@ bool cold_compile_source_to_object(const char *out_path,
         int32_t si = reloc_symbols[ri];
         if (si < 0 || si >= func_count) continue;
         if (ext_sym_map[si] >= 0) { reloc_symbols[ri] = ext_sym_map[si]; continue; }
+        if (!symbols->functions[si].is_external)
+            die("cold object undefined symbol must be explicit external");
         Span nm = cold_fn_object_symbol_span(&symbols->functions[si], true);
         const uint8_t *base = nm.ptr;
         int32_t blen = nm.len;
@@ -19684,11 +20552,15 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
             int32_t written_function_count = 0;
             int32_t written_word_count = 0;
             int32_t written_reloc_count = 0;
+            int32_t written_data_count = 0;
+            int32_t written_data_reloc_count = 0;
             bool counted = written_facts.len > 0 &&
                 cold_csg_v2_count_primary_records(written_facts,
                                                    &written_function_count,
                                                    &written_word_count,
-                                                   &written_reloc_count);
+                                                   &written_reloc_count,
+                                                   &written_data_count,
+                                                   &written_data_reloc_count);
             if (written_facts.len > 0) {
                 munmap((void *)written_facts.ptr, (size_t)written_facts.len);
             }
@@ -19700,6 +20572,8 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
             stats.facts_function_count = written_function_count;
             stats.facts_word_count = written_word_count;
             stats.facts_reloc_count = written_reloc_count;
+            stats.facts_data_count = written_data_count;
+            stats.facts_data_reloc_count = written_data_reloc_count;
         }
         stats.csg_lowering = 1;
         stats.function_count = symbols->function_count;
