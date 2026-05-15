@@ -5221,6 +5221,7 @@ int32_t cold_return_kind_from_span(Symbols *symbols, Span ret) {
     if (known_type && known_type->alias_type.len > 0) {
         return cold_slot_kind_from_type_with_symbols(symbols, known_type->alias_type);
     }
+    if (known_type && known_type->is_enum) return SLOT_I32;
     if (known_type) return SLOT_VARIANT;
     ObjectDef *ret_obj = symbols_resolve_object(symbols, ret);
     if (ret_obj) return ret_obj->is_ref ? SLOT_PTR : SLOT_OBJECT;

@@ -434,6 +434,7 @@ bool cold_type_is_builtin_surface(Span type) {
            span_eq(type, "void") || span_eq(type, "str") ||
            span_eq(type, "cstring") || span_eq(type, "ptr") ||
            span_eq(type, "Bytes") ||
+           cold_span_starts_with(type, "fn(") ||
            cold_parse_i32_seq_type(type) || cold_parse_str_seq_type(type);
 }
 
@@ -2019,6 +2020,56 @@ static void cold_print_same_name_call_candidates(Symbols *symbols, BodyIR *body,
     }
 }
 
+static bool cold_try_field_function_pointer_call(Parser *parser, BodyIR *body,
+                                                 Locals *locals, Span name,
+                                                 int32_t arg_start,
+                                                 int32_t arg_count,
+                                                 int32_t *slot_out,
+                                                 int32_t *kind_out) {
+    int32_t dot = cold_span_find_char(name, '.');
+    if (dot <= 0 || dot + 1 >= name.len) return false;
+    Span base_name = span_sub(name, 0, dot);
+    Span field_name = span_sub(name, dot + 1, name.len);
+    if (cold_span_find_char(field_name, '.') >= 0) return false;
+    Local *base = locals_find(locals, base_name);
+    if (!base) return false;
+    if (base->kind != SLOT_PTR && base->kind != SLOT_OBJECT_REF &&
+        base->kind != SLOT_OBJECT && base->kind != SLOT_OPAQUE &&
+        base->kind != SLOT_OPAQUE_REF) {
+        return false;
+    }
+    Span type_name = cold_type_strip_var(body->slot_type[base->slot], 0);
+    ObjectDef *object = symbols_resolve_object(parser->symbols, type_name);
+    if (!object) {
+        fprintf(stderr, "cheng_cold: field function call object missing base=%.*s type=%.*s\n",
+                (int)base_name.len, base_name.ptr,
+                (int)type_name.len, type_name.ptr);
+        return false;
+    }
+    ObjectField *field = object_find_field(object, field_name);
+    if (!field || field->kind != SLOT_PTR || field->size != 8) {
+        fprintf(stderr, "cheng_cold: field function call field mismatch base=%.*s type=%.*s field=%.*s",
+                (int)base_name.len, base_name.ptr,
+                (int)type_name.len, type_name.ptr,
+                (int)field_name.len, field_name.ptr);
+        if (field) {
+            fprintf(stderr, " kind=%d size=%d field_type=%.*s",
+                    field->kind, field->size,
+                    (int)field->type_name.len, field->type_name.ptr);
+        }
+        fprintf(stderr, "\n");
+        return false;
+    }
+    int32_t fn_slot = body_slot(body, SLOT_PTR, 8);
+    body_slot_set_type(body, fn_slot, field->type_name);
+    body_op3(body, BODY_OP_PAYLOAD_LOAD, fn_slot, base->slot, field->offset, field->size);
+    int32_t ret_slot = body_slot(body, SLOT_I32, 4);
+    body_op3(body, BODY_OP_CALL_PTR, ret_slot, fn_slot, arg_start, arg_count);
+    if (kind_out) *kind_out = SLOT_I32;
+    if (slot_out) *slot_out = ret_slot;
+    return true;
+}
+
 static int32_t cold_param_sequence_value_kind(int32_t param_kind) {
     if (param_kind == SLOT_SEQ_I32 || param_kind == SLOT_SEQ_I32_REF) return SLOT_SEQ_I32;
     if (param_kind == SLOT_SEQ_STR || param_kind == SLOT_SEQ_STR_REF) return SLOT_SEQ_STR;
@@ -2744,7 +2795,9 @@ int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *locals,
         if (kind_out) *kind_out = SLOT_PTR;
         return slot;
     }
-    Span lookup_name = stripped_name;
+    Span lookup_name = parser_can_scope_bare_name(parser, stripped_name)
+                           ? parser_scoped_bare_name(parser, stripped_name)
+                           : stripped_name;
     int32_t fn_index = symbols_find_fn_for_call(parser->symbols, lookup_name, body, arg_start, arg_count);
     if (fn_index < 0) {
         /* Check for indirect call via local variable (function pointer) */
@@ -2755,13 +2808,11 @@ int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *locals,
             if (kind_out) *kind_out = SLOT_I32;
             return slot;
         }
-        if (parser->import_mode && parser->import_alias.len > 0 &&
-            cold_span_find_char(stripped_name, '.') < 0) {
-            Span qualified = cold_arena_join3(parser->arena, parser->import_alias,
-                                              ".", stripped_name);
-            fn_index = symbols_find_fn_for_call(parser->symbols, qualified,
-                                                body, arg_start, arg_count);
-            if (fn_index >= 0) lookup_name = qualified;
+        int32_t field_call_slot = -1;
+        if (cold_try_field_function_pointer_call(parser, body, locals, name,
+                                                 arg_start, arg_count,
+                                                 &field_call_slot, kind_out)) {
+            return field_call_slot;
         }
     }
     if (fn_index < 0) {
@@ -3065,7 +3116,9 @@ int32_t parse_call_from_args_span(Parser *owner, BodyIR *body, Locals *locals,
         if (kind_out) *kind_out = SLOT_PTR;
         return slot;
     }
-    Span lookup_name = stripped_name;
+    Span lookup_name = parser_can_scope_bare_name(owner, stripped_name)
+                           ? parser_scoped_bare_name(owner, stripped_name)
+                           : stripped_name;
     int32_t fn_index = symbols_find_fn_for_call(owner->symbols, lookup_name, body, arg_start, arg_count);
     if (fn_index < 0) {
         /* Check for indirect call via local variable (function pointer) */
@@ -3076,13 +3129,11 @@ int32_t parse_call_from_args_span(Parser *owner, BodyIR *body, Locals *locals,
             if (kind_out) *kind_out = SLOT_I32;
             return slot;
         }
-        if (owner->import_mode && owner->import_alias.len > 0 &&
-            cold_span_find_char(stripped_name, '.') < 0) {
-            Span qualified = cold_arena_join3(owner->arena, owner->import_alias,
-                                              ".", stripped_name);
-            fn_index = symbols_find_fn_for_call(owner->symbols, qualified,
-                                                body, arg_start, arg_count);
-            if (fn_index >= 0) lookup_name = qualified;
+        int32_t field_call_slot = -1;
+        if (cold_try_field_function_pointer_call(owner, body, locals, name,
+                                                 arg_start, arg_count,
+                                                 &field_call_slot, kind_out)) {
+            return field_call_slot;
         }
     }
     if (fn_index < 0) {
@@ -6265,23 +6316,13 @@ int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32_t *kin
             *kind = alocal->kind;
         } else {
             /* Check if it's a function name: &fnName → function pointer */
+            Span lookup_fn_name = parser_can_scope_bare_name(parser, base_name)
+                                      ? parser_scoped_bare_name(parser, base_name)
+                                      : base_name;
             int32_t fn_idx = -1;
             for (int32_t si = 0; si < parser->symbols->function_count; si++) {
                 FnDef *sfn = &parser->symbols->functions[si];
-                if (span_same(sfn->name, base_name)) { fn_idx = si; break; }
-            }
-            if (fn_idx < 0) {
-                /* Try qualified name lookup (*.base_name) */
-                for (int32_t si = 0; si < parser->symbols->function_count; si++) {
-                    FnDef *sfn = &parser->symbols->functions[si];
-                    if (sfn->name.len > base_name.len + 1 &&
-                        sfn->name.ptr[sfn->name.len - base_name.len - 1] == '.' &&
-                        memcmp(sfn->name.ptr + sfn->name.len - base_name.len,
-                               base_name.ptr, (size_t)base_name.len) == 0) {
-                        fn_idx = si;
-                        break;
-                    }
-                }
+                if (span_same(sfn->name, lookup_fn_name)) { fn_idx = si; break; }
             }
             if (fn_idx >= 0) {
                 addr_slot = body_slot(body, SLOT_PTR, 8);
@@ -6403,10 +6444,11 @@ int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32_t *kin
         if (nobj && nobj->slot_size > 0) {
             int32_t len = body_slot(body, SLOT_I32, 4);
             body_op(body, BODY_OP_I32_CONST, len, nobj->slot_size, 0);
-            int32_t ns = body_slot(body, SLOT_OBJECT_REF, 8);
+            int32_t new_kind = nobj->is_ref ? SLOT_PTR : SLOT_OBJECT_REF;
+            int32_t ns = body_slot(body, new_kind, 8);
             body_slot_set_type(body, ns, nobj->name);
             body_op(body, BODY_OP_MMAP, ns, len, 0);
-            *kind = SLOT_OBJECT_REF;
+            *kind = new_kind;
             return ns;
         }
         die("new(Type): type missing or invalid");
@@ -6419,6 +6461,16 @@ int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32_t *kin
             while (parser->pos < parser->source.len &&
                    parser->source.ptr[parser->pos] != ']') parser->pos++;
             if (parser->pos < parser->source.len) parser->pos++;
+        }
+        /* Payloadless enum variant: produce I32 tag directly instead of VARIANT */
+        if (variant->field_count == 0) {
+            TypeDef *parenum = symbols_find_variant_type(parser->symbols, variant);
+            if (parenum && parenum->is_enum) {
+                int32_t slot = body_slot(body, SLOT_I32, 4);
+                body_op(body, BODY_OP_I32_CONST, slot, variant->tag, 0);
+                *kind = SLOT_I32;
+                return slot;
+            }
         }
         *kind = SLOT_VARIANT;
         return parse_constructor(parser, body, locals, variant);
@@ -6552,6 +6604,16 @@ int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32_t *kin
             }
         }
         if (vc) {
+            /* Payloadless enum variant: produce I32 tag directly */
+            if (vc->field_count == 0) {
+                TypeDef *parenum = symbols_find_variant_type(parser->symbols, vc);
+                if (parenum && parenum->is_enum) {
+                    int32_t slot = body_slot(body, SLOT_I32, 4);
+                    body_op(body, BODY_OP_I32_CONST, slot, vc->tag, 0);
+                    *kind = SLOT_I32;
+                    return slot;
+                }
+            }
             *kind = SLOT_VARIANT;
             if (vc->field_count > 0) {
                 return parse_constructor(parser, body, locals, vc);
@@ -6564,7 +6626,7 @@ int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32_t *kin
         if (!vc) {
             /* Try object constructor for qualified name (e.g. hostops.LoggedRun(label: ...)) */
             ObjectDef *obj = symbols_find_object(parser->symbols, stripped_name);
-            if (obj && !obj->is_ref && span_eq(parser_peek(parser), "(")) {
+            if (obj && !obj->is_ref && parser_next_is_object_constructor(parser)) {
                 *kind = SLOT_OBJECT;
                 return parse_object_constructor(parser, body, locals, obj);
             }
@@ -6737,11 +6799,14 @@ int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32_t *kin
     }
     /* Bare function name reference (used as value, e.g. passed as function pointer) */
     {
-        int32_t fn_idx = symbols_find_fn(parser->symbols, token, 0, 0, 0, (Span){0});
+        Span lookup_fn_name = parser_can_scope_bare_name(parser, token)
+                                  ? parser_scoped_bare_name(parser, token)
+                                  : token;
+        int32_t fn_idx = symbols_find_fn(parser->symbols, lookup_fn_name, 0, 0, 0, (Span){0});
         if (fn_idx < 0) {
             /* Try arity-insensitive lookup -- just check if name matches any function */
             for (int32_t si = 0; si < parser->symbols->function_count; si++) {
-                if (span_same(parser->symbols->functions[si].name, token)) {
+                if (span_same(parser->symbols->functions[si].name, lookup_fn_name)) {
                     fn_idx = si;
                     break;
                 }
@@ -6762,6 +6827,24 @@ int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32_t *kin
         *kind = val_kind;
         return val_slot;
     }
+    /* Last-chance: token might be a known type name used as an expression
+       (e.g. a struct/ADT type name or generic parameter that wasn't registered).
+       Return the type's stored slot_size (or 4 as default). */
+    {
+        TypeDef *ty = symbols_find_type(parser->symbols, token);
+        if (ty) {
+            int32_t sz = ty->max_slot_size > 0 ? ty->max_slot_size : 4;
+            int32_t slot = body_slot(body, SLOT_I32, 4);
+            body_op(body, BODY_OP_I32_CONST, slot, sz, 0);
+            *kind = SLOT_I32;
+            return slot;
+        }
+    }
+    fprintf(stderr, "cheng_cold: unknown identifier token=%.*s body=%.*s offset=%d\n",
+            (int)token.len, token.ptr,
+            body && body->debug_name.len > 0 ? (int)body->debug_name.len : 0,
+            body && body->debug_name.len > 0 ? body->debug_name.ptr : (uint8_t *)"",
+            cold_span_offset(parser->source, token));
     die("unknown identifier");
     return -1;
 }
@@ -10226,6 +10309,11 @@ BodyIR *parse_fn(Parser *parser, int32_t *symbol_index_out) {
     body->debug_name = fn_name;
     Locals locals;
     locals_init(&locals, parser->arena);
+    /* Register generic type parameters as locals so they resolve in expressions */
+    for (int32_t gi = 0; gi < fn_generic_count; gi++) {
+        int32_t slot = body_slot(body, SLOT_I32, 4);
+        locals_add(&locals, fn_generic_names[gi], slot, SLOT_I32);
+    }
     if (cold_kind_is_composite(body->return_kind)) {
         body->sret_slot = body_slot(body, SLOT_PTR, 8);
     }
