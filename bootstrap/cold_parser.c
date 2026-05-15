@@ -2048,6 +2048,17 @@ static bool cold_empty_sequence_arg_matches_param(BodyIR *body, FnDef *fn,
     return cold_slot_is_empty_sequence_literal(body, arg_slot);
 }
 
+static bool cold_exact_ref_arg_matches_ptr_param(BodyIR *body, FnDef *fn,
+                                                 int32_t arg_start, int32_t index) {
+    int32_t arg_slot = body->call_arg_slot[arg_start + index];
+    int32_t arg_kind = body->slot_kind[arg_slot];
+    if (fn->param_kind[index] != SLOT_PTR) return false;
+    if (arg_kind != SLOT_OPAQUE_REF && arg_kind != SLOT_OBJECT_REF) return false;
+    Span param_type = span_trim(fn->param_type[index]);
+    Span arg_type = span_trim(body->slot_type[arg_slot]);
+    return param_type.len > 0 && span_same(param_type, arg_type);
+}
+
 static void cold_apply_contextual_empty_sequence_args(BodyIR *body, FnDef *fn,
                                                       int32_t arg_start,
                                                       int32_t arg_count) {
@@ -2138,6 +2149,8 @@ bool cold_validate_call_args(BodyIR *body, FnDef *fn, int32_t arg_start, int32_t
             continue;
         } else if (fn->param_kind[i] == SLOT_OBJECT && arg_kind == SLOT_OBJECT) {
             continue;
+        } else if (cold_exact_ref_arg_matches_ptr_param(body, fn, arg_start, i)) {
+            continue;
         } else if (cold_empty_sequence_arg_matches_param(body, fn, arg_start, i)) {
             continue;
         } else if (arg_kind != fn->param_kind[i] && arg_kind != 0 && fn->param_kind[i] != 0) {
@@ -2220,6 +2233,8 @@ bool cold_call_args_match(BodyIR *body, FnDef *fn, int32_t arg_start, int32_t ar
         } else if (fn->param_kind[i] == SLOT_OBJECT && arg_kind == SLOT_OBJECT_REF) {
             continue;
         } else if (fn->param_kind[i] == SLOT_OBJECT && arg_kind == SLOT_OBJECT) {
+            continue;
+        } else if (cold_exact_ref_arg_matches_ptr_param(body, fn, arg_start, i)) {
             continue;
         } else if (cold_empty_sequence_arg_matches_param(body, fn, arg_start, i)) {
             continue;
