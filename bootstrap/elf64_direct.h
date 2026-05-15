@@ -125,6 +125,7 @@ static bool elf64_write_object(const char *path,
     }
     /* Build section name string table */
     char shstrtab[128];
+    memset(shstrtab, 0, sizeof(shstrtab));
     int32_t shstr_off = 1; /* first byte is \0 */
     int32_t shstr_text = shstr_off;
     memcpy(shstrtab + shstr_off, ".text", 6); shstr_off += 6;

@@ -18410,7 +18410,7 @@ static bool cold_read_macho_relocatable_view(const uint8_t *data,
     memset(out, 0, sizeof(*out));
     /* MH_OBJECT header */
     uint32_t magic = cold_u32le(data);
-    if (magic != 0xfeedfacf) return false; /* MH_MAGIC_64 */
+    if (magic != 0xfeedfacf) { fprintf(stderr, "[macho] bad magic %08x\n", magic); return false; }
     uint32_t cputype = cold_u32le(data + 4);
     if (cputype != 0x0100000c) return false; /* CPU_TYPE_ARM64 */
     uint32_t filetype = cold_u32le(data + 12);
