@@ -1144,6 +1144,53 @@ ACT=$(compile_run_timed "$COLD" testdata/generic_arithmetic_smoke.cheng /tmp/ct_
 assert "generic_arithmetic_smoke" 0 "$ACT"
 rm -f /tmp/ct_gen_arith
 
+# --- parser.cheng cold compile smoke ---
+rm -f /tmp/ct_parser_smoke.o /tmp/ct_parser_smoke.report
+if $COLD system-link-exec --root:"$PWD" \
+    --in:src/core/lang/parser.cheng --target:arm64-apple-darwin \
+    --out:/tmp/ct_parser_smoke.o --emit:obj \
+    --report-out:/tmp/ct_parser_smoke.report 2>&1 &&
+   [ -s /tmp/ct_parser_smoke.o ] &&
+   grep -q '^system_link_exec=1$' /tmp/ct_parser_smoke.report 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "parser_cold_compile_smoke" 1 "$ACT"
+rm -f /tmp/ct_parser_smoke.o /tmp/ct_parser_smoke.report
+
+# --- primary_object_plan.cheng cold compile smoke ---
+rm -f /tmp/ct_pop_smoke.o /tmp/ct_pop_smoke.report
+if $COLD system-link-exec --root:"$PWD" \
+    --in:src/core/backend/primary_object_plan.cheng --target:arm64-apple-darwin \
+    --out:/tmp/ct_pop_smoke.o --emit:obj \
+    --report-out:/tmp/ct_pop_smoke.report 2>&1 &&
+   [ -s /tmp/ct_pop_smoke.o ] &&
+   grep -q '^direct_macho=1$' /tmp/ct_pop_smoke.report 2>/dev/null &&
+   ! grep -q '^error=' /tmp/ct_pop_smoke.report 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "pop_cold_compile_smoke" 1 "$ACT"
+rm -f /tmp/ct_pop_smoke.o /tmp/ct_pop_smoke.report
+
+# --- gate_main.cheng cold compile smoke ---
+rm -f /tmp/ct_gate_main_smoke.o /tmp/ct_gate_main_smoke.report
+if $COLD system-link-exec --root:"$PWD" \
+    --in:src/core/tooling/gate_main.cheng --target:arm64-apple-darwin \
+    --out:/tmp/ct_gate_main_smoke.o --emit:obj \
+    --report-out:/tmp/ct_gate_main_smoke.report 2>&1 &&
+   [ -s /tmp/ct_gate_main_smoke.o ] &&
+   grep -q '^direct_macho=1$' /tmp/ct_gate_main_smoke.report 2>/dev/null &&
+   ! grep -q '^error=' /tmp/ct_gate_main_smoke.report 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "gate_main_cold_compile_smoke" 1 "$ACT"
+rm -f /tmp/ct_gate_main_smoke.o /tmp/ct_gate_main_smoke.report
+
 # --- for_range_inclusive_leq ---
 cat > /tmp/ct_range_leq.cheng << 'CHENG'
 fn main(): int32 =
