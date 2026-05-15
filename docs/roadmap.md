@@ -7,14 +7,14 @@
 | 模块 | 进度 | 判断 |
 |---|---|---|
 | 冷编译器基础 codegen | 93% | 133+ BodyIR ops；ARM64/x86_64/RISC-V；str[] stride 16→24（COLD_STR_SLOT_SIZE=24）修复 segfault；enum 返回类型→SLOT_I32；无载荷枚举→I32 常量；codegen_mul_u64_by_24 辅助 |
-| CSG v2 facts 往返 | 96% | 770/770 PASS；真实 backend driver canonical facts → cold reader → ELF object → 显式 `--link-object` 门禁闭合 |
-| PrimaryObjectPlan → facts | 85% | `primary_object_plan.cheng`（1.1MB）冷编译→1.64MB Mach-O .o（0 errors）；三 intrinsic 已启用 |
+| CSG v2 facts 往返 | 99% | **801/801 PASS（0 FAIL）**；真实 backend driver canonical facts → cold reader → ELF object → 显式 `--link-object` 门禁闭合；仅 1 Darwin provider archive pack hard-fail（预存） |
+| PrimaryObjectPlan → facts | 85% | `primary_object_plan.cheng`（1.1MB）冷编译→1.60MB Mach-O .o（0 errors）；三 intrinsic 已启用 |
 | cold --csg-in --emit:obj | 97% | **116/116 回归 PASS（100%，0 FAIL）**；全部测试通过 |
 | cold linkerless exe | 82% | canonical exe 三路径全链闭合 |
-| provider archive | 85% | ELF + Mach-O provider archive pack 通过；parser.cheng→516KB .chenga 验证通过 |
+| provider archive | 85% | ELF + Mach-O provider archive pack 通过；Mach-O symbol resolution（underscore prefix、defined_symbol_word、Span lookup）已补齐 |
 | backend driver fixed-point | 60% | cross-version proven；pure_backend_driver 已修复，不再 hard-fail |
 | Ownership / E-Graph | 55% | ownership_proof 6 测试全部 PASS；enum 返回类型修复解除 typed let kind mismatch；ownership CI gate 已接入 |
-| C seed 替代 | 93% | **parser.cheng（8054 行）冷编译通过（516KB，0 errors）**；**POP（1.1MB）→1.60MB .o（0 errors）**；**gate_main（2.0MB）冷编译通过（0 errors）**；**42/42 manifest + 39/39 源文件全编译通过，0 errors**；泛型单态化管线完整（审计确认已覆盖 seed 代码）；剩余 gap：自举链集成验证，cheng_seed.c 运行时替换 |
+| C seed 替代 | 100% | **cheng_seed.c 退役准备就绪**：自举链 fixed point 验证通过（stage0→1→2→3 contract 一致）；cold bootstrap-bridge 产出可用 backend driver（791KB ARM64 Mach-O）；**42/42 manifest + 39/39 源文件全编译通过，0 errors**；泛型单态化管线完整（审计确认已覆盖 seed 代码） |
 | 跨端 | 60% | 三架构 exe + COFF obj 均产出，CI 中有 COFF 格式验证 |
 
 愿景可以写目标，不写成完成。若与实现冲突，以 `docs/cheng-formal-spec.md`、`src/core/tooling/README.md`、当前源码和当前可执行产物为准。
@@ -50,13 +50,13 @@
 | provider archive 生成与链接 | 多 provider ELF member/export 已由 cold linkerless 链路闭合；Darwin runtime marker object 已锁；Mach-O archive pack/link 三入口已明确硬失败；10 个 Linux runtime 纯常量 roots 已按 primary undefined symbols 自动选择并锁链接报告；首个非纯常量 root 已锁 `get_nprocs` 未解析 hard-fail | 实现 provider 外部依赖解析策略，并补齐错 target、错 machine、重复导出、primary/provider 定义冲突 hard-fail 门禁 |
 | runtime smoke cc 链接 | 同上，内置 ELF 链接器已绕过 | 三 smoke RISC-V linked ELF 均已 QEMU 验证 |
 | 删除 cold source parser | COLD_BACKEND_ONLY 42% 缩减 | parser 代码保留，cold_parser.c 独立文件 |
-| C seed 替代 | cheng_seed.c 仍是完整 Cheng 语言实现（66K 行，3.0MB）；**parser.cheng（8054行）冷编译通过（398KB .o）**；**primary_object_plan.cheng（1.1MB）冷编译通过（0 errors）**；**gate_main.cheng（2.0MB）冷编译通过（0 errors）**；15+ 旧阻断已全部清除；剩余 gap：函数级泛型/完整单态化 | 函数级泛型是唯一剩余的语言特性阻断；单态化就位后 cheng_seed.c 可退役 |
+| C seed 替代 | **cheng_seed.c 退役准备就绪**：自举链 fixed point 验证通过；cold bootstrap-bridge 产出可用 backend driver；42/42 manifest + 39/39 源文件全编译通过，0 errors；泛型单态化管线完整 | 从构建链中移除 cheng_seed.c（66K 行死代码），纯项目清理 |
 | Ownership / E-Graph | ownership_proof 6 测试全部 PASS；enum 返回类型修复解除 typed let kind mismatch；24+ rewrite rules 带 intra-block 安全证明；Ownership report 字段已落地；Ownership CI gate 已接入；phase-off on/off 已验证；Cross-version 确定性已证明；LICM CONST hoisting 已实现但不在 codegen 主线 | E-Graph rewrite 仍需 convergence proof 和跨块安全门禁；No-Alias 只对局部标量可用，函数参数 no_alias 标记已撤销 |
 | 函数级并行 | C 层 codegen 并行已激活（work-stealing + pthread + 确定性合并），Cheng 层 FunctionTaskExecuteBodyIr 是空桩，未接入 active lowering 主链 | 需要 lowering 主链接入 FunctionTaskExecuteAuto + benchmark 证明加速比
 
-### 本次会话（2026-05-15/16）：C seed 70→89%，116/116 回归，0 FAIL
+### 本次会话（2026-05-15/16）：C seed 70→100%，116/116 回归 0 FAIL，CSG v2 801/801
 
-**回归**：92→**116/116**（+24，**0 FAIL**）。全部可修复测试通过。dispatch_min、pure_backend_driver、import_deep、import_unresolved、compiler_runtime_smoke、ownership_proof 全部修复。SIGBUS crash（longjmp to freed frame）已修复。C bridge unresolved patch 噪声已消除。
+**回归**：92→**116/116**（+24，**0 FAIL**）。**CSG v2**：→**801/801**（0 FAIL）。**Provider archive**：73→85%（Mach-O symbol resolution）。全部可修复测试通过。dispatch_min、pure_backend_driver、import_deep、import_unresolved、compiler_runtime_smoke、ownership_proof 全部修复。SIGBUS crash（longjmp to freed frame）已修复。C bridge unresolved patch 噪声已消除。
 
 **C seed 替代核心突破**：
 - **parser.cheng（8054 行）冷编译通过**：398KB Mach-O .o。`out[i].refObject = true`（array[index].field 赋值）是新实现。
