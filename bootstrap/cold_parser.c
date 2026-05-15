@@ -8089,6 +8089,21 @@ void cold_store_value_into_slot(BodyIR *body, int32_t dst, int32_t dst_kind,
         body_op3(body, BODY_OP_PAYLOAD_STORE, dst, src, 0, body->slot_size[src]);
         return;
     }
+    /* SLOT_OPAQUE: compatible with pointer-like types (reverse of SLOT_PTR handler) */
+    if (dst_kind == SLOT_OPAQUE) {
+        if (src_kind != SLOT_OPAQUE && src_kind != SLOT_PTR &&
+            src_kind != SLOT_OPAQUE_REF && src_kind != SLOT_OBJECT_REF) {
+            die("inline if opaque branch kind mismatch");
+        }
+        body_op(body, BODY_OP_COPY_I64, dst, src, 0);
+        return;
+    }
+    /* SLOT_OPAQUE_REF: compatible with pointer/opaque types */
+    if (dst_kind == SLOT_OPAQUE_REF &&
+        (src_kind == SLOT_PTR || src_kind == SLOT_OPAQUE || src_kind == SLOT_OPAQUE_REF)) {
+        body_op(body, BODY_OP_COPY_I64, dst, src, 0);
+        return;
+    }
     if (src_kind != dst_kind) die("inline if branch kind mismatch");
     body_op(body, BODY_OP_COPY_COMPOSITE, dst, src, 0);
 }
@@ -8229,6 +8244,16 @@ int32_t parse_let_binding(Parser *parser, BodyIR *body, Locals *locals,
         if (kind != SLOT_I64) die("typed int64 initializer kind mismatch");
         body_op(body, BODY_OP_COPY_I64, owned_slot, slot, 0);
         slot = owned_slot;
+    } else if (owned_slot >= 0 && body->slot_kind[owned_slot] == SLOT_OPAQUE && kind == SLOT_PTR) {
+        /* OPAQUE variable assigned from PTR value: compatible, just copy the pointer */
+        body_op(body, BODY_OP_COPY_I64, owned_slot, slot, 0);
+        slot = owned_slot;
+        kind = SLOT_OPAQUE;
+    } else if (owned_slot >= 0 && body->slot_kind[owned_slot] == SLOT_PTR && kind == SLOT_OPAQUE) {
+        /* PTR variable assigned from OPAQUE value: compatible, just copy the pointer */
+        body_op(body, BODY_OP_COPY_I64, owned_slot, slot, 0);
+        slot = owned_slot;
+        kind = SLOT_PTR;
     }
     if (span_eq(parser_peek(parser), "?")) {
         (void)parser_token(parser);
