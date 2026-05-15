@@ -1,3 +1,14 @@
+# Findings (2026-05-15)
+
+## CompilerCsg materializer intrinsic 启用 (2026-05-15)
+
+- `cold_parser.c` 中三个已完整实现但被 `if (0 && ...)` 禁用的 intrinsic 已启用：`BuildCompilerCsgInto`、`BuildLoweringPlanStubFromCompilerCsg`、`BuildPrimaryObjectPlan`。
+- 这三个 intrinsic 分别产出最小 but 合法的 CompilerCsg（3 nodes + 2 edges）、LoweringPlanStub（1 function entry）、PrimaryObjectPlan（missing reasons 占位）。
+- 启用后，冷编译器编译 `backend_driver_dispatch_min.cheng` 时不再尝试从源码编译 `compiler_csg.cheng` 中这些函数的复杂体，而是走 intrinsic 路径。
+- 生成的 backend driver 的 `system-link-exec` 和 `emit-cold-csg-v2` 命令均正常工作。
+- canonical CHENG_CSG_V2 facts 往返已打通：backend driver 生成 facts → 冷编译器 `--csg-in --emit:obj` 消费 → 产出合法 Mach-O .o。
+- `--emit:exe` 对 canonical 格式暂不支持（`cold_compile_csg_path_to_macho` 仅在 `obj_mode` 下处理 `CHENG_CSG_V2` 头），归入已知限制。
+
 # Findings (2026-05-06)
 
 ## Cold compiler current gaps (2026-05-06)
@@ -240,3 +251,19 @@
 - `artifacts/backend_driver/cheng` 已替换为 cold linkerless 候选。替换前后均验证 `status`、`help`、三个 exe fixture、跨模块 `emit:obj`、自编译自身；正式入口还能再次 `build-backend-driver`，说明不是旁路候选通过。
 - Darwin 入栈参数错读根因是 callee prologue 保存两组寄存器后才建立 `FP`；读 `FP+16+offset` 会把第 9 个参数错成第 7 个参数，现改为 `FP+32+offset`，并用 `cold_stack_arg_abi` 锁住。
 - `BackendDriverDispatchMinRunSystemLinkExecFromCmdline` 的 cold self-exec 短路已删除；生成版 backend driver 跑 `system-link-exec ordinary_zero_exit_fixture` 可生成 Mach-O 并运行 exit `0`。
+
+## 2026-05-15：parser.cheng 冷编译通过
+
+### 已清除的 6 阻断
+1. **for-range 箭头链**：`parse_postfix` 缺 `[index]` 索引访问和 `->` deref + slot_type 更新
+2. **一元负号**：`parse_primary` 缺 `-` 前缀 handler
+3. **三元表达式**：`let` 绑定中的 `? :` 支持
+4. **循环内 var 声明**：循环体中 `var decl: Type` 的 locals 注册
+5. **无 `type` 关键字类型声明**：`TypeName = fields` 隐式对象语法
+6. **索引+字段组合赋值**：`out[i].field = value` 的 `parse_statement` 模式匹配
+
+### 已知剩余限制
+- provider archive Mach-O：打包和解包均硬失败
+- cold linkerless exe on Darwin：parser.cheng 外部符号未解析
+- compiler_runtime_smoke：间歇性 SIGSEGV（大帧代码生成）
+- 函数级泛型/单态化：未闭合

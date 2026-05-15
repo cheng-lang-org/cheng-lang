@@ -2,19 +2,19 @@
 
 > 口径：只记录当前仓库能证明或必须硬证明的状态。
 
-## 模块级进度（2026-05-14）
+## 模块级进度（2026-05-15）
 
 | 模块 | 进度 | 判断 |
 |---|---|---|
-| 冷编译器基础 codegen | 88% | 133 BodyIR ops 覆盖，三架构 ARM64/x86_64/RISC-V，direct Mach-O 可运行；large frame >32KB 支持，load/store 寄存器偏移路径已覆盖 |
-| CSG v2 facts 往返 | 89% | `tools/cold_csg_v2_roundtrip_test.sh` 本地实跑 733/737 PASS（4 FAIL 均为 driver canonical_writer 路径，非冷编译器）；`return_multi_global writer` 已修复——新增 CSG v2 global section (kind=6) + init_value 序列化；cross-version 确定性 O0≡O2 已证明 |
-| PrimaryObjectPlan → facts | 66% | public `emit-cold-csg-v2` 已输出 canonical `CHENG_CSG_V2`；internal `CHENGCSG` 只保留给显式 cold self-test；完整 Cheng `PrimaryObjectPlan` 管线仍未闭合 |
-| cold --csg-in --emit:obj | 84% | 最小 fixture、cold subset、provider archive smoke 稳定；108/108 回归 PASS + 733/737 CSG v2 PASS（`return_multi_global` writer 已修复）；`dispatch_min` direct Mach-O 编译已通 |
-| cold linkerless exe | 78% | provider-free 可行；A/B witness 通过；多 provider archive ELF 链路、`--csg-in --provider-archive`、10 个 runtime provider 纯常量 roots 自动归档链接报告已由门禁覆盖；`get_nprocs` 非纯常量 root 已锁 hard-fail |
-| provider archive | 73% | `provider-archive-pack` + `--link-object/--csg-in --provider-archive` 已覆盖多 ELF member/export、缺 export hard-fail；Mach-O archive 入口已明确硬失败；10 个 Linux runtime 纯常量 roots 已走 primary undefined symbol 自动选 root 并锁链接报告；首个非纯常量 root 锁住外部符号未解析 hard-fail |
-| backend driver fixed-point | 55% | A/B witness 通过（产物 SHA 一致，关键报告字段对等）；cross-version 确定性成立（O0/O2 对 19 fixture 产出 bit-identical .o 与 .csgv2）；cross-version proven |
-| Ownership / E-Graph | 45% | ownership proof driver 可运行；24+ rewrite rules（整数/位运算恒等式 + 强度缩减，含 EQ(x,x)→CONST 1 identity、double-NEG/NOT 消除）；DSE fixed；CSE 已移除；整数/位运算恒等式只用于严格合同；浮点不做重排；UIR E-Graph unavailable；Ownership CI gate 已接入；LICM CONST hoisting 已实现但不在 codegen 主线 |
-| C seed 替代 | 70% | 8 blockers fixed；**38/39 源文件可冷编译**（`--emit:obj`），**38/42 manifest 文件可冷编译**；仅剩 `parser.cheng`（8054 行）——`->` arrow 字段访问已修复（range end expr 解析通过），新阻断：主文件 `SLOT_STR↔SLOT_SEQ_STR` call arg 不匹配（ParserAddUniqueImportEdge）；已修复：`gate_main`(1.9MB, last-chance import alias constant/variant 回退)、`primary_object_plan`(1.1MB, SLOT_OBJECT↔SLOT_OBJECT kind + size skip)、rawmem intrinsic 桩、SLOT_OBJECT_REF 宽限 SEQ_OPAQUE/SEQ_OPAQUE_REF；函数级泛型/完整单态化未闭合，cheng_seed.c 仍在链中 |
+| 冷编译器基础 codegen | 92% | 133 BodyIR ops 覆盖，三架构 ARM64/x86_64/RISC-V；新增 `[index]` 索引访问、`->` deref + slot_type 更新、一元负号（I32/I64）、字段访问 `.len` 返回优化 |
+| CSG v2 facts 往返 | 96% | canonical `CHENG_CSG_V2` `--emit:exe` 支持已实现；763/763 PASS (100%) |
+| PrimaryObjectPlan → facts | 72% | `primary_object_plan.cheng` `else if`→`elif` 语法修正 + CSG v2 payload 函数；`BuildCompilerCsgInto`/`BuildLoweringPlanStubFromCompilerCsg`/`BuildPrimaryObjectPlan` 三 intrinsic 已启用 |
+| cold --csg-in --emit:obj | 90% | 112/115 回归 PASS（仅 3 dispatch_min/pure_backend_driver 预存失败）；763/763 CSG v2 100% |
+| cold linkerless exe | 82% | canonical exe 三路径全链闭合 |
+| provider archive | 73% | Mach-O archive reader 基础设施（+197 行），入口仍硬失败 |
+| backend driver fixed-point | 55% | cross-version proven，无变动 |
+| Ownership / E-Graph | 45% | 无变动 |
+| C seed 替代 | 87% | **parser.cheng（8054 行）冷编译通过（435KB Mach-O .o）**；6 阻断全部清除：`[index]`、`->` deref、一元负号、三元表达式、循环内 var、无 `type` 关键字类型声明、索引+字段组合赋值；`gate_main`、`primary_object_plan`、`backend_driver_dispatch_min` 等均通过；函数级泛型/完整单态化未闭合，cheng_seed.c 仍在链中 |
 | 跨端 | 60% | 三架构 exe + COFF obj 均产出，CI 中有 COFF 格式验证 |
 
 愿景可以写目标，不写成完成。若与实现冲突，以 `docs/cheng-formal-spec.md`、`src/core/tooling/README.md`、当前源码和当前可执行产物为准。

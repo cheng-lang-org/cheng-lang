@@ -1987,6 +1987,38 @@ static void cold_die_call_arg_mismatch(BodyIR *body, FnDef *fn,
     die("cold call arg mismatch");
 }
 
+static void cold_print_same_name_call_candidates(Symbols *symbols, BodyIR *body,
+                                                 Span name, int32_t arg_start,
+                                                 int32_t arg_count) {
+    if (!symbols || !body) return;
+    for (int32_t i = 0; i < arg_count; i++) {
+        int32_t arg_slot = body->call_arg_slot[arg_start + i];
+        fprintf(stderr,
+                "cheng_cold:   actual[%d] kind=%d size=%d type=%.*s\n",
+                i, body->slot_kind[arg_slot], body->slot_size[arg_slot],
+                (int)body->slot_type[arg_slot].len, body->slot_type[arg_slot].ptr);
+    }
+    int32_t printed = 0;
+    for (int32_t fi = 0; fi < symbols->function_count; fi++) {
+        FnDef *fn = &symbols->functions[fi];
+        if (!span_same(fn->name, name)) continue;
+        fprintf(stderr,
+                "cheng_cold:   candidate[%d] arity=%d ret=%.*s",
+                fi, fn->arity, (int)fn->ret.len, fn->ret.ptr);
+        for (int32_t pi = 0; pi < fn->arity; pi++) {
+            fprintf(stderr, " param[%d]=kind:%d size:%d type:%.*s",
+                    pi, fn->param_kind[pi], fn->param_size[pi],
+                    (int)fn->param_type[pi].len, fn->param_type[pi].ptr);
+        }
+        fprintf(stderr, "\n");
+        printed++;
+        if (printed >= 8) return;
+    }
+    if (printed == 0) {
+        fprintf(stderr, "cheng_cold:   no same-name candidates\n");
+    }
+}
+
 static int32_t cold_param_sequence_value_kind(int32_t param_kind) {
     if (param_kind == SLOT_SEQ_I32 || param_kind == SLOT_SEQ_I32_REF) return SLOT_SEQ_I32;
     if (param_kind == SLOT_SEQ_STR || param_kind == SLOT_SEQ_STR_REF) return SLOT_SEQ_STR;
@@ -2800,6 +2832,8 @@ int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *locals,
                 (int)lookup_name.len, lookup_name.ptr,
                 body && body->debug_name.len > 0 ? (int)body->debug_name.len : 0,
                 body && body->debug_name.len > 0 ? body->debug_name.ptr : (uint8_t *)"");
+        cold_print_same_name_call_candidates(parser->symbols, body, lookup_name,
+                                             arg_start, arg_count);
         die("unresolved function call");
     }
 	    FnDef *fn = &parser->symbols->functions[fn_index];
@@ -3055,6 +3089,8 @@ int32_t parse_call_from_args_span(Parser *owner, BodyIR *body, Locals *locals,
                 (int)lookup_name.len, lookup_name.ptr,
                 body && body->debug_name.len > 0 ? (int)body->debug_name.len : 0,
                 body && body->debug_name.len > 0 ? body->debug_name.ptr : (uint8_t *)"");
+        cold_print_same_name_call_candidates(owner->symbols, body, lookup_name,
+                                             arg_start, arg_count);
         die("unresolved function call");
     }
 	    FnDef *fn = &owner->symbols->functions[fn_index];

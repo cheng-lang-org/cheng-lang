@@ -93,6 +93,9 @@
 - cold codegen 禁止用 BodyIR canonical hash 做函数去重；不同零参字符串返回函数会被合并到同一地址，`compiler_runtime_smoke` 会读到错误 target。E-Graph rewrite/dedup 必须先有等价证明再进 codegen。
 - cold DSE 活跃性根必须包含 terminator、`call_arg` side table、以及会读写容器/引用的 dst slot；否则 `while` 条件、call 参数、sequence/object 初始化会被当作死写删除。
 - BodyIR slot 是可变非 SSA；CSE、hash dedup、跨 slot 等价替换必须等 SSA/等价证明后再启用。当前只允许 DSE 和可证明代数恒等式，不允许靠相似 op 做值复用。
+- BodyIR block op ranges 不保证按 block index 单调；压实 tombstone 必须先快照旧 op 数组，再按 block 顺序写新数组，禁止原地边读边写。
+- cold DSE 必须把 `SEQ_*_ADD/REMOVE` 当可观察写入；仅标记 reads-dst 不够，未被后续读取的容器 mutation 仍必须保留。
+- payloadless enum 进入 `int32` ABI、return、condition compare 前必须物化 tag；`SLOT_VARIANT` 不能直接落到 sret/composite return 路径。
 - `build-backend-driver` 候选门禁必须保留 source-direct `while` 运行测试；禁止把真实控制流 smoke 改成 `for`、compile-only 或其它绕路。
 - runtime provider archive 门禁禁止用 allocator/entry/panic stub 冒充闭合；只允许导出真实实现的符号。原子 provider smoke 只能证明 atomic 外部符号解析，不能外推成 runtime roots 完成。
 - Cheng `str` 是 24 字节值布局：data@0、len@8、store_id@12、flags@16；`str[]/uint8[]` 是 16 字节动态序列头。cold ABI/codegen 禁止把二者混成 16 字节字符串。
