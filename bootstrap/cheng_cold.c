@@ -44,6 +44,7 @@ static bool cold_diag_dump_slots = false;
 static int32_t cold_egraph_rewrite_count = 0;
 static int32_t cold_egraph_dedup_count = 0;
 static int32_t cold_egraph_licm_hoisted = 0;
+static int32_t cold_egraph_fixed_point_iterations = 0;
 
 #include "macho_direct.h"
 #include "elf64_direct.h"
@@ -12969,9 +12970,9 @@ static void cold_apply_identity_rewrites(BodyIR *body) {
 }
 
 static void cold_apply_licm(BodyIR *body);
-/* Optimize a BodyIR function with dead store elimination.
-   BodyIR slots are mutable, so CSE belongs after SSA/equivalence proof. */
-static void cold_optimize_body(BodyIR *body, bool enable_licm) {
+static void cold_opt_pass(BodyIR *body) {
+    /* One pass of DSE + identity rewrites.
+       Separated so cold_optimize_body can iterate to convergence. */
     if (!body || body->slot_count <= 0 || body->op_count <= 0) return;
 
     int32_t slot_count = body->slot_count;
@@ -13049,9 +13050,28 @@ static void cold_optimize_body(BodyIR *body, bool enable_licm) {
     /* Algebraic identity rewrites (provably-correct constant folding).
        Runs after DSE so slot writer counts reflect only live ops. */
     cold_apply_identity_rewrites(body);
+}
+
+/* Optimize a BodyIR function with dead store elimination and identity rewrites.
+   Iterates to fixed point so cascading patterns (e.g. double-NEG feeding
+   ADD(x,0)) are fully resolved.
+   BodyIR slots are mutable, so CSE belongs after SSA/equivalence proof. */
+static void cold_optimize_body(BodyIR *body, bool enable_licm) {
+    if (!body || body->slot_count <= 0 || body->op_count <= 0) return;
+
+    int32_t prev = 0;
+    int32_t pass_count = 0;
+    #define COLD_EGRAPH_CONVERGE_MAX_ITER 16
+
+    do {
+        prev = cold_egraph_rewrite_count;
+        pass_count++;
+        cold_opt_pass(body);
+    } while (cold_egraph_rewrite_count != prev && pass_count < COLD_EGRAPH_CONVERGE_MAX_ITER);
+
+    cold_egraph_fixed_point_iterations = pass_count;
 
     if (enable_licm) cold_apply_licm(body);
-
 }
 
 /* LICM: Loop Invariant Code Motion for CONST hoisting. */
@@ -13526,6 +13546,7 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
 
     cold_egraph_rewrite_count = 0;
     cold_egraph_licm_hoisted = 0;
+    cold_egraph_fixed_point_iterations = 0;
     FunctionPatchList function_patches = {0};
     function_patches.arena = code->arena;
 
@@ -14186,6 +14207,7 @@ typedef struct ColdCompileStats {
     int32_t egraph_rewrite_count;
     int32_t egraph_licm_hoisted;
     int32_t egraph_dedup_count;
+    int32_t egraph_fixed_point_iterations;
     int32_t total_function_count;
     int32_t link_object;
     int32_t provider_archive;
@@ -16593,6 +16615,7 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
             stats->egraph_rewrite_count = cold_egraph_rewrite_count;
             stats->egraph_licm_hoisted = cold_egraph_licm_hoisted;
             stats->egraph_dedup_count = cold_egraph_dedup_count;
+            stats->egraph_fixed_point_iterations = cold_egraph_fixed_point_iterations;
             stats->csg_lowering = 1;
             stats->arena_kb = arena->used / 1024;
             uint64_t end_us = cold_now_us();
@@ -17690,6 +17713,7 @@ bool cold_compile_source_path_to_macho(const char *out_path,
             stats->function_count = symbols->function_count;
             stats->type_count = symbols->type_count + symbols->object_count;
             stats->egraph_rewrite_count = cold_egraph_rewrite_count;
+            stats->egraph_fixed_point_iterations = cold_egraph_fixed_point_iterations;
             cold_collect_body_stats(symbols, function_bodies, symbols->function_count, stats);
             stats->code_words = code->count;
             stats->arena_kb = arena->used / 1024;
@@ -17715,6 +17739,7 @@ bool cold_compile_source_path_to_macho(const char *out_path,
         stats->function_count = symbols->function_count;
         stats->type_count = symbols->type_count + symbols->object_count;
         stats->egraph_rewrite_count = cold_egraph_rewrite_count;
+        stats->egraph_fixed_point_iterations = cold_egraph_fixed_point_iterations;
         if (demo_body) {
             stats->op_count = demo_body->op_count;
             stats->block_count = demo_body->block_count;
@@ -17829,6 +17854,7 @@ static bool cold_write_system_link_exec_report(const char *path,
         fprintf(file, "egraph_rewrite_count=%d\n", stats->egraph_rewrite_count);
         fprintf(file, "egraph_licm_hoisted=%d\n", stats->egraph_licm_hoisted);
         fprintf(file, "egraph_dedup_count=%d\n", stats->egraph_dedup_count);
+        fprintf(file, "egraph_fixed_point_iterations=%d\n", stats->egraph_fixed_point_iterations);
         fprintf(file, "ownership_compile_entry=%d\n", stats->ownership_compile_entry);
         fprintf(file, "ownership_runtime_witness=%d\n", stats->ownership_runtime_witness);
         cold_print_elapsed_ms(file, "cold_compile_elapsed_ms", stats->elapsed_us);
@@ -18457,9 +18483,41 @@ static bool cold_read_macho_relocatable_view(const uint8_t *data,
     if (out->word_count <= 0 || out->text_size <= 0) return false;
     out->data = data;
     out->len = len;
-    /* Mach-O relocations are in section headers; for now mark as 0 */
+
+    /* Parse relocations from section headers in LC_SEGMENT_64.
+       Each section header is 80 bytes: reloff at offset 56, nreloc at offset 60. */
     out->relas = 0;
     out->reloc_count = 0;
+    cmd_pos = 0;
+    for (uint32_t ci = 0; ci < ncmds; ci++) {
+        if (cmd_pos + 8 > sizeofcmds) return true;
+        uint32_t scmd = cold_u32le(cmds + cmd_pos);
+        uint32_t scmdsize = cold_u32le(cmds + cmd_pos + 4);
+        if (scmdsize < 8 || cmd_pos + scmdsize > sizeofcmds) return true;
+        if (scmd == 0x19) {
+            int32_t nsects = (int32_t)((scmdsize - 72) / 80);
+            if (nsects > 0) {
+                int32_t total_relocs = 0;
+                const uint8_t *first_relas = 0;
+                for (int32_t si = 0; si < nsects; si++) {
+                    const uint8_t *sec = cmds + cmd_pos + 72 + si * 80;
+                    uint32_t reloff = cold_u32le(sec + 56);
+                    uint32_t nreloc = cold_u32le(sec + 60);
+                    if (nreloc > 0) {
+                        if (!cold_file_range_ok(len, (int64_t)reloff, (int64_t)nreloc * 8)) return true;
+                        if (!first_relas) first_relas = data + reloff;
+                        total_relocs += (int32_t)nreloc;
+                    }
+                }
+                if (first_relas && total_relocs > 0) {
+                    out->relas = (const void *)first_relas;
+                    out->reloc_count = total_relocs;
+                }
+            }
+            break;
+        }
+        cmd_pos += scmdsize;
+    }
     return true;
 }
 
@@ -18946,6 +19004,119 @@ static bool cold_link_relocs_for_object(ColdElfObjectView *obj,
     return true;
 }
 
+#define COLD_MACHO_TEXT_ADDR 0x1000002D8ULL
+
+static bool cold_apply_macho_reloc(uint32_t *words, int32_t word_count,
+                                    int32_t word_pos, int32_t target_word,
+                                    uint32_t reloc_type) {
+    if (!words || word_pos < 0 || word_pos >= word_count ||
+        target_word < 0 || target_word >= word_count) {
+        return false;
+    }
+    int32_t delta = target_word - word_pos;
+
+    if (reloc_type == ARM64_RELOC_BRANCH26) {
+        if (delta < -(1 << 25) || delta >= (1 << 25)) return false;
+        words[word_pos] = (words[word_pos] & 0xFC000000u) |
+                          ((uint32_t)delta & 0x03FFFFFFu);
+        return true;
+    }
+
+    if (reloc_type == ARM64_RELOC_PAGE21) {
+        uint64_t src_addr = COLD_MACHO_TEXT_ADDR + (uint64_t)word_pos * 4;
+        uint64_t tgt_addr = COLD_MACHO_TEXT_ADDR + (uint64_t)target_word * 4;
+        int64_t page_delta = (int64_t)((tgt_addr >> 12) - (src_addr >> 12));
+        if (page_delta < -(1LL << 20) || page_delta >= (1LL << 20)) return false;
+        uint32_t imm21 = (uint32_t)(page_delta & 0x1FFFFF);
+        uint32_t immlo = imm21 & 0x3u;
+        uint32_t immhi = imm21 >> 2;
+        words[word_pos] = (words[word_pos] & 0x9F00001Fu) |
+                          (immlo << 29) | (immhi << 5);
+        return true;
+    }
+
+    if (reloc_type == ARM64_RELOC_PAGEOFF12) {
+        uint64_t tgt_addr = COLD_MACHO_TEXT_ADDR + (uint64_t)target_word * 4;
+        uint32_t page_off = (uint32_t)(tgt_addr & 0xFFF);
+        words[word_pos] = (words[word_pos] & ~0x003FFC00u) |
+                          ((page_off & 0xFFFu) << 10);
+        return true;
+    }
+
+    return false;
+}
+
+static bool cold_link_relocs_for_macho_object(ColdMachOObjectView *obj,
+                                               uint32_t *words,
+                                               int32_t total_words,
+                                               int32_t base_word,
+                                               ColdMachOObjectView *primary,
+                                               ColdProviderArchiveView *archive,
+                                               bool primary_object,
+                                               ColdCompileStats *stats) {
+    for (int32_t i = 0; i < obj->reloc_count; i++) {
+        uint32_t sym_idx = obj->relas[i].r_symbolnum;
+        if (sym_idx >= (uint32_t)obj->sym_count) return false;
+        int32_t r_address = obj->relas[i].r_address;
+        if (r_address < 0 || (r_address % 4) != 0) return false;
+        int32_t word_offset = r_address / 4;
+        if (word_offset >= obj->word_count) return false;
+        const uint8_t n_type = obj->syms[sym_idx].n_type;
+        int32_t target_word = -1;
+        const char *sym_name = cold_macho_symbol_name(obj, sym_idx);
+        if (!sym_name || sym_name[0] == '\0') return false;
+        const char *export_name = (sym_name[0] == '_' && sym_name[1] != '\0') ? sym_name + 1 : sym_name;
+
+        if ((n_type & 0x0e) == 0x0e && obj->syms[sym_idx].n_sect != 0) {
+            uint64_t value = obj->syms[sym_idx].n_value;
+            if ((value % 4) != 0 || value / 4 >= (uint64_t)obj->word_count) return false;
+            target_word = base_word + (int32_t)(value / 4);
+        } else {
+            if (primary_object) {
+                int32_t member_index = cold_provider_archive_find_export(archive, export_name);
+                if (member_index >= 0) {
+                    ColdProviderArchiveMember *member = &archive->members[member_index];
+                    if (!member->selected) return false;
+                    int32_t provider_word = -1;
+                    if (!cold_macho_defined_symbol_word(&member->macho_view, sym_name, &provider_word))
+                        return false;
+                    if (provider_word < 0 || provider_word >= member->macho_view.word_count)
+                        return false;
+                    target_word = member->base_word + provider_word;
+                    if (stats) stats->provider_resolved_symbol_count++;
+                }
+            } else {
+                int32_t primary_word = -1;
+                if (primary &&
+                    cold_macho_defined_symbol_word(primary, sym_name, &primary_word)) {
+                    target_word = primary_word;
+                } else if (cold_provider_archive_find_selected_definition(archive,
+                                                                          export_name,
+                                                                          &target_word)) {
+                    if (stats) stats->provider_resolved_symbol_count++;
+                }
+            }
+            if (target_word < 0) {
+                if (stats) {
+                    stats->unresolved_symbol_count++;
+                    if (stats->first_unresolved_symbol[0] == '\0' && sym_name) {
+                        snprintf(stats->first_unresolved_symbol,
+                                 sizeof(stats->first_unresolved_symbol),
+                                 "%s", sym_name);
+                    }
+                }
+                continue;
+            }
+        }
+        int32_t word_pos = base_word + word_offset;
+        uint32_t r_type = obj->relas[i].r_type;
+        if (!cold_apply_macho_reloc(words, total_words, word_pos, target_word, r_type))
+            return false;
+        if (stats) stats->link_reloc_count++;
+    }
+    return true;
+}
+
 static bool cold_link_elf64_object_with_provider_archive(const char *object_path,
                                                          const char *archive_path,
                                                          const char *out_path,
@@ -19070,6 +19241,7 @@ static bool cold_link_macho_object_with_provider_archive(const char *object_path
     uint64_t start_us = cold_now_us();
     Span primary_span = source_open(object_path);
     Span archive_span = source_open(archive_path);
+    uint32_t *words = 0;
     ColdProviderArchiveView archive = {0};
     bool ok = false;
     if (primary_span.len <= 0 || archive_span.len <= 0) goto done;
@@ -19134,31 +19306,23 @@ static bool cold_link_macho_object_with_provider_archive(const char *object_path
     }
 
     int32_t selected_count = 0;
+    int32_t total_words = primary.word_count;
     for (int32_t mi = 0; mi < archive.member_count; mi++) {
-        if (archive.members[mi].selected) selected_count++;
+        ColdProviderArchiveMember *member = &archive.members[mi];
+        if (!member->selected) continue;
+        member->base_word = total_words;
+        total_words += member->macho_view.word_count;
+        selected_count++;
     }
-
-    char cmd[65536];
-    int n = snprintf(cmd, sizeof(cmd), "cc -o '%s' '%s'", out_path, object_path);
-    if (n < 0 || n >= (int)sizeof(cmd)) goto done;
+    words = (uint32_t *)calloc(total_words > 0 ? (size_t)total_words : 1, sizeof(uint32_t));
+    if (!words) goto done;
+    memcpy(words, primary.words, (size_t)primary.word_count * sizeof(uint32_t));
     for (int32_t mi = 0; mi < archive.member_count; mi++) {
-        if (!archive.members[mi].selected) continue;
-        char member_path[PATH_MAX];
-        int nn2 = snprintf(member_path, sizeof(member_path), "%s.member%d.o", out_path, mi);
-        if (nn2 < 0 || nn2 >= (int)sizeof(member_path)) goto done;
-        int fd = open(member_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (fd < 0) goto done;
-        bool wrote = cold_write_all_fd(fd, archive.members[mi].object_data,
-                                        (size_t)archive.members[mi].object_size);
-        close(fd);
-        if (!wrote) { unlink(member_path); goto done; }
-        int remaining = (int)sizeof(cmd) - n;
-        if (remaining < 4) { unlink(member_path); goto done; }
-        int nn3 = snprintf(cmd + n, (size_t)remaining, " '%s'", member_path);
-        if (nn3 < 0 || nn3 >= remaining) { unlink(member_path); goto done; }
-        n += nn3;
+        ColdProviderArchiveMember *member = &archive.members[mi];
+        if (!member->selected) continue;
+        memcpy(words + member->base_word, member->macho_view.words,
+               (size_t)member->macho_view.word_count * sizeof(uint32_t));
     }
-
     if (stats) {
         stats->link_object = 1;
         stats->provider_archive = 1;
@@ -19166,21 +19330,28 @@ static bool cold_link_macho_object_with_provider_archive(const char *object_path
         stats->provider_archive_member_count = archive.member_count;
         stats->provider_archive_hash = archive_hash;
         stats->provider_export_count = archive.export_count;
-        stats->elapsed_us = cold_now_us() - start_us;
     }
-
-    int ret = system(cmd);
+    if (!cold_link_relocs_for_macho_object(&primary, words, total_words, 0,
+                                           &primary, &archive, true, stats)) goto done;
+    if (stats && stats->unresolved_symbol_count != 0) goto done;
     for (int32_t mi = 0; mi < archive.member_count; mi++) {
-        if (!archive.members[mi].selected) continue;
-        char member_path[PATH_MAX];
-        snprintf(member_path, sizeof(member_path), "%s.member%d.o", out_path, mi);
-        unlink(member_path);
+        ColdProviderArchiveMember *member = &archive.members[mi];
+        if (!member->selected) continue;
+        if (!cold_link_relocs_for_macho_object(&member->macho_view, words, total_words,
+                                               member->base_word, &primary,
+                                               &archive, false, stats)) goto done;
     }
-    if (ret != 0) goto done;
-    if (stats) stats->emit_us = cold_now_us() - start_us;
+    if (stats && stats->unresolved_symbol_count != 0) goto done;
+    if (!macho_write_exec(out_path, words, total_words)) goto done;
+    if (stats) {
+        stats->code_words = total_words;
+        stats->elapsed_us = cold_now_us() - start_us;
+        stats->emit_us = stats->elapsed_us;
+    }
     ok = true;
 
 done:
+    if (words) free(words);
     cold_provider_archive_view_free(&archive);
     if (primary_span.len > 0) munmap((void *)primary_span.ptr, (size_t)primary_span.len);
     if (archive_span.len > 0) munmap((void *)archive_span.ptr, (size_t)archive_span.len);
@@ -20752,21 +20923,25 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
             fprintf(stderr, "[cheng_cold] --link-object requires --emit:exe\n");
             return 2;
         }
-        if (!is_elf) {
-            const char *error = (provider_archive_path && provider_archive_path[0] != '\0' && is_macho)
-                ? COLD_PROVIDER_ARCHIVE_MACHO_ERROR
+        bool linked = false;
+        if (is_elf) {
+            if (provider_archive_path && provider_archive_path[0] != '\0') {
+                linked = cold_link_elf64_object_with_provider_archive(link_object_path, provider_archive_path,
+                                                                      out_path, target, &stats);
+            } else {
+                linked = cold_link_elf64_object_to_exec(link_object_path, out_path, target, &stats);
+            }
+        } else if (is_macho && provider_archive_path && provider_archive_path[0] != '\0') {
+            linked = cold_link_macho_object_with_provider_archive(link_object_path, provider_archive_path,
+                                                                   out_path, target, &stats);
+        } else {
+            const char *error = is_macho
+                ? "--link-object with Mach-O requires --provider-archive"
                 : "--link-object currently requires ELF target";
             cold_write_system_link_exec_report(report_path, false, link_object_path, provider_archive_path, out_path,
                                                target, emit, &stats, error);
             fprintf(stderr, "[cheng_cold] %s\n", error);
             return 2;
-        }
-        bool linked = false;
-        if (provider_archive_path && provider_archive_path[0] != '\0') {
-            linked = cold_link_elf64_object_with_provider_archive(link_object_path, provider_archive_path,
-                                                                  out_path, target, &stats);
-        } else {
-            linked = cold_link_elf64_object_to_exec(link_object_path, out_path, target, &stats);
         }
         if (!linked) {
             cold_write_system_link_exec_report(report_path, false, link_object_path, provider_archive_path, out_path,
@@ -20790,15 +20965,6 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
         stats.provider_archive = 1;
         snprintf(stats.system_link_exec_scope, sizeof(stats.system_link_exec_scope),
                  "cold_csg_provider_archive");
-        if (!is_elf) {
-            const char *error = is_macho
-                ? COLD_PROVIDER_ARCHIVE_MACHO_ERROR
-                : "--provider-archive with --csg-in requires ELF target";
-            cold_write_system_link_exec_report(report_path, false, source_path, csg_in_path, out_path,
-                                               target, emit, &stats, error);
-            fprintf(stderr, "[cheng_cold] %s\n", error);
-            return 2;
-        }
         char primary_o[PATH_MAX];
         int n = snprintf(primary_o, sizeof(primary_o), "%s.primary.o", out_path);
         if (n <= 0 || n >= (int)sizeof(primary_o)) {
@@ -20815,8 +20981,15 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
             unlink(primary_o);
             return 2;
         }
-        if (!cold_link_elf64_object_with_provider_archive(primary_o, provider_archive_path,
-                                                          out_path, target, &stats)) {
+        bool linked = false;
+        if (is_elf) {
+            linked = cold_link_elf64_object_with_provider_archive(primary_o, provider_archive_path,
+                                                                   out_path, target, &stats);
+        } else if (is_macho) {
+            linked = cold_link_macho_object_with_provider_archive(primary_o, provider_archive_path,
+                                                                    out_path, target, &stats);
+        }
+        if (!linked) {
             cold_write_system_link_exec_report(report_path, false, source_path, csg_in_path, out_path,
                                                target, emit, &stats, "provider archive link failed");
             fprintf(stderr, "[cheng_cold] provider archive link failed: %s\n", provider_archive_path);

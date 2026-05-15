@@ -869,6 +869,39 @@ else
 fi
 assert "ownership_phase_consistency" 1 "$ACT"
 
+# 11b: E-Graph convergence test — DSE + identity rewrites iterate to fixed point
+rm -f /tmp/ct_egraph_conv /tmp/ct_egraph_conv.report /tmp/ct_egraph_conv.stdout
+quiet $COLD system-link-exec --in:src/tests/ownership_proof_driver_cold.cheng \
+    --target:arm64-apple-darwin --out:/tmp/ct_egraph_conv \
+    --report-out:/tmp/ct_egraph_conv.report
+if [ -x /tmp/ct_egraph_conv ]; then
+    /tmp/ct_egraph_conv >/tmp/ct_egraph_conv.stdout 2>/dev/null; ACT=$?
+else
+    ACT="COMPILE_FAILED"
+fi
+assert "egraph_convergence_exit" 0 "$ACT"
+if grep -q 'egraph_fixed_point_iterations=' /tmp/ct_egraph_conv.report 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "egraph_convergence_report_field" 1 "$ACT"
+# Verify the convergence iteration count is at least 1
+ITER=$(grep 'egraph_fixed_point_iterations=' /tmp/ct_egraph_conv.report | sed 's/.*=//')
+if [ -n "$ITER" ] && [ "$ITER" -ge 1 ] 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "egraph_convergence_iter_count" 1 "$ACT"
+# Verify the executable still produces correct output
+if grep -q 'ownership_proof_driver ok' /tmp/ct_egraph_conv.stdout 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "egraph_convergence_output" 1 "$ACT"
+
 # 12: emit:obj with object fields (int32 + str)
 rm -f /tmp/ct_eo_fields.cheng /tmp/ct_eo_fields /tmp/ct_eo_fields.o /tmp/ct_eo_fields_link
 cat > /tmp/ct_eo_fields.cheng << 'EOF'
