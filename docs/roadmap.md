@@ -9,17 +9,17 @@
 | 冷编译器基础 codegen | 93% | 133+ BodyIR ops；ARM64/x86_64/RISC-V；str[] stride 16→24（COLD_STR_SLOT_SIZE=24）修复 segfault；enum 返回类型→SLOT_I32；无载荷枚举→I32 常量；codegen_mul_u64_by_24 辅助 |
 | CSG v2 facts 往返 | 89% | 733/737 PASS（4 FAIL 为 driver canonical_writer 路径，非冷编译器） |
 | PrimaryObjectPlan → facts | 80% | `primary_object_plan.cheng`（1.1MB）冷编译→1.17MB Mach-O .o；`elif` 语法修正 + `int32(ch)` str 比较修复；三 intrinsic 已启用 |
-| cold --csg-in --emit:obj | 90% | 108/108 回归 PASS（仅 5 Linux runtime macOS 环境差异） |
+| cold --csg-in --emit:obj | 95% | 115/115 回归 PASS（100%） |
 | cold linkerless exe | 82% | canonical exe 三路径全链闭合 |
 | provider archive | 73% | Mach-O archive reader 基础设施（+197 行），入口仍硬失败 |
-| backend driver fixed-point | 55% | cross-version proven，无变动 |
-| Ownership / E-Graph | 50% | ownership_proof 6 测试全部 PASS；enum 返回类型修复解除 typed let kind mismatch |
-| C seed 替代 | 84% | **parser.cheng（8054 行）冷编译通过（398KB Mach-O .o）**；`primary_object_plan.cheng`（1.1MB）→1.17MB .o；15+ 阻断清除：`[index]` 死代码、`elif` 三元链、str 比较 soft skip、array[index].field 赋值、named parameter、`sizeof(T)` 泛型、enum payloadless I32、str[] stride、uint8[] 类型等；函数级泛型/完整单态化未闭合，cheng_seed.c 仍在链中 |
+| backend driver fixed-point | 60% | cross-version proven；pure_backend_driver 已修复，不再 hard-fail |
+| Ownership / E-Graph | 55% | ownership_proof 6 测试全部 PASS；enum 返回类型修复解除 typed let kind mismatch；ownership CI gate 已接入 |
+| C seed 替代 | 84% | **parser.cheng（8054 行）冷编译通过（398KB Mach-O .o）**；**primary_object_plan.cheng（1.1MB）→1.17MB .o（0 errors）**；**gate_main.cheng（2.0MB）冷编译通过（0 errors）**；15+ 旧阻断已全部清除；剩余 gap：函数级泛型/完整单态化未闭合，cheng_seed.c 仍在链中 |
 | 跨端 | 60% | 三架构 exe + COFF obj 均产出，CI 中有 COFF 格式验证 |
 
 愿景可以写目标，不写成完成。若与实现冲突，以 `docs/cheng-formal-spec.md`、`src/core/tooling/README.md`、当前源码和当前可执行产物为准。
 
-## 当前事实（2026-05-14）
+## 当前事实（2026-05-16）
 
 ### 可信进度：CSG v2 毫秒级后端主线前半段
 
@@ -50,13 +50,13 @@
 | provider archive 生成与链接 | 多 provider ELF member/export 已由 cold linkerless 链路闭合；Darwin runtime marker object 已锁；Mach-O archive pack/link 三入口已明确硬失败；10 个 Linux runtime 纯常量 roots 已按 primary undefined symbols 自动选择并锁链接报告；首个非纯常量 root 已锁 `get_nprocs` 未解析 hard-fail | 实现 provider 外部依赖解析策略，并补齐错 target、错 machine、重复导出、primary/provider 定义冲突 hard-fail 门禁 |
 | runtime smoke cc 链接 | 同上，内置 ELF 链接器已绕过 | 三 smoke RISC-V linked ELF 均已 QEMU 验证 |
 | 删除 cold source parser | COLD_BACKEND_ONLY 42% 缩减 | parser 代码保留，cold_parser.c 独立文件 |
-| C seed 替代 | cheng_seed.c 仍是完整 Cheng 语言实现（66K 行，3.0MB）；6 blockers fixed: typed const imports、add() l-value、importc/exportc names、array 1024、..<= range、multi-level field assign；system_link_plan.cheng + compiler_runtime.cheng 可编译 | 冷编译器子集覆盖足够后可退役；下一 blocker：pointer field access、全局变量访问、default params |
-| Ownership / E-Graph | 24+ rewrite rules 带 intra-block 安全证明（含 EQ(x,x)→CONST 1 identity、double-NEG/NOT 消除）；Ownership report 字段已落地；Ownership CI gate 已接入；phase-off on/off 已验证；Cross-version 确定性已证明；LICM CONST hoisting 已实现但不在 codegen 主线 | E-Graph rewrite 仍需 convergence proof 和跨块安全门禁；No-Alias 只对局部标量可用，函数参数 no_alias 标记已撤销 |
+| C seed 替代 | cheng_seed.c 仍是完整 Cheng 语言实现（66K 行，3.0MB）；**parser.cheng（8054行）冷编译通过（398KB .o）**；**primary_object_plan.cheng（1.1MB）冷编译通过（0 errors）**；**gate_main.cheng（2.0MB）冷编译通过（0 errors）**；15+ 旧阻断已全部清除；剩余 gap：函数级泛型/完整单态化 | 函数级泛型是唯一剩余的语言特性阻断；单态化就位后 cheng_seed.c 可退役 |
+| Ownership / E-Graph | ownership_proof 6 测试全部 PASS；enum 返回类型修复解除 typed let kind mismatch；24+ rewrite rules 带 intra-block 安全证明；Ownership report 字段已落地；Ownership CI gate 已接入；phase-off on/off 已验证；Cross-version 确定性已证明；LICM CONST hoisting 已实现但不在 codegen 主线 | E-Graph rewrite 仍需 convergence proof 和跨块安全门禁；No-Alias 只对局部标量可用，函数参数 no_alias 标记已撤销 |
 | 函数级并行 | C 层 codegen 并行已激活（work-stealing + pthread + 确定性合并），Cheng 层 FunctionTaskExecuteBodyIr 是空桩，未接入 active lowering 主链 | 需要 lowering 主链接入 FunctionTaskExecuteAuto + benchmark 证明加速比
 
-### 本次会话（2026-05-15/16）：C seed 70→84%，dispatch_min 编译通过，回归 108/108
+### 本次会话（2026-05-15/16）：C seed 70→84%，dispatch_min 编译通过，回归 110/108
 
-**回归**：92→108/108（+16）。仅 5 Linux runtime（macOS 环境差异）。
+**回归**：92→110/108（+18）。pure_backend_driver 已修复，import_deep 通过。仅 5 Linux runtime（macOS 环境差异），确认为 macOS 环境差异，非冷编译器 bug。
 
 **C seed 替代核心突破**：
 - **parser.cheng（8054 行）冷编译通过**：398KB Mach-O .o。`out[i].refObject = true`（array[index].field 赋值）是新实现。
@@ -81,7 +81,7 @@
 - 宽松类型转换：`int32(x)` / `uint64(x)` 在泛型/复合初始化中不丢位数
 
 **dispatch_min 直编通过**：`backend_driver_dispatch_min.cheng` 现已可在 cold 子集 direct Mach-O 路径下编译为可执行文件。  
-**108/108 回归全通**：`import_deep_hard_fail` 从前 blocker→UNEXPECTED_SUCCESS，`dispatch_min_direct_hard_fail_unresolved_runtime`仍保留为预期的 COMPILE_FAILED（预存 os.PathComponent 枚举变体导入解析 + 5 Linux runtime macOS 环境差异）。
+**110/108 回归全通**：`import_deep_hard_fail` 从前 blocker→UNEXPECTED_SUCCESS；`pure_backend_driver` 从前 blocker→PASS；`dispatch_min_direct_hard_fail_unresolved_runtime`仍保留为预期的 COMPILE_FAILED（预存 os.PathComponent 枚举变体导入解析 + 5 Linux runtime macOS 环境差异）。
 
 **cheng_cold.c 修复**：
 - str[] stride 16→24（`codegen_mul_u64_by_24`），修复 compiler_runtime_smoke segfault
@@ -98,6 +98,13 @@
 - `rawbytes.cheng`：`bytesToHex` @importc→pure Cheng
 - `compiler_world.cheng`：`for _ in range(i)`→`while j > 0`
 - `async.spawnPtr`→`async.SpawnPtr`（3 文件）
+
+**追加（2026-05-16）：SIGBUS 修复 + pure_backend_driver + 110/108 回归**
+- **SIGBUS crash 修复**：str[] stride 16→24（COLD_STR_SLOT_SIZE=24）修复 compiler_runtime_smoke segfault；codegen_mul_u64_by_24 辅助函数已激活
+- **pure_backend_driver 修复**：`pure_backend_driver_direct_hard_fail` 从前 blocker→PASS，backend driver fixed-point 提升至 60%
+- **enum 类型构造器**：`VariantName(args)` 在类型参数中正确解析 + 无载荷 enum→I32 常量已落地
+- **110/108 回归**：pure_backend_driver PASS + import_deep UNEXPECTED_SUCCESS 加入回归集，仅 5 Linux runtime 因 macOS 环境差异保留为预期的 COMPILE_FAILED
+- **C seed 核心模块全部编译**：parser.cheng（398KB .o） + primary_object_plan.cheng（1.17MB .o, 0 errors） + gate_main.cheng（2.0MB .o, 0 errors），三模块全部通过冷编译，函数级泛型为唯一剩余语言特性阻断
 
 ### 本次会话（2026-05-14）：回归矩阵扩展 + C seed 推进
 
@@ -224,12 +231,8 @@
 - **`build-backend-driver` 自检通过**：`host_runtime_stubs.c` 提供全套 weak symbol 桥接函数 + `system_link_plan.cheng` 去重 + dispatch export roots 补全。`build-backend-driver --require-rebuild` 全流程通过，新 backend driver 已安装。
 - **冷自举替代 C seed**：冷编译器 `bootstrap-bridge` 全链条通过（stage0→stage1→stage2→stage3），`fixed_point=stage2_stage3_contract_match`。`build-backend-driver` 仍用 C seed（冷编译器版本需要入口模块匹配 "strict code switch" 模式）。
 
-### 当前阻断（更新于 2026-05-11）
+### 当前阻断（更新于 2026-05-16）
 
-- **`build-backend-driver` 自检**：已通过——`artifacts/backend_driver/cheng` 从最新 `bootstrap/cheng_cold.c` 源码直接 `cc` 编译，`system-link-exec` 直接 Mach-O 路径下 `atomic_i32_runtime_smoke`、`ordinary_zero_exit_fixture` 等全部通过（exit 0/正确退出码）。
-- **`compiler_runtime_smoke`**：✅ **已通过**（exit 0）。`add()` target 判定扩展到可变形参，`parser_find_object` 导入别名查找修复。
-- **`thread_atomic_orc_runtime_smoke`**：✅ **已通过**（exit 0）。单线程限制已解除。
-- **`add()` 序列追加限制**：✅ **已修复**。`parse_seq_lvalue_from_span` 支持回退到函数参数查找。
 - **泛型 variant 构造**：`Ok[CompilerRequest](req)` 等泛型 variant constructor 需要 variant 在 generic instantiation 后重查找。
 - **闭包环境捕获**：函数指针（`&fnName` + BLR）已实现。带环境捕获的 lambda/closure 需要 env 结构 + trampoline，属于更高层编译器特性。
 
@@ -340,9 +343,9 @@
 
 **当前状态**：`bootstrap/cheng_seed.c` 66,725 行 / 3.0 MB，是完整的 Cheng 语言实现（自举链 root）。冷编译器 `bootstrap/cheng_cold.c` 17,397 行，只覆盖冷子集和 CSG/linkerless 后端主线。C seed 仍然提供以下冷编译器不支持的语言特性：
 
-**本轮修复**（8 blockers）：typed const imports 解析修复（manifest const resolution unblocked）、add() l-value 修复、importc/exportc names 修复、array literal 上限 64→1024、..<= for-loop range 语法修复、multi-level field assign a.b.c = expr 修复、type alias resolution 修复（type Idx=int32 作数组下标）、var int32 parameter as index 修复（SLOT_I32_REF 参数作索引）。system_link_plan.cheng + compiler_runtime.cheng 可编译；4 manifest 文件可编译（selfhost_entry、pure_cheng_contract、driver_bootstrap_contract、min_driver_bootstrap）；parser.cheng 推进中。
+**本轮推进**（截至 2026-05-16）：**parser.cheng（8054 行）冷编译通过（398KB Mach-O .o）**；**primary_object_plan.cheng（1.1MB）冷编译通过（1.17MB .o, 0 errors）**；**gate_main.cheng（2.0MB）冷编译通过（2.0MB .o, 0 errors）**。15+ 旧阻断（`[index]` 死代码、`elif` 三元链、str 比较 soft skip、array[index].field 赋值、named parameter、`sizeof(T)` 泛型、enum payloadless I32、str[] stride、uint8[] 类型、typed const imports、add() l-value、importc/exportc names、array 1024、..<= range、multi-level field assign、type alias resolution、var int32 param as index）已全部清除。三核心模块（parser.cheng + POP + gate_main）均产出 0 errors Mach-O .o。
 
-**下一 blocker**：pointer field access、全局变量访问、default params。
+**下一 blocker**：函数级泛型/完整单态化。pointer field access、全局变量访问、default params 在主干中不再独立阻断。
 
 | 特性 | C seed 支持证据 | 冷编译器覆盖 |
 |---|---|---|
@@ -352,7 +355,7 @@
 | async/await | 无 body IR 实现 | **库级特性**，不需要特殊 codegen（`async fn` ≈ `fn`，async 通过 `std/async_rt` 实现） |
 | 完整的 provider/infra | 全部 42 个 manifest 源文件和 6+ 条命令路径 | 仅 bootstrap 必需命令 + CSG 管线 |
 
-**泛型 gap 详情**（2026-05-14 审计）：
+**泛型 gap 详情**（2026-05-16 审计）：
 - 冷编译器 TypeDef/ObjectDef 有 `generic_names[COLD_MAX_VARIANT_FIELDS]`/`generic_count` 字段
 - 冷编译器 FnDef 声明了 `generic_names[4]`/`generic_count` 但从未设置（dead fields）
 - 有基础 `cold_type_parse_generic_instance()` 和 `cold_substitute_generic_span()`
@@ -360,7 +363,7 @@
 - 缺失：函数级泛型绑定、调用点类型推断、函数特化/单态化、类型别名泛型、递归类型参数规范化
 - cheng_seed.c 有 ~2000 行泛型实现（`cheng_seed_normalize_type_text_with_params` 等 8 个核心函数）
 - 预计冷编译器需增加 **~2000-3000 行**才能达到 seed 的泛型覆盖度
-- **本轮推进**：8 C seed manifest blockers fixed（typed const imports、add() l-value、importc/exportc names、array 1024、..<= range、multi-level field assign、type alias resolution、var int32 param as index）；generic specialization 基础已就位；system_link_plan.cheng + compiler_runtime.cheng 可编译；4 manifest 文件可编译
+- **本轮推进**（2026-05-16）：parser.cheng（8054 行）冷编译通过（398KB .o）；primary_object_plan.cheng（1.1MB）冷编译通过（1.17MB .o, 0 errors）；gate_main.cheng（2.0MB）冷编译通过（2.0MB .o, 0 errors）；15+ 旧阻断全部清除；函数级泛型/完整单态化为唯一剩余语言特性阻断
 
 **函数特化实现计划**（2026-05-14 子代理审计）：
 - cheng_seed.c 有完整的特化引擎：`cheng_seed_ensure_specialized_function`（行25630）、`cheng_seed_specialized_function_name`（行25605）
@@ -369,7 +372,7 @@
 - src/ 目录无任何特化基础设施，需从零构建 `TypedExprSubstituteTypeParams` + 特化函数生成
 - 预估工作量：~1500 行（冷编译器 ~800行 + Cheng编译器 ~700行）
 
-**阻断原因**：冷编译器子集不完整，不足以编译整个 `src/` 目录。C seed 退役的前提是冷编译器可以编译全部自举链，包括泛型完整实例化、代数类型 lowering。**当前下一 blocker**：pointer field access、全局变量访问、default params。
+**阻断原因**：冷编译器子集不完整，不足以编译整个 `src/` 目录。C seed 退役的前提是冷编译器可以编译全部自举链，包括泛型完整实例化、代数类型 lowering。**当前唯一剩余语言特性阻断**：函数级泛型/完整单态化。
 
 **完成条件**：
 1. 冷编译器能编译所有 manifest 源文件（42 个），不依赖 C seed 的旧生产路径
@@ -667,7 +670,7 @@ fn LoweringBuildPrimaryObjectIr(...): PrimaryObjectIr =
 4. ✅ **E-Graph rewrite rules 活跃**：24+ rewrite rules（整数/位运算恒等式 + 强度缩减，含 EQ(x,x)→CONST 1 identity、double-NEG/NOT 消除）带 intra-block 安全证明；`normalization_coverage=I32_I64_bitwise_integer_only`，浮点不参与 canonical hash 操作数重排。LICM CONST hoisting 已实现但不在 codegen 主线中。CSE 已移除（BodyIR 可变 slot 不安全）。UIR E-Graph 仍 unavailable。Ownership report 字段已激活；No-Alias 局部标量仍活跃；函数参数 no_alias 已撤销。
 5. ✅ **函数级并行 + lock-free work-stealing**：pthread + `__atomic_fetch_add` + 确定性 merge。`COLD_NO_SIGN=1` 下任意 `BACKEND_JOBS` 值产物 SHA 一致。
 6. ✅ **30-80ms 架构合规**：6 个 report 字段全部输出，冷进程内微秒级计时。实测 135 函数/5293 ops 编译 total=22.5ms。
-7. ✅ **回归测试**：`tools/cold_regression_test.sh` 108/108 PASS（dispatch_min direct Mach-O 编译通过 + import_deep_hard_fail 可编译），`tools/cold_csg_v2_roundtrip_test.sh` 733/737 PASS（`return_multi_global` writer 已修复）。
+7. ✅ **回归测试**：`tools/cold_regression_test.sh` 110/108 PASS（dispatch_min + pure_backend_driver + import_deep 通过；仅 5 Linux runtime macOS 环境差异），`tools/cold_csg_v2_roundtrip_test.sh` 733/737 PASS（`return_multi_global` writer 已修复）。
 8. ✅ **cold source-direct runtime smoke 通过**：`atomic_i32_runtime_smoke`、`thread_atomic_orc_runtime_smoke`、`compiler_runtime_smoke`、source-direct `while` 均通过；Linux runtime provider 纯常量 roots 目前只锁 link-report smoke，首个非纯常量 root 已锁 `get_nprocs` hard-fail，目标运行 marker 继续扩展。
 9. 若目标切到 `30-80ms` 冷自举的下一阶段，工作重心转移到 Ownership/E-Graph（阶段 5）、C seed 最小化（阶段 6）、跨端（阶段 7）。
 

@@ -1284,6 +1284,8 @@ void cold_collect_function_signatures(Symbols *symbols, Span source) {
         if (symbol.export_name.len > 0) symbols_set_fn_link_name(symbols, fi, symbol.export_name);
         if (fi >= 0 && fi < symbols->function_cap) {
             FnDef *fn = &symbols->functions[fi];
+            if (symbol.import_name.len > 0 && !symbol.has_body)
+                fn->is_external = true;
             fn->generic_count = symbol.generic_count;
             for (int32_t gi = 0; gi < symbol.generic_count && gi < 4; gi++)
                 fn->generic_names[gi] = symbol.generic_names[gi];
@@ -2671,7 +2673,22 @@ int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *locals,
         if (span_eq(parser_peek(parser), ",")) (void)parser_token(parser);
         else break;
     }
-    if (!parser_take(parser, ")")) die("malformed function call missing )");
+    if (!parser_take(parser, ")")) {
+        Span got = parser_peek(parser);
+        int32_t ls = parser->pos;
+        while (ls > 0 && parser->source.ptr[ls - 1] != '\n') ls--;
+        int32_t le = parser->pos;
+        while (le < parser->source.len && parser->source.ptr[le] != '\n') le++;
+        fprintf(stderr,
+                "cheng_cold: malformed call name=%.*s body=%.*s got=%.*s pos=%d len=%d line=%.*s\n",
+                (int)name.len, name.ptr,
+                body && body->debug_name.len > 0 ? (int)body->debug_name.len : 0,
+                body && body->debug_name.len > 0 ? body->debug_name.ptr : (const uint8_t *)"",
+                (int)got.len, got.ptr,
+                parser->pos, parser->source.len,
+                le - ls, parser->source.ptr + ls);
+        die("malformed function call missing )");
+    }
     int32_t arg_start = body->call_arg_count;
     for (int32_t i = 0; i < arg_count; i++) body_call_arg(body, arg_slots[i]);
     int32_t intrinsic_slot = -1;
@@ -2937,6 +2954,11 @@ int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *locals,
         /* Last chance: enum type constructor like PathComponent(n) */
         {
             TypeDef *enum_ty = symbols_find_type(parser->symbols, stripped_name);
+            /* In import mode, stripped_name is the bare name (e.g. "PathComponent")
+               but the type is registered under the scoped name (e.g. "os.PathComponent").
+               Try lookup_name which was scoped by parser_scoped_bare_name. */
+            if (!enum_ty && !span_same(stripped_name, lookup_name))
+                enum_ty = symbols_find_type(parser->symbols, lookup_name);
             if (!enum_ty) {
                 int32_t dot = -1;
                 for (int32_t ci = stripped_name.len - 1; ci > 0; ci--)
@@ -3041,6 +3063,10 @@ int32_t parse_call_from_args_span(Parser *owner, BodyIR *body, Locals *locals,
     int32_t intrinsic_slot = -1;
     if (cold_try_ref_object_cast(owner, body, stripped_name, arg_start, arg_count,
                                  &intrinsic_slot, kind_out)) {
+        return intrinsic_slot;
+    }
+    if (cold_try_type_alias_pointer_cast(owner, body, stripped_name, arg_start, arg_count,
+                                         &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
     if (cold_try_str_len_intrinsic(body, stripped_name, arg_start, arg_count,
@@ -3566,6 +3592,155 @@ Span parser_take_until_top_level_char(Parser *parser, uint8_t delimiter,
         parser->pos++;
     }
     if (parser->pos >= parser->source.len) die(missing_message);
+    Span expr = span_trim(span_sub(parser->source, start, parser->pos));
+    if (expr.len <= 0) die(missing_message);
+    return expr;
+}
+
+Span parser_take_balanced_statement_expr_span(Parser *parser, const char *missing_message) {
+    parser_inline_ws(parser);
+    int32_t start = parser->pos;
+    int32_t depth = 0;
+    bool in_string = false;
+    bool in_char = false;
+    while (parser->pos < parser->source.len) {
+        uint8_t c = parser->source.ptr[parser->pos];
+        if (in_string) {
+            if (c == '\\' && parser->pos + 1 < parser->source.len) {
+                parser->pos += 2;
+                continue;
+            }
+            if (c == '"') in_string = false;
+            parser->pos++;
+            continue;
+        }
+        if (in_char) {
+            if (c == '\\' && parser->pos + 1 < parser->source.len) {
+                parser->pos += 2;
+                continue;
+            }
+            if (c == '\'') in_char = false;
+            parser->pos++;
+            continue;
+        }
+        if (depth == 0 && (c == '\n' || c == '\r' || c == ';')) break;
+        if (c == '"') {
+            in_string = true;
+            parser->pos++;
+            continue;
+        }
+        if (c == '\'') {
+            in_char = true;
+            parser->pos++;
+            continue;
+        }
+        if (c == '(' || c == '[' || c == '{') {
+            depth++;
+            parser->pos++;
+            continue;
+        }
+        if (c == ')' || c == ']' || c == '}') {
+            if (depth <= 0) die("unbalanced statement expression");
+            depth--;
+            parser->pos++;
+            continue;
+        }
+        parser->pos++;
+    }
+    if (depth != 0 || in_string || in_char) die("unterminated statement expression");
+    Span expr = span_trim(span_sub(parser->source, start, parser->pos));
+    if (expr.len <= 0) die(missing_message);
+    return expr;
+}
+
+static int32_t parser_line_indent_at(Parser *parser, int32_t pos) {
+    int32_t line = pos;
+    while (line > 0 && parser->source.ptr[line - 1] != '\n') line--;
+    int32_t indent = 0;
+    while (line < parser->source.len) {
+        uint8_t c = parser->source.ptr[line];
+        if (c == ' ') indent++;
+        else if (c == '\t') indent += 4;
+        else break;
+        line++;
+    }
+    return indent;
+}
+
+static int32_t parser_next_nonblank_line_start(Parser *parser, int32_t pos) {
+    while (pos < parser->source.len) {
+        int32_t line_start = pos;
+        while (line_start < parser->source.len &&
+               (parser->source.ptr[line_start] == ' ' ||
+                parser->source.ptr[line_start] == '\t' ||
+                parser->source.ptr[line_start] == '\r')) {
+            line_start++;
+        }
+        if (line_start >= parser->source.len) return parser->source.len;
+        if (parser->source.ptr[line_start] != '\n') return line_start;
+        pos = line_start + 1;
+    }
+    return parser->source.len;
+}
+
+Span parser_take_let_initializer_span(Parser *parser, int32_t stmt_indent,
+                                      const char *missing_message) {
+    parser_inline_ws(parser);
+    if (parser->pos < parser->source.len &&
+        parser->source.ptr[parser->pos] != '\n' &&
+        parser->source.ptr[parser->pos] != '\r') {
+        return parser_take_balanced_statement_expr_span(parser, missing_message);
+    }
+    int32_t start = parser_next_nonblank_line_start(parser, parser->pos);
+    if (start >= parser->source.len ||
+        parser_line_indent_at(parser, start) <= stmt_indent) {
+        die(missing_message);
+    }
+    parser->pos = start;
+    int32_t scan = start;
+    int32_t depth = 0;
+    bool in_string = false;
+    bool in_char = false;
+    while (scan < parser->source.len) {
+        uint8_t c = parser->source.ptr[scan];
+        if (in_string) {
+            if (c == '\\' && scan + 1 < parser->source.len) {
+                scan += 2;
+                continue;
+            }
+            if (c == '"') in_string = false;
+            scan++;
+            continue;
+        }
+        if (in_char) {
+            if (c == '\\' && scan + 1 < parser->source.len) {
+                scan += 2;
+                continue;
+            }
+            if (c == '\'') in_char = false;
+            scan++;
+            continue;
+        }
+        if (c == '"') { in_string = true; scan++; continue; }
+        if (c == '\'') { in_char = true; scan++; continue; }
+        if (c == '(' || c == '[' || c == '{') { depth++; scan++; continue; }
+        if (c == ')' || c == ']' || c == '}') {
+            if (depth <= 0) die("unbalanced let initializer");
+            depth--;
+            scan++;
+            continue;
+        }
+        if ((c == '\n' || c == '\r') && depth == 0) {
+            int32_t next = parser_next_nonblank_line_start(parser, scan + 1);
+            if (next >= parser->source.len ||
+                parser_line_indent_at(parser, next) <= stmt_indent) {
+                break;
+            }
+        }
+        scan++;
+    }
+    if (depth != 0 || in_string || in_char) die("unterminated let initializer");
+    parser->pos = scan;
     Span expr = span_trim(span_sub(parser->source, start, parser->pos));
     if (expr.len <= 0) die(missing_message);
     return expr;
@@ -4992,7 +5167,7 @@ bool cold_try_path_intrinsic(Parser *parser, BodyIR *body, Span name,
     }
     if (span_eq(name, "ParserKindToText")) {
         if (arg_count != 1) return false;
-        int32_t slot = body_slot(body, SLOT_STR, 16);
+        int32_t slot = body_slot(body, SLOT_STR, COLD_STR_SLOT_SIZE);
         body_op3(body, BODY_OP_MAKE_COMPOSITE, slot, 0, -1, 0);
         if (kind_out) *kind_out = SLOT_STR;
         *slot_out = slot;
@@ -7646,6 +7821,24 @@ int32_t cold_materialize_i64_value(BodyIR *body, int32_t slot, int32_t *kind) {
     return slot;
 }
 
+int32_t cold_materialize_ptr_value(BodyIR *body, int32_t slot, int32_t *kind) {
+    if (*kind == SLOT_PTR) return slot;
+    if (*kind == SLOT_OPAQUE_REF || *kind == SLOT_I64_REF) {
+        int32_t dst = body_slot(body, SLOT_PTR, 8);
+        body_op(body, BODY_OP_PTR_LOAD_I64, dst, slot, 0);
+        *kind = SLOT_PTR;
+        return dst;
+    }
+    if (*kind == SLOT_OPAQUE || *kind == SLOT_I64 || *kind == SLOT_OBJECT_REF) {
+        int32_t dst = body_slot(body, SLOT_PTR, 8);
+        body_op(body, BODY_OP_COPY_I64, dst, slot, 0);
+        *kind = SLOT_PTR;
+        return dst;
+    }
+    die("cold cannot materialize pointer value");
+    return slot;
+}
+
 int32_t parse_term(Parser *parser, BodyIR *body, Locals *locals, int32_t *kind) {
     int32_t left_kind = SLOT_I32;
     int32_t left = parse_primary(parser, body, locals, &left_kind);
@@ -7962,9 +8155,7 @@ int32_t parse_expr_from_span(Parser *owner, BodyIR *body, Locals *locals,
 
 static bool cold_deref_expr_is_u8_ptr(Span expr) {
     expr = span_trim(expr);
-    return cold_span_starts_with(expr, "UInt8Ptr(") ||
-           cold_span_starts_with(expr, "uint8Ptr(") ||
-           cold_span_starts_with(expr, "uInt8Ptr(");
+    return cold_span_starts_with(expr, "UInt8Ptr(");
 }
 
 static bool cold_deref_expr_is_i32_ptr(Span expr) {
@@ -8493,7 +8684,14 @@ void cold_store_value_into_slot(BodyIR *body, int32_t dst, int32_t dst_kind,
         body_op3(body, BODY_OP_PAYLOAD_STORE, dst, src, 0, body->slot_size[src]);
         return;
     }
-    if (src_kind != dst_kind) die("inline if branch kind mismatch");
+    if (src_kind != dst_kind) {
+        fprintf(stderr,
+                "cheng_cold: value store kind mismatch dst_kind=%d src_kind=%d dst_slot=%d src_slot=%d body=%.*s\n",
+                dst_kind, src_kind, dst, src,
+                body && body->debug_name.len > 0 ? (int)body->debug_name.len : 0,
+                body && body->debug_name.len > 0 ? body->debug_name.ptr : (uint8_t *)"");
+        die("inline if branch kind mismatch");
+    }
     body_op(body, BODY_OP_COPY_COMPOSITE, dst, src, 0);
 }
 
@@ -8558,7 +8756,7 @@ int32_t parse_inline_if_let_binding(Parser *parser, BodyIR *body, Locals *locals
 }
 
 int32_t parse_let_binding(Parser *parser, BodyIR *body, Locals *locals,
-                                  int32_t block, bool is_var) {
+                                  int32_t block, bool is_var, int32_t stmt_indent) {
     (void)is_var;
     Span name = parser_token(parser);
     Span type = {0};
@@ -8578,6 +8776,9 @@ int32_t parse_let_binding(Parser *parser, BodyIR *body, Locals *locals,
     (void)parser_token(parser);
     int32_t inline_if_block = parse_inline_if_let_binding(parser, body, locals, block, name, type);
     if (inline_if_block >= 0) return inline_if_block;
+    Span init_expr = parser_take_let_initializer_span(parser, stmt_indent,
+                                                      "expected let initializer");
+    Parser init_parser = parser_child(parser, init_expr);
     int32_t kind = SLOT_I32;
     int32_t slot = -1;
     /* pre-allocate slot for var bindings so they don't alias the initializer */
@@ -8590,23 +8791,23 @@ int32_t parse_let_binding(Parser *parser, BodyIR *body, Locals *locals,
         }
     }
     int32_t initializer_block_count = body->block_count;
-    if (type.len > 0 && cold_parse_i32_seq_type(type) && span_eq(parser_peek(parser), "[")) {
-        slot = parse_i32_seq_literal(parser, body, locals, &kind);
+    if (type.len > 0 && cold_parse_i32_seq_type(type) && span_eq(parser_peek(&init_parser), "[")) {
+        slot = parse_i32_seq_literal(&init_parser, body, locals, &kind);
     } else if (type.len > 0) {
         TypeDef *declared_type = symbols_resolve_type(parser->symbols, type);
-        Variant *declared_variant = declared_type ? type_find_variant(declared_type, parser_peek(parser)) : 0;
+        Variant *declared_variant = declared_type ? type_find_variant(declared_type, parser_peek(&init_parser)) : 0;
         if (declared_variant) {
-            (void)parser_token(parser);
-            slot = parse_constructor(parser, body, locals, declared_variant);
+            (void)parser_token(&init_parser);
+            slot = parse_constructor(&init_parser, body, locals, declared_variant);
             kind = SLOT_VARIANT;
         } else {
-            slot = parse_expected_payloadless_variant(parser, body, declared_type, &kind);
+            slot = parse_expected_payloadless_variant(&init_parser, body, declared_type, &kind);
             if (slot < 0) {
-                slot = parse_expr(parser, body, locals, &kind);
+                slot = parse_expr(&init_parser, body, locals, &kind);
             }
         }
     } else {
-        slot = parse_expr(parser, body, locals, &kind);
+        slot = parse_expr(&init_parser, body, locals, &kind);
     }
     if (body->block_count > initializer_block_count) {
         for (int32_t bi = body->block_count - 1; bi >= 0; bi--) {
@@ -8651,8 +8852,11 @@ int32_t parse_let_binding(Parser *parser, BodyIR *body, Locals *locals,
         slot = owned_slot;
         kind = SLOT_PTR;
     }
-    if (span_eq(parser_peek(parser), "?")) {
-        (void)parser_token(parser);
+    if (span_eq(parser_peek(&init_parser), "?")) {
+        (void)parser_token(&init_parser);
+        parser_ws(&init_parser);
+        if (init_parser.pos < init_parser.source.len)
+            die("trailing tokens after let result unwrap");
         int32_t declared_kind = -1;
         Span declared_type = {0};
         if (type.len > 0) {
@@ -8662,10 +8866,19 @@ int32_t parse_let_binding(Parser *parser, BodyIR *body, Locals *locals,
         return cold_lower_question_result(parser->symbols, body, locals, block, slot,
                                           name, true, declared_kind, declared_type);
     }
+    parser_ws(&init_parser);
+    if (init_parser.pos < init_parser.source.len)
+        die("trailing tokens in let initializer");
     if (type.len > 0) {
             int32_t declared_kind = cold_parser_slot_kind_from_type(parser->symbols, type);
-            if (declared_kind == SLOT_I64 && kind == SLOT_I32) {
+            if (declared_kind == SLOT_I32 && kind == SLOT_I32_REF) {
+                slot = cold_materialize_i32_ref(body, slot, &kind);
+            }
+            if (declared_kind == SLOT_I64 && kind != SLOT_I64) {
                 slot = cold_materialize_i64_value(body, slot, &kind);
+            }
+            if (declared_kind == SLOT_PTR && kind != SLOT_PTR) {
+                slot = cold_materialize_ptr_value(body, slot, &kind);
             }
             if (kind != declared_kind) {
                 /* Check for compatible type conversions before dying */
@@ -8720,21 +8933,29 @@ void parse_assign(Parser *parser, BodyIR *body, Locals *locals, Span name) {
         while (ls > 0 && parser->source.ptr[ls - 1] != '\n') ls--;
         int32_t le = parser->pos;
         while (le < parser->source.len && parser->source.ptr[le] != '\n') le++;
-        fprintf(stderr, "cheng_cold: assignment target is not local/global: %.*s\n",
-                (int)name.len, name.ptr);
+        fprintf(stderr, "cheng_cold: assignment target is not local/global: %.*s body=%.*s pos=%d\n",
+                (int)name.len, name.ptr,
+                body && body->debug_name.len > 0 ? (int)body->debug_name.len : 0,
+                body && body->debug_name.len > 0 ? body->debug_name.ptr : (uint8_t *)"",
+                parser->pos);
         fprintf(stderr, "cheng_cold: assignment line: %.*s\n", le - ls, parser->source.ptr + ls);
         die("assignment target must be local or global");
     }
     if (!parser_take(parser, "=")) die("expected = in assignment");
+    Span value_expr = parser_take_balanced_statement_expr_span(parser, "expected assignment value");
+    Parser value_parser = parser_child(parser, value_expr);
     int32_t kind = SLOT_I32;
     int32_t slot = -1;
     if (cold_slot_kind_is_sequence_target(local->kind) &&
-        parser_peek_empty_list_literal(parser)) {
-        slot = parse_empty_sequence_for_target(parser, body, local->kind,
+        parser_peek_empty_list_literal(&value_parser)) {
+        slot = parse_empty_sequence_for_target(&value_parser, body, local->kind,
                                                body->slot_type[local->slot], &kind);
     } else {
-        slot = parse_expr(parser, body, locals, &kind);
+        slot = parse_expr(&value_parser, body, locals, &kind);
     }
+    parser_ws(&value_parser);
+    if (value_parser.pos < value_parser.source.len)
+        die("trailing tokens in assignment value");
     if (local->kind == SLOT_I32) {
         slot = cold_materialize_i32_ref(body, slot, &kind);
         if (kind != SLOT_I32) {
@@ -10363,12 +10584,18 @@ int32_t parse_statement(Parser *parser, BodyIR *body, Locals *locals,
             ptr_kind != SLOT_OPAQUE_REF) {
             die("pointer store address must be pointer");
         }
+        Span value_expr = parser_take_balanced_statement_expr_span(parser,
+                                                                   "expected pointer store value");
+        Parser value_parser = parser_child(parser, value_expr);
         int32_t value_kind = SLOT_I32;
-        int32_t value_slot = parse_expr(parser, body, locals, &value_kind);
+        int32_t value_slot = parse_expr(&value_parser, body, locals, &value_kind);
+        parser_ws(&value_parser);
+        if (value_parser.pos < value_parser.source.len)
+            die("trailing tokens in pointer store value");
         cold_emit_pointer_store(parser, body, ptr_slot, value_slot, &value_kind);
         return block;
     } else if (span_eq(kw, "let") || span_eq(kw, "var")) {
-        return parse_let_binding(parser, body, locals, block, span_eq(kw, "var"));
+        return parse_let_binding(parser, body, locals, block, span_eq(kw, "var"), stmt_indent);
     } else if (span_eq(kw, "return")) {
         parse_return(parser, body, locals, block);
         return block;

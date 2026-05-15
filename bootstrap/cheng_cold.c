@@ -345,6 +345,7 @@ static Span cold_decode_string_content(Arena *arena, Span raw, bool fmt_literal)
         }
         out[count++] = c;
     }
+    out[count] = 0;
     return (Span){out, count};
 }
 
@@ -4574,6 +4575,11 @@ static Span cold_type_strip_var(Span type, bool *is_var) {
     return type;
 }
 
+static bool cold_type_has_pointer_suffix(Span type) {
+    type = span_trim(type);
+    return type.len > 0 && type.ptr[type.len - 1] == '*';
+}
+
 static int32_t cold_split_top_level_commas(Span span, Span *items, int32_t cap) {
     int32_t count = 0;
     int32_t start = 0;
@@ -5040,7 +5046,18 @@ static int32_t cold_slot_kind_from_type_with_symbols(Symbols *symbols, Span type
     if (is_var && span_eq(type, "cstring")) return SLOT_OPAQUE_REF;
     if (is_var && cold_parse_i32_seq_type(type)) return SLOT_SEQ_I32_REF;
     if (is_var && cold_parse_str_seq_type(type)) return SLOT_SEQ_STR_REF;
+    /* Before opaque seq ref, resolve element type through alias (e.g. var WalkDirEntry[] -> str[]) */
+    if (is_var && type.len > 2 && type.ptr[type.len-2] == '[' && type.ptr[type.len-1] == ']') {
+        Span elem = span_trim(span_sub(type, 0, type.len - 2));
+        TypeDef *elem_def = symbols_resolve_type(symbols, elem);
+        if (elem_def && elem_def->alias_type.len > 0) {
+            Span resolved = span_trim(elem_def->alias_type);
+            if (span_eq(resolved, "str") || span_eq(resolved, "cstring")) return SLOT_SEQ_STR_REF;
+            if (span_eq(resolved, "int32") || span_eq(resolved, "int")) return SLOT_SEQ_I32_REF;
+        }
+    }
     if (is_var && cold_parse_opaque_seq_type(type)) return SLOT_SEQ_OPAQUE_REF;
+    if (cold_type_has_pointer_suffix(type)) return is_var ? SLOT_OPAQUE_REF : SLOT_OPAQUE;
     if (is_var && symbols && symbols_resolve_object(symbols, type)) return SLOT_OBJECT_REF;
     if (is_var && cold_type_has_qualified_name(type)) return SLOT_OPAQUE_REF;
     if (cold_parse_i32_array_type(type, &array_len)) return SLOT_ARRAY_I32;
@@ -5048,6 +5065,25 @@ static int32_t cold_slot_kind_from_type_with_symbols(Symbols *symbols, Span type
         !cold_parse_opaque_seq_type(span_trim(type))) return SLOT_ARRAY_I32;
     if (cold_parse_i32_seq_type(type)) return SLOT_SEQ_I32;
     if (cold_parse_str_seq_type(type)) return SLOT_SEQ_STR;
+    /* Before opaque seq, resolve element type through alias (e.g. WalkDirEntry[] -> str[]) */
+    if (type.len > 2 && type.ptr[type.len-2] == '[' && type.ptr[type.len-1] == ']') {
+        Span elem = span_trim(span_sub(type, 0, type.len - 2));
+        TypeDef *elem_def = symbols_resolve_type(symbols, elem);
+        if (elem_def && elem_def->alias_type.len > 0) {
+            Span resolved = span_trim(elem_def->alias_type);
+            if (span_eq(resolved, "str") || span_eq(resolved, "cstring")) return SLOT_SEQ_STR;
+            if (span_eq(resolved, "int32") || span_eq(resolved, "int")) return SLOT_SEQ_I32;
+            /* Optional: resolve multi-level aliases */
+            TypeDef *deeper = symbols_resolve_type(symbols, resolved);
+            int32_t safety = 8;
+            while (deeper && deeper->alias_type.len > 0 && safety-- > 0) {
+                resolved = span_trim(deeper->alias_type);
+                if (span_eq(resolved, "str") || span_eq(resolved, "cstring")) return SLOT_SEQ_STR;
+                if (span_eq(resolved, "int32") || span_eq(resolved, "int")) return SLOT_SEQ_I32;
+                deeper = symbols_resolve_type(symbols, resolved);
+            }
+        }
+    }
     if (cold_parse_opaque_seq_type(type)) return SLOT_SEQ_OPAQUE;
     if (span_eq(type, "str") || span_eq(type, "s")) return SLOT_STR;
     if (span_eq(type, "cstring")) return SLOT_OPAQUE;
@@ -5061,6 +5097,7 @@ static int32_t cold_slot_kind_from_type_with_symbols(Symbols *symbols, Span type
     if (span_eq(type, "v")) return SLOT_VARIANT;
     if (span_eq(type, "o")) return SLOT_OPAQUE;
     if (span_eq(type, "ptr")) return SLOT_OPAQUE;
+    if (cold_type_has_pointer_suffix(type)) return SLOT_OPAQUE;
     /* function type like fn(int32): int32 → function pointer */
     if (cold_span_starts_with(type, "fn(")) return is_var ? SLOT_OBJECT_REF : SLOT_PTR;
     if (known_type && known_type->variant_count > 0) return SLOT_VARIANT;
@@ -6781,7 +6818,13 @@ typedef struct PatchList {
 typedef struct FunctionPatch {
     int32_t pos;
     int32_t target_function;
+    int32_t kind;
 } FunctionPatch;
+
+enum {
+    FUNCTION_PATCH_CALL = 1,
+    FUNCTION_PATCH_ADDR = 2
+};
 
 typedef struct FunctionPatchList {
     FunctionPatch *items;
@@ -6960,7 +7003,8 @@ static void patches_add(PatchList *patches, int32_t pos, int32_t target_block, i
     patches->items[patches->count++] = (Patch){pos, target_block, kind};
 }
 
-static void function_patches_add(FunctionPatchList *patches, int32_t pos, int32_t target_function) {
+static void function_patches_add_kind(FunctionPatchList *patches, int32_t pos,
+                                      int32_t target_function, int32_t kind) {
     if (patches->count >= patches->cap) {
         int32_t next = patches->cap ? patches->cap * 2 : 32;
         FunctionPatch *fresh = arena_alloc(patches->arena, (size_t)next * sizeof(FunctionPatch));
@@ -6968,7 +7012,15 @@ static void function_patches_add(FunctionPatchList *patches, int32_t pos, int32_
         patches->items = fresh;
         patches->cap = next;
     }
-    patches->items[patches->count++] = (FunctionPatch){pos, target_function};
+    patches->items[patches->count++] = (FunctionPatch){pos, target_function, kind};
+}
+
+static void function_patches_add(FunctionPatchList *patches, int32_t pos, int32_t target_function) {
+    function_patches_add_kind(patches, pos, target_function, FUNCTION_PATCH_CALL);
+}
+
+static void function_patches_add_addr(FunctionPatchList *patches, int32_t pos, int32_t target_function) {
+    function_patches_add_kind(patches, pos, target_function, FUNCTION_PATCH_ADDR);
 }
 
 /* ---- large immediate / large offset helpers ---- */
@@ -10656,7 +10708,7 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         code_emit(code, a64_adr(R0, 0));
         int32_t skip_pos = code->count;
         code_emit(code, a64_b(0));
-        int32_t data_offset = code_append_bytes(code, (const char *)literal.ptr, literal.len);
+        int32_t data_offset = code_append_bytes(code, (const char *)literal.ptr, literal.len + 1);
         int32_t after_data = code->count;
         code->words[adr_pos] = a64_adr(R0, data_offset - adr_pos * 4);
         code->words[skip_pos] = a64_b(after_data - skip_pos);
@@ -11073,10 +11125,18 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         a64_emit_ldr_sp_off(code, R1, body->slot_offset[a], true);
         code_emit(code, a64_ldr_imm(R0, R1, 0, false));
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
+    } else if (kind == BODY_OP_PTR_LOAD_U8) {
+        a64_emit_ldr_sp_off(code, R1, body->slot_offset[a], true);
+        code_emit(code, a64_ldrb_imm(R0, R1, 0));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
     } else if (kind == BODY_OP_PTR_STORE_I32) {
         a64_emit_ldr_sp_off(code, R1, body->slot_offset[dst], true);
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
         code_emit(code, a64_str_imm(R0, R1, 0, false));
+    } else if (kind == BODY_OP_PTR_STORE_U8) {
+        a64_emit_ldr_sp_off(code, R1, body->slot_offset[dst], true);
+        a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
+        code_emit(code, a64_strb_imm(R0, R1, 0));
     } else if (kind == BODY_OP_PTR_LOAD_I64) {
         a64_emit_ldr_sp_off(code, R1, body->slot_offset[a], true);
         code_emit(code, a64_ldr_imm(R0, R1, 0, true));
@@ -11349,7 +11409,7 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         int32_t fn_index = a;
         int32_t adr_pos = code->count;
         code_emit(code, a64_adr(R0, 0));
-        function_patches_add(function_patches, adr_pos, fn_index);
+        function_patches_add_addr(function_patches, adr_pos, fn_index);
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], true);
     } else if (kind == BODY_OP_CALL_PTR) {
         /* Indirect call: load args into x0-x7, load fn ptr, call via BLR, store result.
@@ -11711,7 +11771,7 @@ static void x64_codegen_op(X64Code *x, BodyIR *body, Symbols *symbols,
         x64_mov_r64_imm64(x, 0, 0);
         x64_mov_mr64_r64(x, 4, off_dst, 0);
         if (fn_idx >= 0 && fn_idx < symbols->function_count)
-            function_patches_add(patches, imm_pos, fn_idx);
+            function_patches_add_addr(patches, imm_pos, fn_idx);
     /* Pointer ops */
     } else if (kind == BODY_OP_PTR_CONST) {
         x64_mov_r64_imm64(x, 0, (uint64_t)(int32_t)a);
@@ -11720,10 +11780,18 @@ static void x64_codegen_op(X64Code *x, BodyIR *body, Symbols *symbols,
         x64_mov_r64_mr64(x, 0, 4, body->slot_offset[a]);
         x64_mov_r32_mr32_base(x, 0, 0);
         x64_mov_mr32_r32(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_PTR_LOAD_U8) {
+        x64_mov_r64_mr64(x, 0, 4, body->slot_offset[a]);
+        x64_movzb_r32_mr8(x, 0, 0);
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
     } else if (kind == BODY_OP_PTR_STORE_I32) {
         x64_mov_r64_mr64(x, 0, 4, body->slot_offset[dst]);
         x64_mov_r32_mr32(x, 1, 4, body->slot_offset[a]);
         x64_mov_mr32_base_r32(x, 0, 1);
+    } else if (kind == BODY_OP_PTR_STORE_U8) {
+        x64_mov_r64_mr64(x, 0, 4, body->slot_offset[dst]);
+        x64_mov_r32_mr32(x, 1, 4, body->slot_offset[a]);
+        x64_mov_mr8_r8(x, 0, 1);
     } else if (kind == BODY_OP_PTR_LOAD_I64) {
         x64_mov_r64_mr64(x, 0, 4, body->slot_offset[a]);
         x64_mov_r64_mr64_base(x, 0, 0);
@@ -12231,7 +12299,7 @@ static void rv64_codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         int32_t fn_idx = a;
         int32_t auipc_pos = code->count;
         code_emit(code, rv_auipc(RV_T0, 0));
-        function_patches_add(patches, auipc_pos, fn_idx);
+        function_patches_add_addr(patches, auipc_pos, fn_idx);
         code_emit(code, rv_sd(RV_T0, RV_SP, (int16_t)off_dst));
     /* Pointer ops */
     } else if (kind == BODY_OP_PTR_CONST) {
@@ -12241,10 +12309,18 @@ static void rv64_codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
         code_emit(code, rv_lw(RV_T0, RV_T0, 0));
         code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_PTR_LOAD_U8) {
+        code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_lbu(RV_T0, RV_T0, 0));
+        code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)off_dst));
     } else if (kind == BODY_OP_PTR_STORE_I32) {
         code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)body->slot_offset[dst]));
         code_emit(code, rv_lw(RV_T1, RV_SP, (int16_t)body->slot_offset[a]));
         code_emit(code, rv_sw(RV_T1, RV_T0, 0));
+    } else if (kind == BODY_OP_PTR_STORE_U8) {
+        code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)body->slot_offset[dst]));
+        code_emit(code, rv_lw(RV_T1, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_sb(RV_T1, RV_T0, 0));
     } else if (kind == BODY_OP_PTR_LOAD_I64) {
         code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
         code_emit(code, rv_ld(RV_T0, RV_T0, 0));
@@ -12483,6 +12559,7 @@ static bool cold_op_has_side_effect(int32_t kind) {
         case BODY_OP_ATOMIC_ADD_I32:
         case BODY_OP_PTR_STORE_I32:
         case BODY_OP_PTR_STORE_I64:
+        case BODY_OP_PTR_STORE_U8:
         case BODY_OP_SLOT_STORE_I32:
         case BODY_OP_SLOT_STORE_I64:
         case BODY_OP_SEQ_SET_LEN:
@@ -12546,6 +12623,7 @@ static bool cold_op_reads_dst_slot(int32_t kind) {
         case BODY_OP_ATOMIC_STORE_I32:
         case BODY_OP_PTR_STORE_I32:
         case BODY_OP_PTR_STORE_I64:
+        case BODY_OP_PTR_STORE_U8:
         case BODY_OP_SLOT_STORE_I32:
         case BODY_OP_SLOT_STORE_I64:
         case BODY_OP_SEQ_I32_ADD:
@@ -13207,10 +13285,6 @@ static bool cold_symbol_matches_export_root(Span name, const char *root, int32_t
         if (c != ' ' && c != '\t' && c != '\n' && c != '\r') break;
         root_len--;
     }
-    if (root_len > 1 && root[0] == '_') {
-        root++;
-        root_len--;
-    }
     return name.len == root_len && root_len > 0 &&
            memcmp(name.ptr, root, (size_t)root_len) == 0;
 }
@@ -13227,6 +13301,22 @@ static Span cold_fn_object_symbol_span(FnDef *fn, bool strip_qualified_name) {
     return name;
 }
 
+static Span cold_private_object_symbol_span(char *buf, size_t cap,
+                                            int32_t function_index) {
+    if (!buf || cap == 0 || function_index < 0) die("cold private symbol invalid");
+    int n = snprintf(buf, cap, ".Lcheng_cold_%d", function_index);
+    if (n <= 0 || (size_t)n >= cap) die("cold private symbol overflow");
+    return (Span){(const uint8_t *)buf, n};
+}
+
+static Span cold_emit_object_symbol_span(FnDef *fn, bool private_symbol,
+                                         int32_t function_index,
+                                         char *scratch, size_t scratch_cap) {
+    if (private_symbol)
+        return cold_private_object_symbol_span(scratch, scratch_cap, function_index);
+    return cold_fn_object_symbol_span(fn, false);
+}
+
 static int32_t cold_find_export_root_function(Symbols *symbols,
                                               const char *root,
                                               int32_t root_len) {
@@ -13234,13 +13324,26 @@ static int32_t cold_find_export_root_function(Symbols *symbols,
     int32_t match_count = 0;
     for (int32_t i = 0; i < symbols->function_count; i++) {
         FnDef *fn = &symbols->functions[i];
-        Span object_name = cold_fn_object_symbol_span(fn, false);
-        bool matched = cold_symbol_matches_export_root(object_name, root, root_len);
+        if (fn->is_external) continue;
+        if (fn->link_name.len <= 0) continue;
+        bool matched = cold_symbol_matches_export_root(fn->link_name, root, root_len);
         if (!matched) continue;
         match = i;
         match_count++;
     }
     if (match_count == 1) return match;
+    if (match_count == 0) {
+        for (int32_t i = 0; i < symbols->function_count; i++) {
+            FnDef *fn = &symbols->functions[i];
+            if (fn->is_external) continue;
+            if (fn->link_name.len > 0) continue;
+            bool matched = cold_symbol_matches_export_root(fn->name, root, root_len);
+            if (!matched) continue;
+            match = i;
+            match_count++;
+        }
+        if (match_count == 1) return match;
+    }
     fprintf(stderr, "cheng_cold: export root ");
     fwrite(root, 1, (size_t)root_len, stderr);
     fprintf(stderr, match_count == 0 ? " not found\n" : " is ambiguous\n");
@@ -13285,14 +13388,23 @@ static int32_t cold_parse_export_roots(Symbols *symbols,
 
 static void cold_check_object_symbol_unique(Symbols *symbols,
                                             const bool *emit_function,
-                                            int32_t function_count) {
+                                            const bool *export_function,
+                                            int32_t function_count,
+                                            bool internal_visibility,
+                                            bool force_all_local) {
     for (int32_t i = 0; i < function_count; i++) {
         if (!emit_function[i]) continue;
-        Span left = cold_fn_object_symbol_span(&symbols->functions[i], false);
+        char left_buf[64];
+        bool left_private = internal_visibility ? !export_function[i] : force_all_local;
+        Span left = cold_emit_object_symbol_span(&symbols->functions[i], left_private,
+                                                 i, left_buf, sizeof(left_buf));
         if (left.len <= 0) die("cold object symbol missing");
         for (int32_t j = i + 1; j < function_count; j++) {
             if (!emit_function[j]) continue;
-            Span right = cold_fn_object_symbol_span(&symbols->functions[j], false);
+            char right_buf[64];
+            bool right_private = internal_visibility ? !export_function[j] : force_all_local;
+            Span right = cold_emit_object_symbol_span(&symbols->functions[j], right_private,
+                                                      j, right_buf, sizeof(right_buf));
             if (span_same(left, right)) {
                 fprintf(stderr, "cheng_cold: duplicate object symbol ");
                 cold_diag_fn_name(left);
@@ -13599,9 +13711,10 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
             for (int32_t j = 0; j < wk->local_patches.count; j++) {
                 int32_t pp = wk->local_patches.items[j].pos;
                 if (pp >= fn_start && pp < fn_end) {
-                    function_patches_add(&function_patches,
+                    function_patches_add_kind(&function_patches,
                         pp - fn_start + base_offset,
-                        wk->local_patches.items[j].target_function);
+                        wk->local_patches.items[j].target_function,
+                        wk->local_patches.items[j].kind);
                 }
             }
         }
@@ -13641,7 +13754,13 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
         FunctionPatch patch = function_patches.items[i];
         if (patch.target_function < 0 || patch.target_function >= function_count ||
             function_pos[patch.target_function] < 0) {
+            if (patch.kind == FUNCTION_PATCH_ADDR) {
+                die("cold external function address relocation unsupported");
+            }
             if (patch.target_function >= 0 && patch.target_function < symbols->function_count) {
+                /* External (importc) functions are expected — skip error, but
+                   still save to unresolved arrays for provider/linker resolution. */
+                bool is_ext = symbols->functions[patch.target_function].is_external;
                 /* Save unresolved patch info for provider resolution */
                 if (out_unresolved_pos && out_unresolved_fn && out_unresolved_count &&
                     *out_unresolved_count < function_count * 8) {
@@ -13650,21 +13769,31 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
                     out_unresolved_fn[idx] = patch.target_function;
                     (*out_unresolved_count)++;
                 }
-                fprintf(stderr, "cheng_cold: unresolved function patch target: ");
-                cold_diag_fn_name(symbols->functions[patch.target_function].name);
-                fputc('\n', stderr);
+                if (!is_ext) {
+                    fprintf(stderr, "cheng_cold: unresolved function patch target: ");
+                    cold_diag_fn_name(cold_fn_object_symbol_span(&symbols->functions[patch.target_function], false));
+                    fputc('\n', stderr);
+                }
             }
             code->words[patch.pos] = use_rv64 ? rv_addi(RV_A0, RV_ZERO, 1) : 0xD2800020u;
             continue;
         }
         int32_t delta = function_pos[patch.target_function] - patch.pos;
         uint32_t ins = code->words[patch.pos];
-        if (use_rv64) {
-            code->words[patch.pos] = rv_jal(RV_RA, delta);
-        } else if ((ins & 0xFC000000u) == 0x10000000u) {
-            code->words[patch.pos] = a64_adr(ins & 0x1Fu, delta * 4);
+        if (patch.kind == FUNCTION_PATCH_ADDR) {
+            if (use_rv64) die("cold RISC-V function address patch unsupported");
+            int64_t delta_bytes = (int64_t)delta * 4;
+            if (delta_bytes < -(1 << 20) || delta_bytes >= (1 << 20))
+                die("cold function address ADR out of range");
+            code->words[patch.pos] = a64_adr(ins & 0x1Fu, (int32_t)delta_bytes);
+        } else if (patch.kind == FUNCTION_PATCH_CALL) {
+            if (use_rv64) {
+                code->words[patch.pos] = rv_jal(RV_RA, delta);
+            } else {
+                code->words[patch.pos] = (ins & 0xFC000000u) | ((uint32_t)delta & 0x03FFFFFFu);
+            }
         } else {
-            code->words[patch.pos] = (ins & 0xFC000000u) | ((uint32_t)delta & 0x03FFFFFFu);
+            die("cold unknown function patch kind");
         }
         if (cold_diag_dump_per_fn) {
             fprintf(stderr, "[patch] pos=%d target=", patch.pos);
@@ -15905,14 +16034,26 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
                 if (patch.target_function < 0 || patch.target_function >= func_count) continue;
                 int32_t target_off = symbol_offset[patch.target_function];
                 if (target_off < 0) {
+                    if (patch.kind == FUNCTION_PATCH_ADDR)
+                        die("cold object external function address relocation unsupported");
                     reloc_offsets[reloc_count] = (int32_t)patch.pos * 4; /* byte offset */
                     reloc_symbols[reloc_count] = patch.target_function;
                     reloc_count++;
                     continue;
                 }
                 int32_t delta = target_off - (int32_t)patch.pos;
-                shared->words[patch.pos] = (shared->words[patch.pos] & 0xFC000000u) |
-                                           ((uint32_t)delta & 0x03FFFFFFu);
+                if (patch.kind == FUNCTION_PATCH_ADDR) {
+                    uint32_t ins = shared->words[patch.pos];
+                    int64_t delta_bytes = (int64_t)delta * 4;
+                    if (delta_bytes < -(1 << 20) || delta_bytes >= (1 << 20))
+                        die("cold object function address ADR out of range");
+                    shared->words[patch.pos] = a64_adr(ins & 0x1Fu, (int32_t)delta_bytes);
+                } else if (patch.kind == FUNCTION_PATCH_CALL) {
+                    shared->words[patch.pos] = (shared->words[patch.pos] & 0xFC000000u) |
+                                               ((uint32_t)delta & 0x03FFFFFFu);
+                } else {
+                    die("cold object unknown function patch kind");
+                }
             }
 
             /* Build symbol name/offset arrays */
@@ -16018,7 +16159,7 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
                                         &prov_reloc_offsets[provider_count],
                                         &prov_reloc_names[provider_count],
                                         &prov_reloc_count[provider_count])) {
-                                    fprintf(stderr, "[cheng_cold] warning: failed to read provider object: %s\n", p);
+                                    die("cold provider object read failed");
                                 } else {
                                     prov_fnames[provider_count] = p;
                                     provider_count++;
@@ -16035,29 +16176,26 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
                         provider_target[ri] = -1;
                         int32_t sym_idx = reloc_symbols[ri];
                         if (sym_idx < 0 || sym_idx >= func_count) { stub_count++; continue; }
-                        Span nm = symbols->functions[sym_idx].name;
+                        Span nm = cold_fn_object_symbol_span(&symbols->functions[sym_idx], false);
                         if (nm.len <= 0) { stub_count++; continue; }
                         char name_buf[1024];
                         int32_t nlen = nm.len < 1023 ? nm.len : 1023;
                         memcpy(name_buf, nm.ptr, (size_t)nlen);
                         name_buf[nlen] = '\0';
-                        const char *short_name = name_buf;
-                        for (int32_t k = nlen - 1; k > 0; k--)
-                            if (name_buf[k] == '.') { short_name = name_buf + k + 1; break; }
                         for (int32_t pi = 0; pi < provider_count; pi++) {
                             for (int32_t ni = 0; ni < prov_nc[pi]; ni++) {
-                                if (strcmp(name_buf, prov_names[pi][ni]) == 0 ||
-                                    strcmp(short_name, prov_names[pi][ni]) == 0) {
+                                if (strcmp(name_buf, prov_names[pi][ni]) == 0) {
                                     provider_target[ri] = pi;
                                     goto next_reloc;
                                 }
                             }
                         }
-                        stub_count++;
-                        next_reloc:;
-                    }
+	                        stub_count++;
+	                        next_reloc:;
+	                    }
+	                    if (stub_count != 0) die("cold provider relocation unresolved");
 
-                    int32_t stub_words = stub_count * 2 + 8;
+	                    int32_t stub_words = 8;
                     int32_t total_prov_words = 0;
                     for (int32_t pi = 0; pi < provider_count; pi++)
                         total_prov_words += prov_code_words[pi];
@@ -16069,18 +16207,11 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
                     /* Emit stubs for unresolved relocations */
                     int32_t *stub_pos = arena_alloc(arena, (size_t)reloc_count * sizeof(int32_t));
                     for (int32_t ri = 0; ri < reloc_count; ri++) {
-                        if (provider_target[ri] >= 0) {
-                            stub_pos[ri] = -1; /* set after provider code placed */
-                        } else {
-                            stub_pos[ri] = linked->count;
-                            if (is_rv) {
-                                code_emit(linked, rv_addi(RV_A0, RV_ZERO, 0));
-                                code_emit(linked, rv_jalr(RV_ZERO, RV_RA, 0));
-                            } else {
-                                code_emit(linked, 0xD2800000u); /* mov x0, #0 */
-                                code_emit(linked, 0xD65F03C0u); /* ret */
-                            }
-                        }
+	                        if (provider_target[ri] >= 0) {
+	                            stub_pos[ri] = -1; /* set after provider code placed */
+	                        } else {
+	                            die("cold provider relocation unresolved");
+	                        }
                     }
 
                     /* Append provider code after stubs */
@@ -16320,7 +16451,7 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
                                     &ep_reloc_offsets[exe_provider_count],
                                     &ep_reloc_names[exe_provider_count],
                                     &ep_reloc_count[exe_provider_count])) {
-                                fprintf(stderr, "[cheng_cold] warning: failed to read provider object: %s\n", p);
+                                die("cold executable provider object read failed");
                             } else {
                                 ep_fnames[exe_provider_count] = p;
                                 exe_provider_count++;
@@ -16381,15 +16512,17 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
                                         break;
                                     }
                                 }
-                                if (target_word >= 0) {
-                                    int32_t delta = target_word - call_word;
-                                    if (provider_is_rv)
-                                        code->words[call_word] = rv_jal(RV_RA, delta);
-                                    else
-                                        code->words[call_word] = (code->words[call_word] & 0xFC000000u) |
-                                                                 ((uint32_t)delta & 0x03FFFFFFu);
-                                    exe_provider_resolved++;
-                                }
+	                                if (target_word >= 0) {
+	                                    int32_t delta = target_word - call_word;
+	                                    if (provider_is_rv)
+	                                        code->words[call_word] = rv_jal(RV_RA, delta);
+	                                    else
+	                                        code->words[call_word] = (code->words[call_word] & 0xFC000000u) |
+	                                                                 ((uint32_t)delta & 0x03FFFFFFu);
+	                                    exe_provider_resolved++;
+	                                } else {
+	                                    die("cold executable provider relocation unresolved");
+	                                }
                             }
                         }
                     }
@@ -16399,34 +16532,32 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
                         int32_t patch_pos = unresolved_pos[ui];
                         int32_t target_fn = unresolved_fn[ui];
                         if (target_fn < 0 || target_fn >= symbols->function_count) continue;
-                        Span nm = symbols->functions[target_fn].name;
+                        Span nm = cold_fn_object_symbol_span(&symbols->functions[target_fn], false);
                         if (nm.len <= 0) continue;
                         char name_buf[1024];
                         int32_t nlen = nm.len < 1023 ? nm.len : 1023;
                         memcpy(name_buf, nm.ptr, (size_t)nlen);
                         name_buf[nlen] = '\0';
-                        const char *short_name = name_buf;
-                        for (int32_t k = nlen - 1; k > 0; k--)
-                            if (name_buf[k] == '.') { short_name = name_buf + k + 1; break; }
                         int32_t target_word = -1;
                         for (int32_t pi = 0; pi < exe_provider_count && target_word < 0; pi++) {
                             for (int32_t ni = 0; ni < ep_nc[pi]; ni++) {
-                                if (strcmp(name_buf, ep_names[pi][ni]) == 0 ||
-                                    strcmp(short_name, ep_names[pi][ni]) == 0) {
+                                if (strcmp(name_buf, ep_names[pi][ni]) == 0) {
                                     target_word = ep_provider_start[pi] + ep_offsets[pi][ni];
                                     break;
                                 }
                             }
                         }
-                        if (target_word >= 0) {
-                            int32_t delta = target_word - patch_pos;
-                            if (provider_is_rv)
-                                code->words[patch_pos] = rv_jal(RV_RA, delta);
-                            else
-                                code->words[patch_pos] = (code->words[patch_pos] & 0xFC000000u) |
-                                                         ((uint32_t)delta & 0x03FFFFFFu);
-                            exe_provider_resolved++;
-                        }
+	                        if (target_word >= 0) {
+	                            int32_t delta = target_word - patch_pos;
+	                            if (provider_is_rv)
+	                                code->words[patch_pos] = rv_jal(RV_RA, delta);
+	                            else
+	                                code->words[patch_pos] = (code->words[patch_pos] & 0xFC000000u) |
+	                                                         ((uint32_t)delta & 0x03FFFFFFu);
+	                            exe_provider_resolved++;
+	                        } else {
+	                            die("cold executable provider symbol unresolved");
+	                        }
                     }
 
                     /* Write provider export manifest */
@@ -17538,6 +17669,7 @@ bool cold_compile_source_path_to_macho(const char *out_path,
     uint64_t parse_end_us = cold_now_us();
 
     Code *code = code_new(arena, 256);
+    bool has_unresolved_patches = false;
     if (demo_body) {
         FunctionPatchList function_patches = {0};
         function_patches.arena = arena;
@@ -17557,7 +17689,7 @@ bool cold_compile_source_path_to_macho(const char *out_path,
                 stats->unresolved_symbol_count = unresolved_count;
                 int32_t first = unresolved_fn[0];
                 if (first >= 0 && first < symbols->function_count) {
-                    Span nm = symbols->functions[first].name;
+                    Span nm = cold_fn_object_symbol_span(&symbols->functions[first], false);
                     int32_t n = nm.len < (int32_t)sizeof(stats->first_unresolved_symbol) - 1
                         ? nm.len
                         : (int32_t)sizeof(stats->first_unresolved_symbol) - 1;
@@ -17565,11 +17697,29 @@ bool cold_compile_source_path_to_macho(const char *out_path,
                     stats->first_unresolved_symbol[n] = '\0';
                 }
             }
-            /* Continue to produce mach-o with stubs for unresolved patches */
+            has_unresolved_patches = true;
         }
     }
 
     uint64_t codegen_end_us = cold_now_us();
+    if (has_unresolved_patches) {
+        if (stats) {
+            stats->function_count = symbols->function_count;
+            stats->type_count = symbols->type_count + symbols->object_count;
+            stats->egraph_rewrite_count = cold_egraph_rewrite_count;
+            cold_collect_body_stats(symbols, function_bodies, symbols->function_count, stats);
+            stats->code_words = code->count;
+            stats->arena_kb = arena->used / 1024;
+            if (start_us > 0 && parse_end_us >= start_us)
+                stats->parse_us = parse_end_us - start_us;
+            if (parse_end_us > 0 && codegen_end_us >= parse_end_us)
+                stats->codegen_us = codegen_end_us - parse_end_us;
+            stats->elapsed_us = codegen_end_us - start_us;
+        }
+        if (out_path && out_path[0] != '\0') unlink(out_path);
+        if (mapped_source.len > 0) munmap((void *)mapped_source.ptr, (size_t)mapped_source.len);
+        return false;
+    }
 
     if (output_direct_macho(out_path, code) != 0) {
         if (mapped_source.len > 0) munmap((void *)mapped_source.ptr, (size_t)mapped_source.len);
@@ -18834,6 +18984,16 @@ done:
 
 static bool cold_runtime_provider_linux_root_supported(const char *symbol) {
     static const char *roots[] = {
+        "cheng_malloc",
+        "cheng_free",
+        "cheng_realloc",
+        "cheng_mem_retain",
+        "cheng_mem_release",
+        "cheng_mem_retain_atomic",
+        "cheng_mem_release_atomic",
+        "cheng_panic_cstring_and_exit",
+        "driver_c_new_string",
+        "driver_c_new_string_copy_n",
         "cheng_native_af_inet_bridge",
         "cheng_native_af_inet6_bridge",
         "cheng_native_sock_stream_bridge",
@@ -18851,6 +19011,121 @@ static bool cold_runtime_provider_linux_root_supported(const char *symbol) {
         if (strcmp(symbol, roots[i]) == 0) return true;
     }
     return false;
+}
+
+static bool cold_runtime_provider_program_support_root(const char *symbol) {
+    static const char *roots[] = {
+        "cheng_malloc",
+        "cheng_free",
+        "cheng_realloc",
+        "cheng_mem_retain",
+        "cheng_mem_release",
+        "cheng_mem_retain_atomic",
+        "cheng_mem_release_atomic",
+        "cheng_panic_cstring_and_exit",
+        "driver_c_new_string",
+        "driver_c_new_string_copy_n",
+    };
+    if (!symbol || symbol[0] == '\0') return false;
+    for (size_t i = 0; i < sizeof(roots) / sizeof(roots[0]); i++) {
+        if (strcmp(symbol, roots[i]) == 0) return true;
+    }
+    return false;
+}
+
+static bool cold_export_symbol_push(const char **exports, int32_t *count,
+                                    int32_t cap, const char *symbol) {
+    if (!exports || !count || !symbol || symbol[0] == '\0') return false;
+    for (int32_t i = 0; i < *count; i++) {
+        if (strcmp(exports[i], symbol) == 0) return true;
+    }
+    if (*count >= cap) return false;
+    exports[(*count)++] = symbol;
+    return true;
+}
+
+static bool cold_roots_csv_append(char *roots_csv, size_t cap, const char *symbol) {
+    if (!roots_csv || cap == 0 || !symbol || symbol[0] == '\0') return false;
+    size_t used = strlen(roots_csv);
+    size_t sym_len = strlen(symbol);
+    size_t need = sym_len + (used ? 1u : 0u) + 1u;
+    if (used + need >= cap) return false;
+    if (used) strcat(roots_csv, ",");
+    strcat(roots_csv, symbol);
+    return true;
+}
+
+static bool cold_linux_syscall_provider_exports_symbol(const char *symbol) {
+    if (!symbol || symbol[0] == '\0') return false;
+    static const char *syscalls[] = {
+        "__cheng_linux_syscall0",
+        "__cheng_linux_syscall1",
+        "__cheng_linux_syscall2",
+        "__cheng_linux_syscall3",
+        "__cheng_linux_syscall4",
+        "__cheng_linux_syscall5",
+        "__cheng_linux_syscall6",
+    };
+    for (size_t i = 0; i < sizeof(syscalls) / sizeof(syscalls[0]); i++) {
+        if (strcmp(symbol, syscalls[i]) == 0) return true;
+    }
+    return false;
+}
+
+static bool cold_source_has_exportc_symbol(const char *path, const char *symbol) {
+    if (!path || !symbol || symbol[0] == '\0') return false;
+    Span source = source_open(path);
+    if (source.len <= 0) return false;
+    bool found = false;
+    int32_t pos = 0;
+    while (pos < source.len) {
+        int32_t start = pos;
+        while (pos < source.len && source.ptr[pos] != '\n') pos++;
+        int32_t end = pos;
+        if (pos < source.len) pos++;
+        Span line = span_trim(span_sub(source, start, end));
+        Span export_name = {0};
+        if (cold_parse_c_symbol_attr(line, "@exportc", &export_name) &&
+            export_name.len == (int32_t)strlen(symbol) &&
+            memcmp(export_name.ptr, symbol, (size_t)export_name.len) == 0) {
+            found = true;
+            break;
+        }
+    }
+    munmap((void *)source.ptr, (size_t)source.len);
+    return found;
+}
+
+static bool cold_write_linux_aarch64_syscall_provider_object(const char *out_path) {
+    static const char *names[] = {
+        "__cheng_linux_syscall0",
+        "__cheng_linux_syscall1",
+        "__cheng_linux_syscall2",
+        "__cheng_linux_syscall3",
+        "__cheng_linux_syscall4",
+        "__cheng_linux_syscall5",
+        "__cheng_linux_syscall6",
+    };
+    enum { NAME_COUNT = (int)(sizeof(names) / sizeof(names[0])) };
+    Arena *arena = mmap(0, sizeof(Arena), PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (arena == MAP_FAILED) return false;
+    Code *code = code_new(arena, 128);
+    int32_t offsets[NAME_COUNT];
+    for (int32_t argc = 0; argc <= 6; argc++) {
+        offsets[argc] = code->count;
+        code_emit(code, a64_orr_reg_x(8, 31, 0));
+        for (int32_t ai = 0; ai < argc; ai++) {
+            code_emit(code, a64_orr_reg_x(ai, 31, ai + 1));
+        }
+        code_emit(code, a64_svc(0));
+        code_emit(code, a64_ret());
+    }
+    bool ok = elf64_write_object(out_path, code->words, code->count,
+                                 names, offsets, NAME_COUNT, 0,
+                                 0, 0, 0, EM_AARCH64);
+    munmap(arena, sizeof(Arena));
+    return ok;
 }
 
 static int32_t cold_collect_elf_undefined_reloc_symbols(const char *object_path,
@@ -19057,6 +19332,7 @@ bool cold_compile_source_to_object(const char *out_path,
     bool internal_visibility = symbol_visibility && strcmp(symbol_visibility, "internal") == 0;
     bool public_visibility = !symbol_visibility || symbol_visibility[0] == '\0' ||
                              strcmp(symbol_visibility, "public") == 0;
+    bool reachable_only = getenv("CHENG_OBJECT_REACHABLE_ONLY") != 0;
     if (!internal_visibility && !public_visibility) die("unsupported cold object symbol visibility");
     bool export_roots_provided = export_roots_csv != 0;
     bool has_export_roots = export_roots_csv && export_roots_csv[0] != '\0';
@@ -19095,9 +19371,10 @@ bool cold_compile_source_to_object(const char *out_path,
     cold_collect_global_vars_from_source(symbols, (Span){0}, mapped_source);
     cold_collect_all_transitive_imports(symbols, mapped_source);
     /* Collect direct imports for bare-name resolution in entry module body */
-    ColdImportSource import_sources[64];
-    int32_t import_source_count = cold_collect_direct_import_sources(mapped_source,
-                                                                     import_sources, 64);
+    ColdImportSource import_sources[128];
+    int32_t import_source_count = reachable_only
+        ? cold_collect_import_source_closure(symbols, mapped_source, import_sources, 128)
+        : cold_collect_direct_import_sources(mapped_source, import_sources, 128);
     { /* workspace root detection for import loading */
       char ws_root[PATH_MAX] = {0};
       const char *sm = strstr(src_path, "/src/");
@@ -19112,16 +19389,13 @@ bool cold_compile_source_to_object(const char *out_path,
 
     /* Non-root object builds keep the historical eager import compilation.
        Rooted provider objects parse only the selected reachable closure below. */
-    fprintf(stderr, "[cold debug] before import body compile, has_export_roots=%d func_count=%d\n",
-            has_export_roots, symbols->function_count);
-    if (!has_export_roots && !getenv("CHENG_NO_IMPORT_BODIES") && symbols->function_count < 4096) {
-        fprintf(stderr, "[cold debug] starting import body compile\n");
+    if (!has_export_roots && !reachable_only &&
+        !getenv("CHENG_NO_IMPORT_BODIES") && symbols->function_count < 4096) {
         ColdErrorRecoveryEnabled = true;
         if (setjmp(ColdErrorJumpBuf) == 0) {
             cold_compile_imported_bodies_no_recurse(symbols, mapped_source, function_bodies, body_cap);
         }
         ColdErrorRecoveryEnabled = false;
-        fprintf(stderr, "[cold debug] after import body compile, recovery=%d\n", ColdErrorRecoveryEnabled);
     }
     if (symbols->function_cap > body_cap) {
         int32_t old_cap = body_cap;
@@ -19202,7 +19476,7 @@ bool cold_compile_source_to_object(const char *out_path,
 
     /* Mark functions with NULL bodies as external (recovers from body
        compilation failures in imported modules or skipped functions). */
-    {
+    if (!has_export_roots && !reachable_only) {
         int32_t fc = symbols->function_count;
         for (int32_t fi = 0; fi < fc && fi < body_cap; fi++) {
             if (!function_bodies[fi]) {
@@ -19239,6 +19513,15 @@ bool cold_compile_source_to_object(const char *out_path,
                                                     emit_function);
             if (first_function < 0) first_function = root_indices[ri];
         }
+    } else if (reachable_only) {
+        if (main_function < 0) die("cold reachable object requires main");
+        cold_compile_object_reachable_functions(symbols, mapped_source,
+                                                import_sources, import_source_count,
+                                                function_bodies, body_cap,
+                                                main_function, emit_function);
+        for (int32_t i = 0; i < func_count; i++) {
+            if (emit_function[i]) export_function[i] = true;
+        }
     } else {
         for (int32_t i = 0; i < func_count && i < body_cap; i++) {
             BodyIR *body = function_bodies[i];
@@ -19260,7 +19543,12 @@ bool cold_compile_source_to_object(const char *out_path,
         }
         if (!any_emit_function) die("cold export roots produced no object code");
     }
-    cold_check_object_symbol_unique(symbols, emit_function, func_count);
+    bool force_all_local = !has_export_roots &&
+                           (getenv("CHENG_NO_IMPORT_BODIES") || reachable_only);
+    if (!reachable_only)
+        cold_check_object_symbol_unique(symbols, emit_function, export_function,
+                                        func_count, internal_visibility,
+                                        force_all_local);
 
     /* Compile selected functions into a shared Code buffer with position tracking.
        This enables cross-function BL instruction resolution while leaving
@@ -19336,6 +19624,8 @@ bool cold_compile_source_to_object(const char *out_path,
         for (int32_t pi = 0; pi < function_patches.count; pi++) {
             FunctionPatch patch = function_patches.items[pi];
             if (patch.target_function < 0 || patch.target_function >= func_count) continue;
+            if (patch.kind == FUNCTION_PATCH_ADDR)
+                die("cold x86_64 object function address relocation unsupported");
             int32_t target_off = symbol_offset[patch.target_function];
             if (target_off < 0) continue; /* external: leave as relocation */
             x64_patch_call_rel32(&x64_buf, (int32_t)patch.pos, target_off);
@@ -19345,6 +19635,8 @@ bool cold_compile_source_to_object(const char *out_path,
             FunctionPatch patch = function_patches.items[pi];
             if (patch.target_function < 0 || patch.target_function >= func_count) continue;
             if (symbol_offset[patch.target_function] >= 0) continue; /* already resolved */
+            if (patch.kind == FUNCTION_PATCH_ADDR)
+                die("cold object external function address relocation unsupported");
             if (!symbols->functions[patch.target_function].is_external)
                 die("cold object missing reachable Cheng function body");
             if (reloc_count >= reloc_cap) die("cold object relocation overflow");
@@ -19365,6 +19657,8 @@ bool cold_compile_source_to_object(const char *out_path,
             }
             int32_t target_off = symbol_offset[patch.target_function];
             if (target_off < 0) {
+                if (patch.kind == FUNCTION_PATCH_ADDR)
+                    die("cold object external function address relocation unsupported");
                 if (!symbols->functions[patch.target_function].is_external)
                     die("cold object missing reachable Cheng function body");
                 if (reloc_count >= reloc_cap) die("cold object relocation overflow");
@@ -19374,7 +19668,14 @@ bool cold_compile_source_to_object(const char *out_path,
                 continue;
             }
             int32_t delta = target_off - (int32_t)patch.pos;
-            if (use_rv64) {
+            if (patch.kind == FUNCTION_PATCH_ADDR) {
+                if (use_rv64) die("cold RISC-V object function address relocation unsupported");
+                uint32_t ins = shared->words[patch.pos];
+                int64_t delta_bytes = (int64_t)delta * 4;
+                if (delta_bytes < -(1 << 20) || delta_bytes >= (1 << 20))
+                    die("cold object function address ADR out of range");
+                shared->words[patch.pos] = a64_adr(ins & 0x1Fu, (int32_t)delta_bytes);
+            } else if (patch.kind == FUNCTION_PATCH_CALL && use_rv64) {
                 /* RISC-V JAL: patch the 20-bit immediate using RV_J encoding */
                 uint32_t w = shared->words[patch.pos];
                 uint32_t imm = (uint32_t)(delta & 0x1FFFFF);
@@ -19383,9 +19684,11 @@ bool cold_compile_source_to_object(const char *out_path,
                     ((imm & 0x800u) << 9) |
                     ((imm & 0x7FEu) << 20) |
                     ((imm & 0x100000u) << 11);
-            } else {
+            } else if (patch.kind == FUNCTION_PATCH_CALL) {
                 shared->words[patch.pos] = (shared->words[patch.pos] & 0xFC000000u) |
                                            ((uint32_t)delta & 0x03FFFFFFu);
+            } else {
+                die("cold object unknown function patch kind");
             }
         }
     }
@@ -19405,13 +19708,15 @@ bool cold_compile_source_to_object(const char *out_path,
     const char **func_names = arena_alloc(arena, (size_t)max_names * sizeof(const char *));
     int32_t *func_offsets = arena_alloc(arena, (size_t)max_names * sizeof(int32_t));
     int32_t name_count = 0, local_count = 0;
-    bool force_all_local = !has_export_roots && getenv("CHENG_NO_IMPORT_BODIES");
     for (int32_t pass = 0; pass < 2; pass++) {
         for (int32_t i = 0; i < func_count; i++) {
             if (symbol_offset[i] < 0) continue;
             bool make_local = internal_visibility ? !export_function[i] : force_all_local;
             if ((pass == 0) != make_local) continue;
-            Span nm = cold_fn_object_symbol_span(&symbols->functions[i], false);
+            char private_name[64];
+            Span nm = cold_emit_object_symbol_span(&symbols->functions[i], make_local,
+                                                   i, private_name,
+                                                   sizeof(private_name));
             int32_t offset = (use_entry_trampoline && i == main_function) ? 0 : symbol_offset[i];
             func_offsets[name_count] = offset;
             char *nc = arena_alloc(arena, (size_t)nm.len + 1);
@@ -19584,10 +19889,22 @@ static bool cold_emit_canonical_csg_v2_facts_from_bodyir(const char *path,
         int32_t target_off = symbol_offset[patch.target_function];
         if (target_off >= 0) {
             int32_t delta = target_off - patch.pos;
-            shared->words[patch.pos] = (shared->words[patch.pos] & 0xFC000000u) |
-                                       ((uint32_t)delta & 0x03FFFFFFu);
+            if (patch.kind == FUNCTION_PATCH_ADDR) {
+                uint32_t ins = shared->words[patch.pos];
+                int64_t delta_bytes = (int64_t)delta * 4;
+                if (delta_bytes < -(1 << 20) || delta_bytes >= (1 << 20))
+                    die("cold csg function address ADR out of range");
+                shared->words[patch.pos] = a64_adr(ins & 0x1Fu, (int32_t)delta_bytes);
+            } else if (patch.kind == FUNCTION_PATCH_CALL) {
+                shared->words[patch.pos] = (shared->words[patch.pos] & 0xFC000000u) |
+                                           ((uint32_t)delta & 0x03FFFFFFu);
+            } else {
+                die("cold csg unknown function patch kind");
+            }
             continue;
         }
+        if (patch.kind == FUNCTION_PATCH_ADDR)
+            die("cold csg external function address relocation unsupported");
         if (!symbols->functions[patch.target_function].is_external) return false;
         int32_t source_item = cold_csg_v2_source_item_for_word(emit_function, symbol_offset,
                                                                symbol_end, func_count,
@@ -20630,15 +20947,18 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
     if (link_providers) {
         snprintf(stats.system_link_exec_scope, sizeof(stats.system_link_exec_scope),
                  "cold_runtime_provider_archive");
-        char primary_o[PATH_MAX], provider_o[PATH_MAX], provider_archive[PATH_MAX];
+        char primary_o[PATH_MAX], provider_o[PATH_MAX], provider_syscall_o[PATH_MAX], provider_archive[PATH_MAX];
         const char *error = "";
+        char error_buf[256];
+        error_buf[0] = '\0';
         bool linked = false;
         bool primary_written = false;
         bool provider_written = false;
         bool archive_written = false;
         int n1 = snprintf(primary_o, sizeof(primary_o), "%s.primary.o", out_path);
         int n2 = snprintf(provider_o, sizeof(provider_o), "%s.provider.o", out_path);
-        int n3 = snprintf(provider_archive, sizeof(provider_archive), "%s.provider.chenga", out_path);
+        int n3 = snprintf(provider_syscall_o, sizeof(provider_syscall_o), "%s.provider.syscall.o", out_path);
+        int n4 = snprintf(provider_archive, sizeof(provider_archive), "%s.provider.chenga", out_path);
         if (strcmp(emit, "exe") != 0) {
             error = "--link-providers requires --emit:exe";
             goto link_providers_done;
@@ -20649,7 +20969,8 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
         }
         if (n1 <= 0 || n1 >= (int)sizeof(primary_o) ||
             n2 <= 0 || n2 >= (int)sizeof(provider_o) ||
-            n3 <= 0 || n3 >= (int)sizeof(provider_archive)) {
+            n3 <= 0 || n3 >= (int)sizeof(provider_syscall_o) ||
+            n4 <= 0 || n4 >= (int)sizeof(provider_archive)) {
             error = "temporary provider path too long";
             goto link_providers_done;
         }
@@ -20665,10 +20986,10 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
                 error = "missing --in";
                 goto link_providers_done;
             }
-            setenv("CHENG_NO_IMPORT_BODIES", "1", 1);
+            setenv("CHENG_OBJECT_REACHABLE_ONLY", "1", 1);
             bool primary_ok = cold_compile_source_to_object(primary_o, source_path,
                                                             target, 0, "public");
-            unsetenv("CHENG_NO_IMPORT_BODIES");
+            unsetenv("CHENG_OBJECT_REACHABLE_ONLY");
             if (!primary_ok) {
                 error = "primary object emit failed";
                 goto link_providers_done;
@@ -20686,59 +21007,150 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
             error = "provider arena allocation failed";
             goto link_providers_done;
         }
-        const char *undefined_symbols[128];
+        const char *undefined_symbols[256];
         int32_t undefined_count = cold_collect_elf_undefined_reloc_symbols(primary_o,
                                                                            target,
                                                                            undefined_symbols,
-                                                                           128,
+                                                                           256,
                                                                            provider_arena);
         if (undefined_count <= 0) {
             error = undefined_count == 0 ? "no provider roots selected" : "primary undefined symbol scan failed";
             goto link_providers_done;
         }
-        const char *export_symbols[128];
+        const char *export_symbols[256];
         int32_t export_count = 0;
-        char roots_csv[4096];
+        bool needs_program_support_provider = false;
+        bool needs_core_runtime_provider = false;
+        char roots_csv[8192];
         roots_csv[0] = '\0';
         for (int32_t ui = 0; ui < undefined_count; ui++) {
             const char *sym = undefined_symbols[ui];
             if (!cold_runtime_provider_linux_root_supported(sym)) {
-                error = "unsupported runtime provider symbol";
+                snprintf(error_buf, sizeof(error_buf),
+                         "unsupported runtime provider symbol: %s", sym);
+                error = error_buf;
                 goto link_providers_done;
             }
-            size_t used = strlen(roots_csv);
-            size_t need = strlen(sym) + (used ? 1u : 0u) + 1u;
-            if (used + need >= sizeof(roots_csv) || export_count >= 128) {
+            if (cold_runtime_provider_program_support_root(sym))
+                needs_program_support_provider = true;
+            else
+                needs_core_runtime_provider = true;
+            if (!cold_roots_csv_append(roots_csv, sizeof(roots_csv), sym)) {
                 error = "too many runtime provider roots";
                 goto link_providers_done;
             }
-            if (used) strcat(roots_csv, ",");
-            strcat(roots_csv, sym);
+            if (export_count >= 256) {
+                error = "too many runtime provider roots";
+                goto link_providers_done;
+            }
             export_symbols[export_count++] = sym;
         }
-        const char *provider_source = "src/core/runtime/core_runtime_provider_linux.cheng";
-#ifndef COLD_BACKEND_ONLY
-        if (!cold_compile_source_to_object(provider_o, provider_source, target,
-                                           roots_csv, "internal")) {
-            error = "runtime provider object emit failed";
+        if (needs_program_support_provider && needs_core_runtime_provider) {
+            error = "mixed runtime provider roots unsupported";
             goto link_providers_done;
         }
-        provider_written = true;
+        bool use_linux_nolibc_provider = needs_program_support_provider &&
+            target && strstr(target, "linux") && strstr(target, "aarch64");
+        const char *provider_source = use_linux_nolibc_provider
+            ? "src/std/system_helpers_backend_nolibc_linux_aarch64.cheng"
+            : needs_program_support_provider
+                ? "src/core/runtime/program_support_backend.cheng"
+            : "src/core/runtime/core_runtime_provider_linux.cheng";
+        if (roots_csv[0] == '\0') {
+            error = "no Cheng runtime provider roots selected";
+            goto link_providers_done;
+        }
+#ifndef COLD_BACKEND_ONLY
+        for (int32_t closure_iter = 0; closure_iter < 16; closure_iter++) {
+            if (!cold_compile_source_to_object(provider_o, provider_source, target,
+                                               roots_csv, "internal")) {
+                error = "runtime provider object emit failed";
+                goto link_providers_done;
+            }
+            provider_written = true;
+            const char *provider_undefined[256];
+            int32_t provider_undefined_count =
+                cold_collect_elf_undefined_reloc_symbols(provider_o, target,
+                                                         provider_undefined, 256,
+                                                         provider_arena);
+            if (provider_undefined_count < 0) {
+                error = "provider undefined symbol scan failed";
+                goto link_providers_done;
+            }
+            bool added_provider_root = false;
+            for (int32_t pi = 0; pi < provider_undefined_count; pi++) {
+                const char *dep = provider_undefined[pi];
+                if (use_linux_nolibc_provider &&
+                    cold_linux_syscall_provider_exports_symbol(dep)) {
+                    continue;
+                }
+                bool already_exported = false;
+                for (int32_t ei = 0; ei < export_count; ei++) {
+                    if (strcmp(export_symbols[ei], dep) == 0) {
+                        already_exported = true;
+                        break;
+                    }
+                }
+                if (already_exported) continue;
+                if (!cold_source_has_exportc_symbol(provider_source, dep)) {
+                    snprintf(error_buf, sizeof(error_buf),
+                             "provider dependency has no export root: %s", dep);
+                    error = error_buf;
+                    goto link_providers_done;
+                }
+                if (!cold_roots_csv_append(roots_csv, sizeof(roots_csv), dep) ||
+                    !cold_export_symbol_push(export_symbols, &export_count, 256, dep)) {
+                    error = "too many runtime provider roots";
+                    goto link_providers_done;
+                }
+                added_provider_root = true;
+            }
+            if (!added_provider_root) break;
+            if (closure_iter == 15) {
+                error = "provider root closure did not converge";
+                goto link_providers_done;
+            }
+        }
 #else
         error = "provider source compile disabled in backend-only mode";
         goto link_providers_done;
 #endif
-        const char *object_paths[1] = { provider_o };
+        const char *object_paths[2];
+        int32_t object_path_count = 0;
+        object_paths[object_path_count++] = provider_o;
+        if (use_linux_nolibc_provider) {
+            static const char *syscall_exports[] = {
+                "__cheng_linux_syscall0",
+                "__cheng_linux_syscall1",
+                "__cheng_linux_syscall2",
+                "__cheng_linux_syscall3",
+                "__cheng_linux_syscall4",
+                "__cheng_linux_syscall5",
+                "__cheng_linux_syscall6",
+            };
+            for (size_t si = 0; si < sizeof(syscall_exports) / sizeof(syscall_exports[0]); si++) {
+                if (!cold_export_symbol_push(export_symbols, &export_count, 256,
+                                             syscall_exports[si])) {
+                    error = "too many runtime provider exports";
+                    goto link_providers_done;
+                }
+            }
+            if (!cold_write_linux_aarch64_syscall_provider_object(provider_syscall_o)) {
+                error = "linux syscall provider object emit failed";
+                goto link_providers_done;
+            }
+            object_paths[object_path_count++] = provider_syscall_o;
+        }
         int32_t archive_member_count = 0;
         uint64_t archive_hash = 0;
         if (!cold_write_provider_archive(provider_archive, target,
-                                         object_paths, 1,
+                                         object_paths, object_path_count,
                                          "runtime_core_runtime",
                                          provider_source,
                                          export_symbols, export_count,
                                          &archive_member_count,
                                          &archive_hash) ||
-            archive_member_count != 1 ||
+            archive_member_count != object_path_count ||
             !cold_verify_provider_archive(provider_archive, target,
                                           &archive_member_count,
                                           &archive_hash)) {
@@ -20771,6 +21183,7 @@ link_providers_done:
         }
         if (primary_written) unlink(primary_o);
         if (provider_written) unlink(provider_o);
+        if (use_linux_nolibc_provider) unlink(provider_syscall_o);
         if (archive_written) unlink(provider_archive);
         return linked ? 0 : 2;
     }
