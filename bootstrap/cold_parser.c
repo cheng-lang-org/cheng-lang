@@ -2711,8 +2711,14 @@ int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *locals,
     if (cold_is_i32_to_str_intrinsic(stripped_name)) {
         if (arg_count != 1) die("int to str intrinsic arity mismatch");
         int32_t arg_slot = body->call_arg_slot[arg_start];
-        if (body->slot_kind[arg_slot] != SLOT_I32 && body->slot_kind[arg_slot] != SLOT_I64)
+        if (body->slot_kind[arg_slot] != SLOT_I32 && body->slot_kind[arg_slot] != SLOT_I64) {
+            if (ColdErrorRecoveryEnabled) {
+                int32_t slot = body_slot(body, SLOT_STR, COLD_STR_SLOT_SIZE);
+                if (kind_out) *kind_out = SLOT_STR;
+                return slot;
+            }
             die("int to str intrinsic requires integer arg");
+        }
         int32_t slot = body_slot(body, SLOT_STR, COLD_STR_SLOT_SIZE);
         body_op(body, body->slot_kind[arg_slot] == SLOT_I64 ? BODY_OP_I64_TO_STR : BODY_OP_I32_TO_STR, slot, arg_slot, 0);
         if (kind_out) *kind_out = SLOT_STR;
@@ -2979,6 +2985,11 @@ int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *locals,
                 }
             }
         }
+        if (ColdErrorRecoveryEnabled) {
+            int32_t slot = body_slot(body, SLOT_I32, 4);
+            if (kind_out) *kind_out = SLOT_I32;
+            return slot;
+        }
         fprintf(stderr, "cheng_cold: unresolved function call name=%.*s body=%.*s\n",
                 (int)lookup_name.len, lookup_name.ptr,
                 body && body->debug_name.len > 0 ? (int)body->debug_name.len : 0,
@@ -3080,7 +3091,14 @@ int32_t parse_call_from_args_span(Parser *owner, BodyIR *body, Locals *locals,
     if (cold_is_i32_to_str_intrinsic(stripped_name)) {
         if (arg_count != 1) die("int to str intrinsic arity mismatch");
         int32_t arg_slot = body->call_arg_slot[arg_start];
-        if (body->slot_kind[arg_slot] != SLOT_I32) die("int to str intrinsic expects int32");
+        if (body->slot_kind[arg_slot] != SLOT_I32) {
+            if (ColdErrorRecoveryEnabled) {
+                int32_t slot = body_slot(body, SLOT_STR, COLD_STR_SLOT_SIZE);
+                if (kind_out) *kind_out = SLOT_STR;
+                return slot;
+            }
+            die("int to str intrinsic expects int32");
+        }
         int32_t slot = body_slot(body, SLOT_STR, COLD_STR_SLOT_SIZE);
         body_op(body, BODY_OP_I32_TO_STR, slot, arg_slot, 0);
         if (kind_out) *kind_out = SLOT_STR;
@@ -3240,6 +3258,11 @@ int32_t parse_call_from_args_span(Parser *owner, BodyIR *body, Locals *locals,
         }
     }
     if (fn_index < 0) {
+        if (ColdErrorRecoveryEnabled) {
+            int32_t slot = body_slot(body, SLOT_I32, 4);
+            if (kind_out) *kind_out = SLOT_I32;
+            return slot;
+        }
         fprintf(stderr, "cheng_cold: unresolved function call name=%.*s body=%.*s\n",
                 (int)lookup_name.len, lookup_name.ptr,
                 body && body->debug_name.len > 0 ? (int)body->debug_name.len : 0,
@@ -4946,34 +4969,65 @@ bool cold_try_os_intrinsic(Parser *parser, BodyIR *body, Span name,
         *slot_out = slot;
         return true;
     }
-    if (span_eq(name, "cold_mmap")) {
-        if (arg_count != 1) return false;
-        int32_t len = body->call_arg_slot[arg_start];
-        if (body->slot_kind[len] != SLOT_I32) return false;
-        int32_t slot = body_slot(body, SLOT_I64, 8);
+	    if (span_eq(name, "cold_mmap")) {
+	        if (arg_count != 1) return false;
+	        int32_t len = body->call_arg_slot[arg_start];
+	        if (body->slot_kind[len] != SLOT_I32) return false;
+	        int32_t slot = body_slot(body, SLOT_I64, 8);
         body_op(body, BODY_OP_MMAP, slot, len, 0);
         if (kind_out) *kind_out = SLOT_I64;
-        *slot_out = slot;
-        return true;
-    }
-    if (span_eq(name, "ptrLoadI32")) {
-        if (arg_count != 1) return false;
-        int32_t ptr = body->call_arg_slot[arg_start];
-        int32_t slot = body_slot(body, SLOT_I32, 4);
-        body_op(body, BODY_OP_PTR_LOAD_I32, slot, ptr, 0);
+	        *slot_out = slot;
+	        return true;
+	    }
+	    if (span_eq(name, "addr")) {
+	        if (arg_count != 1) return false;
+	        int32_t src = body->call_arg_slot[arg_start];
+	        int32_t slot = body_slot(body, SLOT_PTR, 8);
+	        body_slot_set_type(body, slot, cold_cstr_span("ptr"));
+	        body_op3(body, BODY_OP_FIELD_REF, slot, src, 0, 0);
+	        if (kind_out) *kind_out = SLOT_PTR;
+	        *slot_out = slot;
+	        return true;
+	    }
+	    if (span_eq(name, "ptrLoadI32")) {
+	        if (arg_count != 1) return false;
+	        int32_t ptr = body->call_arg_slot[arg_start];
+	        int32_t slot = body_slot(body, SLOT_I32, 4);
+	        body_op(body, BODY_OP_PTR_LOAD_I32, slot, ptr, 0);
         if (kind_out) *kind_out = SLOT_I32;
-        *slot_out = slot;
-        return true;
-    }
-    if (span_eq(name, "ptrStoreI32")) {
-        if (arg_count != 2) return false;
-        int32_t ptr = body->call_arg_slot[arg_start];
-        int32_t val = body->call_arg_slot[arg_start + 1];
-        body_op(body, BODY_OP_PTR_STORE_I32, ptr, val, 0);
+	        *slot_out = slot;
+	        return true;
+	    }
+	    if (span_eq(name, "load")) {
+	        if (arg_count != 1) return false;
+	        int32_t ptr = body->call_arg_slot[arg_start];
+	        if (!cold_kind_is_pointer_like(body->slot_kind[ptr])) die("load expects pointer");
+	        int32_t slot = body_slot(body, SLOT_I32, 4);
+	        body_op(body, BODY_OP_PTR_LOAD_I32, slot, ptr, 0);
+	        if (kind_out) *kind_out = SLOT_I32;
+	        *slot_out = slot;
+	        return true;
+	    }
+	    if (span_eq(name, "ptrStoreI32")) {
+	        if (arg_count != 2) return false;
+	        int32_t ptr = body->call_arg_slot[arg_start];
+	        int32_t val = body->call_arg_slot[arg_start + 1];
+	        body_op(body, BODY_OP_PTR_STORE_I32, ptr, val, 0);
         if (kind_out) *kind_out = SLOT_I32;
-        *slot_out = val;
-        return true;
-    }
+	        *slot_out = val;
+	        return true;
+	    }
+	    if (span_eq(name, "store")) {
+	        if (arg_count != 2) return false;
+	        int32_t ptr = body->call_arg_slot[arg_start];
+	        int32_t val = body->call_arg_slot[arg_start + 1];
+	        if (!cold_kind_is_pointer_like(body->slot_kind[ptr])) die("store expects pointer");
+	        if (body->slot_kind[val] != SLOT_I32) die("store expects int32 value");
+	        body_op(body, BODY_OP_PTR_STORE_I32, ptr, val, 0);
+	        if (kind_out) *kind_out = SLOT_I32;
+	        *slot_out = val;
+	        return true;
+	    }
     if (span_eq(name, "ptrLoadI64")) {
         if (arg_count != 1) return false;
         int32_t ptr = body->call_arg_slot[arg_start];
@@ -7045,6 +7099,12 @@ int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32_t *kin
             }
         }
         if (!span_eq(parser_peek(parser), "(")) {
+            if (ColdErrorRecoveryEnabled) {
+                int32_t zero = body_slot(body, SLOT_I32, 4);
+                body_op(body, BODY_OP_I32_CONST, zero, 0, 0);
+                *kind = SLOT_I32;
+                return zero;
+            }
             fprintf(stderr, "cheng_cold: unsupported qualified expression name=%.*s offset=%d\n",
                     call_name.len, call_name.ptr,
                     cold_span_offset(parser->source, call_name));
@@ -7191,6 +7251,12 @@ int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32_t *kin
             *kind = val_kind;
             return val_slot;
         }
+        if (ColdErrorRecoveryEnabled) {
+            int32_t zero = body_slot(body, SLOT_I32, 4);
+            body_op(body, BODY_OP_I32_CONST, zero, 0, 0);
+            *kind = SLOT_I32;
+            return zero;
+        }
         fprintf(stderr, "cheng_cold: unknown qualified identifier token=%.*s qualified=%.*s offset=%d\n",
                 token.len, token.ptr, qualified.len, qualified.ptr,
                 cold_span_offset(parser->source, qualified));
@@ -7252,6 +7318,12 @@ int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32_t *kin
             *kind = SLOT_I32;
             return slot;
         }
+    }
+    if (ColdErrorRecoveryEnabled) {
+        int32_t zero = body_slot(body, SLOT_I32, 4);
+        body_op(body, BODY_OP_I32_CONST, zero, 0, 0);
+        *kind = SLOT_I32;
+        return zero;
     }
     fprintf(stderr, "cheng_cold: unknown identifier token=%.*s body=%.*s offset=%d\n",
             (int)token.len, token.ptr,
@@ -7817,6 +7889,12 @@ int32_t cold_materialize_i64_value(BodyIR *body, int32_t slot, int32_t *kind) {
         *kind = SLOT_I64;
         return dst;
     }
+    if (ColdErrorRecoveryEnabled) {
+        int32_t dst = body_slot(body, SLOT_I64, 8);
+        body_op(body, BODY_OP_I64_FROM_I32, dst, 0, 0);
+        *kind = SLOT_I64;
+        return dst;
+    }
     die("cold cannot materialize int64 value");
     return slot;
 }
@@ -7832,6 +7910,12 @@ int32_t cold_materialize_ptr_value(BodyIR *body, int32_t slot, int32_t *kind) {
     if (*kind == SLOT_OPAQUE || *kind == SLOT_I64 || *kind == SLOT_OBJECT_REF) {
         int32_t dst = body_slot(body, SLOT_PTR, 8);
         body_op(body, BODY_OP_COPY_I64, dst, slot, 0);
+        *kind = SLOT_PTR;
+        return dst;
+    }
+    if (ColdErrorRecoveryEnabled) {
+        int32_t dst = body_slot(body, SLOT_PTR, 8);
+        body_op(body, BODY_OP_I64_FROM_I32, dst, 0, 0);
         *kind = SLOT_PTR;
         return dst;
     }
@@ -8685,6 +8769,10 @@ void cold_store_value_into_slot(BodyIR *body, int32_t dst, int32_t dst_kind,
         return;
     }
     if (src_kind != dst_kind) {
+        if (ColdErrorRecoveryEnabled) {
+            body_op(body, BODY_OP_COPY_COMPOSITE, dst, src, 0);
+            return;
+        }
         fprintf(stderr,
                 "cheng_cold: value store kind mismatch dst_kind=%d src_kind=%d dst_slot=%d src_slot=%d body=%.*s\n",
                 dst_kind, src_kind, dst, src,
@@ -8891,6 +8979,14 @@ int32_t parse_let_binding(Parser *parser, BodyIR *body, Locals *locals,
                     int32_t owned = body_slot(body, declared_kind, dsz);
                     body_slot_set_type(body, owned, type);
                     body_op(body, BODY_OP_COPY_I64, owned, slot, 0);
+                    slot = owned;
+                } else if (ColdErrorRecoveryEnabled) {
+                    /* Lenient conversion: force kind to declared */
+                    kind = declared_kind;
+                    int32_t dsz = cold_slot_size_for_kind(declared_kind);
+                    int32_t owned = body_slot(body, declared_kind, dsz);
+                    body_slot_set_type(body, owned, type);
+                    body_op(body, BODY_OP_COPY_COMPOSITE, owned, slot, 0);
                     slot = owned;
                 } else {
                     fprintf(stderr,
