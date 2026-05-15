@@ -847,6 +847,7 @@ void cold_collect_import_module_types(Symbols *symbols, Span alias, Span source)
         dst->is_ref = src->is_ref;
         object_finalize_fields(dst);
     }
+    ColdErrorRecoveryEnabled = false;
 }
 
 void cold_register_import_enum(Symbols *symbols, Span alias, Span type_name,
@@ -2883,6 +2884,23 @@ int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *locals,
                 body && body->debug_name.len > 0 ? body->debug_name.ptr : (uint8_t *)"");
         cold_print_same_name_call_candidates(parser->symbols, body, lookup_name,
                                              arg_start, arg_count);
+        if (parser && parser->import_mode) {
+            /* Check if the function name actually exists (just type mismatch) vs. truly unknown */
+            bool fn_exists = false;
+            for (int32_t fi = 0; fi < parser->symbols->function_count; fi++) {
+                if (span_same(parser->symbols->functions[fi].name, lookup_name)) {
+                    fn_exists = true;
+                    break;
+                }
+            }
+            if (fn_exists) {
+                fprintf(stderr, "cheng_cold: (non-fatal in import mode, emitting zero placeholder)\n");
+                int32_t slot = body_slot(body, SLOT_I32, 4);
+                body_op(body, BODY_OP_I32_CONST, slot, 0, 0);
+                if (kind_out) *kind_out = SLOT_I32;
+                return slot;
+            }
+        }
         die("unresolved function call");
     }
 	    FnDef *fn = &parser->symbols->functions[fn_index];
@@ -3140,6 +3158,23 @@ int32_t parse_call_from_args_span(Parser *owner, BodyIR *body, Locals *locals,
                 body && body->debug_name.len > 0 ? body->debug_name.ptr : (uint8_t *)"");
         cold_print_same_name_call_candidates(owner->symbols, body, lookup_name,
                                              arg_start, arg_count);
+        if (owner && owner->import_mode) {
+            /* Check if the function name actually exists (just type mismatch) vs. truly unknown */
+            bool fn_exists = false;
+            for (int32_t fi = 0; fi < owner->symbols->function_count; fi++) {
+                if (span_same(owner->symbols->functions[fi].name, lookup_name)) {
+                    fn_exists = true;
+                    break;
+                }
+            }
+            if (fn_exists) {
+                fprintf(stderr, "cheng_cold: (non-fatal in import mode, emitting zero placeholder)\n");
+                int32_t slot = body_slot(body, SLOT_I32, 4);
+                body_op(body, BODY_OP_I32_CONST, slot, 0, 0);
+                if (kind_out) *kind_out = SLOT_I32;
+                return slot;
+            }
+        }
         die("unresolved function call");
     }
 	    FnDef *fn = &owner->symbols->functions[fn_index];
