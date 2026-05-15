@@ -7,14 +7,14 @@
 | 模块 | 进度 | 判断 |
 |---|---|---|
 | 冷编译器基础 codegen | 93% | 133+ BodyIR ops；ARM64/x86_64/RISC-V；str[] stride 16→24（COLD_STR_SLOT_SIZE=24）修复 segfault；enum 返回类型→SLOT_I32；无载荷枚举→I32 常量；codegen_mul_u64_by_24 辅助 |
-| CSG v2 facts 往返 | 96% | 745/745 PASS；ELF object emit 与显式 `--link-object` 链接门禁闭合 |
+| CSG v2 facts 往返 | 96% | 770/770 PASS；真实 backend driver canonical facts → cold reader → ELF object → 显式 `--link-object` 门禁闭合 |
 | PrimaryObjectPlan → facts | 85% | `primary_object_plan.cheng`（1.1MB）冷编译→1.64MB Mach-O .o（0 errors）；三 intrinsic 已启用 |
 | cold --csg-in --emit:obj | 97% | **116/116 回归 PASS（100%，0 FAIL）**；全部测试通过 |
 | cold linkerless exe | 82% | canonical exe 三路径全链闭合 |
-| provider archive | 73% | Mach-O archive reader 基础设施（+197 行），入口仍硬失败 |
+| provider archive | 78% | ELF provider archive/link 门禁通过；Mach-O provider archive reader/linker 明确不支持并硬失败 |
 | backend driver fixed-point | 60% | cross-version proven；pure_backend_driver 已修复，不再 hard-fail |
 | Ownership / E-Graph | 55% | ownership_proof 6 测试全部 PASS；enum 返回类型修复解除 typed let kind mismatch；ownership CI gate 已接入 |
-| C seed 替代 | 89% | **parser.cheng（8054 行）冷编译通过（398KB）**；**POP（1.1MB）→1.59MB .o（14 非致命错误）**；**gate_main（2.0MB）冷编译通过**；**42/42 manifest + 39/39 源文件全编译通过**；枚举构造器、seq 类型别名解析、import mode enum lookup 已修复；剩余 gap：函数级泛型/完整单态化未闭合，cheng_seed.c 仍在链中 |
+| C seed 替代 | 93% | **parser.cheng（8054 行）冷编译通过（516KB，0 errors）**；**POP（1.1MB）→1.60MB .o（0 errors）**；**gate_main（2.0MB）冷编译通过（0 errors）**；**42/42 manifest + 39/39 源文件全编译通过，0 errors**；泛型单态化管线完整（审计确认已覆盖 seed 代码）；剩余 gap：自举链集成验证，cheng_seed.c 运行时替换 |
 | 跨端 | 60% | 三架构 exe + COFF obj 均产出，CI 中有 COFF 格式验证 |
 
 愿景可以写目标，不写成完成。若与实现冲突，以 `docs/cheng-formal-spec.md`、`src/core/tooling/README.md`、当前源码和当前可执行产物为准。
@@ -27,7 +27,7 @@
 
 - **冷编译器三架构 codegen**：ARM64/x86_64/RISC-V 全 133 BodyIR ops 覆盖
 - **ordinary provider-free direct Mach-O**：`ordinary_zero_exit_fixture` 直接编译运行 exit 0
-- **CSG v2 facts 往返**：`tools/cold_csg_v2_roundtrip_test.sh` 745/745 PASS
+- **CSG v2 facts 往返**：`tools/cold_csg_v2_roundtrip_test.sh` 770/770 PASS
   - public `emit-cold-csg-v2` → canonical facts → cold reader → .o → link/run
   - internal `CHENGCSG` fixed-point 仍由显式 `system-link-exec --emit:csg-v2` 锁定
   - 错误输入 hard-fail（unknown record、truncated）
@@ -137,7 +137,7 @@
 ### 历史记录（2026-05-14）：provider archive 最小闭环 + mutable-slot CSE 禁用
 
 - **provider archive 最小闭环已落地**：`provider-archive-pack` 接受 `--target/--object/--export/--module/--source/--out/--report-out`，写 `.chenga` archive、member count、export count、hash 和 report。`system-link-exec --link-object:<primary.o> --provider-archive:<provider.chenga> --emit:exe` 在 cold 内部读取 ELF relocatable object 和 archive，解析 undefined symbol，应用 call relocation，生成 ELF executable。
-- **门禁已更新**：`tools/cold_csg_v2_roundtrip_test.sh` 覆盖正向 provider archive、坏 magic、缺 export、双 provider member/export、`--csg-in --provider-archive`、显式 `--link-object`、CSG v2 fixed-point、DSE noop、Darwin runtime marker object、Mach-O provider archive pack/link 硬失败，并新增 canonical `CHENG_CSG_V2` writer/read/link/run smoke。当前结果为 **745/745 PASS**。
+- **门禁已更新**：`tools/cold_csg_v2_roundtrip_test.sh` 覆盖正向 provider archive、坏 magic、缺 export、双 provider member/export、`--csg-in --provider-archive`、显式 `--link-object`、CSG v2 fixed-point、DSE noop、Darwin runtime marker object、Mach-O provider archive pack/link 硬失败，并新增 canonical `CHENG_CSG_V2` writer/read/link/run smoke 与真实 backend driver → aarch64 ELF `--link-object` smoke。当前结果为 **770/770 PASS**。
 - **当前边界**：archive 已支持多 ELF member/export，目标限定在当前 cold ELF reloc linker 支持的 AArch64/RISC-V；runtime provider 纯常量 roots 已锁链接报告，首个非纯常量 root 已锁 `get_nprocs` 未解析 hard-fail，目标运行 marker 仍需逐个纳入；Darwin Mach-O provider archive reader/linker 不支持并已硬失败锁定。
 - **mutable-slot CSE 与 hash-only dedup 已禁用**：原先的 mutating rewrite 会把 build-backend-driver 的 system-link smoke 编错；hash-only 函数去重会把不同零参函数合并到同一地址，导致 `compiler_runtime_smoke` 读到错误字符串。当前只保留 DSE 和可证明代数恒等式；后续 E-Graph 必须先做只读等价证明和运行门禁，再允许 rewrite。
 - **函数参数 no_alias 标记已撤销**：参数参与跨 block/call 后的值流，直接标记为 no_alias 会污染寄存器缓存假设。No-Alias 当前只对明确局部标量 slot 生效。
