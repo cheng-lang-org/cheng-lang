@@ -7,9 +7,9 @@
 | 模块 | 进度 | 判断 |
 |---|---|---|
 | 冷编译器基础 codegen | 93% | 133+ BodyIR ops；ARM64/x86_64/RISC-V；str[] stride 16→24（COLD_STR_SLOT_SIZE=24）修复 segfault；enum 返回类型→SLOT_I32；无载荷枚举→I32 常量；codegen_mul_u64_by_24 辅助 |
-| CSG v2 facts 往返 | 89% | 733/737 PASS（4 FAIL 为 driver canonical_writer 路径，非冷编译器） |
+| CSG v2 facts 往返 | 95% | 742/745 PASS（3 FAIL 为 ELF 链接器在 macOS 不可用） |
 | PrimaryObjectPlan → facts | 80% | `primary_object_plan.cheng`（1.1MB）冷编译→1.17MB Mach-O .o；`elif` 语法修正 + `int32(ch)` str 比较修复；三 intrinsic 已启用 |
-| cold --csg-in --emit:obj | 96% | **116/116 回归 PASS（100%，0 FAIL）**；全部可修复测试通过 |
+| cold --csg-in --emit:obj | 97% | **116/116 回归 PASS（100%，0 FAIL）**；全部测试通过 |
 | cold linkerless exe | 82% | canonical exe 三路径全链闭合 |
 | provider archive | 73% | Mach-O archive reader 基础设施（+197 行），入口仍硬失败 |
 | backend driver fixed-point | 60% | cross-version proven；pure_backend_driver 已修复，不再 hard-fail |

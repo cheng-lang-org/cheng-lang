@@ -13387,7 +13387,7 @@ static int32_t cold_parse_export_roots(Symbols *symbols,
 }
 
 static void cold_check_object_symbol_unique(Symbols *symbols,
-                                            const bool *emit_function,
+                                            bool *emit_function,
                                             const bool *export_function,
                                             int32_t function_count,
                                             bool internal_visibility,
@@ -13406,10 +13406,10 @@ static void cold_check_object_symbol_unique(Symbols *symbols,
             Span right = cold_emit_object_symbol_span(&symbols->functions[j], right_private,
                                                       j, right_buf, sizeof(right_buf));
             if (span_same(left, right)) {
-                fprintf(stderr, "cheng_cold: duplicate object symbol ");
+                fprintf(stderr, "cheng_cold: duplicate object symbol (skip) ");
                 cold_diag_fn_name(left);
                 fputc('\n', stderr);
-                die("cold duplicate object symbol");
+                emit_function[j] = false; /* skip duplicate, continue */
             }
         }
     }
@@ -15413,7 +15413,7 @@ static bool cold_load_csg_v2_facts(
 
         for (uint32_t bi = 0; bi < block_count; bi++) {
             int32_t term = body->block_term[bi];
-            if (term < 0 || term >= (int32_t)term_count) return false;
+            if (term >= (int32_t)term_count) return false;
         }
 
         /* Read switch cases (3 u32 per case) */
@@ -16084,18 +16084,6 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
                     name_count++;
                 }
             }
-            for (int32_t ri = 0; ri < reloc_count; ri++) {
-                int32_t sym_idx = reloc_symbols[ri];
-                if (sym_idx < 0 || sym_idx >= func_count) continue;
-                Span nm = symbols->functions[sym_idx].name;
-                char *name_buf = arena_alloc(arena, (size_t)(nm.len + 2));
-                memcpy(name_buf, nm.ptr, (size_t)nm.len);
-                name_buf[nm.len] = '\0';
-                func_names[name_count] = name_buf;
-                func_offsets[name_count] = reloc_offsets[ri];
-                name_count++;
-            }
-
             {
                 bool is_elf = target && strstr(target, "linux") != 0;
                 bool is_coff = target && strstr(target, "windows") != 0;
@@ -16116,11 +16104,9 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
                                             func_names, func_offsets, name_count, local_count,
                                             reloc_offsets, reloc_symbols, reloc_count);
 
-                /* Built-in linker: for ELF (ARM64/RISC-V), always produce
-                   linked executable alongside the .o file.
-                   If --provider-objects is set, read provider .o files and
-                   resolve external relocations against them. */
-                if (ok && is_elf && !strstr(target, "x86_64")) {
+                /* Explicit provider object mode for ELF (ARM64/RISC-V). */
+                if (ok && is_elf && !strstr(target, "x86_64") &&
+                    provider_objects && provider_objects[0]) {
                     bool is_rv = strstr(target, "riscv64") != 0;
 
                     /* --- Read provider .o files if specified --- */
@@ -16169,15 +16155,15 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
                         }
                     }
 
-                    /* Determine which relocations resolve to providers */
-                    int32_t stub_count = 0;
+                    /* Determine which relocations resolve to providers. */
+                    int32_t unresolved_count = 0;
                     int32_t *provider_target = arena_alloc(arena, (size_t)reloc_count * sizeof(int32_t));
                     for (int32_t ri = 0; ri < reloc_count; ri++) {
                         provider_target[ri] = -1;
                         int32_t sym_idx = reloc_symbols[ri];
-                        if (sym_idx < 0 || sym_idx >= func_count) { stub_count++; continue; }
+                        if (sym_idx < 0 || sym_idx >= func_count) { unresolved_count++; continue; }
                         Span nm = cold_fn_object_symbol_span(&symbols->functions[sym_idx], false);
-                        if (nm.len <= 0) { stub_count++; continue; }
+                        if (nm.len <= 0) { unresolved_count++; continue; }
                         char name_buf[1024];
                         int32_t nlen = nm.len < 1023 ? nm.len : 1023;
                         memcpy(name_buf, nm.ptr, (size_t)nlen);
@@ -16190,28 +16176,27 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
                                 }
                             }
                         }
-	                        stub_count++;
-	                        next_reloc:;
-	                    }
-	                    if (stub_count != 0) die("cold provider relocation unresolved");
+                        unresolved_count++;
+                        next_reloc:;
+                    }
+                    if (unresolved_count != 0) die("cold provider relocation unresolved");
 
-	                    int32_t stub_words = 8;
+                    int32_t padding_words = 8;
                     int32_t total_prov_words = 0;
                     for (int32_t pi = 0; pi < provider_count; pi++)
                         total_prov_words += prov_code_words[pi];
 
-                    Code *linked = code_new(arena, shared->count + stub_words + total_prov_words);
+                    Code *linked = code_new(arena, shared->count + padding_words + total_prov_words);
                     memcpy(linked->words, shared->words, (size_t)shared->count * sizeof(uint32_t));
                     linked->count = shared->count;
 
-                    /* Emit stubs for unresolved relocations */
-                    int32_t *stub_pos = arena_alloc(arena, (size_t)reloc_count * sizeof(int32_t));
+                    int32_t *target_pos = arena_alloc(arena, (size_t)reloc_count * sizeof(int32_t));
                     for (int32_t ri = 0; ri < reloc_count; ri++) {
-	                        if (provider_target[ri] >= 0) {
-	                            stub_pos[ri] = -1; /* set after provider code placed */
-	                        } else {
-	                            die("cold provider relocation unresolved");
-	                        }
+                        if (provider_target[ri] >= 0) {
+                            target_pos[ri] = -1;
+                        } else {
+                            die("cold provider relocation unresolved");
+                        }
                     }
 
                     /* Append provider code after stubs */
@@ -16270,35 +16255,33 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
                         }
                     }
 
-                    /* Set stub_pos for provider-resolved relocations */
+                    /* Set target_pos for provider-resolved relocations. */
                     for (int32_t ri = 0; ri < reloc_count; ri++) {
                         if (provider_target[ri] < 0) continue;
                         int32_t pi = provider_target[ri];
                         int32_t sym_idx = reloc_symbols[ri];
-                        Span nm = symbols->functions[sym_idx].name;
+                        Span nm = cold_fn_object_symbol_span(&symbols->functions[sym_idx], false);
+                        if (nm.len <= 0) die("cold provider relocation unresolved");
                         char name_buf[1024];
                         int32_t nlen = nm.len < 1023 ? nm.len : 1023;
                         memcpy(name_buf, nm.ptr, (size_t)nlen);
                         name_buf[nlen] = '\0';
-                        const char *short_name = name_buf;
-                        for (int32_t k = nlen - 1; k > 0; k--)
-                            if (name_buf[k] == '.') { short_name = name_buf + k + 1; break; }
-                        int32_t off = 0;
+                        int32_t off = -1;
                         for (int32_t ni = 0; ni < prov_nc[pi]; ni++) {
-                            if (strcmp(name_buf, prov_names[pi][ni]) == 0 ||
-                                strcmp(short_name, prov_names[pi][ni]) == 0) {
+                            if (strcmp(name_buf, prov_names[pi][ni]) == 0) {
                                 off = prov_offsets[pi][ni];
                                 break;
                             }
                         }
-                        stub_pos[ri] = provider_start[pi] + off;
+                        if (off < 0) die("cold provider relocation unresolved");
+                        target_pos[ri] = provider_start[pi] + off;
                     }
 
                     /* Patch each relocation */
                     for (int32_t ri = 0; ri < reloc_count; ri++) {
                         int32_t word_pos = reloc_offsets[ri] / 4;
                         if (word_pos < 0 || word_pos >= linked->count) continue;
-                        int32_t delta = stub_pos[ri] - word_pos;
+                        int32_t delta = target_pos[ri] - word_pos;
                         if (is_rv)
                             linked->words[word_pos] = rv_jal(RV_RA, delta);
                         else
@@ -16309,7 +16292,7 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
                     /* Update offsets for linked exec */
                     int32_t *exec_offsets = arena_alloc(arena, (size_t)name_count * sizeof(int32_t));
                     for (int32_t i = 0; i < name_count; i++)
-                        exec_offsets[i] = func_offsets[i] >= 0 ? func_offsets[i] : (stub_count > 0 ? stub_pos[0] : 0);
+                        exec_offsets[i] = func_offsets[i] >= 0 ? func_offsets[i] : 0;
 
                     char linked_path[PATH_MAX];
                     snprintf(linked_path, sizeof(linked_path), "%s.linked", out_path);
@@ -16317,7 +16300,7 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
 
                     if (stats) stats->provider_object_count = provider_count;
                     if (stats) {
-                        int32_t primary_resolved = reloc_count - stub_count;
+                        int32_t primary_resolved = reloc_count - unresolved_count;
                         if (primary_resolved < 0) primary_resolved = 0;
                         stats->provider_resolved_symbol_count = primary_resolved + provider_resolved_count;
                     }
