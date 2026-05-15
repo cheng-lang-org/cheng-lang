@@ -13,6 +13,8 @@ WORK="${CHENG_CSG_V2_WORK:-/tmp/cheng_csg_v2_roundtrip}"
 
 if [ ! -x "$COLD" ] ||
    [ bootstrap/cheng_cold.c -nt "$COLD" ] ||
+   [ bootstrap/cold_parser.c -nt "$COLD" ] ||
+   [ bootstrap/cold_parser.h -nt "$COLD" ] ||
    [ bootstrap/macho_direct.h -nt "$COLD" ] ||
    [ bootstrap/elf64_direct.h -nt "$COLD" ] ||
    [ bootstrap/rv64_emit.h -nt "$COLD" ]; then
@@ -22,6 +24,8 @@ fi
 COLD_O0="${CHENG_COLD_O0:-/tmp/cheng_cold_O0}"
 if [ ! -x "$COLD_O0" ] ||
    [ bootstrap/cheng_cold.c -nt "$COLD_O0" ] ||
+   [ bootstrap/cold_parser.c -nt "$COLD_O0" ] ||
+   [ bootstrap/cold_parser.h -nt "$COLD_O0" ] ||
    [ bootstrap/macho_direct.h -nt "$COLD_O0" ] ||
    [ bootstrap/elf64_direct.h -nt "$COLD_O0" ] ||
    [ bootstrap/rv64_emit.h -nt "$COLD_O0" ]; then
@@ -352,6 +356,81 @@ canonical_driver_writer_str_smoke() {
     fi
 }
 
+canonical_writer_aarch64_link_object_smoke() {
+    local target="aarch64-unknown-linux-gnu"
+    local facts="$WORK/canonical_writer_aarch64_ordinary.facts"
+    local obj="$WORK/canonical_writer_aarch64_ordinary.o"
+    local exe="$WORK/canonical_writer_aarch64_ordinary.exe"
+    local report="$WORK/canonical_writer_aarch64_ordinary.writer.report.txt"
+    local obj_report="$WORK/canonical_writer_aarch64_ordinary.obj.report.txt"
+    local link_report="$WORK/canonical_writer_aarch64_ordinary.link.report.txt"
+    if "$DRIVER" emit-cold-csg-v2 \
+        --root:"$ROOT" \
+        --in:src/tests/ordinary_zero_exit_fixture.cheng \
+        --out:"$facts" \
+        --target:"$target" \
+        --report-out:"$report" >/dev/null; then
+        ok "canonical_writer_aarch64_command"
+    else
+        bad "canonical_writer_aarch64_command"
+        return
+    fi
+    if [ "$(facts_magic_kind "$facts")" = "canonical" ]; then
+        ok "canonical_writer_aarch64_magic"
+    else
+        bad "canonical_writer_aarch64_magic"
+    fi
+    require_grep "canonical_writer_aarch64_report_target" '^target=aarch64-unknown-linux-gnu$' "$report"
+    require_grep "canonical_writer_aarch64_report_emit" '^emit=csg-v2-primary$' "$report"
+    require_grep "canonical_writer_aarch64_report_status" '^cold_csg_v2_writer_status=ok$' "$report"
+    require_report_positive "canonical_writer_aarch64_report_facts_bytes" "facts_bytes" "$report"
+    require_grep "canonical_writer_aarch64_report_writer_function_count" '^facts_function_count=1$' "$report"
+    require_report_positive "canonical_writer_aarch64_report_writer_word_count" "facts_word_count" "$report"
+    rm -f "$obj" "$obj.linked" "$exe"
+    if "$COLD" system-link-exec \
+        --csg-in:"$facts" \
+        --emit:obj \
+        --target:"$target" \
+        --out:"$obj" \
+        --report-out:"$obj_report" >/dev/null; then
+        ok "canonical_writer_aarch64_emit_obj"
+    else
+        bad "canonical_writer_aarch64_emit_obj"
+    fi
+    if [ -s "$obj" ] && [ ! -e "$obj.linked" ] && file "$obj" | grep -q "ELF.*relocatable"; then
+        ok "canonical_writer_aarch64_obj_format"
+    else
+        bad "canonical_writer_aarch64_obj_format"
+    fi
+    require_grep "canonical_writer_aarch64_obj_report_emit" '^emit=obj$' "$obj_report"
+    require_grep "canonical_writer_aarch64_obj_report_target" '^target=aarch64-unknown-linux-gnu$' "$obj_report"
+    require_grep "canonical_writer_aarch64_obj_report_link_object" '^link_object=0$' "$obj_report"
+    require_grep "canonical_writer_aarch64_obj_report_system_link" '^system_link=0$' "$obj_report"
+    require_grep "canonical_writer_aarch64_obj_report_unresolved" '^unresolved_symbol_count=0$' "$obj_report"
+    require_grep "canonical_writer_aarch64_obj_report_function_count" '^facts_function_count=1$' "$obj_report"
+    require_report_positive "canonical_writer_aarch64_obj_report_word_count" "facts_word_count" "$obj_report"
+    if "$COLD" system-link-exec \
+        --link-object:"$obj" \
+        --emit:exe \
+        --target:"$target" \
+        --out:"$exe" \
+        --report-out:"$link_report" >/dev/null; then
+        ok "canonical_writer_aarch64_link_object"
+    else
+        bad "canonical_writer_aarch64_link_object"
+    fi
+    if [ -s "$exe" ] && file "$exe" | grep -q "ELF.*executable"; then
+        ok "canonical_writer_aarch64_exe_format"
+    else
+        bad "canonical_writer_aarch64_exe_format"
+    fi
+    require_grep "canonical_writer_aarch64_link_report_target" '^target=aarch64-unknown-linux-gnu$' "$link_report"
+    require_grep "canonical_writer_aarch64_link_report_link_object" '^link_object=1$' "$link_report"
+    require_grep "canonical_writer_aarch64_link_report_system_link" '^system_link=0$' "$link_report"
+    require_grep "canonical_writer_aarch64_link_report_unresolved" '^unresolved_symbol_count=0$' "$link_report"
+    require_grep "canonical_writer_aarch64_link_report_linkerless" '^linkerless_image=1$' "$link_report"
+}
+
 roundtrip_fixture() {
     local name="$1"
     local source="$2"
@@ -438,6 +517,7 @@ roundtrip_fixture() {
 cross_version_opt_test() {
     local name="$1"
     local facts="$2"
+    local target="${3:-$TARGET}"
 
     local obj_O0="$WORK/$name.xver_O0.o"
     local obj_O2="$WORK/$name.xver_O2.o"
@@ -446,10 +526,10 @@ cross_version_opt_test() {
 
     echo "  - ${name}_xver_obj"
     if "$COLD_O0" system-link-exec \
-        --csg-in:"$facts" --emit:obj --target:"$TARGET" \
+        --csg-in:"$facts" --emit:obj --target:"$target" \
         --out:"$obj_O0" >/dev/null 2>&1 &&
        "$COLD" system-link-exec \
-        --csg-in:"$facts" --emit:obj --target:"$TARGET" \
+        --csg-in:"$facts" --emit:obj --target:"$target" \
         --out:"$obj_O2" >/dev/null 2>&1; then
         if cmp -s "$obj_O0" "$obj_O2" 2>/dev/null; then
             ok "${name}_xver_obj"
@@ -466,10 +546,10 @@ cross_version_opt_test() {
 
     echo "  - ${name}_xver_csg"
     if "$COLD_O0" system-link-exec \
-        --csg-in:"$facts" --emit:csg-v2 --target:"$TARGET" \
+        --csg-in:"$facts" --emit:csg-v2 --target:"$target" \
         --out:"$csg_O0" >/dev/null 2>&1 &&
        "$COLD" system-link-exec \
-        --csg-in:"$facts" --emit:csg-v2 --target:"$TARGET" \
+        --csg-in:"$facts" --emit:csg-v2 --target:"$target" \
         --out:"$csg_O2" >/dev/null 2>&1; then
         if cmp -s "$csg_O0" "$csg_O2" 2>/dev/null; then
             ok "${name}_xver_csg"
@@ -512,6 +592,7 @@ canonical_reader_smoke
 canonical_data_reader_smoke
 canonical_writer_smoke
 canonical_driver_writer_str_smoke
+canonical_writer_aarch64_link_object_smoke
 
 # Baseline: minimal smoke tests
 roundtrip_fixture ordinary src/tests/ordinary_zero_exit_fixture.cheng 32768
@@ -1211,7 +1292,15 @@ echo "=== Cross-Version Determinism ==="
 for f in "$WORK"/*.facts; do
     base="$(basename "$f" .facts)"
     case "$base" in *truncated|*unknown-record) continue ;; esac
-    cross_version_opt_test "$base" "$f"
+    facts_target="$TARGET"
+    target_report="$WORK/$base.writer.report.txt"
+    if [ -s "$target_report" ]; then
+        reported_target="$(awk -F= '$1 == "target" { print $2; exit }' "$target_report" 2>/dev/null)"
+        if [ -n "$reported_target" ]; then
+            facts_target="$reported_target"
+        fi
+    fi
+    cross_version_opt_test "$base" "$f" "$facts_target"
 done
 
 # CSG v2 fixed-point: read facts, codegen (DSE), re-emit, verify convergence

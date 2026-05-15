@@ -18089,6 +18089,11 @@ static bool cold_read_elf64_relocatable_view(const uint8_t *data,
                                              const char *target,
                                              ColdElfObjectView *out);
 static int32_t cold_elf_find_defined_symbol(ColdElfObjectView *obj, const char *name);
+static bool cold_read_macho_relocatable_view(const uint8_t *data,
+                                             int32_t len,
+                                             const char *target,
+                                             ColdMachOObjectView *out);
+static int32_t cold_macho_find_defined_symbol(ColdMachOObjectView *obj, const char *name);
 
 static const char *cold_object_format_for_target_cstr(const char *target) {
     if (!target) return "";
@@ -18139,13 +18144,15 @@ static bool cold_write_provider_archive(const char *out_path,
     if (member_object_count > 128 || export_symbol_count > 512) return false;
     const char *module = member_module && member_module[0] ? member_module : "";
     const char *source = member_source && member_source[0] ? member_source : "";
+    bool is_macho = (strcmp(format, "macho") == 0);
+    if (is_macho) return false;
     Span *objects = (Span *)calloc((size_t)member_object_count, sizeof(Span));
-    ColdElfObjectView *views = (ColdElfObjectView *)calloc((size_t)member_object_count,
-                                                           sizeof(ColdElfObjectView));
+    ColdElfObjectView *views = is_macho ? 0 : (ColdElfObjectView *)calloc((size_t)member_object_count, sizeof(ColdElfObjectView));
+    ColdMachOObjectView *macho_views = is_macho ? (ColdMachOObjectView *)calloc((size_t)member_object_count, sizeof(ColdMachOObjectView)) : 0;
     int32_t *member_export_counts = (int32_t *)calloc((size_t)member_object_count, sizeof(int32_t));
     int32_t *export_owner = (int32_t *)calloc((size_t)export_symbol_count, sizeof(int32_t));
-    if (!objects || !views || !member_export_counts || !export_owner) {
-        free(objects); free(views); free(member_export_counts); free(export_owner);
+    if (!objects || (!views && !macho_views) || !member_export_counts || !export_owner) {
+        free(objects); free(views); free(macho_views); free(member_export_counts); free(export_owner);
         return false;
     }
     for (int32_t ei = 0; ei < export_symbol_count; ei++) export_owner[ei] = -1;
@@ -18153,10 +18160,11 @@ static bool cold_write_provider_archive(const char *out_path,
     for (int32_t oi = 0; oi < member_object_count; oi++) {
         if (!member_objects[oi] || member_objects[oi][0] == '\0') { valid = false; break; }
         objects[oi] = source_open(member_objects[oi]);
-        if (objects[oi].len <= 0 || objects[oi].len > INT32_MAX ||
-            !cold_read_elf64_relocatable_view(objects[oi].ptr, objects[oi].len, target, &views[oi])) {
-            valid = false;
-            break;
+        if (objects[oi].len <= 0 || objects[oi].len > INT32_MAX) { valid = false; break; }
+        if (is_macho) {
+            if (!cold_read_macho_relocatable_view(objects[oi].ptr, objects[oi].len, target, &macho_views[oi])) { valid = false; break; }
+        } else {
+            if (!cold_read_elf64_relocatable_view(objects[oi].ptr, objects[oi].len, target, &views[oi])) { valid = false; break; }
         }
     }
     for (int32_t ei = 0; valid && ei < export_symbol_count; ei++) {
@@ -18172,7 +18180,10 @@ static bool cold_write_provider_archive(const char *out_path,
         int32_t owner = -1;
         int32_t def_count = 0;
         for (int32_t oi = 0; oi < member_object_count; oi++) {
-            if (cold_elf_find_defined_symbol(&views[oi], name) >= 0) {
+            bool found = is_macho
+                ? (cold_macho_find_defined_symbol(&macho_views[oi], name) >= 0)
+                : (cold_elf_find_defined_symbol(&views[oi], name) >= 0);
+            if (found) {
                 owner = oi;
                 def_count++;
             }
@@ -18450,6 +18461,28 @@ static bool cold_read_macho_relocatable_view(const uint8_t *data,
     out->relas = 0;
     out->reloc_count = 0;
     return true;
+}
+
+static const char *cold_macho_symbol_name(ColdMachOObjectView *obj, uint32_t sym_index) {
+    if (!obj || sym_index >= (uint32_t)obj->sym_count) return 0;
+    uint32_t off = obj->syms[sym_index].n_strx;
+    if ((uint64_t)off >= obj->strtab_size) return 0;
+    const char *name = obj->strtab + off;
+    uint64_t remain = obj->strtab_size - (uint64_t)off;
+    if (!memchr(name, '\0', (size_t)remain)) return 0;
+    return name;
+}
+
+static int32_t cold_macho_find_defined_symbol(ColdMachOObjectView *obj, const char *name) {
+    if (!obj || !name || name[0] == '\0') return -1;
+    for (int32_t i = 0; i < obj->sym_count; i++) {
+        const uint8_t n_type = obj->syms[i].n_type;
+        if ((n_type & 0x0e) != 0x0e) continue;
+        if (obj->syms[i].n_sect == 0) continue;
+        const char *sn = cold_macho_symbol_name(obj, (uint32_t)i);
+        if (sn && strcmp(sn, name) == 0) return i;
+    }
+    return -1;
 }
 
 static bool cold_read_elf64_relocatable_view(const uint8_t *data,
@@ -19211,11 +19244,15 @@ static int cold_cmd_provider_archive_pack(int argc, char **argv) {
         return 2;
     }
     const char *format = cold_object_format_for_target_cstr(target);
-    if (strcmp(format, "macho") == 0) {
-        cold_write_provider_archive_pack_report(report_path, false, target, object_path, out_path,
-                                                export_symbol, 0, 0, 0, COLD_PROVIDER_ARCHIVE_MACHO_ERROR);
-        fprintf(stderr, "[cheng_cold] %s\n", COLD_PROVIDER_ARCHIVE_MACHO_ERROR);
-        return 2;
+    bool is_macho = (strcmp(format, "macho") == 0);
+    if (is_macho) {
+        int32_t mc = 0; uint64_t hash = 0;
+        bool ok = cold_write_provider_archive(out_path, target, (const char **)object_paths, object_count,
+                                              module, source, (const char **)export_symbols, export_count, &mc, &hash);
+        cold_write_provider_archive_pack_report(report_path, ok, target, object_path, out_path,
+                                                export_symbol, ok ? object_count : 0, ok ? export_count : 0,
+                                                hash, ok ? 0 : "pack failed");
+        return ok ? 0 : 2;
     }
     uint16_t machine = cold_elf_machine_for_target(target);
     if (machine == 0) {
