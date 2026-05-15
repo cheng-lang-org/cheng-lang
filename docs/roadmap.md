@@ -14,7 +14,7 @@
 | provider archive | 85% | ELF + Mach-O provider archive pack 通过；Mach-O symbol resolution（underscore prefix、defined_symbol_word、Span lookup）已补齐 |
 | backend driver fixed-point | 60% | cross-version proven；pure_backend_driver 已修复，不再 hard-fail |
 | Ownership / E-Graph | 55% | ownership_proof 6 测试全部 PASS；enum 返回类型修复解除 typed let kind mismatch；ownership CI gate 已接入 |
-| C seed 替代 | 100% | **cheng_seed.c 退役准备就绪**：自举链 fixed point 验证通过（stage0→1→2→3 contract 一致）；cold bootstrap-bridge 产出可用 backend driver（791KB ARM64 Mach-O）；**42/42 manifest + 39/39 源文件全编译通过，0 errors**；泛型单态化管线完整（审计确认已覆盖 seed 代码） |
+| C seed 替代 | 100% | **cheng_seed.c 已从仓库移除**（66K 行, 3.1MB 死代码退役）；cold 自举链完全自持，bootstrap chain fixed point 已验证 |
 | 跨端 | 60% | 三架构 exe + COFF obj 均产出，CI 中有 COFF 格式验证 |
 
 愿景可以写目标，不写成完成。若与实现冲突，以 `docs/cheng-formal-spec.md`、`src/core/tooling/README.md`、当前源码和当前可执行产物为准。
