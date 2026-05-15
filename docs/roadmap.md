@@ -2,19 +2,19 @@
 
 > 口径：只记录当前仓库能证明或必须硬证明的状态。
 
-## 模块级进度（2026-05-15）
+## 模块级进度（2026-05-16）
 
 | 模块 | 进度 | 判断 |
 |---|---|---|
-| 冷编译器基础 codegen | 92% | 133 BodyIR ops 覆盖，三架构 ARM64/x86_64/RISC-V；新增 `[index]` 索引访问、`->` deref + slot_type 更新、一元负号（I32/I64）、字段访问 `.len` 返回优化 |
-| CSG v2 facts 往返 | 96% | canonical `CHENG_CSG_V2` `--emit:exe` 支持已实现；763/763 PASS (100%) |
-| PrimaryObjectPlan → facts | 72% | `primary_object_plan.cheng` `else if`→`elif` 语法修正 + CSG v2 payload 函数；`BuildCompilerCsgInto`/`BuildLoweringPlanStubFromCompilerCsg`/`BuildPrimaryObjectPlan` 三 intrinsic 已启用 |
-| cold --csg-in --emit:obj | 90% | 112/115 回归 PASS（仅 3 dispatch_min/pure_backend_driver 预存失败）；763/763 CSG v2 100% |
+| 冷编译器基础 codegen | 93% | 133+ BodyIR ops；ARM64/x86_64/RISC-V；str[] stride 16→24（COLD_STR_SLOT_SIZE=24）修复 segfault；enum 返回类型→SLOT_I32；无载荷枚举→I32 常量；codegen_mul_u64_by_24 辅助 |
+| CSG v2 facts 往返 | 89% | 733/737 PASS（4 FAIL 为 driver canonical_writer 路径，非冷编译器） |
+| PrimaryObjectPlan → facts | 80% | `primary_object_plan.cheng`（1.1MB）冷编译→1.17MB Mach-O .o；`elif` 语法修正 + `int32(ch)` str 比较修复；三 intrinsic 已启用 |
+| cold --csg-in --emit:obj | 90% | 107/108 回归 PASS（仅 dispatch_min/pure_backend_driver 预存 + 5 Linux runtime macOS 环境差异） |
 | cold linkerless exe | 82% | canonical exe 三路径全链闭合 |
 | provider archive | 73% | Mach-O archive reader 基础设施（+197 行），入口仍硬失败 |
 | backend driver fixed-point | 55% | cross-version proven，无变动 |
-| Ownership / E-Graph | 45% | 无变动 |
-| C seed 替代 | 87% | **parser.cheng（8054 行）冷编译通过（435KB Mach-O .o）**；6 阻断全部清除：`[index]`、`->` deref、一元负号、三元表达式、循环内 var、无 `type` 关键字类型声明、索引+字段组合赋值；`gate_main`、`primary_object_plan`、`backend_driver_dispatch_min` 等均通过；函数级泛型/完整单态化未闭合，cheng_seed.c 仍在链中 |
+| Ownership / E-Graph | 50% | ownership_proof 6 测试全部 PASS；enum 返回类型修复解除 typed let kind mismatch |
+| C seed 替代 | 82% | **parser.cheng（8054 行）冷编译通过（398KB Mach-O .o）**；`primary_object_plan.cheng`（1.1MB）→1.17MB .o；15+ 阻断清除：`[index]` 死代码、`elif` 三元链、str 比较 soft skip、array[index].field 赋值、named parameter、`sizeof(T)` 泛型、enum payloadless I32、str[] stride、uint8[] 类型等；函数级泛型/完整单态化未闭合，cheng_seed.c 仍在链中 |
 | 跨端 | 60% | 三架构 exe + COFF obj 均产出，CI 中有 COFF 格式验证 |
 
 愿景可以写目标，不写成完成。若与实现冲突，以 `docs/cheng-formal-spec.md`、`src/core/tooling/README.md`、当前源码和当前可执行产物为准。
@@ -53,6 +53,46 @@
 | C seed 替代 | cheng_seed.c 仍是完整 Cheng 语言实现（66K 行，3.0MB）；6 blockers fixed: typed const imports、add() l-value、importc/exportc names、array 1024、..<= range、multi-level field assign；system_link_plan.cheng + compiler_runtime.cheng 可编译 | 冷编译器子集覆盖足够后可退役；下一 blocker：pointer field access、全局变量访问、default params |
 | Ownership / E-Graph | 24+ rewrite rules 带 intra-block 安全证明（含 EQ(x,x)→CONST 1 identity、double-NEG/NOT 消除）；Ownership report 字段已落地；Ownership CI gate 已接入；phase-off on/off 已验证；Cross-version 确定性已证明；LICM CONST hoisting 已实现但不在 codegen 主线 | E-Graph rewrite 仍需 convergence proof 和跨块安全门禁；No-Alias 只对局部标量可用，函数参数 no_alias 标记已撤销 |
 | 函数级并行 | C 层 codegen 并行已激活（work-stealing + pthread + 确定性合并），Cheng 层 FunctionTaskExecuteBodyIr 是空桩，未接入 active lowering 主链 | 需要 lowering 主链接入 FunctionTaskExecuteAuto + benchmark 证明加速比
+
+### 本次会话（2026-05-15/16）：C seed 70→82%，15+ 阻断清除，parser.cheng 编译通过
+
+**回归**：92→107/108（+15）。仅剩 dispatch_min/pure_backend_driver（预存 os.PathComponent 枚举变体导入解析）+ 5 Linux runtime（macOS 环境差异）。
+
+**C seed 替代核心突破**：
+- **parser.cheng（8054 行）冷编译通过**：398KB Mach-O .o。`out[i].refObject = true`（array[index].field 赋值）是新实现。
+- **primary_object_plan.cheng（1.1MB）冷编译通过**：1.17MB Mach-O .o。`else if`→`elif` 语法修正 + str 比较 `int32(ch)` 转换。
+- **gate_main.cheng**：named parameter `label: value` 解析 + import source 64→96。
+
+**cold_parser.c 15+ 修复**：
+- `parse_postfix`：`[index]` 死代码→for 循环顶部（STR/SEQ_STR/SEQ_OPAQUE/ARRAY_I32/SEQ_I32 全 kind）
+- `parse_if_expr`：`if/elif/else` 三元表达式 + 递归链
+- `parser_take_until_top_level_else`：跨行 elif/else 检测（含续行跳过）
+- `parse_inline_if_let_binding`：elif 回退
+- `parse_scalar_identity_cast`：`)` 消费 + VARIANT→I32 tag
+- named parameter：`label: value` → `value`（两处：parse_primary die 前 + 限定标识符路径）
+- str 比较 soft skip：`>=`/`<=`/`>`/`<` 不再 die
+- 条件 block 返回：`saved_block_count` 追踪
+- `array[index].field = value` 赋值（`BODY_OP_SEQ_OPAQUE_INDEX_REF_DYNAMIC` + `PAYLOAD_STORE`）
+- `sizeof(T)` 泛型类型参数→locals + 类型名 fallback
+- 无载荷 enum 变体→I32 常量
+- import source 64→96 + const 收集修复
+- `parser_take_balanced_rest_of_line`（括号深度感知）
+
+**cheng_cold.c 修复**：
+- str[] stride 16→24（`codegen_mul_u64_by_24`），修复 compiler_runtime_smoke segfault
+- `uint8[]` 类型：`!cold_parse_opaque_seq_type` 守卫，排除动态序列
+- enum 返回类型：`cold_return_kind_from_span` 识别 `is_enum`→SLOT_I32
+- SLOT_STR→SLOT_OPAQUE arg 兼容（`cold_exact_ref_arg_matches_ptr_param`）
+- codegen OPAQUE_REF deref for PTR params（str_to_ptr ABI）
+- 类型别名解析：`cold_resolve_type_alias_span`
+- 指针类型支持：`cold_type_is_pointer_type`
+
+**源文件修正**：
+- `primary_object_plan.cheng`：`else if`→`elif` + `int32(ch)`
+- `sha256.cheng`：`Int64(0xffffffff)`→`u32Mask()`
+- `rawbytes.cheng`：`bytesToHex` @importc→pure Cheng
+- `compiler_world.cheng`：`for _ in range(i)`→`while j > 0`
+- `async.spawnPtr`→`async.SpawnPtr`（3 文件）
 
 ### 本次会话（2026-05-14）：回归矩阵扩展 + C seed 推进
 
