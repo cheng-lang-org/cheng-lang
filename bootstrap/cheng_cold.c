@@ -18094,6 +18094,7 @@ static bool cold_read_macho_relocatable_view(const uint8_t *data,
                                              const char *target,
                                              ColdMachOObjectView *out);
 static int32_t cold_macho_find_defined_symbol(ColdMachOObjectView *obj, const char *name);
+static bool cold_cstr_eq_span(const char *text, Span span);
 
 static const char *cold_object_format_for_target_cstr(const char *target) {
     if (!target) return "";
@@ -18474,12 +18475,54 @@ static const char *cold_macho_symbol_name(ColdMachOObjectView *obj, uint32_t sym
 
 static int32_t cold_macho_find_defined_symbol(ColdMachOObjectView *obj, const char *name) {
     if (!obj || !name || name[0] == '\0') return -1;
+    char underscored[1024];
+    int32_t ulen = 0;
+    bool try_underscore = (name[0] != '_');
+    if (try_underscore && (ulen = (int32_t)strlen(name)) < 1022) {
+        underscored[0] = '_';
+        memcpy(underscored + 1, name, (size_t)ulen);
+        underscored[ulen + 1] = '\0';
+    }
     for (int32_t i = 0; i < obj->sym_count; i++) {
         const uint8_t n_type = obj->syms[i].n_type;
         if ((n_type & 0x0e) != 0x0e) continue;
         if (obj->syms[i].n_sect == 0) continue;
         const char *sn = cold_macho_symbol_name(obj, (uint32_t)i);
-        if (sn && strcmp(sn, name) == 0) return i;
+        if (!sn) continue;
+        if (strcmp(sn, name) == 0) return i;
+        if (try_underscore && strcmp(sn, underscored) == 0) return i;
+    }
+    return -1;
+}
+
+static bool cold_macho_defined_symbol_word(ColdMachOObjectView *obj,
+                                            const char *name,
+                                            int32_t *word_out) {
+    if (!obj || !name || name[0] == '\0') return false;
+    int32_t sym_idx = cold_macho_find_defined_symbol(obj, name);
+    if (sym_idx < 0) return false;
+    uint64_t value = obj->syms[sym_idx].n_value;
+    if ((value % 4) != 0 || value / 4 >= (uint64_t)obj->word_count) return false;
+    if (word_out) *word_out = (int32_t)(value / 4);
+    return true;
+}
+
+static int32_t cold_macho_find_defined_symbol_span(ColdMachOObjectView *obj, Span name) {
+    if (!obj || name.len <= 0) return -1;
+    char underscored[1024];
+    bool try_underscore = (name.len > 0 && name.ptr[0] != '_' && name.len < 1022);
+    if (try_underscore) {
+        underscored[0] = '_';
+        memcpy(underscored + 1, name.ptr, (size_t)name.len);
+        underscored[name.len + 1] = '\0';
+    }
+    for (int32_t i = 0; i < obj->sym_count; i++) {
+        const uint8_t n_type = obj->syms[i].n_type;
+        if ((n_type & 0x0e) != 0x0e) continue;
+        if (obj->syms[i].n_sect == 0) continue;
+        const char *sn = cold_macho_symbol_name(obj, (uint32_t)i);
+        if (cold_cstr_eq_span(sn, name)) return i;
+        if (try_underscore && sn && strcmp(sn, underscored) == 0) return i;
     }
     return -1;
 }
