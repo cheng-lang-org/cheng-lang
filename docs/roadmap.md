@@ -11,7 +11,7 @@
 | PrimaryObjectPlan → facts | 85% | `primary_object_plan.cheng`（1.1MB）冷编译→1.64MB Mach-O .o（0 errors）；三 intrinsic 已启用 |
 | cold --csg-in --emit:obj | 97% | **116/116 回归 PASS（100%，0 FAIL）**；全部测试通过 |
 | cold linkerless exe | 82% | canonical exe 三路径全链闭合 |
-| provider archive | 78% | ELF provider archive/link 门禁通过；Mach-O provider archive reader/linker 明确不支持并硬失败 |
+| provider archive | 85% | ELF + Mach-O provider archive pack 通过；parser.cheng→516KB .chenga 验证通过 |
 | backend driver fixed-point | 60% | cross-version proven；pure_backend_driver 已修复，不再 hard-fail |
 | Ownership / E-Graph | 55% | ownership_proof 6 测试全部 PASS；enum 返回类型修复解除 typed let kind mismatch；ownership CI gate 已接入 |
 | C seed 替代 | 93% | **parser.cheng（8054 行）冷编译通过（516KB，0 errors）**；**POP（1.1MB）→1.60MB .o（0 errors）**；**gate_main（2.0MB）冷编译通过（0 errors）**；**42/42 manifest + 39/39 源文件全编译通过，0 errors**；泛型单态化管线完整（审计确认已覆盖 seed 代码）；剩余 gap：自举链集成验证，cheng_seed.c 运行时替换 |

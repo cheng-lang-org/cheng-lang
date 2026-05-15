@@ -431,6 +431,132 @@ canonical_writer_aarch64_link_object_smoke() {
     require_grep "canonical_writer_aarch64_link_report_linkerless" '^linkerless_image=1$' "$link_report"
 }
 
+canonical_writer_aarch64_provider_archive_smoke() {
+    local target="aarch64-unknown-linux-gnu"
+    local provider_one_source="$WORK/canonical_provider_aarch64_one.cheng"
+    local provider_two_source="$WORK/canonical_provider_aarch64_two.cheng"
+    local primary_source="$WORK/canonical_provider_aarch64_primary.cheng"
+    local provider_one_obj="$WORK/canonical_provider_aarch64_one.o"
+    local provider_two_obj="$WORK/canonical_provider_aarch64_two.o"
+    local archive="$WORK/canonical_provider_aarch64.chenga"
+    local facts="$WORK/canonical_provider_aarch64_primary.facts"
+    local primary_obj="$WORK/canonical_provider_aarch64_primary.o"
+    local exe="$WORK/canonical_provider_aarch64.exe"
+    local writer_report="$WORK/canonical_provider_aarch64_primary.writer.report.txt"
+    local obj_report="$WORK/canonical_provider_aarch64.obj.report.txt"
+    local pack_report="$WORK/canonical_provider_aarch64.pack.report.txt"
+    local link_report="$WORK/canonical_provider_aarch64.link.report.txt"
+
+    cat > "$provider_one_source" <<'CHENG'
+@exportc("canonical_provider_aarch64_one")
+fn canonical_provider_aarch64_one(): int32 = return 11
+CHENG
+
+    cat > "$provider_two_source" <<'CHENG'
+@exportc("canonical_provider_aarch64_two")
+fn canonical_provider_aarch64_two(): int32 = return 31
+CHENG
+
+    cat > "$primary_source" <<'CHENG'
+@importc("canonical_provider_aarch64_one")
+fn canonical_provider_aarch64_one(): int32
+@importc("canonical_provider_aarch64_two")
+fn canonical_provider_aarch64_two(): int32
+fn main(): int32 = return canonical_provider_aarch64_one() + canonical_provider_aarch64_two()
+CHENG
+
+    if "$DRIVER" emit-cold-csg-v2 \
+        --root:"$ROOT" \
+        --in:"$primary_source" \
+        --out:"$facts" \
+        --target:"$target" \
+        --report-out:"$writer_report" >/dev/null; then
+        ok "canonical_provider_aarch64_writer"
+    else
+        bad "canonical_provider_aarch64_writer"
+        return
+    fi
+    if [ "$(facts_magic_kind "$facts")" = "canonical" ]; then
+        ok "canonical_provider_aarch64_magic"
+    else
+        bad "canonical_provider_aarch64_magic"
+    fi
+    require_grep "canonical_provider_aarch64_writer_target" '^target=aarch64-unknown-linux-gnu$' "$writer_report"
+    require_grep "canonical_provider_aarch64_writer_emit" '^emit=csg-v2-primary$' "$writer_report"
+    require_grep "canonical_provider_aarch64_writer_status" '^cold_csg_v2_writer_status=ok$' "$writer_report"
+    require_grep "canonical_provider_aarch64_writer_function_count" '^facts_function_count=1$' "$writer_report"
+    require_grep "canonical_provider_aarch64_writer_reloc_count" '^facts_reloc_count=2$' "$writer_report"
+    require_report_positive "canonical_provider_aarch64_writer_word_count" "facts_word_count" "$writer_report"
+    if "$COLD" system-link-exec \
+        --in:"$provider_one_source" \
+        --emit:obj --target:"$target" \
+        --out:"$provider_one_obj" >/dev/null &&
+       "$COLD" system-link-exec \
+        --in:"$provider_two_source" \
+        --emit:obj --target:"$target" \
+        --out:"$provider_two_obj" >/dev/null &&
+       "$COLD" provider-archive-pack \
+        --target:"$target" \
+        --object:"$provider_one_obj" \
+        --object:"$provider_two_obj" \
+        --export:canonical_provider_aarch64_one \
+        --export:canonical_provider_aarch64_two \
+        --module:canonical_provider_aarch64 \
+        --source:"$WORK" \
+        --out:"$archive" \
+        --report-out:"$pack_report" >/dev/null; then
+        ok "canonical_provider_aarch64_archive"
+    else
+        bad "canonical_provider_aarch64_archive"
+    fi
+    require_grep "canonical_provider_aarch64_pack_ok" '^provider_archive_pack=1$' "$pack_report"
+    require_grep "canonical_provider_aarch64_pack_members" '^provider_object_count=2$' "$pack_report"
+    require_grep "canonical_provider_aarch64_pack_exports" '^provider_export_count=2$' "$pack_report"
+    require_grep "canonical_provider_aarch64_pack_system_link" '^system_link=0$' "$pack_report"
+    require_grep "canonical_provider_aarch64_pack_linkerless" '^linkerless_image=1$' "$pack_report"
+    if "$COLD" system-link-exec \
+        --csg-in:"$facts" \
+        --emit:obj --target:"$target" \
+        --out:"$primary_obj" \
+        --report-out:"$obj_report" >/dev/null; then
+        ok "canonical_provider_aarch64_emit_obj"
+    else
+        bad "canonical_provider_aarch64_emit_obj"
+    fi
+    if [ -s "$primary_obj" ] && file "$primary_obj" | grep -q "ELF.*relocatable"; then
+        ok "canonical_provider_aarch64_obj_format"
+    else
+        bad "canonical_provider_aarch64_obj_format"
+    fi
+    require_grep "canonical_provider_aarch64_obj_emit" '^emit=obj$' "$obj_report"
+    require_grep "canonical_provider_aarch64_obj_target" '^target=aarch64-unknown-linux-gnu$' "$obj_report"
+    require_grep "canonical_provider_aarch64_obj_link_object" '^link_object=0$' "$obj_report"
+    require_grep "canonical_provider_aarch64_obj_system_link" '^system_link=0$' "$obj_report"
+    require_grep "canonical_provider_aarch64_obj_reloc_count" '^facts_reloc_count=2$' "$obj_report"
+    if "$COLD" system-link-exec \
+        --link-object:"$primary_obj" \
+        --provider-archive:"$archive" \
+        --emit:exe --target:"$target" \
+        --out:"$exe" \
+        --report-out:"$link_report" >/dev/null; then
+        ok "canonical_provider_aarch64_link"
+    else
+        bad "canonical_provider_aarch64_link"
+    fi
+    if [ -s "$exe" ] && file "$exe" | grep -q "ELF.*executable"; then
+        ok "canonical_provider_aarch64_exe_format"
+    else
+        bad "canonical_provider_aarch64_exe_format"
+    fi
+    require_grep "canonical_provider_aarch64_link_object" '^link_object=1$' "$link_report"
+    require_grep "canonical_provider_aarch64_link_members" '^provider_archive_member_count=2$' "$link_report"
+    require_grep "canonical_provider_aarch64_link_exports" '^provider_export_count=2$' "$link_report"
+    require_grep "canonical_provider_aarch64_link_resolved" '^provider_resolved_symbol_count=2$' "$link_report"
+    require_grep "canonical_provider_aarch64_link_unresolved" '^unresolved_symbol_count=0$' "$link_report"
+    require_grep "canonical_provider_aarch64_link_system_link" '^system_link=0$' "$link_report"
+    require_grep "canonical_provider_aarch64_link_linkerless" '^linkerless_image=1$' "$link_report"
+}
+
 roundtrip_fixture() {
     local name="$1"
     local source="$2"
@@ -593,6 +719,7 @@ canonical_data_reader_smoke
 canonical_writer_smoke
 canonical_driver_writer_str_smoke
 canonical_writer_aarch64_link_object_smoke
+canonical_writer_aarch64_provider_archive_smoke
 
 # Baseline: minimal smoke tests
 roundtrip_fixture ordinary src/tests/ordinary_zero_exit_fixture.cheng 32768

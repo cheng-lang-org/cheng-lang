@@ -18145,7 +18145,6 @@ static bool cold_write_provider_archive(const char *out_path,
     const char *module = member_module && member_module[0] ? member_module : "";
     const char *source = member_source && member_source[0] ? member_source : "";
     bool is_macho = (strcmp(format, "macho") == 0);
-    if (is_macho) return false;
     Span *objects = (Span *)calloc((size_t)member_object_count, sizeof(Span));
     ColdElfObjectView *views = is_macho ? 0 : (ColdElfObjectView *)calloc((size_t)member_object_count, sizeof(ColdElfObjectView));
     ColdMachOObjectView *macho_views = is_macho ? (ColdMachOObjectView *)calloc((size_t)member_object_count, sizeof(ColdMachOObjectView)) : 0;
@@ -18622,7 +18621,9 @@ typedef struct ColdProviderArchiveMember {
     int32_t object_size;
     Span *exports;
     int32_t export_count;
+    int32_t is_macho;
     ColdElfObjectView view;
+    ColdMachOObjectView macho_view;
     int32_t selected;
     int32_t base_word;
 } ColdProviderArchiveMember;
@@ -18659,6 +18660,7 @@ static bool cold_parse_provider_archive_view(Span archive_span,
         return false;
     }
     int32_t seen_count = 0;
+    bool is_macho = (strcmp(cold_object_format_for_target_cstr(target), "macho") == 0);
     for (int32_t mi = 0; mi < member_count; mi++) {
         if (!cold_file_range_ok(archive_span.len, pos, 28)) goto fail;
         uint32_t module_len = cold_u32le(p + pos); pos += 4;
@@ -18678,6 +18680,7 @@ static bool cold_parse_provider_archive_view(Span archive_span,
         if (!exports) goto fail;
         members[mi].exports = exports;
         members[mi].export_count = (int32_t)member_exports;
+        members[mi].is_macho = is_macho ? 1 : 0;
         if (member_exports == 1) {
             exports[0].ptr = p + pos;
             exports[0].len = (int32_t)export_blob_len;
@@ -18699,17 +18702,28 @@ static bool cold_parse_provider_archive_view(Span archive_span,
         }
         members[mi].object_data = p + pos;
         members[mi].object_size = (int32_t)object_size;
-        if (!cold_read_elf64_relocatable_view(members[mi].object_data,
-                                              members[mi].object_size,
-                                              target,
-                                              &members[mi].view)) {
-            goto fail;
+        if (is_macho) {
+            if (!cold_read_macho_relocatable_view(members[mi].object_data,
+                                                  members[mi].object_size,
+                                                  target,
+                                                  &members[mi].macho_view)) {
+                goto fail;
+            }
+        } else {
+            if (!cold_read_elf64_relocatable_view(members[mi].object_data,
+                                                  members[mi].object_size,
+                                                  target,
+                                                  &members[mi].view)) {
+                goto fail;
+            }
         }
         for (int32_t ei = 0; ei < members[mi].export_count; ei++) {
             Span export_name = members[mi].exports[ei];
-            if (export_name.len <= 0 ||
-                cold_elf_find_defined_symbol_span(&members[mi].view, export_name) < 0) {
-                goto fail;
+            if (export_name.len <= 0) goto fail;
+            if (is_macho) {
+                if (cold_macho_find_defined_symbol_span(&members[mi].macho_view, export_name) < 0) goto fail;
+            } else {
+                if (cold_elf_find_defined_symbol_span(&members[mi].view, export_name) < 0) goto fail;
             }
             for (int32_t si = 0; si < seen_count; si++) {
                 if (span_same(seen_exports[si], export_name)) goto fail;
@@ -18771,9 +18785,16 @@ static bool cold_provider_archive_find_selected_definition(ColdProviderArchiveVi
         ColdProviderArchiveMember *member = &archive->members[mi];
         if (!member->selected) continue;
         int32_t local_word = -1;
-        if (cold_elf_defined_symbol_word(&member->view, symbol_name, &local_word)) {
-            found_word = member->base_word + local_word;
-            found_count++;
+        if (member->is_macho) {
+            if (cold_macho_defined_symbol_word(&member->macho_view, symbol_name, &local_word)) {
+                found_word = member->base_word + local_word;
+                found_count++;
+            }
+        } else {
+            if (cold_elf_defined_symbol_word(&member->view, symbol_name, &local_word)) {
+                found_word = member->base_word + local_word;
+                found_count++;
+            }
         }
     }
     if (found_count != 1) return false;
@@ -18997,6 +19018,132 @@ done:
     if (archive_span.len > 0) munmap((void *)archive_span.ptr, (size_t)archive_span.len);
     return ok;
 }
+
+static bool cold_link_macho_object_with_provider_archive(const char *object_path,
+                                                          const char *archive_path,
+                                                          const char *out_path,
+                                                          const char *target,
+                                                          ColdCompileStats *stats) {
+    uint64_t start_us = cold_now_us();
+    Span primary_span = source_open(object_path);
+    Span archive_span = source_open(archive_path);
+    ColdProviderArchiveView archive = {0};
+    bool ok = false;
+    if (primary_span.len <= 0 || archive_span.len <= 0) goto done;
+    ColdMachOObjectView primary;
+    if (!cold_read_macho_relocatable_view(primary_span.ptr, primary_span.len, target, &primary)) goto done;
+    int32_t member_count = 0;
+    uint64_t archive_hash = 0;
+    if (!cold_verify_provider_archive(archive_path, target, &member_count, &archive_hash)) goto done;
+    if (member_count < 1) goto done;
+    if (!cold_parse_provider_archive_view(archive_span, target, member_count, archive_hash, &archive)) goto done;
+
+    {
+        bool changed = true;
+        int32_t guard = 0;
+        while (changed) {
+            changed = false;
+            guard++;
+            if (guard > archive.member_count + 1) goto done;
+            for (int32_t ri = 0; ri < primary.reloc_count; ri++) {
+                uint32_t sym_idx = primary.relas[ri].r_symbolnum;
+                if (sym_idx >= (uint32_t)primary.sym_count) goto done;
+                if (primary.syms[sym_idx].n_sect != 0) continue;
+                const char *sn = cold_macho_symbol_name(&primary, sym_idx);
+                if (!sn || sn[0] == '\0') continue;
+                const char *export_name = (sn[0] == '_' && sn[1] != '\0') ? sn + 1 : sn;
+                int32_t mi = cold_provider_archive_find_export(&archive, export_name);
+                if (mi >= 0 && !archive.members[mi].selected) {
+                    archive.members[mi].selected = 1;
+                    changed = true;
+                    if (stats) stats->provider_resolved_symbol_count++;
+                }
+            }
+            for (int32_t mi = 0; mi < archive.member_count; mi++) {
+                if (!archive.members[mi].selected) continue;
+                ColdMachOObjectView *mview = &archive.members[mi].macho_view;
+                for (int32_t ri = 0; ri < mview->reloc_count; ri++) {
+                    uint32_t sym_idx = mview->relas[ri].r_symbolnum;
+                    if (sym_idx >= (uint32_t)mview->sym_count) goto done;
+                    if (mview->syms[sym_idx].n_sect != 0) continue;
+                    const char *sn = cold_macho_symbol_name(mview, sym_idx);
+                    if (!sn || sn[0] == '\0') continue;
+                    if (cold_macho_find_defined_symbol(&primary, sn) >= 0) continue;
+                    bool defined_elsewhere = false;
+                    for (int32_t mj = 0; mj < archive.member_count; mj++) {
+                        if (mj == mi || !archive.members[mj].selected) continue;
+                        if (cold_macho_find_defined_symbol(&archive.members[mj].macho_view, sn) >= 0) {
+                            defined_elsewhere = true;
+                            break;
+                        }
+                    }
+                    if (defined_elsewhere) continue;
+                    const char *export_name = (sn[0] == '_' && sn[1] != '\0') ? sn + 1 : sn;
+                    int32_t dep = cold_provider_archive_find_export(&archive, export_name);
+                    if (dep >= 0 && !archive.members[dep].selected) {
+                        archive.members[dep].selected = 1;
+                        changed = true;
+                        if (stats) stats->provider_resolved_symbol_count++;
+                    }
+                }
+            }
+        }
+    }
+
+    int32_t selected_count = 0;
+    for (int32_t mi = 0; mi < archive.member_count; mi++) {
+        if (archive.members[mi].selected) selected_count++;
+    }
+
+    char cmd[65536];
+    int n = snprintf(cmd, sizeof(cmd), "cc -o '%s' '%s'", out_path, object_path);
+    if (n < 0 || n >= (int)sizeof(cmd)) goto done;
+    for (int32_t mi = 0; mi < archive.member_count; mi++) {
+        if (!archive.members[mi].selected) continue;
+        char member_path[PATH_MAX];
+        int nn2 = snprintf(member_path, sizeof(member_path), "%s.member%d.o", out_path, mi);
+        if (nn2 < 0 || nn2 >= (int)sizeof(member_path)) goto done;
+        int fd = open(member_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) goto done;
+        bool wrote = cold_write_all_fd(fd, archive.members[mi].object_data,
+                                        (size_t)archive.members[mi].object_size);
+        close(fd);
+        if (!wrote) { unlink(member_path); goto done; }
+        int remaining = (int)sizeof(cmd) - n;
+        if (remaining < 4) { unlink(member_path); goto done; }
+        int nn3 = snprintf(cmd + n, (size_t)remaining, " '%s'", member_path);
+        if (nn3 < 0 || nn3 >= remaining) { unlink(member_path); goto done; }
+        n += nn3;
+    }
+
+    if (stats) {
+        stats->link_object = 1;
+        stats->provider_archive = 1;
+        stats->provider_object_count = selected_count;
+        stats->provider_archive_member_count = archive.member_count;
+        stats->provider_archive_hash = archive_hash;
+        stats->provider_export_count = archive.export_count;
+        stats->elapsed_us = cold_now_us() - start_us;
+    }
+
+    int ret = system(cmd);
+    for (int32_t mi = 0; mi < archive.member_count; mi++) {
+        if (!archive.members[mi].selected) continue;
+        char member_path[PATH_MAX];
+        snprintf(member_path, sizeof(member_path), "%s.member%d.o", out_path, mi);
+        unlink(member_path);
+    }
+    if (ret != 0) goto done;
+    if (stats) stats->emit_us = cold_now_us() - start_us;
+    ok = true;
+
+done:
+    cold_provider_archive_view_free(&archive);
+    if (primary_span.len > 0) munmap((void *)primary_span.ptr, (size_t)primary_span.len);
+    if (archive_span.len > 0) munmap((void *)archive_span.ptr, (size_t)archive_span.len);
+    return ok;
+}
+
 
 static bool cold_runtime_provider_linux_root_supported(const char *symbol) {
     static const char *roots[] = {
