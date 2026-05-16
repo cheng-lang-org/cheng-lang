@@ -10994,6 +10994,7 @@ Span parse_index_bracket(Parser *parser) {
 int32_t parse_statement(Parser *parser, BodyIR *body, Locals *locals,
                                int32_t block, LoopCtx *loop) {
     int32_t stmt_indent = parser_next_indent(parser);
+    int32_t stmt_token_pos = parser->pos;  /* save position in case we need to reparse as expression */
     Span kw = parser_token(parser);
     if (kw.len == 0) return block;
     if (span_eq(kw, "*")) {
@@ -11341,7 +11342,13 @@ int32_t parse_statement(Parser *parser, BodyIR *body, Locals *locals,
         while (parser->pos < parser->source.len && parser->source.ptr[parser->pos] != '\n') parser->pos++;
         if (parser->pos < parser->source.len) parser->pos++;
     } else {
-        /* skip to next line to continue compilation */
+        /* Expression statement: reparse from saved position as a bare expression.
+           The function body's last expression acts as implicit return. */
+        parser->pos = stmt_token_pos;
+        int32_t ek = SLOT_I32;
+        int32_t expr_slot = parse_expr(parser, body, locals, &ek);
+        (void)expr_slot;
+        /* consume rest of line */
         while (parser->pos < parser->source.len && parser->source.ptr[parser->pos] != '\n') parser->pos++;
         if (parser->pos < parser->source.len) parser->pos++;
     }
@@ -11583,20 +11590,30 @@ BodyIR *parse_fn(Parser *parser, int32_t *symbol_index_out) {
         int32_t body_indent = parser_next_indent(parser);
         int32_t end_block = parse_statements_until(parser, body, &locals, block, body_indent, 0, 0);
         if (body->block_term[end_block] < 0) {
-            if (cold_return_span_is_void(ret)) {
+            /* Unterminated block: find the last expression result and use as implicit return */
+            int32_t last_expr_slot = -1;
+            int32_t op_start = body->block_op_start[end_block];
+            int32_t op_end = body->op_count;
+            for (int32_t oi = op_end - 1; oi >= op_start; oi--) {
+                int32_t ds = body->op_dst[oi];
+                if (body->op_kind[oi] > 0 && ds >= 0 && ds < body->slot_count &&
+                    body->slot_kind[ds] == SLOT_I32) {
+                    last_expr_slot = ds;
+                    break;
+                }
+            }
+            if (last_expr_slot >= 0) {
+                body_op(body, BODY_OP_LOAD_I32, last_expr_slot, 0, 0);
+                int32_t term = body_term(body, BODY_TERM_RET, last_expr_slot, -1, 0, -1, -1);
+                body_end_block(body, end_block, term);
+            } else {
+                /* No expression found: use default ret 0 */
                 int32_t zero = body_slot(body, SLOT_I32, 4);
                 body_op(body, BODY_OP_I32_CONST, zero, 0, 0);
                 body_op(body, BODY_OP_LOAD_I32, zero, 0, 0);
                 int32_t term = body_term(body, BODY_TERM_RET, zero, -1, 0, -1, -1);
                 body_end_block(body, end_block, term);
-                return body;
             }
-            /* Auto-terminate function body with ret 0 */
-            int32_t zero = body_slot(body, SLOT_I32, 4);
-            body_op(body, BODY_OP_I32_CONST, zero, 0, 0);
-            body_op(body, BODY_OP_LOAD_I32, zero, 0, 0);
-            int32_t term = body_term(body, BODY_TERM_RET, zero, -1, 0, -1, -1);
-            body_end_block(body, end_block, term);
             return body;
         }
         if (body && body->block_count > 0 && body->block_term[0] < 0) {

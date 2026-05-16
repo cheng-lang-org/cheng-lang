@@ -1430,6 +1430,57 @@ fi
 assert "cross_block_constprop_safe_field" 1 "$ACT"
 rm -f /tmp/ct_xb_const.cheng /tmp/ct_xb_const /tmp/ct_xb_const.report
 
+# 11i: E-Graph optimization correctness for composite types (arrays, structs)
+rm -f /tmp/ct_eg_comp /tmp/ct_eg_comp.report
+cat > /tmp/ct_eg_comp.cheng << 'EOF'
+type Point =
+    x: int32
+    y: int32
+
+fn main(): int32 =
+    # Struct field rewrite: field access after identity ops on struct fields
+    let p = Point(x: 10, y: 20)
+    let a = p.x + 0
+    let b = p.y * 1
+    let c = a + b
+    if c != 30: return 1
+    # Array index after const folding
+    let arr: int32[4] = [5, 10, 15, 20]
+    let i = 2
+    let v = arr[i]
+    if v != 15: return 2
+    # Dead store elimination on unused composite field
+    let q = Point(x: 100, y: 200)
+    let dead = q.x + 1
+    let r = q.y
+    if r != 200: return 3
+    return 0
+EOF
+quiet $COLD system-link-exec --in:/tmp/ct_eg_comp.cheng \
+    --target:arm64-apple-darwin --out:/tmp/ct_eg_comp \
+    --report-out:/tmp/ct_eg_comp.report
+if [ -x /tmp/ct_eg_comp ]; then
+    /tmp/ct_eg_comp >/dev/null 2>&1; ACT=$?
+else
+    ACT="COMPILE_FAILED"
+fi
+assert "egraph_composite_exit" 0 "$ACT"
+EGC_RW=$(grep '^egraph_rewrite_count=' /tmp/ct_eg_comp.report | sed 's/.*=//')
+if [ -n "$EGC_RW" ] && [ "$EGC_RW" -ge 1 ] 2>/dev/null; then
+    ACT=1; else ACT=0
+fi
+assert "egraph_composite_rewrites_ge_1" 1 "$ACT"
+EGC_ITER=$(grep '^egraph_fixed_point_iterations=' /tmp/ct_eg_comp.report | sed 's/.*=//')
+if [ -n "$EGC_ITER" ] && [ "$EGC_ITER" -ge 1 ] 2>/dev/null; then
+    ACT=1; else ACT=0
+fi
+assert "egraph_composite_iterations_ge_1" 1 "$ACT"
+if grep -q '^cross_block_analysis_ran=1$' /tmp/ct_eg_comp.report 2>/dev/null; then
+    ACT=1; else ACT=0
+fi
+assert "egraph_composite_xblock_ran" 1 "$ACT"
+rm -f /tmp/ct_eg_comp.cheng /tmp/ct_eg_comp /tmp/ct_eg_comp.report
+
 # 12: emit:obj with object fields (int32 + str)
 rm -f /tmp/ct_eo_fields.cheng /tmp/ct_eo_fields /tmp/ct_eo_fields.o /tmp/ct_eo_fields_link
 cat > /tmp/ct_eo_fields.cheng << 'EOF'
@@ -6083,11 +6134,11 @@ rm -rf /tmp/ct_fuzz
 mkdir -p /tmp/ct_fuzz
 
 # Generate 10 random arithmetic expressions, computing expected values in Python
-# Note: multiplication (*) excluded because cold compiler has 8-bit truncation bug
+# Multiplication is verified correct for int32 (i32_mul_large test above)
 python3 /dev/stdin << 'PYEOF' || true
 import random, os, json
 random.seed(42)
-ops = ['+', '-', '&', '|', '^']
+ops = ['+', '-', '*', '&', '|', '^']
 mapping = {}
 for i in range(10):
     depth = random.randint(2, 6)
@@ -6098,6 +6149,7 @@ for i in range(10):
         op = ops[(i * 7 + j * 3) % len(ops)]
         if op == '+': expected = expected + vals[j]
         elif op == '-': expected = expected - vals[j]
+        elif op == '*': expected = expected * vals[j]
         elif op == '&': expected = expected & vals[j]
         elif op == '|': expected = expected | vals[j]
         elif op == '^': expected = expected ^ vals[j]
@@ -6230,6 +6282,28 @@ if [ -n "$ID_RW" ] && [ "$ID_RW" -ge 4 ] 2>/dev/null; then
 fi
 assert "egraph_fuzz_identity_rewrites_ge_4" 1 "$ACT"
 rm -f /tmp/ct_fuzz_identity.cheng /tmp/ct_fuzz_identity /tmp/ct_fuzz_identity.report
+
+# Fuzzing: specific multiplication correctness (verify no 8-bit truncation)
+cat > /tmp/ct_fuzz_mul.cheng << 'EOF'
+fn main(): int32 =
+    let a = 100 * 16
+    if a != 1600: return 1
+    let b = 3 * 256
+    if b != 768: return 2
+    let c = 255 * 255
+    if c != 65025: return 3
+    return 0
+EOF
+quiet $COLD system-link-exec --in:/tmp/ct_fuzz_mul.cheng \
+    --target:arm64-apple-darwin --out:/tmp/ct_fuzz_mul \
+    --report-out:/tmp/ct_fuzz_mul.report
+if [ -x /tmp/ct_fuzz_mul ]; then
+    /tmp/ct_fuzz_mul >/dev/null 2>&1; ACT=$?
+else
+    ACT="COMPILE_FAILED"
+fi
+assert "egraph_fuzz_mul_correct" 0 "$ACT"
+rm -f /tmp/ct_fuzz_mul.cheng /tmp/ct_fuzz_mul /tmp/ct_fuzz_mul.report
 
 rm -rf /tmp/ct_fuzz
 
@@ -6421,7 +6495,6 @@ for nn_entry in \
 done
 assert "nightly_bd_nm_otool_3" 1 "$nightly_nm_ok"
 rm -rf /tmp/ct_nightly
-
 # ============================================================
 # 48: compile_obj_smoke for remaining untested source files
 # ============================================================
@@ -6443,6 +6516,200 @@ ACT=$(compile_obj_smoke "tailnet_train_island_app" "src/apps/tailnet/tailnet_tra
 assert "tailnet_train_island_app_cold_compile_smoke" 1 "$ACT"
 ACT=$(compile_obj_smoke "chain_node_app" "src/apps/chain_node/chain_node.cheng")
 assert "chain_node_app_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "astrology_calendar_core" "src/apps/astrology/astrology_calendar_core.cheng")
+assert "astrology_calendar_core_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "astrology_daily_guide_core" "src/apps/astrology/astrology_daily_guide_core.cheng")
+assert "astrology_daily_guide_core_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "oracle_types" "src/oracle/oracle_types.cheng")
+assert "oracle_types_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "r2c_schema" "src/r2c/schema.cheng")
+assert "r2c_schema_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "wasm_control_flow_ext" "src/tests/wasm_control_flow_ext_smoke.cheng")
+assert "wasm_control_flow_ext_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "wasm_memory_ops" "src/tests/wasm_memory_ops_smoke.cheng")
+assert "wasm_memory_ops_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "wasm_string_ops" "src/tests/wasm_string_ops_self_contained_smoke.cheng")
+assert "wasm_string_ops_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "astrology_calendar_table" "src/apps/astrology/astrology_calendar_table.cheng")
+assert "astrology_calendar_table_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "astrology_peer_did_core" "src/apps/astrology/astrology_peer_did_core.cheng")
+assert "astrology_peer_did_core_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "astrology_jie_boundary_minute" "src/apps/astrology/astrology_scalar_jie_boundary_minute_table.cheng")
+assert "astrology_jie_boundary_minute_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "astrology_jie_boundary_second" "src/apps/astrology/astrology_scalar_jie_boundary_second_table.cheng")
+assert "astrology_jie_boundary_second_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "astrology_lunar_year_code" "src/apps/astrology/astrology_scalar_lunar_year_code_table.cheng")
+assert "astrology_lunar_year_code_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "astrology_lunar_year_start" "src/apps/astrology/astrology_scalar_lunar_year_start_table.cheng")
+assert "astrology_lunar_year_start_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "oracle_bft_state_machine" "src/oracle/oracle_bft_state_machine.cheng")
+assert "oracle_bft_state_machine_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "oracle_fixture" "src/oracle/oracle_fixture.cheng")
+assert "oracle_fixture_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "oracle_plane" "src/oracle/oracle_plane.cheng")
+assert "oracle_plane_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "r2c_react" "src/r2c/r2c_react.cheng")
+assert "r2c_react_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "r2c_react_smoke_support" "src/r2c/r2c_react_smoke_support.cheng")
+assert "r2c_react_smoke_support_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "r2c_process" "src/r2c/r2c_process.cheng")
+assert "r2c_process_cold_compile_smoke" 1 "$ACT"
+
+# ============================================================
+# 49: Backend contract stability across cold compiler versions
+# ============================================================
+# Verify key report fields remain stable across V1 -> V2 build cycle
+rm -rf /tmp/ct_contract
+mkdir -p /tmp/ct_contract
+
+# Build V2 from V1
+$COLD build-backend-driver --out:/tmp/ct_contract/cheng_v2 \
+    --report-out:/tmp/ct_contract/build.report >/dev/null 2>&1
+
+# Compile a standard test file with V1 and V2, compare report field names
+cat > /tmp/ct_contract_src.cheng << 'EOF'
+fn main(): int32 =
+    let x = 42
+    let y = x + 1
+    return y
+EOF
+
+# V1 compile
+quiet $COLD system-link-exec --root:"$PWD" \
+    --in:/tmp/ct_contract_src.cheng --target:arm64-apple-darwin \
+    --out:/tmp/ct_contract/v1_out --emit:obj \
+    --report-out:/tmp/ct_contract/v1.report
+
+# V2 compile (if available)
+if [ -x /tmp/ct_contract/cheng_v2 ]; then
+    quiet /tmp/ct_contract/cheng_v2 system-link-exec --root:"$PWD" \
+        --in:/tmp/ct_contract_src.cheng --target:arm64-apple-darwin \
+        --out:/tmp/ct_contract/v2_out --emit:obj \
+        --report-out:/tmp/ct_contract/v2.report
+    V2_AVAIL=1
+else
+    V2_AVAIL=0
+fi
+
+# Contract field names that must exist across versions
+contract_ok=1
+for cf_field in \
+    "system_link_exec" \
+    "real_backend_codegen" \
+    "emit" \
+    "target" \
+    "direct_macho" \
+    "system_link" \
+    "linkerless_image"; do
+    if grep -q "^${cf_field}=" /tmp/ct_contract/v1.report 2>/dev/null; then
+        :
+    else
+        contract_ok=0
+    fi
+    if [ "$V2_AVAIL" -eq 1 ]; then
+        if grep -q "^${cf_field}=" /tmp/ct_contract/v2.report 2>/dev/null; then
+            :
+        else
+            contract_ok=0
+        fi
+    fi
+done
+assert "contract_stability_core_fields" 1 "$contract_ok"
+
+# Verify numeric report fields are parseable as integers
+contract_int_ok=1
+for ci_field in \
+    "system_link_exec" \
+    "provider_object_count" \
+    "provider_archive_member_count" \
+    "provider_export_count" \
+    "unresolved_symbol_count"; do
+    V1_VAL=$(grep "^${ci_field}=" /tmp/ct_contract/v1.report 2>/dev/null | sed 's/.*=//')
+    if [ -n "$V1_VAL" ] && [ "$V1_VAL" -ge 0 ] 2>/dev/null; then
+        :
+    else
+        contract_int_ok=0
+    fi
+done
+assert "contract_stability_int_fields" 1 "$contract_int_ok"
+
+# Verify V2 report (if built) has same non-empty set of fields as V1
+if [ "$V2_AVAIL" -eq 1 ]; then
+    V1_FIELDS=$(grep -c '=' /tmp/ct_contract/v1.report 2>/dev/null || echo 0)
+    V2_FIELDS=$(grep -c '=' /tmp/ct_contract/v2.report 2>/dev/null || echo 0)
+    if [ "$V1_FIELDS" -gt 0 ] && [ "$V2_FIELDS" -gt 0 ] && [ "$V1_FIELDS" -eq "$V2_FIELDS" ]; then
+        ACT=1
+    else
+        ACT=0
+    fi
+else
+    ACT="SKIP"
+fi
+assert "contract_stability_v1_v2_field_count" 1 "$ACT"
+
+rm -f /tmp/ct_contract_src.cheng
+rm -rf /tmp/ct_contract
+
+# ============================================================
+# 50: Cold compiler diagnostic test (--diag flags)
+# ============================================================
+# Verify --diag:dump_per_fn and --diag:dump_slots produce expected output
+rm -f /tmp/ct_diag_test.cheng /tmp/ct_diag_per_fn_stderr /tmp/ct_diag_slots_stderr
+
+cat > /tmp/ct_diag_test.cheng << 'EOF'
+fn main(): int32 = return 42
+EOF
+
+# Test --diag:dump_per_fn
+rm -f /tmp/ct_diag_per_fn_stderr
+$COLD system-link-exec --in:/tmp/ct_diag_test.cheng \
+    --target:arm64-apple-darwin \
+    --out:/tmp/ct_diag_per_fn_out \
+    --diag:dump_per_fn >/dev/null 2>/tmp/ct_diag_per_fn_stderr
+if grep -q '\[diag\] dump_per_fn ENABLED' /tmp/ct_diag_per_fn_stderr 2>/dev/null &&
+   grep -q '\[diag\] entry fn main' /tmp/ct_diag_per_fn_stderr 2>/dev/null; then
+    ACT=1; else ACT=0
+fi
+assert "diag_dump_per_fn" 1 "$ACT"
+
+# Test --diag:dump_slots
+rm -f /tmp/ct_diag_slots_stderr
+$COLD system-link-exec --in:/tmp/ct_diag_test.cheng \
+    --target:arm64-apple-darwin \
+    --out:/tmp/ct_diag_slots_out \
+    --diag:dump_slots >/dev/null 2>/tmp/ct_diag_slots_stderr
+if grep -q '\[diag\] dump_slots ENABLED' /tmp/ct_diag_slots_stderr 2>/dev/null &&
+   grep -q '\[diag-body\]' /tmp/ct_diag_slots_stderr 2>/dev/null &&
+   grep -q 'kind=' /tmp/ct_diag_slots_stderr 2>/dev/null; then
+    ACT=1; else ACT=0
+fi
+assert "diag_dump_slots" 1 "$ACT"
+
+# Test both flags together
+rm -f /tmp/ct_diag_both_stderr
+$COLD system-link-exec --in:/tmp/ct_diag_test.cheng \
+    --target:arm64-apple-darwin \
+    --out:/tmp/ct_diag_both_out \
+    --diag:dump_per_fn --diag:dump_slots >/dev/null 2>/tmp/ct_diag_both_stderr
+if grep -q '\[diag\] dump_per_fn ENABLED' /tmp/ct_diag_both_stderr 2>/dev/null &&
+   grep -q '\[diag\] dump_slots ENABLED' /tmp/ct_diag_both_stderr 2>/dev/null &&
+   grep -q '\[diag-body\]' /tmp/ct_diag_both_stderr 2>/dev/null &&
+   grep -q '\[diag\] entry fn main' /tmp/ct_diag_both_stderr 2>/dev/null; then
+    ACT=1; else ACT=0
+fi
+assert "diag_dump_both" 1 "$ACT"
+
+# Verify the compiled binary still works with diagnostic flags
+if [ -x /tmp/ct_diag_both_out ]; then
+    /tmp/ct_diag_both_out >/dev/null 2>&1; ACT=$?
+else
+    ACT="COMPILE_FAILED"
+fi
+assert "diag_both_exit_correct" 42 "$ACT"
+
+rm -f /tmp/ct_diag_test.cheng /tmp/ct_diag_per_fn_out /tmp/ct_diag_per_fn_stderr \
+      /tmp/ct_diag_slots_out /tmp/ct_diag_slots_stderr \
+      /tmp/ct_diag_both_out /tmp/ct_diag_both_stderr
 
 # --- zero regression gate ---
 if [ "${CHENG_ZRG_INNER:-0}" != "1" ]; then
@@ -6464,3 +6731,4 @@ echo ""
 echo "=== $PASS passed, $FAIL failed ==="
 
 [ "$FAIL" -eq 0 ]
+
