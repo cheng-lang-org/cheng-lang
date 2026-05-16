@@ -1311,6 +1311,13 @@ else
     ACT=0
 fi
 assert "gate_main_cold_compile_smoke" 1 "$ACT"
+# Verify .o has valid symbol entries via nm
+if [ -s /tmp/ct_gate_main_smoke.o ] && nm /tmp/ct_gate_main_smoke.o >/dev/null 2>&1; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "gate_main_cold_compile_smoke_nm_valid" 1 "$ACT"
 rm -f /tmp/ct_gate_main_smoke.o /tmp/ct_gate_main_smoke.report
 
 # --- concurrent_assembly.cheng cold compile smoke ---
@@ -1326,6 +1333,13 @@ else
     ACT=0
 fi
 assert "concurrent_assembly_cold_compile_smoke" 1 "$ACT"
+# Verify .o has valid symbol entries via nm
+if [ -s /tmp/ct_concurrent_assembly.o ] && nm /tmp/ct_concurrent_assembly.o >/dev/null 2>&1; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "concurrent_assembly_cold_compile_smoke_nm_valid" 1 "$ACT"
 rm -f /tmp/ct_concurrent_assembly.o /tmp/ct_concurrent_assembly.report
 
 # --- target_matrix.cheng cold compile smoke ---
@@ -1341,6 +1355,13 @@ else
     ACT=0
 fi
 assert "target_matrix_cold_compile_smoke" 1 "$ACT"
+# Verify .o has valid symbol entries via nm
+if [ -s /tmp/ct_target_matrix.o ] && nm /tmp/ct_target_matrix.o >/dev/null 2>&1; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "target_matrix_cold_compile_smoke_nm_valid" 1 "$ACT"
 rm -f /tmp/ct_target_matrix.o /tmp/ct_target_matrix.report
 
 # --- function_task_executor.cheng cold compile smoke ---
@@ -1356,6 +1377,13 @@ else
     ACT=0
 fi
 assert "func_task_exec_cold_compile_smoke" 1 "$ACT"
+# Verify .o has valid symbol entries via nm
+if [ -s /tmp/ct_func_task_exec.o ] && nm /tmp/ct_func_task_exec.o >/dev/null 2>&1; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "func_task_exec_cold_compile_smoke_nm_valid" 1 "$ACT"
 rm -f /tmp/ct_func_task_exec.o /tmp/ct_func_task_exec.report
 
 # --- program_support.cheng cold compile smoke ---
@@ -1371,6 +1399,13 @@ else
     ACT=0
 fi
 assert "program_support_cold_compile_smoke" 1 "$ACT"
+# Verify .o has valid symbol entries via nm
+if [ -s /tmp/ct_program_support.o ] && nm /tmp/ct_program_support.o >/dev/null 2>&1; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "program_support_cold_compile_smoke_nm_valid" 1 "$ACT"
 rm -f /tmp/ct_program_support.o /tmp/ct_program_support.report
 
 # --- compiler_request.cheng cold compile smoke ---
@@ -1999,6 +2034,104 @@ assert "line_map_cold_compile_smoke" 1 "$ACT"
 # --- bytes.cheng cold compile smoke ---
 ACT=$(compile_obj_smoke "bytes" "src/std/bytes.cheng")
 assert "bytes_cold_compile_smoke" 1 "$ACT"
+
+# --- option.cheng cold compile smoke ---
+ACT=$(compile_obj_smoke "option" "src/core/option.cheng")
+assert "option_cold_compile_smoke" 1 "$ACT"
+
+# --- borrow_checker.cheng cold compile smoke ---
+ACT=$(compile_obj_smoke "borrow_checker" "src/core/analysis/borrow_checker.cheng")
+assert "borrow_checker_cold_compile_smoke" 1 "$ACT"
+
+# --- borrow_ir.cheng cold compile smoke ---
+ACT=$(compile_obj_smoke "borrow_ir" "src/core/analysis/borrow_ir.cheng")
+assert "borrow_ir_cold_compile_smoke" 1 "$ACT"
+
+# --- body_kind_parse.cheng cold compile smoke ---
+ACT=$(compile_obj_smoke "body_kind_parse" "src/core/backend/body_kind_parse.cheng")
+assert "body_kind_parse_cold_compile_smoke" 1 "$ACT"
+
+# --- object_buffer.cheng cold compile smoke ---
+ACT=$(compile_obj_smoke "object_buffer" "src/core/backend/object_buffer.cheng")
+assert "object_buffer_cold_compile_smoke" 1 "$ACT"
+
+# --- object_plan.cheng cold compile smoke ---
+ACT=$(compile_obj_smoke "object_plan" "src/core/backend/object_plan.cheng")
+assert "object_plan_cold_compile_smoke" 1 "$ACT"
+
+# --- hot_patch.cheng cold compile smoke ---
+ACT=$(compile_obj_smoke "hot_patch" "src/core/backend/hot_patch.cheng")
+assert "hot_patch_cold_compile_smoke" 1 "$ACT"
+
+# --- riscv64_encode.cheng cold compile smoke ---
+ACT=$(compile_obj_smoke "riscv64_encode" "src/core/backend/riscv64_encode.cheng")
+assert "riscv64_encode_cold_compile_smoke" 1 "$ACT"
+
+# --- aarch64_encode.cheng cold compile smoke ---
+ACT=$(compile_obj_smoke "aarch64_encode" "src/core/backend/aarch64_encode.cheng")
+assert "aarch64_encode_cold_compile_smoke" 1 "$ACT"
+
+# --- thunk_driver.cheng cold compile smoke ---
+ACT=$(compile_obj_smoke "thunk_driver" "src/core/backend/thunk_driver.cheng")
+assert "thunk_driver_cold_compile_smoke" 1 "$ACT"
+
+# --- direct_exe_emit.cheng cold compile smoke ---
+ACT=$(compile_obj_smoke "direct_exe_emit" "src/core/backend/direct_exe_emit.cheng")
+assert "direct_exe_emit_cold_compile_smoke" 1 "$ACT"
+
+# --- direct_object_emit.cheng cold compile smoke ---
+ACT=$(compile_obj_smoke "direct_object_emit" "src/core/backend/direct_object_emit.cheng")
+assert "direct_object_emit_cold_compile_smoke" 1 "$ACT"
+
+# --- linkerless_object_writer.cheng cold compile smoke ---
+ACT=$(compile_obj_smoke "linkerless_object_writer" "src/core/backend/linkerless_object_writer.cheng")
+assert "linkerless_object_writer_cold_compile_smoke" 1 "$ACT"
+
+# --- lowering_plan.cheng cold compile smoke ---
+ACT=$(compile_obj_smoke "lowering_plan" "src/core/backend/lowering_plan.cheng")
+assert "lowering_plan_cold_compile_smoke" 1 "$ACT"
+
+# --- backend_driver_dispatch_min.cheng cold compile smoke ---
+ACT=$(compile_obj_smoke "backend_driver_dispatch_min" "src/core/backend/backend_driver_dispatch_min.cheng")
+assert "backend_driver_dispatch_min_cold_compile_smoke" 1 "$ACT"
+
+# --- cold compiler self-test: compile the largest cheng source file (typed_expr 11775 lines) ---
+rm -f /tmp/ct_typed_expr.o /tmp/ct_typed_expr.report
+if $COLD system-link-exec --root:"$PWD" \
+    --in:src/core/lang/typed_expr.cheng --target:arm64-apple-darwin \
+    --out:/tmp/ct_typed_expr.o --emit:obj \
+    --report-out:/tmp/ct_typed_expr.report >/dev/null 2>&1 &&
+   [ -s /tmp/ct_typed_expr.o ] &&
+   grep -q '^system_link_exec=1$' /tmp/ct_typed_expr.report 2>/dev/null &&
+   grep -q '^emit=obj$' /tmp/ct_typed_expr.report 2>/dev/null &&
+   grep -q '^direct_macho=1$' /tmp/ct_typed_expr.report 2>/dev/null &&
+   grep -q '^system_link=0$' /tmp/ct_typed_expr.report 2>/dev/null &&
+   grep -q '^linkerless_image=1$' /tmp/ct_typed_expr.report 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "typed_expr_cold_compile_smoke" 1 "$ACT"
+# Verify .o has valid symbol entries via nm
+if [ -s /tmp/ct_typed_expr.o ] && nm /tmp/ct_typed_expr.o >/dev/null 2>&1; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "typed_expr_cold_compile_smoke_nm_valid" 1 "$ACT"
+rm -f /tmp/ct_typed_expr.o /tmp/ct_typed_expr.report
+
+# --- system_link_exec.cheng cold compile smoke ---
+ACT=$(compile_obj_smoke "system_link_exec" "src/core/backend/system_link_exec.cheng")
+assert "system_link_exec_cold_compile_smoke" 1 "$ACT"
+
+# --- native_link_plan.cheng cold compile smoke ---
+ACT=$(compile_obj_smoke "native_link_plan" "src/core/backend/native_link_plan.cheng")
+assert "native_link_plan_cold_compile_smoke" 1 "$ACT"
+
+# --- system_link_plan.cheng cold compile smoke ---
+ACT=$(compile_obj_smoke "system_link_plan" "src/core/backend/system_link_plan.cheng")
+assert "system_link_plan_cold_compile_smoke" 1 "$ACT"
 
 # --- cross-compilation smoke (arm64-apple-darwin explicit target) ---
 cat > /tmp/ct_cross_target.cheng << 'EOF'

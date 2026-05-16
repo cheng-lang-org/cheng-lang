@@ -730,8 +730,25 @@ int32_t cold_imported_param_specs(Symbols *symbols, Span alias, Span params,
         Span type = cold_cstr_span("int32");
         if (span_eq(parser_peek(&parser), ":")) {
             (void)parser_token(&parser);
-            type = cold_qualify_import_type(symbols->arena, alias,
-                                            parser_take_type_span(&parser));
+            /* Manual type span: skip balanced brackets (child parser peek limitation) */
+            int32_t ts = parser.pos;
+            while (parser.pos < parser.source.len) {
+                if (parser.source.ptr[parser.pos] == '[') {
+                    int32_t d = 1;
+                    parser.pos++;
+                    while (parser.pos < parser.source.len && d > 0) {
+                        if (parser.source.ptr[parser.pos] == '[') d++;
+                        else if (parser.source.ptr[parser.pos] == ']') d--;
+                        parser.pos++;
+                    }
+                    continue;
+                }
+                if (parser.source.ptr[parser.pos] == ',' || parser.source.ptr[parser.pos] == ')')
+                    break;
+                parser.pos++;
+            }
+            Span raw_type = span_trim(span_sub(parser.source, ts, parser.pos));
+            type = cold_qualify_import_type(symbols->arena, alias, raw_type);
         }
         int32_t kind = cold_parser_slot_kind_from_type(symbols, type);
         names[count] = name;

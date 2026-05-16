@@ -11952,7 +11952,17 @@ static void x64_codegen_op(X64Code *x, BodyIR *body, Symbols *symbols,
         x64_movzb_r8_r32(x, 0, 0);
         x64_mov_mr32_r32(x, 4, off_dst, 0);
     } else if (kind == BODY_OP_ATOMIC_ADD_I32) {
-        die("atomicAddI32 x64 codegen not implemented");
+        /* lock cmpxchg loop: ptr in rdi, delta in edx, expected in eax */
+        x64_mov_r64_mr64(x, 7, 4, body->slot_offset[a]);   /* rdi = ptr */
+        x64_mov_r32_mr32(x, 2, 4, body->slot_offset[b]);   /* edx = delta */
+        x64_mov_r32_mr32_base(x, 0, 7);                    /* eax = *ptr (1st expected) */
+        int32_t add_loop = x->len;
+        x64_mov_r32_r32(x, 1, 0);                           /* ecx = eax = expected */
+        x64_add_r32_r32(x, 1, 2);                            /* ecx += edx = new value */
+        x64_lock_cmpxchg_r32_mr(x, 7, 1);                   /* lock cmpxchg [rdi], ecx */
+        int32_t after_cmpxchg = x->len;
+        x64_jcc_rel8(x, CC_NE, (int8_t)(add_loop - (after_cmpxchg + 2)));
+        x64_mov_mr32_r32(x, 4, off_dst, 1);                 /* store new value */
     /* Syscall-based ops (macOS x86_64: syscall in RAX, args RDI/RSI/RDX/R10/R8/R9) */
     } else if (kind == BODY_OP_EXIT) {
         x64_mov_r32_mr32(x, 0, 4, body->slot_offset[a]);
@@ -12007,12 +12017,28 @@ static void x64_codegen_op(X64Code *x, BodyIR *body, Symbols *symbols,
         x64_mov_r32_mr32(x, 0, 4, body->slot_offset[a]);
         x64_cmp_r32_imm8(x, 0, (int8_t)b);
         x64_int3(x); /* trap on mismatch */
+    } else if (kind == BODY_OP_TEXT_SET_INIT) {
+        x64_xor_r64_r64(x, 0, 0); /* zero rax */
+        int32_t tsz = body->slot_size[dst];
+        for (int32_t toff = 0; toff < tsz; toff += 8)
+            x64_mov_mr64_r64(x, 4, off_dst + toff, 0);
+    } else if (kind == BODY_OP_MMAP) {
+        /* mmap(addr=0, len, prot=3, flags=0x1002, fd=-1, offset=0) */
+        x64_mov_r64_imm64(x, 7, 0);              /* RDI = addr (0) */
+        x64_mov_r32_mr32(x, 0, 4, body->slot_offset[a]); /* EAX = len (32-bit, zero-extended) */
+        x64_mov_r64_r64(x, 6, 0);                /* RSI = RAX = len */
+        x64_mov_r64_imm64(x, 2, 3);              /* RDX = PROT_READ|PROT_WRITE */
+        x64_mov_r64_imm64(x, 10, 0x1002);        /* R10 = MAP_PRIVATE|MAP_ANONYMOUS */
+        x64_mov_r64_imm64(x, 8, -1ULL);          /* R8 = fd = -1 */
+        x64_mov_r64_imm64(x, 9, 0);              /* R9 = offset = 0 */
+        x64_mov_r32_imm32(x, 0, 0x20000C5);      /* RAX = mmap syscall */
+        x64_syscall(x);
+        x64_mov_mr64_r64(x, 4, off_dst, 0);      /* store result ptr */
     /* Remaining target-specific ops are not implemented for x86_64. */
     } else if (kind == BODY_OP_MAKE_SEQ_I32 ||
-               kind == BODY_OP_MMAP ||
                kind == BODY_OP_TIME_NS || kind == BODY_OP_GETRUSAGE ||
                kind == BODY_OP_GETENV_STR || kind == BODY_OP_READ_FLAG ||
-               kind == BODY_OP_PARSE_INT || kind == BODY_OP_TEXT_SET_INIT ||
+               kind == BODY_OP_PARSE_INT ||
                kind == BODY_OP_TEXT_SET_INSERT || kind == BODY_OP_CWD_STR ||
                kind == BODY_OP_PATH_JOIN || kind == BODY_OP_PATH_ABSOLUTE ||
                kind == BODY_OP_PATH_PARENT || kind == BODY_OP_PATH_EXISTS ||
@@ -12456,7 +12482,15 @@ static void rv64_codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         code_emit(code, rv_sltiu(RV_T0, RV_T3, 1)); /* success=1 if SC succeeded */
         code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)off_dst));
     } else if (kind == BODY_OP_ATOMIC_ADD_I32) {
-        die("atomicAddI32 RV64 codegen not implemented");
+        /* LR/SC loop: atomic add */
+        code_emit(code, rv_lw(RV_T0, RV_SP, (int16_t)body->slot_offset[a])); /* ptr */
+        code_emit(code, rv_lw(RV_T1, RV_SP, (int16_t)body->slot_offset[b])); /* delta */
+        int32_t rv_add_loop = code->count;
+        code_emit(code, rv_lr_w(RV_T2, RV_T0));                /* t2 = *ptr */
+        code_emit(code, rv_add(RV_T3, RV_T2, RV_T1));          /* t3 = t2 + delta */
+        code_emit(code, rv_sc_w(RV_T4, RV_T0, RV_T3));         /* try SC */
+        code_emit(code, rv_bne(RV_T4, RV_ZERO, (int16_t)(rv_add_loop - code->count)));
+        code_emit(code, rv_sw(RV_T3, RV_SP, (int16_t)off_dst)); /* store new value */
     /* Syscall / OS */
     } else if (kind == BODY_OP_EXIT) {
         code_emit(code, rv_lw(RV_A0, RV_SP, (int16_t)body->slot_offset[a]));
@@ -12478,6 +12512,21 @@ static void rv64_codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         rv_li(code->words, &code->count, RV_T1, (int32_t)b);
         code_emit(code, rv_bne(RV_T0, RV_T1, 0)); /* patched to after ebreak */
         code_emit(code, rv_ebreak());
+    } else if (kind == BODY_OP_TEXT_SET_INIT) {
+        code_emit(code, rv_sub(RV_T0, RV_T0, RV_T0)); /* t0 = 0 */
+        int32_t rv_tsz = body->slot_size[dst];
+        for (int32_t rv_toff = 0; rv_toff < rv_tsz; rv_toff += 8)
+            code_emit(code, rv_sd(RV_T0, RV_SP, (int16_t)(off_dst + rv_toff)));
+    } else if (kind == BODY_OP_MMAP) {
+        code_emit(code, rv_add(RV_A0, RV_ZERO, RV_ZERO)); /* a0 = addr = 0 */
+        code_emit(code, rv_lw(RV_A1, RV_SP, (int16_t)body->slot_offset[a])); /* a1 = len */
+        rv_li(code->words, &code->count, RV_A2, 3);       /* a2 = PROT_READ|PROT_WRITE */
+        rv_li(code->words, &code->count, RV_A3, 0x1002);  /* a3 = flags */
+        rv_li(code->words, &code->count, RV_A4, -1);      /* a4 = fd = -1 */
+        code_emit(code, rv_add(RV_A5, RV_ZERO, RV_ZERO)); /* a5 = offset = 0 */
+        rv_li(code->words, &code->count, RV_A7, 222);     /* a7 = mmap syscall */
+        code_emit(code, rv_ecall());
+        code_emit(code, rv_sd(RV_A0, RV_SP, (int16_t)off_dst)); /* store result ptr */
     /* Remaining complex ops are not implemented for RV64. */
     } else if (kind == BODY_OP_STR_EQ || kind == BODY_OP_STR_CONCAT ||
                kind == BODY_OP_I32_TO_STR || kind == BODY_OP_I64_TO_STR ||
@@ -12486,7 +12535,7 @@ static void rv64_codegen_op(Code *code, BodyIR *body, Symbols *symbols,
                kind == BODY_OP_STR_SLICE || kind == BODY_OP_SHELL_QUOTE ||
                kind == BODY_OP_STR_SELECT_NONEMPTY ||
                kind == BODY_OP_READ_FLAG || kind == BODY_OP_PARSE_INT ||
-               kind == BODY_OP_TEXT_SET_INIT || kind == BODY_OP_TEXT_SET_INSERT ||
+               kind == BODY_OP_TEXT_SET_INSERT ||
                kind == BODY_OP_CWD_STR || kind == BODY_OP_PATH_JOIN ||
                kind == BODY_OP_PATH_ABSOLUTE || kind == BODY_OP_PATH_PARENT ||
                kind == BODY_OP_PATH_EXISTS || kind == BODY_OP_PATH_FILE_SIZE ||
@@ -12494,7 +12543,7 @@ static void rv64_codegen_op(Code *code, BodyIR *body, Symbols *symbols,
                kind == BODY_OP_REMOVE_FILE || kind == BODY_OP_CHMOD_X ||
                kind == BODY_OP_COLD_SELF_EXEC || kind == BODY_OP_MKDIR_ONE ||
                kind == BODY_OP_TEXT_CONTAINS || kind == BODY_OP_EXEC_SHELL ||
-               kind == BODY_OP_ARGV_STR || kind == BODY_OP_MMAP ||
+               kind == BODY_OP_ARGV_STR ||
                kind == BODY_OP_OPEN || kind == BODY_OP_READ || kind == BODY_OP_CLOSE ||
                kind == BODY_OP_TIME_NS || kind == BODY_OP_GETRUSAGE ||
                kind == BODY_OP_GETENV_STR || kind == BODY_OP_ASSERT ||
@@ -19659,7 +19708,6 @@ static bool cold_link_macho_object_with_provider_archive(const char *object_path
                 if (mi >= 0 && !archive.members[mi].selected) {
                     archive.members[mi].selected = 1;
                     changed = true;
-                    if (stats) stats->provider_resolved_symbol_count++;
                 }
             }
             for (int32_t mi = 0; mi < archive.member_count; mi++) {
@@ -19690,7 +19738,6 @@ static bool cold_link_macho_object_with_provider_archive(const char *object_path
                     if (dep >= 0 && !archive.members[dep].selected) {
                         archive.members[dep].selected = 1;
                         changed = true;
-                        if (stats) stats->provider_resolved_symbol_count++;
                     }
                 }
             }

@@ -937,7 +937,7 @@ darwin_pack_report="$WORK/core_runtime_provider_darwin.pack.report.txt"
 if "$COLD" provider-archive-pack \
     --target:arm64-apple-darwin \
     --object:"$darwin_runtime_provider_obj" \
-    --export:_core_runtime_stub_trace \
+    --export:core_runtime_stub_trace \
     --module:runtime/core_runtime \
     --source:"$darwin_runtime_provider_source" \
     --out:"$darwin_pack_archive" \
@@ -951,6 +951,75 @@ if "$COLD" provider-archive-pack \
     ok "darwin_provider_archive_pack"
 else
     bad "darwin_provider_archive_pack"
+fi
+
+darwin_runtime_const_provider_obj="$WORK/core_runtime_provider_darwin_af_inet.o"
+darwin_runtime_const_provider_report="$WORK/core_runtime_provider_darwin_af_inet.report.txt"
+darwin_runtime_const_primary="$WORK/darwin_runtime_provider_primary.cheng"
+darwin_runtime_const_primary_obj="$WORK/darwin_runtime_provider_primary.o"
+darwin_runtime_const_primary_report="$WORK/darwin_runtime_provider_primary.report.txt"
+darwin_runtime_const_archive="$WORK/core_runtime_provider_darwin_af_inet.chenga"
+darwin_runtime_const_pack_report="$WORK/core_runtime_provider_darwin_af_inet.pack.report.txt"
+darwin_runtime_const_exe="$WORK/darwin_runtime_provider_link"
+darwin_runtime_const_link_report="$WORK/darwin_runtime_provider_link.report.txt"
+cat > "$darwin_runtime_const_primary" <<'CHENG'
+@importc("cheng_native_af_inet_bridge")
+fn cheng_native_af_inet_bridge(): int32
+fn main(): int32 = return cheng_native_af_inet_bridge()
+CHENG
+if "$COLD" system-link-exec \
+    --root:"$ROOT" \
+    --in:"$darwin_runtime_provider_source" \
+    --emit:obj \
+    --target:arm64-apple-darwin \
+    --symbol-visibility:internal \
+    --export-roots:cheng_native_af_inet_bridge \
+    --out:"$darwin_runtime_const_provider_obj" \
+    --report-out:"$darwin_runtime_const_provider_report" >/dev/null 2>&1 &&
+   "$COLD" system-link-exec \
+    --root:"$ROOT" \
+    --in:"$darwin_runtime_const_primary" \
+    --emit:obj \
+    --target:arm64-apple-darwin \
+    --out:"$darwin_runtime_const_primary_obj" \
+    --report-out:"$darwin_runtime_const_primary_report" >/dev/null 2>&1 &&
+   "$COLD" provider-archive-pack \
+    --target:arm64-apple-darwin \
+    --object:"$darwin_runtime_const_provider_obj" \
+    --export:cheng_native_af_inet_bridge \
+    --module:runtime/core_runtime \
+    --source:"$darwin_runtime_provider_source" \
+    --out:"$darwin_runtime_const_archive" \
+    --report-out:"$darwin_runtime_const_pack_report" >/dev/null 2>&1 &&
+   "$COLD" system-link-exec \
+    --link-object:"$darwin_runtime_const_primary_obj" \
+    --provider-archive:"$darwin_runtime_const_archive" \
+    --emit:exe \
+    --target:arm64-apple-darwin \
+    --out:"$darwin_runtime_const_exe" \
+    --report-out:"$darwin_runtime_const_link_report" >/dev/null 2>&1; then
+    ok "darwin_runtime_provider_archive_link"
+else
+    bad "darwin_runtime_provider_archive_link"
+fi
+require_grep "darwin_runtime_provider_archive_provider_obj" '^direct_macho=1$' "$darwin_runtime_const_provider_report"
+require_grep "darwin_runtime_provider_archive_primary_obj" '^direct_macho=1$' "$darwin_runtime_const_primary_report"
+require_grep "darwin_runtime_provider_archive_pack_ok" '^provider_archive_pack=1$' "$darwin_runtime_const_pack_report"
+require_grep "darwin_runtime_provider_archive_link_ok" '^system_link_exec=1$' "$darwin_runtime_const_link_report"
+require_grep "darwin_runtime_provider_archive_link_direct" '^direct_macho=1$' "$darwin_runtime_const_link_report"
+require_grep "darwin_runtime_provider_archive_link_objects" '^provider_object_count=1$' "$darwin_runtime_const_link_report"
+require_grep "darwin_runtime_provider_archive_link_members" '^provider_archive_member_count=1$' "$darwin_runtime_const_link_report"
+require_grep "darwin_runtime_provider_archive_link_exports" '^provider_export_count=1$' "$darwin_runtime_const_link_report"
+require_grep "darwin_runtime_provider_archive_link_resolved" '^provider_resolved_symbol_count=1$' "$darwin_runtime_const_link_report"
+require_grep "darwin_runtime_provider_archive_link_unresolved" '^unresolved_symbol_count=0$' "$darwin_runtime_const_link_report"
+require_grep "darwin_runtime_provider_archive_linkerless" '^linkerless_image=1$' "$darwin_runtime_const_link_report"
+require_grep "darwin_runtime_provider_archive_no_system_link" '^system_link=0$' "$darwin_runtime_const_link_report"
+darwin_runtime_const_rc=0
+"$darwin_runtime_const_exe" >/dev/null 2>&1 || darwin_runtime_const_rc=$?
+if [ "$darwin_runtime_const_rc" -eq 2 ]; then
+    ok "darwin_runtime_provider_archive_run"
+else
+    bad "darwin_runtime_provider_archive_run"
 fi
 
 darwin_archive_report="$WORK/darwin_provider_archive_hard_fail.report.txt"
