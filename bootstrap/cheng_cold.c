@@ -22910,7 +22910,7 @@ static uint8_t wasm_valtype_for_slot(int32_t slot_kind) {
     if (slot_kind == SLOT_I32 || slot_kind == SLOT_PTR || slot_kind == SLOT_I32_REF)
         return WASM_TYPE_I32;
     if (slot_kind == SLOT_I64 || slot_kind == SLOT_I64_REF)
-        return WASM_TYPE_I64;
+        return WASM_TYPE_I32;
     if (slot_kind == SLOT_F32)
         return WASM_TYPE_F32;
     if (slot_kind == SLOT_F64)
