@@ -7296,7 +7296,7 @@ static void codegen_store_params(Code *code, BodyIR *body) {
         } else if (kind == SLOT_SEQ_I32_REF || kind == SLOT_SEQ_STR_REF ||
                    kind == SLOT_SEQ_OPAQUE_REF ||
                    kind == SLOT_OBJECT_REF || kind == SLOT_OPAQUE ||
-                   kind == SLOT_OPAQUE_REF) {
+                   kind == SLOT_OPAQUE_REF || kind == -1) {
             if (in_regs) {
                 a64_emit_str_sp_off(code, base_reg, body->slot_offset[slot], true);
             } else {
@@ -12768,6 +12768,121 @@ static bool cold_is_same_block_as(BodyIR *body, int32_t idx_a, int32_t idx_b) {
     return false;
 }
 
+/* Cross-block slot liveness analysis.
+   For each slot, track which basic blocks write it and which read it.
+   A no_alias slot written in exactly one block and read in at least one
+   other block is "cross-block safe": its value is deterministic at all
+   read sites because there is only one producer.  This information can
+   later be used to extend rewrite rules across block boundaries. */
+static void cold_cross_block_slot_analysis(BodyIR *body,
+                                            int32_t *out_safe_count,
+                                            int32_t *out_unsafe_count) {
+    if (out_safe_count) *out_safe_count = 0;
+    if (out_unsafe_count) *out_unsafe_count = 0;
+    if (!body || body->slot_count <= 0 || body->block_count <= 0) return;
+
+    int32_t slot_count = body->slot_count;
+    int32_t block_count = body->block_count;
+    int32_t op_count = body->op_count;
+
+    /* Flat bit-per-block arrays: [slot * block_count + block] = written/read */
+    bool *slot_written = (bool *)calloc((size_t)slot_count * (size_t)block_count, sizeof(bool));
+    bool *slot_read    = (bool *)calloc((size_t)slot_count * (size_t)block_count, sizeof(bool));
+    if (!slot_written || !slot_read) {
+        free(slot_written);
+        free(slot_read);
+        return;
+    }
+
+    /* Walk blocks and record which slots each block touches */
+    int32_t term_value_slot, term_left_slot, term_right_slot;
+    for (int32_t bi = 0; bi < block_count; bi++) {
+        int32_t start = body->block_op_start[bi];
+        int32_t end   = start + body->block_op_count[bi];
+        for (int32_t oi = start; oi < end; oi++) {
+            int32_t k = body->op_kind[oi];
+            if (k <= 0) continue;
+            int32_t dst = body->op_dst[oi];
+            int32_t a   = body->op_a[oi];
+            int32_t bop = body->op_b[oi];
+            int32_t c   = body->op_c[oi];
+            if (dst >= 0 && dst < slot_count)
+                slot_written[dst * block_count + bi] = true;
+            if (a >= 0 && a < slot_count)
+                slot_read[a * block_count + bi] = true;
+            if (bop >= 0 && bop < slot_count)
+                slot_read[bop * block_count + bi] = true;
+            if (cold_op_reads_c_slot(k) && c >= 0 && c < slot_count)
+                slot_read[c * block_count + bi] = true;
+        }
+        /* Terminators that read a value slot */
+        int32_t tm = body->block_term[bi];
+        if (tm >= 0 && tm < body->term_count) {
+            int32_t tk = body->term_kind[tm];
+            if (tk == BODY_TERM_RET || tk == BODY_TERM_SWITCH) {
+                term_value_slot = body->term_value[tm];
+                if (term_value_slot >= 0 && term_value_slot < slot_count)
+                    slot_read[term_value_slot * block_count + bi] = true;
+            } else if (tk == BODY_TERM_CBR) {
+                term_left_slot  = body->term_value[tm];
+                term_right_slot = body->term_case_count[tm];
+                if (term_left_slot >= 0 && term_left_slot < slot_count)
+                    slot_read[term_left_slot * block_count + bi] = true;
+                if (term_right_slot >= 0 && term_right_slot < slot_count)
+                    slot_read[term_right_slot * block_count + bi] = true;
+            }
+        }
+    }
+
+    /* Call args (function params) are read in block 0 (entry block) */
+    for (int32_t ca = 0; ca < body->call_arg_count; ca++) {
+        int32_t s = body->call_arg_slot[ca];
+        if (s >= 0 && s < slot_count) {
+            slot_read[s * block_count + 0] = true;
+        }
+    }
+
+    /* Classify each slot */
+    int32_t safe = 0, unsafe = 0;
+    for (int32_t s = 0; s < slot_count; s++) {
+        int32_t writer_blocks = 0, writer_b = -1;
+        bool written = false;
+        for (int32_t bi = 0; bi < block_count; bi++) {
+            if (slot_written[s * block_count + bi]) {
+                writer_blocks++;
+                writer_b = bi;
+                written = true;
+            }
+        }
+        if (writer_blocks == 1 && writer_b >= 0) {
+            /* Cross-block safe: read in at least one block other than writer */
+            bool cross_read = false;
+            for (int32_t bi = 0; bi < block_count; bi++) {
+                if (bi != writer_b && slot_read[s * block_count + bi]) {
+                    cross_read = true;
+                    break;
+                }
+            }
+            if (cross_read) safe++; else unsafe++;
+        } else if (!written) {
+            /* Slot never written (e.g. param): treat as cross-block safe if read */
+            bool any_read = false;
+            for (int32_t bi = 0; bi < block_count; bi++) {
+                if (slot_read[s * block_count + bi]) { any_read = true; break; }
+            }
+            if (any_read) safe++; else unsafe++;
+        } else {
+            unsafe++;
+        }
+    }
+
+    if (out_safe_count)   *out_safe_count   = safe;
+    if (out_unsafe_count) *out_unsafe_count = unsafe;
+
+    free(slot_written);
+    free(slot_read);
+}
+
 /* Algebraic identity rewrites (constant folding for provably-correct patterns).
    These are safe because the rewrites are mathematically provable algebraic
    identities, independent of BodyIR slot mutability:
@@ -13186,6 +13301,15 @@ static void cold_optimize_body(BodyIR *body, bool enable_licm) {
     cold_egraph_fixed_point_iterations = pass_count;
 
     if (enable_licm) cold_apply_licm(body);
+
+    /* Run cross-block no-alias liveness analysis on the optimized IR */
+    {
+        int32_t safe = 0, unsafe = 0;
+        cold_cross_block_slot_analysis(body, &safe, &unsafe);
+        cold_cross_block_analysis_ran = 1;
+        cold_cross_block_safe_slots   = safe;
+        cold_cross_block_unsafe_slots = unsafe;
+    }
 }
 
 /* LICM: Loop Invariant Code Motion for CONST hoisting. */
@@ -14339,6 +14463,9 @@ typedef struct ColdCompileStats {
     int32_t lowering_parallel_schedule;
     int32_t ownership_compile_entry;
     int32_t ownership_runtime_witness;
+    int32_t cross_block_analysis_ran;
+    int32_t cross_block_safe_slots;
+    int32_t cross_block_unsafe_slots;
     char system_link_exec_scope[COLD_NAME_CAP];
 } ColdCompileStats;
 
@@ -17972,6 +18099,9 @@ static bool cold_write_system_link_exec_report(const char *path,
         fprintf(file, "egraph_fixed_point_iterations=%d\n", stats->egraph_fixed_point_iterations);
         fprintf(file, "ownership_compile_entry=%d\n", stats->ownership_compile_entry);
         fprintf(file, "ownership_runtime_witness=%d\n", stats->ownership_runtime_witness);
+        fprintf(file, "cross_block_analysis_ran=%d\n", stats->cross_block_analysis_ran);
+        fprintf(file, "cross_block_safe_slots=%d\n", stats->cross_block_safe_slots);
+        fprintf(file, "cross_block_unsafe_slots=%d\n", stats->cross_block_unsafe_slots);
         cold_print_elapsed_ms(file, "cold_compile_elapsed_ms", stats->elapsed_us);
     }
     fprintf(file, "link_object=%d\n", link_object);
