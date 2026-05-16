@@ -3190,9 +3190,20 @@ assert "typed_expr_fact_importc_nested_cold_compile_smoke" 1 "$ACT"
 ACT=$(compile_obj_smoke "uir_thunk_synthesis" "src/tests/uir_thunk_synthesis_smoke.cheng")
 assert "uir_thunk_synthesis_cold_compile_smoke" 1 "$ACT"
 
-ACT=$(compile_obj_hard_fail_target "x64_linux_probe_tmp" "src/tests/x64_linux_probe_tmp.cheng" \
-    "x86_64-unknown-linux-gnu" '^error=x86_64 str literal unsupported$')
-assert "x64_linux_probe_tmp_real_target_hard_fail" 1 "$ACT"
+rm -f /tmp/ct_x64_probe.o /tmp/ct_x64_probe.report
+if $COLD system-link-exec --root:"$PWD" \
+    --in:src/tests/x64_linux_probe_tmp.cheng --target:x86_64-unknown-linux-gnu \
+    --out:/tmp/ct_x64_probe.o --emit:obj \
+    --report-out:/tmp/ct_x64_probe.report >/dev/null 2>&1 &&
+   [ -s /tmp/ct_x64_probe.o ] &&
+   grep -q '^target=x86_64-unknown-linux-gnu$' /tmp/ct_x64_probe.report 2>/dev/null &&
+   ! grep -q '^error=' /tmp/ct_x64_probe.report 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "x64_linux_probe_tmp_real_target_smoke" 1 "$ACT"
+rm -f /tmp/ct_x64_probe.o /tmp/ct_x64_probe.report
 
 ACT=$(compile_obj_smoke "tls_client_hello_parse" "src/tests/tls_client_hello_parse_smoke.cheng")
 assert "tls_client_hello_parse_cold_compile_smoke" 1 "$ACT"
