@@ -876,8 +876,8 @@ else
     bad "darwin_runtime_provider_marker_object"
 fi
 
-# provider-archive-pack now handles Mach-O (cold_write_provider_archive reads
-# Mach-O objects and writes Chenga archives successfully).
+# provider-archive-pack accepts Mach-O provider objects and writes a Chenga
+# archive. Mach-O archive linking remains a separate hard-fail gate below.
 darwin_pack_archive="$WORK/core_runtime_provider_darwin.chenga"
 darwin_pack_report="$WORK/core_runtime_provider_darwin.pack.report.txt"
 if "$COLD" provider-archive-pack \
@@ -887,9 +887,13 @@ if "$COLD" provider-archive-pack \
     --module:runtime/core_runtime \
     --source:"$darwin_runtime_provider_source" \
     --out:"$darwin_pack_archive" \
-    --report-out:"$darwin_pack_report" >/dev/null 2>&1 &&
+   --report-out:"$darwin_pack_report" >/dev/null 2>&1 &&
    [ -s "$darwin_pack_archive" ] &&
-   grep -q '^provider_archive_pack=1$' "$darwin_pack_report" 2>/dev/null; then
+   grep -q '^provider_archive_pack=1$' "$darwin_pack_report" 2>/dev/null &&
+   grep -q '^provider_object_count=1$' "$darwin_pack_report" 2>/dev/null &&
+   grep -q '^provider_export_count=1$' "$darwin_pack_report" 2>/dev/null &&
+   grep -q '^system_link=0$' "$darwin_pack_report" 2>/dev/null &&
+   grep -q '^linkerless_image=1$' "$darwin_pack_report" 2>/dev/null; then
     ok "darwin_provider_archive_pack"
 else
     bad "darwin_provider_archive_pack"
