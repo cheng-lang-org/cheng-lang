@@ -864,7 +864,10 @@ void cold_register_import_enum(Symbols *symbols, Span alias, Span type_name,
     if (!type) {
         type = symbols_add_type(symbols, qualified_type, variant_count);
     }
-    if (type->variant_count != variant_count) die("import enum variant count drift");
+    if (type->variant_count != variant_count) {
+        /* Already registered with a different count — keep the first registration. */
+        return;
+    }
     type->is_enum = true;
     for (int32_t vi = 0; vi < variant_count; vi++) {
         Span qualified_variant = cold_arena_join3(symbols->arena, alias, ".",

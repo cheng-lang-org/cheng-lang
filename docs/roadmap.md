@@ -345,7 +345,7 @@
 
 ### 2. C seed 替代
 
-**当前状态**：`bootstrap/cheng_seed.c` 66,725 行 / 3.0 MB，是完整的 Cheng 语言实现（自举链 root）。冷编译器 `bootstrap/cheng_cold.c` 17,397 行，只覆盖冷子集和 CSG/linkerless 后端主线。C seed 仍然提供以下冷编译器不支持的语言特性：
+**当前状态**：`bootstrap/cheng_seed.c` 已从仓库移除；本阶段只记录 cold/CSG/provider archive 和纯 Cheng 源模块能证明的事实。下表保留的是历史上 C seed 覆盖过、当前仍需由 cold/Cheng 主线继续证明的语言面：
 
 **本轮推进**（截至 2026-05-16）：**parser.cheng（8054 行）冷编译通过（398KB Mach-O .o）**；**primary_object_plan.cheng（1.1MB）冷编译通过（1.17MB .o, 0 errors）**；**gate_main.cheng（2.0MB）冷编译通过（2.0MB .o, 0 errors）**。15+ 旧阻断（`[index]` 死代码、`elif` 三元链、str 比较结构化处理、array[index].field 赋值、named parameter、`sizeof(T)` 泛型、enum payloadless I32、str[] stride、uint8[] 类型、typed const imports、add() l-value、importc/exportc names、array 1024、..<= range、multi-level field assign、type alias resolution、var int32 param as index）已全部清除。三核心模块（parser.cheng + POP + gate_main）均产出 0 errors Mach-O .o。
 
@@ -438,7 +438,7 @@
 
 **Cheng 层 lowering 并行（实现存在，主链未接入）**：
 - `src/core/ir/function_task_executor.cheng`：完整的 work-stealing 框架（`FunctionTaskExecuteBodyIr`、`FunctionTaskExecuteAuto`、`FunctionTaskExecuteWorkStealing`、`FunctionTaskExecuteSerial`、`FunctionTaskMergeResults`、`FunctionTaskWorkStealingLastWorkerCount`）
-- 但 `FunctionTaskExecuteBodyIr`（行 27-80）**只做 word count 统计**——遍历 ops 累加 word count，不做实际 lowering
+- `FunctionTaskExecuteBodyIr` 的实际 lowering 实现存在；当前缺口是 active 主链仍未调用 executor
 - **`LoweringBuildPrimaryObjectIr` 在 `lowering_plan.cheng`（行 1443-1450）使用纯串行 `for` 循环，从不调用 `FunctionTaskExecuteAuto`**
 - `backend_driver_dispatch_min.cheng` 保留 `function_task_schedule=ws/serial` 动态报告，但该报告只反映 `cold_jobs_from_env()` 的值，与 lowering 并行无关
 - 唯一客户端：`function_task_executor_contract_smoke.cheng` 测试（`src/tests/`），该测试构造纯 `FunctionTask` 调用 executor，不经过实际 lowering 管线
@@ -446,14 +446,14 @@
 
 **阻断原因**：
 1. `LoweringBuildPrimaryObjectIr`（`lowering_plan.cheng:1443`）是纯串行 `for` 循环，未使用 `FunctionTaskExecuteAuto`
-2. `FunctionTaskExecuteBodyIr` 只做 word count，不做实际 lowering——其类型输出是 `FunctionTaskResult`（含 `wordCount`），不是 lowering 管线需要的 `PrimaryObjectIrFunction`
+2. `FunctionTaskExecuteBodyIr` 的实际 lowering 实现未接入主链；当前主链仍直接串行调用 `LoweringBuildOneFunction`
 3. 即使替换为实际 lowering，`LoweringBuildOneFunction` 依赖 `LoweringPlanStub` 的共享可变状态（`plan.typedIr`、`plan.functionNames` 等），当前 API 设计需要先确认每函数独立是否线程安全
 4. §716 循环导入约束阻止了 `function_task_executor ↔ lowering_plan` 直接回调
 5. 正确路径：在 C/importc 层（codegen 以下）实现线程调度并暴露简单调用接口——这正是 cold C 编译器已经做到的
 
 **完成条件**：
 1. `LoweringBuildPrimaryObjectIr` 使用 `FunctionTaskExecuteAuto` 或等价并行调度
-2. `FunctionTaskExecuteBodyIr` 做实际 lowering（调用 `LoweringBuildOneFunction`），而非只算 word count
+2. `FunctionTaskExecuteBodyIr` 的实际 lowering 结果接入 `LoweringBuildPrimaryObjectIr`
 3. `BACKEND_JOBS=1` 与 `BACKEND_JOBS=N` 同输入产物 SHA 一致（确定性约束）
 4. worker 任一失败硬失败，不能串行接管
 5. report 明确写 `function_task_schedule=ws`、`job_count>1`
