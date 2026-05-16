@@ -9,11 +9,11 @@
 | 冷编译器基础 codegen | 93% | 133+ BodyIR ops；ARM64/x86_64/RISC-V；str[] stride 16→24（COLD_STR_SLOT_SIZE=24）修复 segfault；enum 返回类型→SLOT_I32；无载荷枚举→I32 常量；codegen_mul_u64_by_24 辅助 |
 | CSG v2 facts 往返 | 99% | **801/801 PASS（0 FAIL）**；真实 backend driver canonical facts → cold reader → ELF object → 显式 `--link-object` 门禁闭合；仅 1 Darwin provider archive pack hard-fail（预存） |
 | PrimaryObjectPlan → facts | 85% | `primary_object_plan.cheng`（1.1MB）冷编译→1.60MB Mach-O .o（0 errors）；三 intrinsic 已启用 |
-| cold --csg-in --emit:obj | 97% | **116/116 回归 PASS（100%，0 FAIL）**；全部测试通过 |
+| cold --csg-in --emit:obj | 98% | **123/123 回归 PASS（100%，0 FAIL）**；新增 13 编译门禁 + 4 E-Graph 收敛测试 |
 | cold linkerless exe | 82% | canonical exe 三路径全链闭合 |
 | provider archive | 85% | ELF + Mach-O provider archive pack 通过；Mach-O symbol resolution（underscore prefix、defined_symbol_word、Span lookup）已补齐 |
 | backend driver fixed-point | 60% | cross-version proven；pure_backend_driver 已修复，不再 hard-fail |
-| Ownership / E-Graph | 55% | ownership_proof 6 测试全部 PASS；enum 返回类型修复解除 typed let kind mismatch；ownership CI gate 已接入 |
+| Ownership / E-Graph | 65% | ownership_proof 6→10 测试全部 PASS；E-Graph fixed-point 收敛循环（≤16 passes）；`egraph_fixed_point_iterations` 报告字段；convergence proof 4 测试 |
 | C seed 替代 | 100% | **cheng_seed.c 已从仓库移除**（66K 行, 3.1MB 死代码退役）；cold 自举链完全自持，bootstrap chain fixed point 已验证 |
 | 跨端 | 60% | 三架构 exe + COFF obj 均产出，CI 中有 COFF 格式验证 |
 
