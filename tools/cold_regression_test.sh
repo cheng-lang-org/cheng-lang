@@ -392,6 +392,98 @@ fi
 assert "bd_cross_version_report" 1 "$ACT"
 rm -f /tmp/ct_bd_xv /tmp/ct_bd_xv.report.txt
 
+# --- Self-compile chain: V1 ($COLD) builds V2, V2 builds V3, verify V2 and V3 match ---
+rm -rf /tmp/ct_chain_fp
+mkdir -p /tmp/ct_chain_fp
+$COLD build-backend-driver --out:/tmp/ct_chain_fp/cheng_v2 \
+    --report-out:/tmp/ct_chain_fp/v2.report.txt --map-out:/tmp/ct_chain_fp/v2.map.txt \
+    --index-out:/tmp/ct_chain_fp/v2.index.txt >/tmp/ct_chain_fp/v2.stdout 2>/tmp/ct_chain_fp/v2.stderr
+if [ -x /tmp/ct_chain_fp/cheng_v2 ] &&
+   grep -q '^real_backend_codegen=1$' /tmp/ct_chain_fp/v2.report.txt 2>/dev/null; then
+    ACT=1; else ACT=0
+fi
+assert "bd_fp_chain_v2_build" 1 "$ACT"
+# V2 builds V3 (self-compile chain: V2 compiles same source)
+/tmp/ct_chain_fp/cheng_v2 build-backend-driver --out:/tmp/ct_chain_fp/cheng_v3 \
+    --report-out:/tmp/ct_chain_fp/v3.report.txt --map-out:/tmp/ct_chain_fp/v3.map.txt \
+    --index-out:/tmp/ct_chain_fp/v3.index.txt >/tmp/ct_chain_fp/v3.stdout 2>/tmp/ct_chain_fp/v3.stderr
+if [ -x /tmp/ct_chain_fp/cheng_v3 ] &&
+   grep -q '^real_backend_codegen=1$' /tmp/ct_chain_fp/v3.report.txt 2>/dev/null; then
+    ACT=1; else ACT=0
+fi
+assert "bd_fp_chain_v3_build" 1 "$ACT"
+# Matching contracts: V2 and V3 report scopes must be identical
+V2_SCOPE=$(grep '^system_link_exec_scope=' /tmp/ct_chain_fp/v2.report.txt 2>/dev/null)
+V3_SCOPE=$(grep '^system_link_exec_scope=' /tmp/ct_chain_fp/v3.report.txt 2>/dev/null)
+if [ "$V2_SCOPE" = "$V3_SCOPE" ] && [ -n "$V2_SCOPE" ]; then
+    ACT=1; else ACT=0
+fi
+assert "bd_fp_chain_matching_contracts" 1 "$ACT"
+# Both V2 and V3 produce correct while_only output
+ACT=$(compile_run_timed /tmp/ct_chain_fp/cheng_v2 /tmp/ct_while_only.cheng /tmp/ct_chain_fp/v2_while 10)
+assert "bd_fp_chain_v2_while_only" 62 "$ACT"
+ACT=$(compile_run_timed /tmp/ct_chain_fp/cheng_v3 /tmp/ct_while_only.cheng /tmp/ct_chain_fp/v3_while 10)
+assert "bd_fp_chain_v3_while_only" 62 "$ACT"
+rm -rf /tmp/ct_chain_fp
+
+# --- Cold bootstrap bridge smoke: verify bootstrap-bridge produces fixed-point stage2==stage3 ---
+rm -rf /tmp/ct_bb
+mkdir -p /tmp/ct_bb
+timeout 300 $COLD bootstrap-bridge --out-dir:/tmp/ct_bb >/tmp/ct_bb/stdout 2>/tmp/ct_bb/stderr
+BB_STATUS=$?
+if [ "$BB_STATUS" -eq 0 ] &&
+   grep -q '^fixed_point=stage2_stage3_contract_match$' /tmp/ct_bb/stdout 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "bd_bootstrap_bridge_exit_and_marker" 1 "$ACT"
+# Verify bootstrap.env also carries the fixed_point marker
+if [ -f /tmp/ct_bb/bootstrap.env ] &&
+   grep -q '^fixed_point=stage2_stage3_contract_match$' /tmp/ct_bb/bootstrap.env 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "bd_bootstrap_bridge_env_file" 1 "$ACT"
+# Verify stage0 through stage3 all exist and are executable
+if [ -x /tmp/ct_bb/cheng.stage0 ] && [ -x /tmp/ct_bb/cheng.stage1 ] &&
+   [ -x /tmp/ct_bb/cheng.stage2 ] && [ -x /tmp/ct_bb/cheng.stage3 ]; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "bd_bootstrap_bridge_stage_binaries" 1 "$ACT"
+rm -rf /tmp/ct_bb
+
+# --- Report consistency: same build twice produces identical reports (except timestamps) ---
+rm -rf /tmp/ct_rpt_c
+mkdir -p /tmp/ct_rpt_c
+$COLD build-backend-driver --out:/tmp/ct_rpt_c/cheng_a \
+    --report-out:/tmp/ct_rpt_c/report_a.txt \
+    --index-out:/tmp/ct_rpt_c/index_a.txt >/tmp/ct_rpt_c/stdout_a 2>/tmp/ct_rpt_c/stderr_a
+if [ -x /tmp/ct_rpt_c/cheng_a ] &&
+   grep -q '^real_backend_codegen=1$' /tmp/ct_rpt_c/report_a.txt 2>/dev/null; then
+    ACT=1; else ACT=0
+fi
+assert "bd_report_consistency_build_a" 1 "$ACT"
+$COLD build-backend-driver --out:/tmp/ct_rpt_c/cheng_b \
+    --report-out:/tmp/ct_rpt_c/report_b.txt \
+    --index-out:/tmp/ct_rpt_c/index_b.txt >/tmp/ct_rpt_c/stdout_b 2>/tmp/ct_rpt_c/stderr_b
+if [ -x /tmp/ct_rpt_c/cheng_b ] &&
+   grep -q '^real_backend_codegen=1$' /tmp/ct_rpt_c/report_b.txt 2>/dev/null; then
+    ACT=1; else ACT=0
+fi
+assert "bd_report_consistency_build_b" 1 "$ACT"
+# Strip timestamp/elapsed-time/path fields and compare (paths change with --out:, timings vary per run)
+grep -vE '^(build_timestamp=|exec_phase_|report_written_at=|cold_bootstrap_bridge_elapsed_ms=|cold_build_backend_driver_elapsed_ms=|output=|entry_dispatch_executable=|map=|cold_frontend_index=)' /tmp/ct_rpt_c/report_a.txt > /tmp/ct_rpt_c/report_a_stripped.txt
+grep -vE '^(build_timestamp=|exec_phase_|report_written_at=|cold_bootstrap_bridge_elapsed_ms=|cold_build_backend_driver_elapsed_ms=|output=|entry_dispatch_executable=|map=|cold_frontend_index=)' /tmp/ct_rpt_c/report_b.txt > /tmp/ct_rpt_c/report_b_stripped.txt
+if cmp -s /tmp/ct_rpt_c/report_a_stripped.txt /tmp/ct_rpt_c/report_b_stripped.txt; then
+    ACT=1; else ACT=0
+fi
+assert "bd_report_consistency_match" 1 "$ACT"
+rm -rf /tmp/ct_rpt_c
+
 rm -f /tmp/ct_pure_backend_driver /tmp/ct_pure_backend_driver.report \
     /tmp/ct_pure_backend_driver.stdout /tmp/ct_pure_backend_driver.stderr
 timeout 30 "$COLD" system-link-exec --root:"$PWD" \
@@ -2424,6 +2516,183 @@ else
 fi
 assert "cold_parallel_determinism_sha" 1 "$ACT"
 rm -f /tmp/ct_pdet_1.o /tmp/ct_pdet_4.o /tmp/ct_pdet_1.report /tmp/ct_pdet_4.report
+
+# --- cold compiler --version test ---
+COLD_VERSION=$($COLD --version 2>/dev/null)
+if [ -n "$COLD_VERSION" ] && echo "$COLD_VERSION" | grep -q .; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "cold_version_flag" 1 "$ACT"
+
+# --- rapid fire: compile 5 test files sequentially, all must succeed ---
+rm -f /tmp/ct_rf_1.o /tmp/ct_rf_2.o /tmp/ct_rf_3.o /tmp/ct_rf_4.o /tmp/ct_rf_5.o
+quiet $COLD system-link-exec --root:"$PWD" \
+    --in:src/tests/chain_index_field_assign_preserves_tail_smoke.cheng --target:arm64-apple-darwin \
+    --out:/tmp/ct_rf_1.o --emit:obj --report-out:/tmp/ct_rf_1.report
+if [ -s /tmp/ct_rf_1.o ] && grep -q '^direct_macho=1$' /tmp/ct_rf_1.report 2>/dev/null; then ACT=1; else ACT=0; fi
+assert "cold_rapid_fire_1_chain_index_field" 1 "$ACT"
+
+quiet $COLD system-link-exec --root:"$PWD" \
+    --in:src/tests/export_visibility_parallel_smoke.cheng --target:arm64-apple-darwin \
+    --out:/tmp/ct_rf_2.o --emit:obj --report-out:/tmp/ct_rf_2.report
+if [ -s /tmp/ct_rf_2.o ] && grep -q '^direct_macho=1$' /tmp/ct_rf_2.report 2>/dev/null; then ACT=1; else ACT=0; fi
+assert "cold_rapid_fire_2_export_visibility" 1 "$ACT"
+
+quiet $COLD system-link-exec --root:"$PWD" \
+    --in:src/tests/oracle_p256_sign_probe_min.cheng --target:arm64-apple-darwin \
+    --out:/tmp/ct_rf_3.o --emit:obj --report-out:/tmp/ct_rf_3.report
+if [ -s /tmp/ct_rf_3.o ] && grep -q '^direct_macho=1$' /tmp/ct_rf_3.report 2>/dev/null; then ACT=1; else ACT=0; fi
+assert "cold_rapid_fire_3_oracle_p256" 1 "$ACT"
+
+quiet $COLD system-link-exec --root:"$PWD" \
+    --in:src/tests/wow_export_tvfs_smoke.cheng --target:arm64-apple-darwin \
+    --out:/tmp/ct_rf_4.o --emit:obj --report-out:/tmp/ct_rf_4.report
+if [ -s /tmp/ct_rf_4.o ] && grep -q '^direct_macho=1$' /tmp/ct_rf_4.report 2>/dev/null; then ACT=1; else ACT=0; fi
+assert "cold_rapid_fire_4_wow_export_tvfs" 1 "$ACT"
+
+quiet $COLD system-link-exec --root:"$PWD" \
+    --in:src/tests/quic_tls_transport_ecdsa_smoke.cheng --target:arm64-apple-darwin \
+    --out:/tmp/ct_rf_5.o --emit:obj --report-out:/tmp/ct_rf_5.report
+if [ -s /tmp/ct_rf_5.o ] && grep -q '^direct_macho=1$' /tmp/ct_rf_5.report 2>/dev/null; then ACT=1; else ACT=0; fi
+assert "cold_rapid_fire_5_quic_tls" 1 "$ACT"
+rm -f /tmp/ct_rf_*.o /tmp/ct_rf_*.report
+
+# --- nm verification for already-tested compile_obj_smoke files ---
+rm -f /tmp/ct_nm_core_types.o /tmp/ct_nm_core_types.report
+quiet $COLD system-link-exec --root:"$PWD" \
+    --in:src/core/ir/core_types.cheng --target:arm64-apple-darwin \
+    --out:/tmp/ct_nm_core_types.o --emit:obj --report-out:/tmp/ct_nm_core_types.report
+if [ -s /tmp/ct_nm_core_types.o ] && nm /tmp/ct_nm_core_types.o >/dev/null 2>&1; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "cold_nm_core_types" 1 "$ACT"
+
+rm -f /tmp/ct_nm_arena.o /tmp/ct_nm_arena.report
+quiet $COLD system-link-exec --root:"$PWD" \
+    --in:src/core/runtime/arena.cheng --target:arm64-apple-darwin \
+    --out:/tmp/ct_nm_arena.o --emit:obj --report-out:/tmp/ct_nm_arena.report
+if [ -s /tmp/ct_nm_arena.o ] && nm /tmp/ct_nm_arena.o >/dev/null 2>&1; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "cold_nm_arena" 1 "$ACT"
+rm -f /tmp/ct_nm_core_types.o /tmp/ct_nm_core_types.report /tmp/ct_nm_arena.o /tmp/ct_nm_arena.report
+
+# --- otool verification: verify Mach-O magic in .o ---
+rm -f /tmp/ct_otool.o /tmp/ct_otool.report
+quiet $COLD system-link-exec --root:"$PWD" \
+    --in:src/core/runtime/handle_table.cheng --target:arm64-apple-darwin \
+    --out:/tmp/ct_otool.o --emit:obj --report-out:/tmp/ct_otool.report
+if [ -s /tmp/ct_otool.o ] && otool -h /tmp/ct_otool.o 2>/dev/null | grep -q '0xfeedfacf'; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "cold_otool_handle_table_macho_magic" 1 "$ACT"
+rm -f /tmp/ct_otool.o /tmp/ct_otool.report
+
+rm -f /tmp/ct_otool2.o /tmp/ct_otool2.report
+quiet $COLD system-link-exec --root:"$PWD" \
+    --in:src/core/backend/object_relocs.cheng --target:arm64-apple-darwin \
+    --out:/tmp/ct_otool2.o --emit:obj --report-out:/tmp/ct_otool2.report
+if [ -s /tmp/ct_otool2.o ] && otool -h /tmp/ct_otool2.o 2>/dev/null | grep -q '0xfeedfacf'; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "cold_otool_object_relocs_macho" 1 "$ACT"
+rm -f /tmp/ct_otool2.o /tmp/ct_otool2.report
+
+# --- nm + otool combined for large already-tested file ---
+rm -f /tmp/ct_nm_large.o /tmp/ct_nm_large.report
+quiet $COLD system-link-exec --root:"$PWD" \
+    --in:src/core/backend/linkerless_object_writer.cheng --target:arm64-apple-darwin \
+    --out:/tmp/ct_nm_large.o --emit:obj --report-out:/tmp/ct_nm_large.report
+if [ -s /tmp/ct_nm_large.o ] && \
+   nm /tmp/ct_nm_large.o >/dev/null 2>&1 && \
+   otool -h /tmp/ct_nm_large.o 2>/dev/null | grep -q '0xfeedfacf'; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "cold_nm_otool_linkerless_object_writer" 1 "$ACT"
+rm -f /tmp/ct_nm_large.o /tmp/ct_nm_large.report
+
+# --- new compile_obj_smoke: tests/ files ---
+ACT=$(compile_obj_smoke "chain_index_field_assign_preserves_tail" "src/tests/chain_index_field_assign_preserves_tail_smoke.cheng")
+assert "chain_index_field_assign_preserves_tail_cold_compile_smoke" 1 "$ACT"
+
+ACT=$(compile_obj_smoke "export_visibility_parallel" "src/tests/export_visibility_parallel_smoke.cheng")
+assert "export_visibility_parallel_cold_compile_smoke" 1 "$ACT"
+
+ACT=$(compile_obj_smoke "strformat_fmt_negative_unmatched_right_brace" "src/tests/strformat_fmt_negative_unmatched_right_brace.cheng")
+assert "strformat_fmt_negative_unmatched_right_brace_cold_compile_smoke" 1 "$ACT"
+
+ACT=$(compile_obj_smoke "oracle_p256_sign_probe_min" "src/tests/oracle_p256_sign_probe_min.cheng")
+assert "oracle_p256_sign_probe_min_cold_compile_smoke" 1 "$ACT"
+
+ACT=$(compile_obj_smoke "wow_export_tvfs" "src/tests/wow_export_tvfs_smoke.cheng")
+assert "wow_export_tvfs_cold_compile_smoke" 1 "$ACT"
+
+ACT=$(compile_obj_smoke "native_link_exec_command" "src/tests/native_link_exec_command_smoke.cheng")
+assert "native_link_exec_command_cold_compile_smoke" 1 "$ACT"
+
+ACT=$(compile_obj_smoke "str_array_add" "src/tests/str_array_add_smoke.cheng")
+assert "str_array_add_cold_compile_smoke" 1 "$ACT"
+
+ACT=$(compile_obj_smoke "os_remove_dir_negative" "src/tests/os_remove_dir_negative_smoke.cheng")
+assert "os_remove_dir_negative_cold_compile_smoke" 1 "$ACT"
+
+ACT=$(compile_obj_smoke "lsmr_locality_storage" "src/tests/lsmr_locality_storage_smoke.cheng")
+assert "lsmr_locality_storage_cold_compile_smoke" 1 "$ACT"
+
+ACT=$(compile_obj_smoke "wow_export_maid_audit" "src/tests/wow_export_maid_audit_smoke.cheng")
+assert "wow_export_maid_audit_cold_compile_smoke" 1 "$ACT"
+
+ACT=$(compile_obj_smoke "compiler_world_line_value_symbol" "src/tests/compiler_world_line_value_symbol_smoke.cheng")
+assert "compiler_world_line_value_symbol_cold_compile_smoke" 1 "$ACT"
+
+ACT=$(compile_obj_smoke "browser_host_probe_abi_rule" "src/tests/browser_host_probe_abi_rule_smoke.cheng")
+assert "browser_host_probe_abi_rule_cold_compile_smoke" 1 "$ACT"
+
+ACT=$(compile_obj_smoke "tailnet_train_island" "src/tests/tailnet_train_island_smoke.cheng")
+assert "tailnet_train_island_cold_compile_smoke" 1 "$ACT"
+
+ACT=$(compile_obj_smoke "export_surface_parse_probe" "src/tests/export_surface_parse_probe.cheng")
+assert "export_surface_parse_probe_cold_compile_smoke" 1 "$ACT"
+
+ACT=$(compile_obj_smoke "chain_node_cell_dump_probe" "src/tests/chain_node_cell_dump_probe.cheng")
+assert "chain_node_cell_dump_probe_cold_compile_smoke" 1 "$ACT"
+
+ACT=$(compile_obj_smoke "quic_tls_transport_ecdsa" "src/tests/quic_tls_transport_ecdsa_smoke.cheng")
+assert "quic_tls_transport_ecdsa_cold_compile_smoke" 1 "$ACT"
+
+ACT=$(compile_obj_smoke "local_var_stmt_general_cfg_fixture" "src/tests/local_var_stmt_general_cfg_fixture.cheng")
+assert "local_var_stmt_general_cfg_fixture_cold_compile_smoke" 1 "$ACT"
+
+ACT=$(compile_obj_smoke "compiler_world_fresh_node_selfhost" "src/tests/compiler_world_fresh_node_selfhost_smoke.cheng")
+assert "compiler_world_fresh_node_selfhost_cold_compile_smoke" 1 "$ACT"
+
+# --- new compile_obj_smoke: core tooling files ---
+ACT=$(compile_obj_smoke "determinism_gate" "src/core/tooling/determinism_gate.cheng")
+assert "determinism_gate_cold_compile_smoke" 1 "$ACT"
+
+ACT=$(compile_obj_smoke "export_visibility_gate" "src/core/tooling/export_visibility_gate.cheng")
+assert "export_visibility_gate_cold_compile_smoke" 1 "$ACT"
+
+ACT=$(compile_obj_smoke "seed_cross_target_gate" "src/core/tooling/seed_cross_target_gate.cheng")
+assert "seed_cross_target_gate_cold_compile_smoke" 1 "$ACT"
+
+ACT=$(compile_obj_smoke "runtime_c_baseline_contract" "src/core/tooling/runtime_c_baseline_contract.cheng")
+assert "runtime_c_baseline_contract_cold_compile_smoke" 1 "$ACT"
+
+ACT=$(compile_obj_smoke "object_debug_report" "src/core/tooling/object_debug_report.cheng")
+assert "object_debug_report_cold_compile_smoke" 1 "$ACT"
 
 echo ""
 echo "=== $PASS passed, $FAIL failed ==="

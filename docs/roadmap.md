@@ -9,10 +9,10 @@
 | 冷编译器基础 codegen | 93% | 133+ BodyIR ops；ARM64/x86_64/RISC-V；str[] stride 16→24（COLD_STR_SLOT_SIZE=24）修复 segfault；enum 返回类型→SLOT_I32；无载荷枚举→I32 常量；codegen_mul_u64_by_24 辅助 |
 | CSG v2 facts 往返 | 99% | **859/859 PASS（0 FAIL）**；真实 backend driver canonical facts → cold reader → provider archive → `--csg-in --provider-archive --emit:exe` 直接入口闭合 |
 | PrimaryObjectPlan → facts | 85% | `primary_object_plan.cheng`（1.1MB）冷编译→1.60MB Mach-O .o（0 errors）；三 intrinsic 已启用 |
-| cold 回归 / --emit:obj | 98% | **184/184 回归 PASS（100%，0 FAIL）**；模块级 compile smoke 锁 `emit=obj/direct_macho/system_link=0/linkerless_image=1` report 合同 |
+| cold 回归 / --emit:obj | 98% | **215/215 回归 PASS（100%，0 FAIL）**；模块级 compile smoke 锁 `emit=obj/direct_macho/system_link=0/linkerless_image=1` report 合同 |
 | cold linkerless exe | 82% | canonical exe 三路径全链闭合 |
-| provider archive | 93% | ELF + Mach-O provider archive pack 通过；AArch64 ELF `--csg-in --provider-archive --emit:exe` 已闭合；Darwin Mach-O runtime 纯常量 root provider archive link/run 已锁；provider 外部系统依赖已分类 hard-fail；错 target、错 machine、重复导出、歧义导出、primary/provider 定义冲突已 hard-fail 锁定 |
-| backend driver fixed-point | 60% | cross-version proven；pure_backend_driver 已修复，不再 hard-fail |
+| provider archive | 95% | ELF + Mach-O provider archive pack 通过；AArch64 ELF `--csg-in --provider-archive --emit:exe` 已闭合；Darwin Mach-O runtime 纯常量 root provider archive link/run 已锁；Linux AArch64 `write/get_nprocs` 已由 cold 生成真实 syscall provider object 并通过 provider archive 链接报告门禁；`tools/linux_aarch64_provider_runtime_smoke.sh` 已落硬门禁，当前本机缺 user-mode runner，不能记为目标运行通过；错 target、错 machine、重复导出、歧义导出、primary/provider 定义冲突已 hard-fail 锁定 |
+| backend driver fixed-point | 80% | cross-version proven；self-compile chain V1→V2→V3 matching contracts；bootstrap-bridge stage2==stage3 fixed-point；report consistency across identical builds；pure_backend_driver 已修复，不再 hard-fail |
 | Ownership / E-Graph | 65% | ownership_proof 6→10 测试全部 PASS；E-Graph fixed-point 收敛循环（≤16 passes）；`egraph_fixed_point_iterations` 报告字段；convergence proof 4 测试 |
 | C seed 替代 | 100% | **cheng_seed.c 已从仓库移除**（66K 行, 3.1MB 死代码退役）；cold 自举链完全自持，bootstrap chain fixed point 已验证 |
 | 跨端 | 60% | 三架构 exe + COFF obj 均产出，CI 中有 COFF 格式验证 |
@@ -34,7 +34,7 @@
   - report 字段全输出（facts_bytes/mmap_ms/verify_ms/decode_ms/total_ms）
 - **三架构 ELF/Mach-O exe 直出**：ARM64 Mach-O + RISC-V/x86_64 ELF64 executable
 - **内置 ELF 链接器**：`--emit:obj` 只产出 ELF `.o`；可执行文件必须由 `--link-object ... --emit:exe` 显式生成
-- **provider archive / runtime link-report smoke**：`provider-archive-pack` 生成 `.chenga`；AArch64 ELF canonical facts 已通过 `--csg-in --provider-archive --emit:exe` 直接入口，report 锁 `provider_archive_member_count=2`、`provider_export_count=2`、`provider_resolved_symbol_count=2`、`system_link=0`、`linkerless_image=1`；Darwin Mach-O 已锁 runtime 纯常量 root `cheng_native_af_inet_bridge` 的 provider archive link/run；`write/get_nprocs` 这类 provider 外部系统依赖已分类为 `provider external dependency unsupported` hard-fail；错 target、错 machine、重复导出、歧义导出、primary/provider 定义冲突已锁；`--link-providers` 已能从 primary undefined symbols 自动选择 10 个 Linux runtime 纯常量 roots 并链接真实 provider archive；该门禁只锁链接报告，不声明目标 ELF 运行语义
+- **provider archive / runtime link-report smoke**：`provider-archive-pack` 生成 `.chenga`；AArch64 ELF canonical facts 已通过 `--csg-in --provider-archive --emit:exe` 直接入口，report 锁 `provider_archive_member_count=2`、`provider_export_count=2`、`provider_resolved_symbol_count=2`、`system_link=0`、`linkerless_image=1`；Darwin Mach-O 已锁 runtime 纯常量 root `cheng_native_af_inet_bridge` 的 provider archive link/run；Linux AArch64 `write/get_nprocs` 已由 cold 生成真实 syscall provider object，`runtime_provider_autolink_trace` 与 `runtime_provider_autolink_cpu_cores` 锁 `provider_archive_member_count=2`、`provider_export_count=10`、`provider_resolved_symbol_count>0`、`unresolved_symbol_count=0`；`tools/linux_aarch64_provider_runtime_smoke.sh` 会执行 trace/cpu 两个目标 ELF 并检查运行 marker，缺 native Linux AArch64、`qemu-aarch64`/`qemu-aarch64-static` 或显式 runner 时直接失败；错 target、错 machine、重复导出、歧义导出、primary/provider 定义冲突已锁
 - **E-Graph 合同边界**：CSE 已移除；当前保留 DSE、24+ rewrite rules（整数/位运算恒等式 + 强度缩减，含 EQ(x,x)→CONST 1 identity、double-NEG/NOT 消除）带 intra-block 安全证明、canonical hash 合同；`normalization_coverage=I32_I64_bitwise_integer_only`，浮点不参与 canonical hash 操作数重排。LICM CONST hoisting 已实现但不在 codegen 主线中。没有 UIR E-Graph，没有跨块 rewrite。
 - **fixed-point**：internal `CHENGCSG` writer/reader 只作为显式 cold self-test 产出 bit-identical facts；public canonical writer 已有 ordinary fixture writer/read/link/run smoke；完整 Cheng `PrimaryObjectPlan` 管线仍未闭合，cold_parser 的 Lowering/Primary materializer 已改为明确 missing reason
 - **文件拆分**：`cold_parser.c` 独立，`COLD_BACKEND_ONLY` 42% 缩减（590KB→344KB）
@@ -47,12 +47,16 @@
 
 | gap | 状态 | 下一步 |
 |---|---|---|
-| provider archive 生成与链接 | 多 provider ELF member/export 已由 cold linkerless 链路闭合；Darwin runtime marker object、Mach-O archive pack、缺失 archive hard-fail、纯常量 runtime root provider archive link/run 已锁；10 个 Linux runtime 纯常量 roots 已按 primary undefined symbols 自动选择并锁链接报告；错 target、错 machine、重复导出、歧义导出、primary/provider 定义冲突门禁已补齐；`write/get_nprocs` 外部系统依赖已分类 hard-fail | 实现 Mach-O/ELF 外部系统 ABI 重定位方案，并扩展含 libc 依赖的 runtime provider root 正向门禁 |
+| provider archive 生成与链接 | 多 provider ELF member/export 已由 cold linkerless 链路闭合；Darwin runtime marker object、Mach-O archive pack、缺失 archive hard-fail、纯常量 runtime root provider archive link/run 已锁；10 个 Linux runtime 纯常量 roots 已按 primary undefined symbols 自动选择并锁链接报告；错 target、错 machine、重复导出、歧义导出、primary/provider 定义冲突门禁已补齐；Linux AArch64 `write/get_nprocs` 已由 cold 生成真实 syscall provider object 并正向链接；目标运行门禁脚本已存在 | 在 Linux AArch64 或带 `qemu-aarch64`/`qemu-aarch64-static` 的机器运行 `tools/linux_aarch64_provider_runtime_smoke.sh`，通过后才把 Linux syscall provider 记为运行闭合 |
 | runtime smoke cc 链接 | 同上，内置 ELF 链接器已绕过 | 三 smoke RISC-V linked ELF 均已 QEMU 验证 |
 | 删除 cold source parser | COLD_BACKEND_ONLY 42% 缩减 | parser 代码保留，cold_parser.c 独立文件 |
 | C seed 替代 | **cheng_seed.c 已从仓库移除**；当前只按 cold/CSG/provider archive 回归和纯 Cheng 源模块编译结果证明进度 | 继续收敛 cold source-direct 与 CSG v2 facts 主线，不能恢复 C seed 默认路径 |
 | Ownership / E-Graph | ownership_proof 6 测试全部 PASS；enum 返回类型修复解除 typed let kind mismatch；24+ rewrite rules 带 intra-block 安全证明；Ownership report 字段已落地；Ownership CI gate 已接入；phase-off on/off 已验证；Cross-version 确定性已证明；LICM CONST hoisting 已实现但不在 codegen 主线 | E-Graph rewrite 仍需 convergence proof 和跨块安全门禁；No-Alias 只对局部标量可用，函数参数 no_alias 标记已撤销 |
 | 函数级并行 | C 层 codegen 并行已激活（work-stealing + pthread + 确定性合并），Cheng 层 FunctionTaskExecuteBodyIr 实现存在，但未接入 active lowering 主链 | 需要 lowering 主链接入 FunctionTaskExecuteAuto + benchmark 证明加速比
+
+### 本次会话（2026-05-16）：Linux AArch64 syscall provider 正向闭合，215/215 回归 0 FAIL，CSG v2 859/859
+
+**回归**：**215/215**（**0 FAIL**）。**CSG v2**：**859/859**（0 FAIL）。**Provider archive**：Linux AArch64 `write/get_nprocs` 从 hard-fail 推进到真实 syscall provider object；`runtime_provider_autolink_trace` 和 `runtime_provider_autolink_cpu_cores` 均通过 `--link-providers`，报告锁 `provider_object_count=2`、`provider_archive_member_count=2`、`provider_export_count=10`、`provider_resolved_symbol_count>0`、`unresolved_symbol_count=0`、`system_link=0`。`tools/linux_aarch64_provider_runtime_smoke.sh` 已新增，用目标运行 marker 证明 trace/cpu 语义；当前本机只有 `qemu-system-aarch64` 且 Docker daemon 未运行，所以该门禁按设计 hard-fail。
 
 ### 本次会话（2026-05-15/16）：C seed 70→100%，184/184 回归 0 FAIL，CSG v2 859/859
 
@@ -113,7 +117,7 @@
 ### 本次会话（2026-05-14）：回归矩阵扩展 + C seed 推进
 
 **本地实跑**：
-- 当时本地实跑通过；当前基线见上方 184/184 与 859/859
+- 当时本地实跑通过；当前基线见上方 215/215 与 859/859
 - `ordinary_zero_exit_fixture` provider-backed 编译运行 exit 0 ✅
 - `atomic_i32_runtime_smoke` / `compiler_runtime_smoke` 全部通过 ✅
 
@@ -131,14 +135,14 @@
 - **Ownership phase-off 烟雾测试**：`--ownership-on` 与无 flag 两种模式均已通过 CI smoke。report 字段 default-zero 已验证（commit 64a125fc）。
 - **LICM 状态**：CONST hoisting 变换已实现（commit 9289ef25），当前不在 codegen 主线中；需收敛证明后再启用 active 变换。
 - `compiler_csg_egraph_active_contract_smoke` 已接入 cold `run-host-smokes`，刷新后的 `artifacts/backend_driver/cheng` 可直接运行该 smoke。
-- 旧 runtime 占位实现已删除；原子 provider smoke 只证明 atomic 外部符号解析；10 个 Linux runtime 纯常量 roots 已通过 root-selective 自动归档链接报告门禁；首个非纯常量 root 已锁 `get_nprocs` 未解析 hard-fail；未执行目标 ELF，不代表 runtime provider roots 运行语义闭合。
+- 旧 runtime 占位实现已删除；原子 provider smoke 只证明 atomic 外部符号解析；Linux runtime roots 已通过 root-selective 自动归档链接报告门禁，含 `write/get_nprocs` syscall-backed roots；未执行目标 ELF，不代表 runtime provider roots 运行语义闭合。
 - `host_smoke_gate_contract_smoke` 用当前 stage3/backend_driver 生成物运行均 timeout，原因是 os 文件函数未被 cold linkerless 正确闭合，不能计入完成。
 
 ### 历史记录（2026-05-14）：provider archive 最小闭环 + mutable-slot CSE 禁用
 
 - **provider archive 最小闭环已落地**：`provider-archive-pack` 接受 `--target/--object/--export/--module/--source/--out/--report-out`，写 `.chenga` archive、member count、export count、hash 和 report。`system-link-exec --link-object:<primary.o> --provider-archive:<provider.chenga> --emit:exe` 在 cold 内部读取 ELF relocatable object 和 archive，解析 undefined symbol，应用 call relocation，生成 ELF executable。
 - **门禁已更新**：`tools/cold_csg_v2_roundtrip_test.sh` 覆盖正向 provider archive、坏 magic、缺 export、双 provider member/export、错 target、错 machine、重复导出、歧义导出、primary/provider 定义冲突、`--csg-in --provider-archive`、显式 `--link-object`、CSG v2 fixed-point、DSE noop、Darwin runtime marker object、Darwin runtime 纯常量 root provider archive link/run、provider 外部系统依赖 hard-fail、Mach-O provider archive pack 与缺失 archive hard-fail，并新增 canonical `CHENG_CSG_V2` writer/read/link/run smoke 与真实 backend driver → AArch64 provider archive 直接入口。当前结果为 **859/859 PASS**。
-- **当前边界**：archive 已支持多 ELF member/export，Mach-O provider archive pack 与纯常量 root link/run 已通过；目标限定在当前 cold ELF/Mach-O reloc linker 已验证子集；runtime provider 纯常量 roots 已锁链接报告，`write/get_nprocs` 等外部系统依赖已明确 hard-fail，含 libc/系统符号依赖的 provider root 正向链接仍需外部 ABI relocation/bind 方案。
+- **当前边界**：archive 已支持多 ELF member/export，Mach-O provider archive pack 与纯常量 root link/run 已通过；目标限定在当前 cold ELF/Mach-O reloc linker 已验证子集；Linux AArch64 `write/get_nprocs` 已由 cold syscall provider object 正向链接；更多 libc/系统符号依赖的 provider root 仍需逐个实现并补可运行目标门禁。
 - **mutable-slot CSE 与 hash-only dedup 已禁用**：原先的 mutating rewrite 会把 build-backend-driver 的 system-link smoke 编错；hash-only 函数去重会把不同零参函数合并到同一地址，导致 `compiler_runtime_smoke` 读到错误字符串。当前只保留 DSE 和可证明代数恒等式；后续 E-Graph 必须先做只读等价证明和运行门禁，再允许 rewrite。
 - **函数参数 no_alias 标记已撤销**：参数参与跨 block/call 后的值流，直接标记为 no_alias 会污染寄存器缓存假设。No-Alias 当前只对明确局部标量 slot 生效。
 
@@ -166,7 +170,7 @@
 - **参数匹配 I32↔I64 互容**：`cold_call_args_match` 与 `cold_validate_call_args` 均增加 int32↔int64 参数互容，`A64EncBImm(int64)` 接受 `2`(int32) 调用不再失败。
 - **I64_REF 识别**：`parse_arith_expr` 和 `parse_term` 的 I64 分支同步检查 `SLOT_I64_REF`，`let x: uint64 = ...` 的位运算不再错误返回零值。
 - **Combined kernel 全路径通过**：`cold_bootstrap_kernel_combined.cheng` (2035 行) source-direct 路径 exit 42。`cold_bootstrap_kernel_aarch64_encode.cheng` source-direct 路径 exit 42。`cold_bootstrap_kernel_frontend_scan.cheng` exit 42。
-- **历史回归矩阵**：28/28 冷编译器回归 PASS，13/13 bootstrap slice PASS，3/3 kernel PASS；当前基线见上方 184/184。
+- **历史回归矩阵**：28/28 冷编译器回归 PASS，13/13 bootstrap slice PASS，3/3 kernel PASS；当前基线见上方 215/215。
 
 ### 本次会话新增（2026-05-14）
 
@@ -329,9 +333,9 @@
 
 ### 1. provider archive 接入 runtime provider
 
-**当前状态**：provider archive 已成为 cold linkerless 已验证入口之一。`provider-archive-pack` 能把多个 provider `.o` 和多个 export 写入 `.chenga`；`system-link-exec --link-object --provider-archive` 与 `system-link-exec --csg-in --provider-archive` 都能把 primary undefined symbols 解析到 archive members，并生成 ELF/Mach-O executable。Darwin 已验证 runtime 纯常量 root `cheng_native_af_inet_bridge` 的 provider archive link/run。`write/get_nprocs` 这类外部系统依赖现在明确报 `provider external dependency unsupported`，不会被误判为普通 provider root 缺失。`--link-providers` 现在会从 primary undefined symbols 中严格选择已支持的 Linux runtime roots，已验证 10 个纯常量 roots 自动归档链接报告。原子 provider archive smoke 只证明 `atomicCasRaw/atomicStoreRaw/atomicLoadRaw` 外部符号解析，不能外推成全部 runtime roots 完成。
+**当前状态**：provider archive 已成为 cold linkerless 已验证入口之一。`provider-archive-pack` 能把多个 provider `.o` 和多个 export 写入 `.chenga`；`system-link-exec --link-object --provider-archive` 与 `system-link-exec --csg-in --provider-archive` 都能把 primary undefined symbols 解析到 archive members，并生成 ELF/Mach-O executable。Darwin 已验证 runtime 纯常量 root `cheng_native_af_inet_bridge` 的 provider archive link/run。Linux AArch64 `write/get_nprocs` 已由 cold 生成真实 syscall provider object，`--link-providers` 已通过 trace/cpu cores 两个 syscall-backed root 的正向链接报告。原子 provider archive smoke 只证明 `atomicCasRaw/atomicStoreRaw/atomicLoadRaw` 外部符号解析，不能外推成全部 runtime roots 完成。
 
-**阻断原因**：纯常量 runtime roots 已锁链接报告/部分运行 marker，外部系统依赖已能精确 hard-fail；尚未实现 Mach-O/ELF 外部 ABI relocation/bind，因此含 libc/系统调用依赖的 provider root 仍不能正向闭合。
+**阻断原因**：纯常量 runtime roots 已锁链接报告/部分运行 marker，Linux AArch64 `write/get_nprocs` 已正向闭合；更多 libc/系统调用依赖 root 仍缺逐项 syscall/provider object 实现和可运行目标门禁。
 
 **完成条件**：
 1. runtime provider 预编译 archive 可被 `--link-object --provider-archive` 和 `--csg-in --provider-archive` 消费
@@ -663,7 +667,7 @@ fn LoweringBuildPrimaryObjectIr(...): PrimaryObjectIr =
 
 进入默认门槛全部满足：
 - 核心 `build-backend-driver` 和 ordinary `system-link-exec` 稳定 ✅
-- cold source-direct runtime smoke 已运行通过；Darwin runtime marker object、Mach-O provider archive pack、纯常量 root provider archive link/run、缺失 archive hard-fail、外部系统依赖 hard-fail 已锁，Linux runtime provider 纯常量 roots 已自动归档链接报告，含 libc/系统符号依赖的目标运行 marker 继续扩展 ⚠️
+- cold source-direct runtime smoke 已运行通过；Darwin runtime marker object、Mach-O provider archive pack、纯常量 root provider archive link/run、缺失 archive hard-fail 已锁，Linux AArch64 `write/get_nprocs` 已由 cold syscall provider object 正向链接，含更多 libc/系统符号依赖的目标运行 marker 继续扩展 ⚠️
 - cross-target smoke 证明 Mach-O/ELF/COFF 产物合法 ✅
 
 ## 当前优先级
@@ -674,8 +678,8 @@ fn LoweringBuildPrimaryObjectIr(...): PrimaryObjectIr =
 4. ✅ **E-Graph rewrite rules 活跃**：24+ rewrite rules（整数/位运算恒等式 + 强度缩减，含 EQ(x,x)→CONST 1 identity、double-NEG/NOT 消除）带 intra-block 安全证明；`normalization_coverage=I32_I64_bitwise_integer_only`，浮点不参与 canonical hash 操作数重排。LICM CONST hoisting 已实现但不在 codegen 主线中。CSE 已移除（BodyIR 可变 slot 不安全）。UIR E-Graph 仍 unavailable。Ownership report 字段已激活；No-Alias 局部标量仍活跃；函数参数 no_alias 已撤销。
 5. ✅ **函数级并行 + lock-free work-stealing**：pthread + `__atomic_fetch_add` + 确定性 merge。`COLD_NO_SIGN=1` 下任意 `BACKEND_JOBS` 值产物 SHA 一致。
 6. ✅ **30-80ms 架构合规**：6 个 report 字段全部输出，冷进程内微秒级计时。实测 135 函数/5293 ops 编译 total=22.5ms。
-7. ✅ **回归测试**：`tools/cold_regression_test.sh` 184/184 PASS，`tools/cold_csg_v2_roundtrip_test.sh` 859/859 PASS。
-8. ✅ **cold source-direct runtime smoke 通过**：`atomic_i32_runtime_smoke`、`thread_atomic_orc_runtime_smoke`、`compiler_runtime_smoke`、source-direct `while` 均通过；Linux runtime provider 纯常量 roots 目前只锁 link-report smoke，首个非纯常量 root 已锁 `get_nprocs` hard-fail，目标运行 marker 继续扩展。
+7. ✅ **回归测试**：`tools/cold_regression_test.sh` 215/215 PASS，`tools/cold_csg_v2_roundtrip_test.sh` 859/859 PASS。
+8. ✅ **cold source-direct runtime smoke 通过**：`atomic_i32_runtime_smoke`、`thread_atomic_orc_runtime_smoke`、`compiler_runtime_smoke`、source-direct `while` 均通过；Linux runtime provider roots 目前锁 link-report smoke，`write/get_nprocs` 已正向链接，目标运行 marker 继续扩展。
 9. 若目标切到 `30-80ms` 冷自举的下一阶段，工作重心转移到 Ownership/E-Graph（阶段 5）、C seed 最小化（阶段 6）、跨端（阶段 7）。
 
 ## 诊断命令

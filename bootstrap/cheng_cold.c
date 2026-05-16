@@ -12552,6 +12552,195 @@ static void rv64_codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         code->words[rv_bne_pos] = rv_bne(RV_T1, RV_ZERO, (int16_t)((code->count - rv_bne_pos) * 4));
         code_emit(code, rv_sd(RV_T0, RV_SP, (int16_t)off_dst));                    /* store ptr */
         code_emit(code, rv_sw(RV_T1, RV_SP, (int16_t)(off_dst + 8)));              /* store len */
+    /* PTR_ADD: pointer + offset (i32 or i64) */
+    } else if (kind == BODY_OP_PTR_ADD) {
+        code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+        if (body->slot_kind[b] == SLOT_I32) {
+            code_emit(code, rv_lw(RV_T1, RV_SP, (int16_t)body->slot_offset[b]));
+        } else {
+            code_emit(code, rv_ld(RV_T1, RV_SP, (int16_t)body->slot_offset[b]));
+        }
+        code_emit(code, rv_add(RV_T0, RV_T0, RV_T1));
+        code_emit(code, rv_sd(RV_T0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_THREAD_YIELD) {
+        rv_li(code->words, &code->count, RV_A7, 331); /* sched_yield */
+        code_emit(code, rv_ecall());
+        code_emit(code, rv_sw(RV_ZERO, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_SEQ_I32_INDEX) {
+        code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)(body->slot_offset[a] + 8)));
+        code_emit(code, rv_lw(RV_T0, RV_T0, (int16_t)(b * 4)));
+        code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_PATH_IS_ABSOLUTE) {
+        code_emit(code, rv_lw(RV_T1, RV_SP, (int16_t)(body->slot_offset[a] + 8)));
+        code_emit(code, rv_sw(RV_ZERO, RV_SP, (int16_t)off_dst));
+        int32_t rv_abs_empty = code->count;
+        code_emit(code, rv_beq(RV_T1, RV_ZERO, 0));
+        code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_lbu(RV_T0, RV_T0, 0));
+        rv_li(code->words, &code->count, RV_T2, '/');
+        int32_t rv_abs_not = code->count;
+        code_emit(code, rv_bne(RV_T0, RV_T2, 0));
+        code_emit(code, rv_addi(RV_T0, RV_ZERO, 1));
+        code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)off_dst));
+        int32_t rv_abs_done = code->count;
+        code->words[rv_abs_empty] = rv_beq(RV_T1, RV_ZERO, (int16_t)((rv_abs_done - rv_abs_empty) * 4));
+        code->words[rv_abs_not] = rv_bne(RV_T0, RV_T2, (int16_t)((rv_abs_done - rv_abs_not) * 4));
+    } else if (kind == BODY_OP_SELECT) {
+        code_emit(code, rv_lw(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+        int32_t rv_sel_else = code->count;
+        code_emit(code, rv_beq(RV_T0, RV_ZERO, 0));
+        { int32_t rv_sel_sz = body->slot_size[dst], rv_sel_so = body->slot_offset[b];
+          for (int32_t rv_off = 0; rv_off < rv_sel_sz; rv_off += 8) {
+              code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)(rv_sel_so + rv_off)));
+              code_emit(code, rv_sd(RV_T0, RV_SP, (int16_t)(off_dst + rv_off))); } }
+        int32_t rv_sel_end = code->count;
+        code_emit(code, rv_jal(RV_ZERO, 0));
+        { int32_t rv_sel_sz = body->slot_size[dst], rv_sel_eo = body->slot_offset[c];
+          for (int32_t rv_off = 0; rv_off < rv_sel_sz; rv_off += 8) {
+              code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)(rv_sel_eo + rv_off)));
+              code_emit(code, rv_sd(RV_T0, RV_SP, (int16_t)(off_dst + rv_off))); } }
+        code->words[rv_sel_else] = rv_beq(RV_T0, RV_ZERO, (int16_t)((rv_sel_end + 1 - rv_sel_else) * 4));
+        code->words[rv_sel_end] = rv_jal(RV_ZERO, (int32_t)((code->count - rv_sel_end) * 4));
+    } else if (kind == BODY_OP_WRITE_RAW) {
+        code_emit(code, rv_lw(RV_A0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_ld(RV_A1, RV_SP, (int16_t)body->slot_offset[b]));
+        code_emit(code, rv_lw(RV_A2, RV_SP, (int16_t)body->slot_offset[c]));
+        rv_li(code->words, &code->count, RV_A7, 64); /* sys_write */
+        code_emit(code, rv_ecall());
+        code_emit(code, rv_sw(RV_A0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_WRITE_BYTES) {
+        code_emit(code, rv_lw(RV_A0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_addi(RV_A1, RV_SP, (int16_t)body->slot_offset[b]));
+        code_emit(code, rv_lw(RV_A2, RV_SP, (int16_t)body->slot_offset[c]));
+        rv_li(code->words, &code->count, RV_A7, 64); /* sys_write */
+        code_emit(code, rv_ecall());
+        code_emit(code, rv_sw(RV_A0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_ASSERT) {
+        if (body->slot_kind[a] == SLOT_I32_REF) {
+            code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+            code_emit(code, rv_lw(RV_T0, RV_T0, 0));
+        } else {
+            code_emit(code, rv_lw(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+        }
+        int32_t rv_as_ok = code->count;
+        code_emit(code, rv_bne(RV_T0, RV_ZERO, 0));
+        if (body->slot_kind[b] == SLOT_STR_REF) {
+            code_emit(code, rv_ld(RV_T1, RV_SP, (int16_t)body->slot_offset[b]));
+            code_emit(code, rv_ld(RV_A1, RV_T1, 0));
+            code_emit(code, rv_lw(RV_A2, RV_T1, 8));
+        } else {
+            code_emit(code, rv_ld(RV_A1, RV_SP, (int16_t)body->slot_offset[b]));
+            code_emit(code, rv_lw(RV_A2, RV_SP, (int16_t)(body->slot_offset[b] + 8)));
+        }
+        rv_li(code->words, &code->count, RV_A0, 2);
+        rv_li(code->words, &code->count, RV_A7, 64);
+        code_emit(code, rv_ecall());
+        rv_li(code->words, &code->count, RV_A0, 2);
+        code_emit(code, rv_addi(RV_T0, RV_ZERO, '\n'));
+        code_emit(code, rv_sb(RV_T0, RV_SP, (int16_t)off_dst));
+        code_emit(code, rv_addi(RV_A1, RV_SP, (int16_t)off_dst));
+        rv_li(code->words, &code->count, RV_A2, 1);
+        rv_li(code->words, &code->count, RV_A7, 64);
+        code_emit(code, rv_ecall());
+        rv_li(code->words, &code->count, RV_A0, 1);
+        rv_li(code->words, &code->count, RV_A7, 93); /* sys_exit */
+        code_emit(code, rv_ecall());
+        code->words[rv_as_ok] = rv_bne(RV_T0, RV_ZERO, (int16_t)((code->count - rv_as_ok) * 4));
+        code_emit(code, rv_sw(RV_ZERO, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_COPY_RAW) {
+        code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_ld(RV_T1, RV_SP, (int16_t)body->slot_offset[b]));
+        if (body->slot_kind[c] == SLOT_I32) {
+            code_emit(code, rv_lw(RV_T2, RV_SP, (int16_t)body->slot_offset[c]));
+        } else {
+            code_emit(code, rv_ld(RV_T2, RV_SP, (int16_t)body->slot_offset[c]));
+        }
+        int32_t rv_cp_loop = code->count;
+        code_emit(code, rv_beq(RV_T2, RV_ZERO, 0));
+        code_emit(code, rv_lbu(RV_T3, RV_T1, 0));
+        code_emit(code, rv_sb(RV_T3, RV_T0, 0));
+        code_emit(code, rv_addi(RV_T0, RV_T0, 1));
+        code_emit(code, rv_addi(RV_T1, RV_T1, 1));
+        code_emit(code, rv_addi(RV_T2, RV_T2, -1));
+        code_emit(code, rv_jal(RV_ZERO, (int32_t)((rv_cp_loop - code->count) * 4)));
+        code->words[rv_cp_loop] = rv_beq(RV_T2, RV_ZERO, (int16_t)((code->count - rv_cp_loop) * 4));
+        code_emit(code, rv_sw(RV_ZERO, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_SET_RAW) {
+        code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+        if (body->slot_kind[b] == SLOT_I32) {
+            code_emit(code, rv_lw(RV_T1, RV_SP, (int16_t)body->slot_offset[b]));
+        } else {
+            code_emit(code, rv_ld(RV_T1, RV_SP, (int16_t)body->slot_offset[b]));
+        }
+        if (body->slot_kind[c] == SLOT_I32) {
+            code_emit(code, rv_lw(RV_T2, RV_SP, (int16_t)body->slot_offset[c]));
+        } else {
+            code_emit(code, rv_ld(RV_T2, RV_SP, (int16_t)body->slot_offset[c]));
+        }
+        int32_t rv_st_loop = code->count;
+        code_emit(code, rv_beq(RV_T2, RV_ZERO, 0));
+        code_emit(code, rv_sb(RV_T1, RV_T0, 0));
+        code_emit(code, rv_addi(RV_T0, RV_T0, 1));
+        code_emit(code, rv_addi(RV_T2, RV_T2, -1));
+        code_emit(code, rv_jal(RV_ZERO, (int32_t)((rv_st_loop - code->count) * 4)));
+        code->words[rv_st_loop] = rv_beq(RV_T2, RV_ZERO, (int16_t)((code->count - rv_st_loop) * 4));
+        code_emit(code, rv_sw(RV_ZERO, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_HEAP_ALLOC) {
+        code_emit(code, rv_add(RV_A0, RV_ZERO, RV_ZERO));
+        if (body->slot_kind[a] == SLOT_I32) {
+            code_emit(code, rv_lw(RV_A1, RV_SP, (int16_t)body->slot_offset[a]));
+        } else {
+            code_emit(code, rv_ld(RV_A1, RV_SP, (int16_t)body->slot_offset[a]));
+        }
+        rv_li(code->words, &code->count, RV_A2, 3);
+        rv_li(code->words, &code->count, RV_A3, 0x1002);
+        rv_li(code->words, &code->count, RV_A4, -1);
+        code_emit(code, rv_add(RV_A5, RV_ZERO, RV_ZERO));
+        rv_li(code->words, &code->count, RV_A7, 222); /* mmap */
+        code_emit(code, rv_ecall());
+        code_emit(code, rv_sd(RV_A0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_HEAP_FREE) {
+        code_emit(code, rv_ld(RV_A0, RV_SP, (int16_t)body->slot_offset[a]));
+        if (body->slot_kind[b] == SLOT_I32) {
+            code_emit(code, rv_lw(RV_A1, RV_SP, (int16_t)body->slot_offset[b]));
+        } else {
+            code_emit(code, rv_ld(RV_A1, RV_SP, (int16_t)body->slot_offset[b]));
+        }
+        rv_li(code->words, &code->count, RV_A7, 215); /* munmap */
+        code_emit(code, rv_ecall());
+        code_emit(code, rv_sw(RV_A0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_MAKE_SEQ_I32) {
+        for (int32_t rv_i = 0; rv_i < body->slot_size[dst]; rv_i += 8)
+            code_emit(code, rv_sd(RV_ZERO, RV_SP, (int16_t)(off_dst + rv_i)));
+    } else if (kind == BODY_OP_MAKE_SEQ_OPAQUE) {
+        for (int32_t rv_i = 0; rv_i < body->slot_size[dst]; rv_i += 8)
+            code_emit(code, rv_sd(RV_ZERO, RV_SP, (int16_t)(off_dst + rv_i)));
+    } else if (kind == BODY_OP_BYTES_ALLOC) {
+        for (int32_t rv_i = 0; rv_i < body->slot_size[dst]; rv_i += 8)
+            code_emit(code, rv_sd(RV_ZERO, RV_SP, (int16_t)(off_dst + rv_i)));
+        code_emit(code, rv_lw(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+        int32_t rv_ba_done = code->count;
+        code_emit(code, rv_beq(RV_T0, RV_ZERO, 0));
+        code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)(off_dst + 8)));
+        code_emit(code, rv_add(RV_A0, RV_ZERO, RV_ZERO));
+        code_emit(code, rv_add(RV_A1, RV_T0, RV_ZERO));
+        rv_li(code->words, &code->count, RV_A2, 3);
+        rv_li(code->words, &code->count, RV_A3, 0x1002);
+        rv_li(code->words, &code->count, RV_A4, -1);
+        code_emit(code, rv_add(RV_A5, RV_ZERO, RV_ZERO));
+        rv_li(code->words, &code->count, RV_A7, 222);
+        code_emit(code, rv_ecall());
+        code_emit(code, rv_sd(RV_A0, RV_SP, (int16_t)off_dst));
+        { code_emit(code, rv_lw(RV_T1, RV_SP, (int16_t)(off_dst + 8)));
+          code_emit(code, rv_add(RV_T2, RV_A0, RV_ZERO));
+          int32_t rv_ba_zero = code->count;
+          code_emit(code, rv_beq(RV_T1, RV_ZERO, 0));
+          code_emit(code, rv_sb(RV_ZERO, RV_T2, 0));
+          code_emit(code, rv_addi(RV_T2, RV_T2, 1));
+          code_emit(code, rv_addi(RV_T1, RV_T1, -1));
+          code_emit(code, rv_jal(RV_ZERO, (int32_t)((rv_ba_zero - code->count) * 4)));
+          code->words[rv_ba_zero] = rv_beq(RV_T1, RV_ZERO, (int16_t)((code->count - rv_ba_zero) * 4)); }
+        code->words[rv_ba_done] = rv_beq(RV_T0, RV_ZERO, (int16_t)((code->count - rv_ba_done) * 4));
     /* Remaining complex ops are not implemented for RV64. */
     } else if (kind == BODY_OP_STR_EQ || kind == BODY_OP_STR_CONCAT ||
                kind == BODY_OP_I32_TO_STR || kind == BODY_OP_I64_TO_STR ||
@@ -12570,10 +12759,7 @@ static void rv64_codegen_op(Code *code, BodyIR *body, Symbols *symbols,
                kind == BODY_OP_ARGV_STR ||
                kind == BODY_OP_OPEN || kind == BODY_OP_READ || kind == BODY_OP_CLOSE ||
                kind == BODY_OP_TIME_NS || kind == BODY_OP_GETRUSAGE ||
-               kind == BODY_OP_GETENV_STR || kind == BODY_OP_ASSERT ||
-               kind == BODY_OP_WRITE_RAW || kind == BODY_OP_WRITE_BYTES ||
-               kind == BODY_OP_MAKE_SEQ_I32 ||
-               kind == BODY_OP_MAKE_SEQ_OPAQUE ||
+               kind == BODY_OP_GETENV_STR ||
                kind == BODY_OP_SEQ_I32_ADD || kind == BODY_OP_SEQ_STR_ADD ||
                kind == BODY_OP_SEQ_STR_INDEX_DYNAMIC ||
                kind == BODY_OP_SEQ_OPAQUE_INDEX_DYNAMIC ||
@@ -12581,7 +12767,9 @@ static void rv64_codegen_op(Code *code, BodyIR *body, Symbols *symbols,
                kind == BODY_OP_SEQ_OPAQUE_INDEX_STORE ||
                kind == BODY_OP_SEQ_OPAQUE_REMOVE ||
                kind == BODY_OP_SEQ_OPAQUE_INDEX_REF_DYNAMIC ||
-               kind == BODY_OP_HEAP_ALLOC || kind == BODY_OP_HEAP_FREE) {
+               kind == BODY_OP_BYTES_GET || kind == BODY_OP_BYTES_SET ||
+               kind == BODY_OP_BYTES_TO_HEX || kind == BODY_OP_PATH_WRITE_BYTES ||
+               kind == BODY_OP_SEQ_SET_LEN) {
         fprintf(stderr, "cheng_cold: unsupported RV64 BodyIR op kind=%d\n", kind);
         die("unsupported RV64 BodyIR op");
     } else {
