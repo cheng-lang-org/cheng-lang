@@ -4490,6 +4490,89 @@ ACT=$(compile_obj_smoke "std_crash_trace_internal" "src/std/crash_trace_internal
 assert "std_crash_trace_internal_cold_compile_smoke" 1 "$ACT"
 ACT=$(compile_obj_smoke "std_net_ipaddr" "src/std/net/ipaddr.cheng")
 assert "std_net_ipaddr_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_async_rt" "src/std/async_rt.cheng")
+assert "std_async_rt_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_async_rt_legacy" "src/std/async_rt_legacy.cheng")
+assert "std_async_rt_legacy_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_crypto_aes" "src/std/crypto/aes.cheng")
+assert "std_crypto_aes_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_crypto_aesgcm" "src/std/crypto/aesgcm.cheng")
+assert "std_crypto_aesgcm_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_crypto_bigint" "src/std/crypto/bigint.cheng")
+assert "std_crypto_bigint_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_crypto_chacha20poly1305" "src/std/crypto/chacha20poly1305.cheng")
+assert "std_crypto_chacha20poly1305_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_crypto_curve25519" "src/std/crypto/curve25519.cheng")
+assert "std_crypto_curve25519_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_crypto_ed25519_ref10" "src/std/crypto/ed25519/ref10.cheng")
+assert "std_crypto_ed25519_ref10_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_crypto_fixed256" "src/std/crypto/fixed256.cheng")
+assert "std_crypto_fixed256_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_crypto_gf256" "src/std/crypto/gf256.cheng")
+assert "std_crypto_gf256_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_crypto_hash256" "src/std/crypto/hash256.cheng")
+assert "std_crypto_hash256_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_crypto_hkdf" "src/std/crypto/hkdf.cheng")
+assert "std_crypto_hkdf_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_crypto_minasn1" "src/std/crypto/minasn1.cheng")
+assert "std_crypto_minasn1_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_crypto_p256_fixed" "src/std/crypto/p256_fixed.cheng")
+assert "std_crypto_p256_fixed_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_crypto_rand" "src/std/crypto/rand.cheng")
+assert "std_crypto_rand_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_crypto_rsa" "src/std/crypto/rsa.cheng")
+assert "std_crypto_rsa_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_crypto_sha1" "src/std/crypto/sha1.cheng")
+assert "std_crypto_sha1_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_crypto_sha256" "src/std/crypto/sha256.cheng")
+assert "std_crypto_sha256_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_crypto_sha384" "src/std/crypto/sha384.cheng")
+assert "std_crypto_sha384_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_crypto_sha512" "src/std/crypto/sha512.cheng")
+assert "std_crypto_sha512_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_multiformats_base58" "src/std/multiformats/base58.cheng")
+assert "std_multiformats_base58_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_multiformats_multiaddress" "src/std/multiformats/multiaddress.cheng")
+assert "std_multiformats_multiaddress_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_multiformats_multibase" "src/std/multiformats/multibase.cheng")
+assert "std_multiformats_multibase_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_multiformats_multicodec" "src/std/multiformats/multicodec.cheng")
+assert "std_multiformats_multicodec_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_multiformats_multihash" "src/std/multiformats/multihash.cheng")
+assert "std_multiformats_multihash_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_net_bandwidthmanager" "src/std/net/bandwidthmanager.cheng")
+assert "std_net_bandwidthmanager_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_net_memorymanager" "src/std/net/memorymanager.cheng")
+assert "std_net_memorymanager_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_net_resourcemanager" "src/std/net/resourcemanager.cheng")
+assert "std_net_resourcemanager_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_net_stream_bufferstream" "src/std/net/stream/bufferstream.cheng")
+assert "std_net_stream_bufferstream_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_net_stream_connection" "src/std/net/stream/connection.cheng")
+assert "std_net_stream_connection_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_net_transports_tcp_syscall" "src/std/net/transports/tcp_syscall.cheng")
+assert "std_net_transports_tcp_syscall_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_net_transports_udp_syscall" "src/std/net/transports/udp_syscall.cheng")
+assert "std_net_transports_udp_syscall_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_net_utils_zeroqueue" "src/std/net/utils/zeroqueue.cheng")
+assert "std_net_utils_zeroqueue_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_option" "src/std/option.cheng")
+assert "std_option_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_os_host_process" "src/std/os_host_process.cheng")
+assert "std_os_host_process_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_os" "src/std/os.cheng")
+assert "std_os_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_sequninit" "src/std/sequninit.cheng")
+assert "std_sequninit_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_sync" "src/std/sync.cheng")
+assert "std_sync_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_system" "src/std/system.cheng")
+assert "std_system_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_times" "src/std/times.cheng")
+assert "std_times_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_tls_x509" "src/std/tls/x509.cheng")
+assert "std_tls_x509_cold_compile_smoke" 1 "$ACT"
+
 
 # --- compile_obj_smoke for remaining untested chain and runtime files ---
 ACT=$(compile_obj_smoke "chain_pin_plane" "src/chain/pin_plane.cheng")
@@ -4529,6 +4612,134 @@ for pb_entry in \
     assert "perf_bench_${pb_tag}_${pb_ms}ms" 1 "$ACT"
     rm -f "/tmp/ct_pb_${pb_tag}.o" "/tmp/ct_pb_${pb_tag}.report"
 done
+
+# --- multi-target stress test ---
+for mt_entry in \
+    "std_json:src/std/json.cheng" \
+    "std_sha256:src/std/crypto/sha256.cheng" \
+    "std_strings:src/std/strings.cheng" \
+    "std_tables:src/std/tables.cheng" \
+    "std_bytes:src/std/bytes.cheng"; do
+    mt_tag="${mt_entry%%:*}"; mt_src="${mt_entry#*:}"
+    for mt_target in "arm64-apple-darwin" "wasm32-unknown-unknown"; do
+        mt_full="${mt_tag}_${mt_target%%-*}"
+        rm -f "/tmp/ct_mt_${mt_full}.o" "/tmp/ct_mt_${mt_full}.report"
+        quiet $COLD system-link-exec --root:"$PWD" \
+            --in:"$mt_src" --target:"$mt_target" \
+            --out:"/tmp/ct_mt_${mt_full}.o" --emit:obj \
+            --report-out:"/tmp/ct_mt_${mt_full}.report"
+        if [ -s "/tmp/ct_mt_${mt_full}.o" ] && \
+           ! grep -q '^error=' "/tmp/ct_mt_${mt_full}.report" 2>/dev/null; then
+            ACT=1; else ACT=0; fi
+        assert "multitarget_${mt_full}" 1 "$ACT"
+        rm -f "/tmp/ct_mt_${mt_full}.o" "/tmp/ct_mt_${mt_full}.report"
+    done
+done
+
+# --- std library import all test ---
+cat > /tmp/ct_import_all_std.cheng << 'CHENGEOF'
+import std/algorithm
+import std/async_rt
+import std/atomic
+import std/buffer
+import std/bytes
+import std/cmdline
+import std/crash_trace_internal
+import std/hashsets
+import std/json
+import std/monotimes
+import std/option as std_opt_alias
+import std/os
+import std/os_host_process
+import std/parseutils
+import std/rawbytes
+import std/rawmem_support
+import std/result
+import std/sequninit
+import std/streams
+import std/strformat
+import std/stringlist
+import std/strings
+import std/strutils
+import std/sync
+import std/system
+import std/tables
+import std/thread
+import std/times
+import std/varint
+import std/crypto/aes
+import std/crypto/aesgcm
+import std/crypto/bigint
+import std/crypto/chacha20poly1305
+import std/crypto/curve25519
+import std/crypto/ed25519/ref10
+import std/crypto/fixed256
+import std/crypto/gf256
+import std/crypto/hash256
+import std/crypto/hkdf
+import std/crypto/minasn1
+import std/crypto/p256_fixed
+import std/crypto/rand
+import std/crypto/rsa
+import std/crypto/sha1
+import std/crypto/sha256
+import std/crypto/sha384
+import std/crypto/sha512
+import std/multiformats/base58
+import std/multiformats/multiaddress
+import std/multiformats/multibase
+import std/multiformats/multicodec
+import std/multiformats/multihash
+import std/net/bandwidthmanager
+import std/net/ipaddr
+import std/net/memorymanager
+import std/net/resourcemanager
+import std/net/stream/bufferstream
+import std/net/stream/connection
+import std/net/transports/tcp_syscall
+import std/net/transports/udp_syscall
+import std/net/utils/zeroqueue
+import std/tls/x509
+fn main(): int32 = return 0
+CHENGEOF
+rm -f /tmp/ct_import_all_std_out /tmp/ct_import_all_std.report
+quiet $COLD system-link-exec --in:/tmp/ct_import_all_std.cheng \
+    --target:arm64-apple-darwin --out:/tmp/ct_import_all_std_out \
+    --report-out:/tmp/ct_import_all_std.report
+if [ -x /tmp/ct_import_all_std_out ] && \
+   ! grep -q '^error=' /tmp/ct_import_all_std.report 2>/dev/null; then
+    /tmp/ct_import_all_std_out >/dev/null 2>&1; ACT=$?
+else
+    ACT="COMPILE_FAILED"
+fi
+assert "import_all_std" 0 "$ACT"
+rm -f /tmp/ct_import_all_std.cheng /tmp/ct_import_all_std_out /tmp/ct_import_all_std.report
+
+# --- std runtime execution tests ---
+cat > /tmp/ct_std_monotimes_smoke.cheng << ''CHENGEOF''
+import std/monotimes
+fn main(): int32 =
+    let t = GetMonoTime()
+    let ns = MonoTimeNs(t)
+    if ns > int64(0): return 1
+    return 0
+CHENGEOF
+ACT=$(compile_run /tmp/ct_std_monotimes_smoke.cheng /tmp/ct_std_monotimes_smoke_out)
+assert "std_monotimes_now" 1 "$ACT"
+rm -f /tmp/ct_std_monotimes_smoke.cheng /tmp/ct_std_monotimes_smoke_out
+
+cat > /tmp/ct_std_strings_smoke.cheng << ''CHENGEOF''
+import std/strings
+fn main(): int32 =
+    let s = "hello, world"
+    if len(s) == 12: return 1
+    return 0
+CHENGEOF
+ACT=$(compile_run /tmp/ct_std_strings_smoke.cheng /tmp/ct_std_strings_smoke_out)
+assert "std_strings_len_runtime" 1 "$ACT"
+rm -f /tmp/ct_std_strings_smoke.cheng /tmp/ct_std_strings_smoke_out
+
+
 
 # ============================================================
 # 16: E-Graph rewrite rule completeness test

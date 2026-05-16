@@ -21,7 +21,45 @@ Parser parser_child(Parser *owner, Span source) {
     child.import_source_count = owner->import_source_count;
     child.function_bodies = owner->function_bodies;
     child.function_body_cap = owner->function_body_cap;
+    child.source_path = owner->source_path;
     return child;
+}
+
+/* Return 1-based line number for token in parser source */
+static int32_t cold_token_line(Parser *parser, Span token) {
+    int32_t offset = cold_span_offset(parser->source, token);
+    if (offset < 0) return 1;
+    int32_t line = 1;
+    for (int32_t i = 0; i < offset && i < parser->source.len; i++) {
+        if (parser->source.ptr[i] == '\n') line++;
+    }
+    return line;
+}
+
+/* Print source context line containing token, with caret underline */
+static void cold_print_context(Parser *parser, Span token) {
+    int32_t offset = cold_span_offset(parser->source, token);
+    if (offset < 0) return;
+    int32_t line_start = offset;
+    while (line_start > 0 && parser->source.ptr[line_start - 1] != '\n') line_start--;
+    int32_t line_end = offset;
+    while (line_end < parser->source.len && parser->source.ptr[line_end] != '\n') line_end++;
+    if (line_end <= line_start) return;
+    fprintf(stderr, "  |\n  | %.*s\n  |", (int)(line_end - line_start), parser->source.ptr + line_start);
+    for (int32_t i = line_start; i < line_end; i++) {
+        if (i >= offset && i < offset + token.len) fprintf(stderr, "^");
+        else if (i < offset) fprintf(stderr, " ");
+    }
+    fprintf(stderr, "\n");
+}
+
+/* Print file:line: offset for error messages */
+static void cold_error_loc(Parser *parser, Span token) {
+    int32_t offset = cold_span_offset(parser->source, token);
+    int32_t line = cold_token_line(parser, token);
+    if (offset < 0) { fprintf(stderr, "???"); return; }
+    fprintf(stderr, "%s:%d (offset %d)",
+            parser->source_path ? parser->source_path : "?", line, offset);
 }
 
 void parser_ws(Parser *parser) {
@@ -1963,8 +2001,11 @@ void parse_const_member_line(Parser *parser, Span line) {
     }
     int32_t eq = cold_span_find_top_level_char(trimmed, '=');
     if (eq <= 0) {
-        fprintf(stderr, "cheng_cold: invalid const declaration: %.*s\n",
+        fprintf(stderr, "cheng_cold: ");
+        cold_error_loc(parser, trimmed);
+        fprintf(stderr, " invalid const declaration: '%.*s'\n",
                 trimmed.len, trimmed.ptr);
+        cold_print_context(parser, trimmed);
         die("invalid const declaration");
     }
     Span head = span_trim(span_sub(trimmed, 0, eq));
@@ -2096,11 +2137,14 @@ static bool cold_trailing_params_have_defaults(FnDef *fn, int32_t arg_count) {
     return true;
 }
 
-static void cold_die_call_arg_mismatch(BodyIR *body, FnDef *fn,
+static void cold_die_call_arg_mismatch(Parser *parser, Span name,
+                                       BodyIR *body, FnDef *fn,
                                        int32_t arg_start, int32_t arg_count) {
-    fprintf(stderr,
-            "cheng_cold: call arg mismatch callee=%.*s expected=%d actual=%d\n",
+    fprintf(stderr, "cheng_cold: ");
+    cold_error_loc(parser, name);
+    fprintf(stderr, " call arg mismatch callee=%.*s expected=%d actual=%d\n",
             (int)fn->name.len, fn->name.ptr, fn->arity, arg_count);
+    cold_print_context(parser, name);
     int32_t n = arg_count < fn->arity ? arg_count : fn->arity;
     for (int32_t i = 0; i < n; i++) {
         int32_t arg_slot = body->call_arg_slot[arg_start + i];
@@ -2923,18 +2967,12 @@ int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *locals,
     }
     if (!parser_take(parser, ")")) {
         Span got = parser_peek(parser);
-        int32_t ls = parser->pos;
-        while (ls > 0 && parser->source.ptr[ls - 1] != '\n') ls--;
-        int32_t le = parser->pos;
-        while (le < parser->source.len && parser->source.ptr[le] != '\n') le++;
-        fprintf(stderr,
-                "cheng_cold: malformed call name=%.*s body=%.*s got=%.*s pos=%d len=%d line=%.*s\n",
+        fprintf(stderr, "cheng_cold: ");
+        cold_error_loc(parser, name);
+        fprintf(stderr, " malformed call name='%.*s' got='%.*s'\n",
                 (int)name.len, name.ptr,
-                body && body->debug_name.len > 0 ? (int)body->debug_name.len : 0,
-                body && body->debug_name.len > 0 ? body->debug_name.ptr : (const uint8_t *)"",
-                (int)got.len, got.ptr,
-                parser->pos, parser->source.len,
-                le - ls, parser->source.ptr + ls);
+                (int)got.len, got.ptr);
+        cold_print_context(parser, got);
         die("malformed function call missing )");
     }
     int32_t arg_start = body->call_arg_count;
@@ -3238,20 +3276,21 @@ int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *locals,
             if (kind_out) *kind_out = SLOT_I32;
             return slot;
         }
-        fprintf(stderr, "cheng_cold: unresolved function call name=%.*s body=%.*s\n",
-                (int)lookup_name.len, lookup_name.ptr,
-                body && body->debug_name.len > 0 ? (int)body->debug_name.len : 0,
-                body && body->debug_name.len > 0 ? body->debug_name.ptr : (uint8_t *)"");
+        fprintf(stderr, "cheng_cold: ");
+        cold_error_loc(parser, lookup_name);
+        fprintf(stderr, " unresolved function call '%.*s'\n",
+                (int)lookup_name.len, lookup_name.ptr);
+        cold_print_context(parser, lookup_name);
         cold_print_same_name_call_candidates(parser->symbols, body, lookup_name,
                                              arg_start, arg_count);
         die("unresolved function call");
     }
-		    FnDef *fn = &parser->symbols->functions[fn_index];
-        cold_validate_explicit_generic_call(parser, fn, explicit_generic_args);
-	        cold_materialize_specialized_body_if_needed(parser, fn_index);
-	    cold_apply_contextual_empty_sequence_args(body, parser->symbols, fn, arg_start, arg_count);
-	    if (!cold_validate_call_args(body, fn, arg_start, arg_count, parser->import_mode)) {
-	        cold_die_call_arg_mismatch(body, fn, arg_start, arg_count);
+	FnDef *fn = &parser->symbols->functions[fn_index];
+	cold_validate_explicit_generic_call(parser, fn, explicit_generic_args);
+	cold_materialize_specialized_body_if_needed(parser, fn_index);
+	cold_apply_contextual_empty_sequence_args(body, parser->symbols, fn, arg_start, arg_count);
+	if (!cold_validate_call_args(body, fn, arg_start, arg_count, parser->import_mode)) {
+		cold_die_call_arg_mismatch(parser, lookup_name, body, fn, arg_start, arg_count);
 	    }
     if (cold_fn_is_rawbytes_bytes_alloc(fn, lookup_name)) {
         return cold_emit_bytes_alloc_call(parser, body, fn, arg_start, arg_count, kind_out);
@@ -3536,20 +3575,21 @@ int32_t parse_call_from_args_span(Parser *owner, BodyIR *body, Locals *locals,
             if (kind_out) *kind_out = SLOT_I32;
             return slot;
         }
-        fprintf(stderr, "cheng_cold: unresolved function call name=%.*s body=%.*s\n",
-                (int)lookup_name.len, lookup_name.ptr,
-                body && body->debug_name.len > 0 ? (int)body->debug_name.len : 0,
-                body && body->debug_name.len > 0 ? body->debug_name.ptr : (uint8_t *)"");
+        fprintf(stderr, "cheng_cold: ");
+        cold_error_loc(owner, lookup_name);
+        fprintf(stderr, " unresolved function call '%.*s'\n",
+                (int)lookup_name.len, lookup_name.ptr);
+        cold_print_context(owner, lookup_name);
         cold_print_same_name_call_candidates(owner->symbols, body, lookup_name,
                                              arg_start, arg_count);
         die("unresolved function call");
     }
-		    FnDef *fn = &owner->symbols->functions[fn_index];
-        cold_validate_explicit_generic_call(owner, fn, explicit_generic_args);
-	        cold_materialize_specialized_body_if_needed(owner, fn_index);
-	    cold_apply_contextual_empty_sequence_args(body, owner->symbols, fn, arg_start, arg_count);
-	    if (!cold_validate_call_args(body, fn, arg_start, arg_count, owner->import_mode)) {
-	        cold_die_call_arg_mismatch(body, fn, arg_start, arg_count);
+	FnDef *fn = &owner->symbols->functions[fn_index];
+	cold_validate_explicit_generic_call(owner, fn, explicit_generic_args);
+	cold_materialize_specialized_body_if_needed(owner, fn_index);
+	cold_apply_contextual_empty_sequence_args(body, owner->symbols, fn, arg_start, arg_count);
+	if (!cold_validate_call_args(body, fn, arg_start, arg_count, owner->import_mode)) {
+		cold_die_call_arg_mismatch(owner, lookup_name, body, fn, arg_start, arg_count);
 	    }
     if (cold_fn_is_rawbytes_bytes_alloc(fn, lookup_name)) {
         return cold_emit_bytes_alloc_call(owner, body, fn, arg_start, arg_count, kind_out);
@@ -7370,9 +7410,11 @@ int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32_t *kin
                 *kind = SLOT_I32;
                 return zero;
             }
-            fprintf(stderr, "cheng_cold: unsupported qualified expression name=%.*s offset=%d\n",
-                    call_name.len, call_name.ptr,
-                    cold_span_offset(parser->source, call_name));
+            fprintf(stderr, "cheng_cold: ");
+            cold_error_loc(parser, call_name);
+            fprintf(stderr, " unsupported qualified expression '%.*s'\n",
+                    (int)call_name.len, call_name.ptr);
+            cold_print_context(parser, call_name);
             die("unsupported qualified expression");
         }
         return parse_call_after_name(parser, body, locals, call_name, kind);
@@ -7522,9 +7564,11 @@ int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32_t *kin
             *kind = SLOT_I32;
             return zero;
         }
-        fprintf(stderr, "cheng_cold: unknown qualified identifier token=%.*s qualified=%.*s offset=%d\n",
-                token.len, token.ptr, qualified.len, qualified.ptr,
-                cold_span_offset(parser->source, qualified));
+        fprintf(stderr, "cheng_cold: ");
+        cold_error_loc(parser, token);
+        fprintf(stderr, " unknown qualified identifier '%.*s' in '%.*s'\n",
+                (int)token.len, token.ptr, qualified.len, qualified.ptr);
+        cold_print_context(parser, token);
         die("unknown qualified identifier");
     }
     ConstDef *constant = parser_find_const(parser, token);
@@ -7612,11 +7656,11 @@ int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32_t *kin
         *kind = SLOT_I32;
         return zero;
     }
-    fprintf(stderr, "cheng_cold: unknown identifier token=%.*s body=%.*s offset=%d\n",
-            (int)token.len, token.ptr,
-            body && body->debug_name.len > 0 ? (int)body->debug_name.len : 0,
-            body && body->debug_name.len > 0 ? body->debug_name.ptr : (uint8_t *)"",
-            cold_span_offset(parser->source, token));
+    fprintf(stderr, "cheng_cold: ");
+    cold_error_loc(parser, token);
+    fprintf(stderr, " unknown identifier '%.*s'\n",
+            (int)token.len, token.ptr);
+    cold_print_context(parser, token);
     die("unknown identifier");
     return -1;
 }
@@ -9326,16 +9370,11 @@ void parse_assign(Parser *parser, BodyIR *body, Locals *locals, Span name) {
         if (global) local = locals_add_global_shadow(parser, body, locals, name, global);
     }
     if (!local) {
-        int32_t ls = parser->pos;
-        while (ls > 0 && parser->source.ptr[ls - 1] != '\n') ls--;
-        int32_t le = parser->pos;
-        while (le < parser->source.len && parser->source.ptr[le] != '\n') le++;
-        fprintf(stderr, "cheng_cold: assignment target is not local/global: %.*s body=%.*s pos=%d\n",
-                (int)name.len, name.ptr,
-                body && body->debug_name.len > 0 ? (int)body->debug_name.len : 0,
-                body && body->debug_name.len > 0 ? body->debug_name.ptr : (uint8_t *)"",
-                parser->pos);
-        fprintf(stderr, "cheng_cold: assignment line: %.*s\n", le - ls, parser->source.ptr + ls);
+        fprintf(stderr, "cheng_cold: ");
+        cold_error_loc(parser, name);
+        fprintf(stderr, " assignment target is not local/global: '%.*s'\n",
+                (int)name.len, name.ptr);
+        cold_print_context(parser, name);
         die("assignment target must be local or global");
     }
     if (!parser_take(parser, "=")) die("expected = in assignment");
@@ -9410,13 +9449,11 @@ void parse_assign(Parser *parser, BodyIR *body, Locals *locals, Span name) {
     if (local->kind == SLOT_OBJECT_REF) {
         if (kind != SLOT_OBJECT && kind != SLOT_OBJECT_REF &&
             kind != SLOT_OPAQUE && kind != SLOT_OPAQUE_REF) {
-            int32_t ls = parser->pos;
-            while (ls > 0 && parser->source.ptr[ls - 1] != '\n') ls--;
-            int32_t le = parser->pos;
-            while (le < parser->source.len && parser->source.ptr[le] != '\n') le++;
-            fprintf(stderr, "cheng_cold: object ref assignment mismatch target=%.*s local_kind=%d value_kind=%d line=%.*s\n",
-                    (int)name.len, name.ptr, local->kind, kind,
-                    le - ls, parser->source.ptr + ls);
+            fprintf(stderr, "cheng_cold: ");
+            cold_error_loc(parser, name);
+            fprintf(stderr, " object ref assignment mismatch target='%.*s' local_kind=%d value_kind=%d\n",
+                    (int)name.len, name.ptr, local->kind, kind);
+            cold_print_context(parser, name);
             die("object ref assignment value kind mismatch");
         }
         int32_t copy_size = body->slot_size[slot];

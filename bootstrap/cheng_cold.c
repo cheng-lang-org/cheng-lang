@@ -5530,6 +5530,7 @@ typedef struct Parser {
     BodyIR **function_bodies;   /* for storing closure/anonymous function bodies */
     int32_t function_body_cap;  /* capacity of function_bodies array */
     int32_t closure_count;      /* counter for generating unique closure names */
+    const char *source_path;    /* path to source file, for error messages (NULL if unknown) */
 } Parser;
 
 /* ================================================================
@@ -15634,12 +15635,7 @@ static void cold_die_missing_reachable_body(Symbols *symbols, int32_t fn_index) 
 static void cold_diag_dump_target_body(Symbols *symbols, int32_t fn_index, BodyIR *body) {
     if (!cold_diag_dump_slots || !symbols || !body ||
         fn_index < 0 || fn_index >= symbols->function_count) return;
-    if (!span_same(symbols->functions[fn_index].name,
-                   cold_cstr_span("layout.byteBufToBytes")) &&
-        !span_same(symbols->functions[fn_index].name,
-                   cold_cstr_span("layout.fixedBytes32FromBytes")) &&
-        !span_same(symbols->functions[fn_index].name,
-                   cold_cstr_span("rawbytes.BytesAlloc"))) return;
+    if (0) { /* skip filter */ }
     fprintf(stderr, "[diag-body] fn[%d] ", fn_index);
     cold_diag_fn_name(symbols->functions[fn_index].name);
     fprintf(stderr, " slots=%d ops=%d blocks=%d terms=%d frame=%d\n",
@@ -19211,6 +19207,7 @@ static int32_t cold_compile_one_import_direct(Symbols *symbols, const char *path
     parser.import_source_count = local_import_count;
     parser.function_bodies = function_bodies;
     parser.function_body_cap = body_cap;
+    parser.source_path = path;
     fn_pos = 0;
     while (parser.pos < source.len) {
         parser_ws(&parser);
@@ -19577,6 +19574,7 @@ static void cold_compile_import_function_direct(Symbols *symbols,
                          true /* import_mode */, import_source->alias};
         parser.import_sources = local_imports;
         parser.import_source_count = local_import_count;
+        parser.source_path = import_source->path;
         int32_t parsed_index = -1;
         BodyIR *body = parse_fn(&parser, &parsed_index);
         if (!body) {
@@ -19933,6 +19931,7 @@ bool cold_compile_source_path_to_macho(const char *out_path,
         parser.import_source_count = import_source_count;
         parser.function_bodies = function_bodies;
         parser.function_body_cap = body_cap;
+        parser.source_path = src_path;
         while (parser.pos < mapped_source.len) {
             parser_ws(&parser);
             if (parser.pos >= mapped_source.len) break;
@@ -23247,7 +23246,8 @@ static void wasm_codegen_op(WasmCode *wasm, BodyIR *body, Symbols *symbols,
     /* Calls */
     case BODY_OP_CALL_I32: {
         int32_t wf = (a >= 0 && a < symbols->function_count) ? func_to_wasm_idx[a] : a;
-        for (int32_t ai = 0; ai < c; ai++) {
+        int32_t arg_count = (a >= 0 && a < symbols->function_count) ? symbols->functions[a].arity : c;
+        for (int32_t ai = 0; ai < arg_count; ai++) {
             int32_t arg_slot = body->call_arg_slot[b + ai];
             wasm_op_local_get(wasm, (uint32_t)wasm_local_for_slot(body, arg_slot));
         }
@@ -25454,7 +25454,8 @@ static void wasm_codegen_op(WasmCode *wasm, BodyIR *body, Symbols *symbols,
 static int wasm_emit_block_recursive(WasmCode *wasm, BodyIR *body, Symbols *symbols,
                                       FunctionPatchList *patches, int32_t bi,
                                       int32_t *func_to_wasm_idx, bool *absorbed,
-                                      int32_t func_idx, int32_t nesting_depth) {
+                                      int32_t func_idx, int32_t nesting_depth,
+                                      bool *is_loop_header) {
     if (bi < 0 || bi >= body->block_count || absorbed[bi]) return 0;
     absorbed[bi] = true;
 
@@ -25484,27 +25485,59 @@ static int wasm_emit_block_recursive(WasmCode *wasm, BodyIR *body, Symbols *symb
         return 1;
     } else if (tkind == BODY_TERM_BR) {
         int32_t target = body->term_true_block[term];
+        /* Bridge blocks (0 ops) are NOP forwarders - always fall through.
+         * This check must come before the backward-target check because bridge
+         * blocks in merge chains may have BR targets earlier in the block
+         * ordering (appearing backward) but are not loop continues. */
+        if (body->block_op_count[bi] == 0) {
+            return 0;
+        }
         if (target >= 0 && target < bi) {
             /* Backward branch = loop continue.
              * br must skip (nesting_depth) IF labels to reach the LOOP label. */
             wasm_op_br(wasm, (uint32_t)nesting_depth);
             return 1;
         }
-        /* Forward branch: if inside a CBR/SWITCH IF, emit br 0 to skip ELSE
-         * and land after the IF/ELSE/END. Otherwise, fall through is correct. */
+        /* Forward branch: at depth>0 (inside IF), emit br 0 to exit IF */
         if (nesting_depth > 0) {
             wasm_op_br(wasm, 0);
             return 1;
+        }
+        /* At depth 0, chain to target if not a loop header */
+        if (target >= 0 && target < body->block_count && !absorbed[target] &&
+            !is_loop_header[target]) {
+            return wasm_emit_block_recursive(wasm, body, symbols, patches, target,
+                                              func_to_wasm_idx, absorbed, func_idx,
+                                              0, is_loop_header);
         }
         /* Fall through (next block in linear order) */
         return 0;
     } else if (tkind == BODY_TERM_CBR) {
         int32_t cond_slot = body->term_value[term];
+        int32_t cond_op = body->term_case_start[term];
+        int32_t cmp_slot = body->term_case_count[term];
         int32_t tb = body->term_true_block[term];
         int32_t fb = body->term_false_block[term];
 
-        /* Load condition value (0 or 1, non-zero = true) */
-        wasm_op_local_get(wasm, (uint32_t)wasm_local_for_slot(body, cond_slot));
+        /* Emit comparison: cond_slot COND cmp_slot → pushes 0 or 1 onto the stack.
+         * CBR always represents left_operand COND right_operand.
+         * Most common: value != 0 (boolean check), iter < limit (for loop), tag == err_tag (unwrap). */
+        wasm_op_local_get(wasm, wasm_local_for_slot(body, cond_slot));
+        wasm_op_local_get(wasm, wasm_local_for_slot(body, cmp_slot));
+        if (cond_op == COND_EQ) wasm_emit1(wasm, WASM_OP_I32_EQ);
+        else if (cond_op == COND_NE) wasm_emit1(wasm, WASM_OP_I32_NE);
+        else if (cond_op == COND_LT) wasm_emit1(wasm, WASM_OP_I32_LT_S);
+        else if (cond_op == COND_GE) {
+            wasm_emit1(wasm, WASM_OP_I32_LT_S);
+            wasm_emit1(wasm, WASM_OP_I32_EQZ);
+        } else if (cond_op == COND_GT) {
+            wasm_emit1(wasm, WASM_OP_I32_GT_S);
+        } else if (cond_op == COND_LE) {
+            wasm_emit1(wasm, WASM_OP_I32_GT_S);
+            wasm_emit1(wasm, WASM_OP_I32_EQZ);
+        } else {
+            die("unsupported CBR comparison operator");
+        }
 
         /* if cond { ... } else { ... } end */
         wasm_emit1(wasm, WASM_OP_IF);
@@ -25513,23 +25546,61 @@ static int wasm_emit_block_recursive(WasmCode *wasm, BodyIR *body, Symbols *symb
         /* Emit true branch block recursively (inside IF, depth+1) */
         int tb_term = wasm_emit_block_recursive(wasm, body, symbols, patches, tb,
                                                   func_to_wasm_idx, absorbed, func_idx,
-                                                  nesting_depth + 1);
+                                                  nesting_depth + 1, is_loop_header);
         /* If true block didn't terminate, add br 0 to skip the ELSE */
         if (!tb_term) {
             wasm_op_br(wasm, 0);
         }
 
         /* Emit false branch if present and not already absorbed */
+        int fb_term = 0;
         if (fb >= 0 && fb < body->block_count && !absorbed[fb]) {
             wasm_emit1(wasm, WASM_OP_ELSE);
-            wasm_emit_block_recursive(wasm, body, symbols, patches, fb,
+            fb_term = wasm_emit_block_recursive(wasm, body, symbols, patches, fb,
                                       func_to_wasm_idx, absorbed, func_idx,
-                                      nesting_depth + 1);
+                                      nesting_depth + 1, is_loop_header);
         }
 
         wasm_emit1(wasm, WASM_OP_END);
-        /* CBR does NOT terminate: execution continues after IF/ELSE/END */
-        return 0;
+        /* Emit merge point chain if both branches forward-BR to the same non-loop target.
+         * Follow bridge blocks (forward BR with no ops) until the chain terminates. */
+        int merge_terminated = 0;
+        if (tb >= 0 && fb >= 0 && tb < body->block_count && fb < body->block_count) {
+            int32_t tt = body->block_term[tb];
+            int32_t ft = body->block_term[fb];
+            if (tt >= 0 && ft >= 0 &&
+                body->term_kind[tt] == BODY_TERM_BR &&
+                body->term_kind[ft] == BODY_TERM_BR) {
+                int32_t tb_target = body->term_true_block[tt];
+                int32_t fb_target = body->term_true_block[ft];
+                if (tb_target == fb_target && tb_target >= 0 &&
+                    !absorbed[tb_target] && !is_loop_header[tb_target]) {
+                    int32_t mt = tb_target;
+                    while (mt >= 0 && !absorbed[mt] && !is_loop_header[mt]) {
+                        int merged_term = wasm_emit_block_recursive(wasm, body, symbols,
+                                          patches, mt, func_to_wasm_idx, absorbed,
+                                          func_idx, nesting_depth, is_loop_header);
+                        if (merged_term) { merge_terminated = 1; break; }
+                        /* Follow bridge block chain (forward BR, continue chain) */
+                        int32_t mti = body->block_term[mt];
+                        if (mti >= 0 && body->term_kind[mti] == BODY_TERM_BR) {
+                            int32_t nxt = body->term_true_block[mti];
+                            if (nxt >= 0 && nxt > mt &&
+                                !absorbed[nxt] && !is_loop_header[nxt]) {
+                                mt = nxt;
+                            } else break;
+                        } else break;
+                    }
+                }
+            }
+        }
+        /* CBR terminates if both branches terminate OR merge point chain terminated.
+         * Emit unreachable instruction to make function implicit return valid. */
+        int both_terminate = tb_term && (fb < 0 || fb_term);
+        if (both_terminate || merge_terminated) {
+            wasm_emit1(wasm, WASM_OP_UNREACHABLE);
+        }
+        return both_terminate || merge_terminated;
     } else if (tkind == BODY_TERM_SWITCH) {
         /* SWITCH: emit as nested if-else chain over tag values.
          * Reload tag from local for each comparison (WASM stack machine). */
@@ -25558,7 +25629,8 @@ static int wasm_emit_block_recursive(WasmCode *wasm, BodyIR *body, Symbols *symb
             int case_term = wasm_emit_block_recursive(wasm, body, symbols, patches,
                                                        target_block,
                                                        func_to_wasm_idx, absorbed,
-                                                       func_idx, nesting_depth + 1);
+                                                       func_idx, nesting_depth + 1,
+                                                       is_loop_header);
             /* If case block didn't terminate, br 0 to skip remaining ELSE chain */
             if (!case_term) {
                 wasm_op_br(wasm, 0);
@@ -25573,7 +25645,7 @@ static int wasm_emit_block_recursive(WasmCode *wasm, BodyIR *body, Symbols *symb
             if (default_block >= 0 && !absorbed[default_block]) {
                 wasm_emit_block_recursive(wasm, body, symbols, patches, default_block,
                                           func_to_wasm_idx, absorbed, func_idx,
-                                          nesting_depth + 1);
+                                          nesting_depth + 1, is_loop_header);
             }
         }
 
@@ -25619,12 +25691,55 @@ static void wasm_codegen_func(WasmCode *wasm, BodyIR *body, Symbols *symbols,
         int32_t tkind = body->term_kind[term_idx];
         if (tkind == BODY_TERM_BR) {
             int32_t target = body->term_true_block[term_idx];
-            if (target >= 0 && target < bi) is_loop_header[target] = true;
+            if (target >= 0 && target < bi) {
+                /* Only mark as loop header if the target has a CBR term (loop condition).
+                 * Bridge blocks with BR terms can have backward edges (e.g. chain merges)
+                 * without being actual loop headers. */
+                int32_t tt = body->block_term[target];
+                if (tt >= 0 && body->term_kind[tt] == BODY_TERM_CBR) {
+                    is_loop_header[target] = true;
+                }
+            }
         } else if (tkind == BODY_TERM_CBR) {
             int32_t tb = body->term_true_block[term_idx];
             int32_t fb = body->term_false_block[term_idx];
             if (tb >= 0 && tb < bi) is_loop_header[tb] = true;
             if (fb >= 0 && fb < bi) is_loop_header[fb] = true;
+        }
+    }
+
+    /* DEBUG: dump body blocks */
+    {
+        fprintf(stderr, "[wasm-body] fn=%d blocks=%d slots=%d\n",
+                func_idx, body->block_count, body->slot_count);
+        for (int32_t dbi = 0; dbi < body->block_count; dbi++) {
+            int32_t dt = body->block_term[dbi];
+            fprintf(stderr, "[wasm-body]   block[%d] ops=%d,%d term=%d",
+                    dbi, body->block_op_start[dbi], body->block_op_count[dbi], dt);
+            if (dt >= 0) {
+                int32_t tk = body->term_kind[dt];
+                fprintf(stderr, " tk=%d", tk);
+                if (tk == 1) fprintf(stderr, " RET val=%d", body->term_value[dt]);
+                else if (tk == 2) fprintf(stderr, " BR tgt=%d", body->term_true_block[dt]);
+                else if (tk == 3) fprintf(stderr, " CBR val=%d tb=%d fb=%d",
+                         body->term_value[dt], body->term_true_block[dt],
+                         body->term_false_block[dt]);
+                else if (tk == 4) fprintf(stderr, " SWITCH");
+                else if (tk == 5) fprintf(stderr, " UNREACHABLE");
+            }
+            int32_t lop_start = body->block_op_start[dbi];
+            int32_t lop_end = lop_start + body->block_op_count[dbi];
+            for (int32_t oi = lop_start; oi < lop_end; oi++) {
+                fprintf(stderr, " op[%d]=%d", oi, body->op_kind[oi]);
+                if (body->op_kind[oi] == 6) { /* CALL_I32 */
+                    fprintf(stderr, "(fn=%d)", body->op_a[oi]);
+                }
+            }
+            fprintf(stderr, "\n");
+        }
+        /* dump is_loop_header */
+        for (int32_t dbi = 0; dbi < body->block_count; dbi++) {
+            if (is_loop_header[dbi]) fprintf(stderr, "[wasm-body]   loop_header[%d]\n", dbi);
         }
     }
 
@@ -25642,14 +25757,24 @@ static void wasm_codegen_func(WasmCode *wasm, BodyIR *body, Symbols *symbols,
             wasm_emit1(wasm, WASM_BLOCK_TYPE_EMPTY);
 
             /* Emit loop body recursively from loop header */
-            wasm_emit_block_recursive(wasm, body, symbols, patches, bi,
-                                      func_to_wasm_idx, absorbed, func_idx, 0);
+            int loop_terminated = wasm_emit_block_recursive(wasm, body, symbols, patches, bi,
+                                      func_to_wasm_idx, absorbed, func_idx, 0,
+                                      is_loop_header);
 
             wasm_emit1(wasm, WASM_OP_END); /* end loop */
             wasm_emit1(wasm, WASM_OP_END); /* end block */
+            /* If the loop body always terminates (via return/br/unreachable),
+             * the code after the loop+block is unreachable. Emit unreachable so
+             * the function's implicit return (the body `end`) validates correctly.
+             * Without this, the WASM validator would expect [i32] on the stack
+             * at the function body's `end`, but the stack would be empty. */
+            if (loop_terminated) {
+                wasm_emit1(wasm, WASM_OP_UNREACHABLE);
+            }
         } else {
             wasm_emit_block_recursive(wasm, body, symbols, patches, bi,
-                                      func_to_wasm_idx, absorbed, func_idx, 0);
+                                      func_to_wasm_idx, absorbed, func_idx, 0,
+                                      is_loop_header);
         }
     }
 
@@ -25996,6 +26121,7 @@ bool cold_compile_source_to_object(const char *out_path,
     parser.import_source_count = import_source_count;
     parser.function_bodies = function_bodies;
     parser.function_body_cap = body_cap;
+    parser.source_path = src_path;
     while (parser.pos < mapped_source.len) {
         parser_ws(&parser);
         if (parser.pos >= mapped_source.len) break;
@@ -27222,6 +27348,7 @@ static bool cold_emit_csg_v2_facts_from_source(const char *facts_path,
     parser.import_source_count = import_count;
     parser.function_bodies = function_bodies;
     parser.function_body_cap = body_cap;
+    parser.source_path = source_path;
     while (parser.pos < src.len) {
         parser_ws(&parser);
         if (parser.pos >= src.len) break;
@@ -27775,6 +27902,7 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
         parser.import_source_count = import_source_count;
         parser.function_bodies = function_bodies;
         parser.function_body_cap = body_cap;
+        parser.source_path = source_path;
         while (parser.pos < mapped_source.len) {
             parser_ws(&parser);
             if (parser.pos >= mapped_source.len) break;
@@ -28189,6 +28317,7 @@ link_providers_done:
                 Parser sc_parser = {sc_src, 0, sc_arena, sc_sym};
                 sc_parser.import_sources = sc_imp;
                 sc_parser.import_source_count = sc_imp_c;
+                sc_parser.source_path = source_path;
                 while (sc_parser.pos < sc_src.len) {
                     parser_ws(&sc_parser);
                     if (sc_parser.pos >= sc_src.len) break;

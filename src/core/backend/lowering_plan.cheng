@@ -1454,15 +1454,44 @@ fn LoweringBuildOneFunction(plan: LoweringPlanStub,
     fnIr.callTargetCount = fnIr.callTargets.len
     return fnIr
 
-fn LoweringWorkStealMain(raw: ptr) =
+fn FunctionTaskExecuteBodyIr(funcIndex: int32) =
+    loweringParallelResults[funcIndex] = LoweringBuildOneFunction(
+        loweringParallelPlan, loweringParallelSourceTexts, funcIndex,
+        loweringParallelLetCallReturnLiteralStart)
+
+fn FunctionTaskExecuteSerial(functionCount: int32) =
+    for i in 0..<functionCount:
+        FunctionTaskExecuteBodyIr(i)
+
+fn FunctionTaskWorkStealingMain(raw: ptr) =
     while true:
         let i = atomic.AddI32(loweringParallelNextFuncIndex, 1) - 1
         if i >= loweringParallelFunctionCount:
             break
-        loweringParallelResults[i] = LoweringBuildOneFunction(
-            loweringParallelPlan, loweringParallelSourceTexts, i,
-            loweringParallelLetCallReturnLiteralStart)
+        FunctionTaskExecuteBodyIr(i)
     let _ = atomic.AddI32(loweringParallelDoneCount, 1)
+
+fn FunctionTaskExecuteWorkStealing(functionCount: int32,
+                                   jobCount: int32) =
+    var actualWorkerCount = jobCount
+    if actualWorkerCount > functionCount:
+        actualWorkerCount = functionCount
+    loweringParallelFunctionCount = functionCount
+    loweringParallelDoneCount = atomic.NewI32(0)
+    loweringParallelNextFuncIndex = atomic.NewI32(0)
+    if loweringParallelDoneCount == nil || loweringParallelNextFuncIndex == nil:
+        panic("function_task_executor_atomic_alloc_failed")
+    for w in 0..<actualWorkerCount:
+        async.SpawnPtr(FunctionTaskWorkStealingMain, nil)
+    while atomic.LoadI32(loweringParallelDoneCount) < actualWorkerCount:
+        thread.Yield()
+
+fn FunctionTaskExecuteAuto(functionCount: int32,
+                            jobCount: int32) =
+    if jobCount > 1:
+        FunctionTaskExecuteWorkStealing(functionCount, jobCount)
+        return
+    FunctionTaskExecuteSerial(functionCount)
 
 fn LoweringBuildPrimaryObjectIr(plan: LoweringPlanStub,
                                  sourceTexts: texpr.TypedExprSourceText[]): PrimaryObjectIr =
@@ -1480,25 +1509,11 @@ fn LoweringBuildPrimaryObjectIr(plan: LoweringPlanStub,
     loweringParallelPlan = plan
     loweringParallelSourceTexts = sourceTexts
     loweringParallelLetCallReturnLiteralStart = letCallReturnLiteralStart
-    if jobCount <= 1:
-        for i in 0..<functionCount:
-            let fnIr = LoweringBuildOneFunction(plan, sourceTexts, i, letCallReturnLiteralStart)
-            add(ir.functions, fnIr)
-        return ir
-    var actualWorkerCount = jobCount
-    if actualWorkerCount > functionCount:
-        actualWorkerCount = functionCount
     loweringParallelResults = []
     for i in 0..<functionCount:
         var empty: PrimaryObjectIrFunction
         add(loweringParallelResults, empty)
-    loweringParallelFunctionCount = functionCount
-    loweringParallelDoneCount = atomic.NewI32(0)
-    loweringParallelNextFuncIndex = atomic.NewI32(0)
-    for w in 0..<actualWorkerCount:
-        async.SpawnPtr(LoweringWorkStealMain, nil)
-    while atomic.LoadI32(loweringParallelDoneCount) < actualWorkerCount:
-        thread.Yield()
+    FunctionTaskExecuteAuto(functionCount, jobCount)
     for i in 0..<functionCount:
         add(ir.functions, loweringParallelResults[i])
     loweringParallelResults = []

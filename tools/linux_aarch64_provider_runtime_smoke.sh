@@ -130,9 +130,9 @@ run_case() {
 }
 
 compile_case "runtime_provider_autolink_trace" "testdata/runtime_provider_autolink_trace.cheng"
-run_case "runtime_provider_autolink_trace" 22
-grep -Fq 'core runtime trace' "$WORK/runtime_provider_autolink_trace.run.stderr" || fail "runtime_provider_autolink_trace_missing_marker"
-pass "runtime_provider_autolink_trace_run_marker"
+run_case "runtime_provider_autolink_trace" 21
+grep -Fq 'core runtime getpid' "$WORK/runtime_provider_autolink_trace.run.stderr" || fail "runtime_provider_autolink_trace_missing_getpid_marker"
+pass "runtime_provider_autolink_trace_getpid_run_marker"
 
 compile_case "runtime_provider_autolink_cpu_cores" "testdata/runtime_provider_autolink_cpu_cores.cheng"
 if [ "$RUNNER" = "__native_linux_aarch64__" ]; then
