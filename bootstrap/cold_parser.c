@@ -7318,8 +7318,8 @@ int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32_t *kin
         return val_slot;
     }
     /* Last-chance: token might be a known type name used as an expression
-       (e.g. a struct/ADT type name or generic parameter that wasn't registered).
-       Return the type's stored slot_size (or 4 as default). */
+       (e.g. a struct/ADT type name, builtin type, or generic parameter).
+       Return a type-descriptor slot. */
     {
         TypeDef *ty = symbols_find_type(parser->symbols, token);
         if (ty) {
@@ -7328,6 +7328,28 @@ int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32_t *kin
             body_op(body, BODY_OP_I32_CONST, slot, sz, 0);
             *kind = SLOT_I32;
             return slot;
+        }
+        /* Check builtin type names: str, int32, bool, int64, etc. */
+        int32_t builtin_kind = cold_parser_slot_kind_from_type(parser->symbols, token);
+        int32_t builtin_size = cold_parser_slot_size_from_type(parser->symbols, token, builtin_kind);
+        if (builtin_kind != SLOT_I32 || !span_eq(token, "int32")) {
+            /* Not the default int32 fallback — it's a recognized type */
+            if (builtin_size > 0) {
+                if (cold_type_is_builtin_surface(token) || cold_span_is_simple_ident(token)) {
+                    int32_t slot = body_slot(body, builtin_kind, builtin_size);
+                    body_slot_set_type(body, slot, token);
+                    /* Create a zero-init slot for type-descriptor use */
+                    if (builtin_kind == SLOT_STR) {
+                        body_op(body, BODY_OP_STR_LITERAL, slot, 0, 0);
+                    } else if (builtin_kind == SLOT_I32 || builtin_kind == SLOT_F32) {
+                        body_op(body, BODY_OP_I32_CONST, slot, 0, 0);
+                    } else if (builtin_kind == SLOT_I64 || builtin_kind == SLOT_F64) {
+                        body_op(body, BODY_OP_I64_CONST, slot, 0, 0);
+                    }
+                    *kind = builtin_kind;
+                    return slot;
+                }
+            }
         }
     }
     if (ColdErrorRecoveryEnabled) {

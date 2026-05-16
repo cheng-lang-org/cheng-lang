@@ -931,7 +931,7 @@ else
 fi
 
 # provider-archive-pack accepts Mach-O provider objects and writes a Chenga
-# archive. Mach-O archive linking remains a separate hard-fail gate below.
+# archive. Missing Mach-O archive paths remain explicit hard-fail gates below.
 darwin_pack_archive="$WORK/core_runtime_provider_darwin.chenga"
 darwin_pack_report="$WORK/core_runtime_provider_darwin.pack.report.txt"
 if "$COLD" provider-archive-pack \
@@ -961,14 +961,14 @@ if "$COLD" system-link-exec \
     --target:arm64-apple-darwin \
     --out:"$WORK/darwin_provider_archive_should_not_exist" \
     --report-out:"$darwin_archive_report" >/dev/null 2>&1; then
-    bad "darwin_provider_archive_hard_fail_no_fallback"
+    bad "darwin_provider_archive_missing_hard_fail"
 elif grep -q '^provider_archive=0$' "$darwin_archive_report" &&
      grep -q '^provider_object_count=0$' "$darwin_archive_report" &&
      grep -q '^system_link=0$' "$darwin_archive_report" &&
-     grep -q '^error=provider archive link failed$' "$darwin_archive_report"; then
-    ok "darwin_provider_archive_hard_fail_no_fallback"
+     grep -q '^error=provider archive open/header failed$' "$darwin_archive_report"; then
+    ok "darwin_provider_archive_missing_hard_fail"
 else
-    bad "darwin_provider_archive_hard_fail_no_fallback"
+    bad "darwin_provider_archive_missing_hard_fail"
 fi
 
 darwin_link_object_primary="$WORK/ordinary_darwin_provider_primary.o"
@@ -988,18 +988,18 @@ if "$COLD" system-link-exec \
     --target:arm64-apple-darwin \
     --out:"$darwin_link_object_out" \
     --report-out:"$darwin_link_object_report" >/dev/null 2>&1; then
-    bad "darwin_link_object_provider_archive_hard_fail_no_fallback"
+    bad "darwin_link_object_provider_archive_missing_hard_fail"
 elif [ -s "$darwin_link_object_primary" ] &&
      grep -q '^direct_macho=1$' "$darwin_link_object_primary_report" &&
      grep -q '^link_object=1$' "$darwin_link_object_report" &&
      grep -q '^provider_archive=1$' "$darwin_link_object_report" &&
      grep -q '^provider_object_count=0$' "$darwin_link_object_report" &&
      grep -q '^system_link=0$' "$darwin_link_object_report" &&
-     grep -q '^error=link object failed$' "$darwin_link_object_report" &&
+     grep -q '^error=provider archive open/header failed$' "$darwin_link_object_report" &&
      [ ! -e "$darwin_link_object_out" ]; then
-    ok "darwin_link_object_provider_archive_hard_fail_no_fallback"
+    ok "darwin_link_object_provider_archive_missing_hard_fail"
 else
-    bad "darwin_link_object_provider_archive_hard_fail_no_fallback"
+    bad "darwin_link_object_provider_archive_missing_hard_fail"
 fi
 
 
@@ -1179,6 +1179,8 @@ fi
 
 echo "  - provider_archive_corrupt_magic_hard_fail"
 corrupt_archive="$WORK/provider_fixture.corrupt_magic.chenga"
+corrupt_out="$WORK/provider_archive_corrupt_magic_should_not_exist"
+corrupt_report="$WORK/provider_archive_corrupt_magic.report.txt"
 if [ ! -s "$provider_archive" ] || [ ! -s "$primary_obj" ]; then
   echo "FAIL provider_archive_corrupt_magic_hard_fail (missing forward artifacts)"
   fail=$((fail + 1))
@@ -1190,14 +1192,21 @@ elif "$COLD" system-link-exec \
   --link-object:"$primary_obj" \
   --provider-archive:"$corrupt_archive" \
   --emit:exe --target:riscv64-unknown-linux-gnu \
-  --out:"$WORK/provider_archive_corrupt_magic_should_not_exist" \
-  --report-out:"$WORK/provider_archive_corrupt_magic.report.txt" \
+  --out:"$corrupt_out" \
+  --report-out:"$corrupt_report" \
   > "$WORK/provider_archive_corrupt_magic.stdout" 2>&1; then
   echo "FAIL provider_archive_corrupt_magic_hard_fail"
   fail=$((fail + 1))
-else
+elif grep -q '^provider_archive=1$' "$corrupt_report" &&
+     grep -q '^provider_object_count=0$' "$corrupt_report" &&
+     grep -q '^system_link=0$' "$corrupt_report" &&
+     grep -q '^error=provider archive magic mismatch$' "$corrupt_report" &&
+     [ ! -e "$corrupt_out" ]; then
   echo "PASS provider_archive_corrupt_magic_hard_fail"
   pass=$((pass + 1))
+else
+  echo "FAIL provider_archive_corrupt_magic_hard_fail"
+  fail=$((fail + 1))
 fi
 
 echo "  - provider_archive_missing_export_pack_fail"
@@ -1218,6 +1227,202 @@ elif "$COLD" provider-archive-pack \
 else
   echo "PASS provider_archive_missing_export_pack_fail"
   pass=$((pass + 1))
+fi
+
+echo "  - provider_archive_duplicate_export_pack_fail"
+dup_archive="$WORK/provider_fixture_duplicate_export.chenga"
+dup_report="$WORK/provider_fixture_duplicate_export.pack.report.txt"
+rm -f "$dup_archive" "$dup_report"
+if [ ! -s "$provider_obj" ]; then
+  echo "FAIL provider_archive_duplicate_export_pack_fail (missing provider object)"
+  fail=$((fail + 1))
+elif "$COLD" provider-archive-pack \
+  --target:riscv64-unknown-linux-gnu \
+  --object:"$provider_obj" \
+  --export:provider_fixture_value \
+  --export:provider_fixture_value \
+  --module:provider_fixture \
+  --source:"$provider_source" \
+  --out:"$dup_archive" \
+  --report-out:"$dup_report" \
+  > "$WORK/provider_fixture_duplicate_export.pack.stdout" 2>&1; then
+  echo "FAIL provider_archive_duplicate_export_pack_fail"
+  fail=$((fail + 1))
+elif grep -q '^provider_archive_pack=0$' "$dup_report" &&
+     grep -q '^error=duplicate provider export: provider_fixture_value$' "$dup_report" &&
+     [ ! -e "$dup_archive" ]; then
+  echo "PASS provider_archive_duplicate_export_pack_fail"
+  pass=$((pass + 1))
+else
+  echo "FAIL provider_archive_duplicate_export_pack_fail"
+  fail=$((fail + 1))
+fi
+
+echo "  - provider_archive_wrong_machine_pack_fail"
+wrong_machine_archive="$WORK/provider_fixture_wrong_machine.chenga"
+wrong_machine_report="$WORK/provider_fixture_wrong_machine.pack.report.txt"
+rm -f "$wrong_machine_archive" "$wrong_machine_report"
+if [ ! -s "$provider_obj" ]; then
+  echo "FAIL provider_archive_wrong_machine_pack_fail (missing provider object)"
+  fail=$((fail + 1))
+elif "$COLD" provider-archive-pack \
+  --target:aarch64-unknown-linux-gnu \
+  --object:"$provider_obj" \
+  --export:provider_fixture_value \
+  --module:provider_fixture \
+  --source:"$provider_source" \
+  --out:"$wrong_machine_archive" \
+  --report-out:"$wrong_machine_report" \
+  > "$WORK/provider_fixture_wrong_machine.pack.stdout" 2>&1; then
+  echo "FAIL provider_archive_wrong_machine_pack_fail"
+  fail=$((fail + 1))
+elif grep -q '^provider_archive_pack=0$' "$wrong_machine_report" &&
+     grep -q '^error=provider object machine mismatch$' "$wrong_machine_report" &&
+     [ ! -e "$wrong_machine_archive" ]; then
+  echo "PASS provider_archive_wrong_machine_pack_fail"
+  pass=$((pass + 1))
+else
+  echo "FAIL provider_archive_wrong_machine_pack_fail"
+  fail=$((fail + 1))
+fi
+
+echo "  - provider_archive_ambiguous_export_pack_fail"
+ambiguous_source="$WORK/provider_fixture_ambiguous.cheng"
+ambiguous_obj="$WORK/provider_fixture_ambiguous.o"
+ambiguous_archive="$WORK/provider_fixture_ambiguous.chenga"
+ambiguous_report="$WORK/provider_fixture_ambiguous.pack.report.txt"
+cat > "$ambiguous_source" <<'CHENG'
+@exportc("provider_fixture_value")
+fn provider_fixture_value(): int32 = return 9
+CHENG
+rm -f "$ambiguous_obj" "$ambiguous_archive" "$ambiguous_report"
+if ! "$COLD" system-link-exec \
+  --in:"$ambiguous_source" \
+  --emit:obj --target:riscv64-unknown-linux-gnu \
+  --out:"$ambiguous_obj" \
+  --report-out:"$WORK/provider_fixture_ambiguous.obj.report.txt" \
+  > "$WORK/provider_fixture_ambiguous.obj.stdout" 2>&1; then
+  echo "FAIL provider_archive_ambiguous_export_pack_fail (ambiguous object build failed)"
+  fail=$((fail + 1))
+elif "$COLD" provider-archive-pack \
+  --target:riscv64-unknown-linux-gnu \
+  --object:"$provider_obj" \
+  --object:"$ambiguous_obj" \
+  --export:provider_fixture_value \
+  --module:provider_fixture \
+  --source:"$WORK" \
+  --out:"$ambiguous_archive" \
+  --report-out:"$ambiguous_report" \
+  > "$WORK/provider_fixture_ambiguous.pack.stdout" 2>&1; then
+  echo "FAIL provider_archive_ambiguous_export_pack_fail"
+  fail=$((fail + 1))
+elif grep -q '^provider_archive_pack=0$' "$ambiguous_report" &&
+     grep -q '^error=provider export ambiguous: provider_fixture_value$' "$ambiguous_report" &&
+     [ ! -e "$ambiguous_archive" ]; then
+  echo "PASS provider_archive_ambiguous_export_pack_fail"
+  pass=$((pass + 1))
+else
+  echo "FAIL provider_archive_ambiguous_export_pack_fail"
+  fail=$((fail + 1))
+fi
+
+echo "  - provider_archive_wrong_target_link_fail"
+wrong_target_out="$WORK/provider_wrong_target_should_not_exist"
+wrong_target_report="$WORK/provider_wrong_target.report.txt"
+rm -f "$wrong_target_out" "$wrong_target_report"
+if [ ! -s "$WORK/canonical_provider_aarch64_primary.o" ] || [ ! -s "$provider_archive" ]; then
+  echo "FAIL provider_archive_wrong_target_link_fail (missing cross-target artifacts)"
+  fail=$((fail + 1))
+elif "$COLD" system-link-exec \
+  --link-object:"$WORK/canonical_provider_aarch64_primary.o" \
+  --provider-archive:"$provider_archive" \
+  --emit:exe --target:aarch64-unknown-linux-gnu \
+  --out:"$wrong_target_out" \
+  --report-out:"$wrong_target_report" \
+  > "$WORK/provider_wrong_target.stdout" 2>&1; then
+  echo "FAIL provider_archive_wrong_target_link_fail"
+  fail=$((fail + 1))
+elif grep -q '^provider_archive=1$' "$wrong_target_report" &&
+     grep -q '^error=provider archive target mismatch$' "$wrong_target_report" &&
+     [ ! -e "$wrong_target_out" ]; then
+  echo "PASS provider_archive_wrong_target_link_fail"
+  pass=$((pass + 1))
+else
+  echo "FAIL provider_archive_wrong_target_link_fail"
+  fail=$((fail + 1))
+fi
+
+echo "  - provider_archive_primary_conflict_hard_fail"
+conflict_provider_source="$WORK/provider_conflict_provider.cheng"
+conflict_provider_obj="$WORK/provider_conflict_provider.o"
+conflict_archive="$WORK/provider_conflict_provider.chenga"
+conflict_pack_report="$WORK/provider_conflict_provider.pack.report.txt"
+conflict_source="$WORK/provider_primary_conflict.cheng"
+conflict_obj="$WORK/provider_primary_conflict.o"
+conflict_out="$WORK/provider_primary_conflict_should_not_exist"
+conflict_report="$WORK/provider_primary_conflict.report.txt"
+cat > "$conflict_provider_source" <<'CHENG'
+@exportc("provider_fixture_value")
+fn provider_fixture_value(): int32 = return 7
+
+@exportc("provider_conflict_extra")
+fn provider_conflict_extra(): int32 = return 5
+CHENG
+cat > "$conflict_source" <<'CHENG'
+@exportc("provider_fixture_value")
+fn provider_fixture_value(): int32 = return 99
+
+@importc("provider_conflict_extra")
+fn provider_conflict_extra(): int32
+
+fn main(): int32 = return provider_fixture_value() + provider_conflict_extra()
+CHENG
+rm -f "$conflict_provider_obj" "$conflict_archive" "$conflict_obj" "$conflict_out" "$conflict_report"
+if ! "$COLD" system-link-exec \
+  --in:"$conflict_provider_source" \
+  --emit:obj --target:riscv64-unknown-linux-gnu \
+  --out:"$conflict_provider_obj" \
+  --report-out:"$WORK/provider_conflict_provider.obj.report.txt" \
+  > "$WORK/provider_conflict_provider.obj.stdout" 2>&1; then
+  echo "FAIL provider_archive_primary_conflict_hard_fail (conflict provider build failed)"
+  fail=$((fail + 1))
+elif ! "$COLD" provider-archive-pack \
+  --target:riscv64-unknown-linux-gnu \
+  --object:"$conflict_provider_obj" \
+  --export:provider_fixture_value \
+  --export:provider_conflict_extra \
+  --module:provider_conflict_provider \
+  --source:"$conflict_provider_source" \
+  --out:"$conflict_archive" \
+  --report-out:"$conflict_pack_report" \
+  > "$WORK/provider_conflict_provider.pack.stdout" 2>&1; then
+  echo "FAIL provider_archive_primary_conflict_hard_fail (conflict archive pack failed)"
+  fail=$((fail + 1))
+elif ! "$COLD" system-link-exec \
+  --in:"$conflict_source" \
+  --emit:obj --target:riscv64-unknown-linux-gnu \
+  --out:"$conflict_obj" \
+  --report-out:"$WORK/provider_primary_conflict.obj.report.txt" \
+  > "$WORK/provider_primary_conflict.obj.stdout" 2>&1; then
+  echo "FAIL provider_archive_primary_conflict_hard_fail (conflict object build failed)"
+  fail=$((fail + 1))
+elif "$COLD" system-link-exec \
+  --link-object:"$conflict_obj" \
+  --provider-archive:"$conflict_archive" \
+  --emit:exe --target:riscv64-unknown-linux-gnu \
+  --out:"$conflict_out" \
+  --report-out:"$conflict_report" \
+  > "$WORK/provider_primary_conflict.stdout" 2>&1; then
+  echo "FAIL provider_archive_primary_conflict_hard_fail"
+  fail=$((fail + 1))
+elif grep -q '^provider_archive=1$' "$conflict_report" &&
+     grep -q '^error=primary/provider symbol conflict: provider_fixture_value$' "$conflict_report" &&
+     [ ! -e "$conflict_out" ]; then
+  echo "PASS provider_archive_primary_conflict_hard_fail"
+  pass=$((pass + 1))
+else
+  echo "FAIL provider_archive_primary_conflict_hard_fail"
+  fail=$((fail + 1))
 fi
 
 multi_one_source="$WORK/provider_multi_one.cheng"

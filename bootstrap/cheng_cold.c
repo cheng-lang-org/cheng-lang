@@ -18201,9 +18201,37 @@ static void cold_provider_error_set(char *buf, size_t cap, const char *text) {
     snprintf(buf, cap, "%s", text ? text : "");
 }
 
+static void cold_provider_error_set_name(char *buf, size_t cap,
+                                         const char *prefix,
+                                         const char *name) {
+    if (!buf || cap == 0) return;
+    if (name && name[0] != '\0') snprintf(buf, cap, "%s: %s", prefix, name);
+    else snprintf(buf, cap, "%s", prefix ? prefix : "");
+}
+
+static void cold_provider_error_set_span(char *buf, size_t cap,
+                                         const char *prefix,
+                                         Span name) {
+    if (!buf || cap == 0) return;
+    if (name.len > 0) {
+        snprintf(buf, cap, "%s: %.*s", prefix, name.len, (const char *)name.ptr);
+    } else {
+        snprintf(buf, cap, "%s", prefix ? prefix : "");
+    }
+}
+
 static void cold_stats_provider_error(ColdCompileStats *stats, const char *text) {
     if (!stats || stats->provider_error[0] != '\0') return;
     cold_provider_error_set(stats->provider_error, sizeof(stats->provider_error), text);
+}
+
+static void cold_stats_provider_error_name(ColdCompileStats *stats,
+                                           const char *prefix,
+                                           const char *name) {
+    if (!stats || stats->provider_error[0] != '\0') return;
+    cold_provider_error_set_name(stats->provider_error,
+                                 sizeof(stats->provider_error),
+                                 prefix, name);
 }
 
 static const char *cold_stats_provider_error_or_default(ColdCompileStats *stats,
@@ -18858,8 +18886,16 @@ static bool cold_parse_provider_archive_view(Span archive_span,
                                              const char *target,
                                              int32_t member_count,
                                              uint64_t archive_hash,
-                                             ColdProviderArchiveView *out) {
-    if (!out || archive_span.len < (int32_t)COLD_PROVIDER_ARCHIVE_HEADER_SIZE) return false;
+                                             ColdProviderArchiveView *out,
+                                             char *error,
+                                             size_t error_cap) {
+    const char *reason = "provider archive parse failed";
+    char reason_buf[COLD_NAME_CAP];
+    reason_buf[0] = '\0';
+    if (!out || archive_span.len < (int32_t)COLD_PROVIDER_ARCHIVE_HEADER_SIZE) {
+        cold_provider_error_set(error, error_cap, "provider archive parse header failed");
+        return false;
+    }
     memset(out, 0, sizeof(*out));
     const uint8_t *p = archive_span.ptr;
     uint64_t pos = COLD_PROVIDER_ARCHIVE_HEADER_SIZE;
@@ -18867,8 +18903,35 @@ static bool cold_parse_provider_archive_view(Span archive_span,
     uint32_t format_len = cold_u32le(p + 16);
     uint32_t export_count = cold_u32le(p + 24);
     if (member_count <= 0 || member_count > 128 ||
-        export_count == 0 || export_count > 512) return false;
-    pos += target_len + format_len;
+        export_count == 0 || export_count > 512) {
+        cold_provider_error_set(error, error_cap, "provider archive parse counts invalid");
+        return false;
+    }
+    if (!cold_file_range_ok(archive_span.len, pos, target_len)) {
+        cold_provider_error_set(error, error_cap, "provider archive target range invalid");
+        return false;
+    }
+    Span target_span = {p + pos, (int32_t)target_len};
+    pos += target_len;
+    if (!cold_file_range_ok(archive_span.len, pos, format_len)) {
+        cold_provider_error_set(error, error_cap, "provider archive format range invalid");
+        return false;
+    }
+    Span format_span = {p + pos, (int32_t)format_len};
+    pos += format_len;
+    if (target && target[0] != '\0' && !span_eq(target_span, target)) {
+        cold_provider_error_set(error, error_cap, "provider archive target mismatch");
+        return false;
+    }
+    const char *format = cold_object_format_for_target_cstr(target);
+    if (!format || format[0] == '\0') {
+        cold_provider_error_set(error, error_cap, "unsupported provider archive target");
+        return false;
+    }
+    if (!span_eq(format_span, format)) {
+        cold_provider_error_set(error, error_cap, "provider archive format mismatch");
+        return false;
+    }
     ColdProviderArchiveMember *members =
         (ColdProviderArchiveMember *)calloc(member_count > 0 ? (size_t)member_count : 1,
                                             sizeof(ColdProviderArchiveMember));
@@ -18876,48 +18939,73 @@ static bool cold_parse_provider_archive_view(Span archive_span,
                                         sizeof(Span));
     if (!members || !seen_exports) {
         free(members); free(seen_exports);
+        cold_provider_error_set(error, error_cap, "provider archive parse allocation failed");
         return false;
     }
     int32_t seen_count = 0;
-    bool is_macho = (strcmp(cold_object_format_for_target_cstr(target), "macho") == 0);
+    bool is_macho = (strcmp(format, "macho") == 0);
     for (int32_t mi = 0; mi < member_count; mi++) {
-        if (!cold_file_range_ok(archive_span.len, pos, 28)) goto fail;
+        if (!cold_file_range_ok(archive_span.len, pos, 28)) {
+            reason = "provider archive member header invalid";
+            goto fail;
+        }
         uint32_t module_len = cold_u32le(p + pos); pos += 4;
         uint32_t source_len = cold_u32le(p + pos); pos += 4;
         uint32_t object_size = cold_u32le(p + pos); pos += 4;
         uint32_t member_exports = cold_u32le(p + pos); pos += 4;
         (void)cold_u64le(p + pos); pos += 8;
         uint32_t export_blob_len = cold_u32le(p + pos); pos += 4;
-        if (member_exports == 0 || export_blob_len == 0) goto fail;
+        if (member_exports == 0 || export_blob_len == 0) {
+            reason = "provider archive member export table empty";
+            goto fail;
+        }
         if (!cold_file_range_ok(archive_span.len, pos,
                                 (uint64_t)module_len + source_len +
                                 export_blob_len + object_size)) {
+            reason = "provider archive member range invalid";
             goto fail;
         }
         pos += module_len + source_len;
         Span *exports = (Span *)calloc((size_t)member_exports, sizeof(Span));
-        if (!exports) goto fail;
+        if (!exports) {
+            reason = "provider archive export allocation failed";
+            goto fail;
+        }
         members[mi].exports = exports;
         members[mi].export_count = (int32_t)member_exports;
         members[mi].is_macho = is_macho ? 1 : 0;
         if (member_exports == 1) {
+            if (export_blob_len > INT32_MAX) {
+                reason = "provider archive export length invalid";
+                goto fail;
+            }
             exports[0].ptr = p + pos;
             exports[0].len = (int32_t)export_blob_len;
             pos += export_blob_len;
         } else {
             uint64_t export_end = pos + export_blob_len;
             for (uint32_t ei = 0; ei < member_exports; ei++) {
-                if (!cold_file_range_ok(archive_span.len, pos, 4)) goto fail;
+                if (!cold_file_range_ok(archive_span.len, pos, 4)) {
+                    reason = "provider archive export table invalid";
+                    goto fail;
+                }
                 uint32_t name_len = cold_u32le(p + pos); pos += 4;
-                if (name_len == 0 || name_len > INT32_MAX ||
-                    !cold_file_range_ok(archive_span.len, pos, name_len)) {
+                if (name_len == 0 || name_len > INT32_MAX) {
+                    reason = "provider archive export length invalid";
+                    goto fail;
+                }
+                if (!cold_file_range_ok(archive_span.len, pos, name_len)) {
+                    reason = "provider archive export name invalid";
                     goto fail;
                 }
                 exports[ei].ptr = p + pos;
                 exports[ei].len = (int32_t)name_len;
                 pos += name_len;
             }
-            if (pos != export_end) goto fail;
+            if (pos != export_end) {
+                reason = "provider archive export table invalid";
+                goto fail;
+            }
         }
         members[mi].object_data = p + pos;
         members[mi].object_size = (int32_t)object_size;
@@ -18926,6 +19014,8 @@ static bool cold_parse_provider_archive_view(Span archive_span,
                                                   members[mi].object_size,
                                                   target,
                                                   &members[mi].macho_view)) {
+                Span object_span = {members[mi].object_data, members[mi].object_size};
+                reason = cold_provider_object_read_error(object_span, target);
                 goto fail;
             }
         } else {
@@ -18933,26 +19023,59 @@ static bool cold_parse_provider_archive_view(Span archive_span,
                                                   members[mi].object_size,
                                                   target,
                                                   &members[mi].view)) {
+                Span object_span = {members[mi].object_data, members[mi].object_size};
+                reason = cold_provider_object_read_error(object_span, target);
                 goto fail;
             }
         }
         for (int32_t ei = 0; ei < members[mi].export_count; ei++) {
             Span export_name = members[mi].exports[ei];
-            if (export_name.len <= 0) goto fail;
+            if (export_name.len <= 0) {
+                reason = "provider archive export length invalid";
+                goto fail;
+            }
             if (is_macho) {
-                if (cold_macho_find_defined_symbol_span(&members[mi].macho_view, export_name) < 0) goto fail;
+                if (cold_macho_find_defined_symbol_span(&members[mi].macho_view, export_name) < 0) {
+                    cold_provider_error_set_span(reason_buf, sizeof(reason_buf),
+                                                 "provider archive export not defined",
+                                                 export_name);
+                    reason = reason_buf;
+                    goto fail;
+                }
             } else {
-                if (cold_elf_find_defined_symbol_span(&members[mi].view, export_name) < 0) goto fail;
+                if (cold_elf_find_defined_symbol_span(&members[mi].view, export_name) < 0) {
+                    cold_provider_error_set_span(reason_buf, sizeof(reason_buf),
+                                                 "provider archive export not defined",
+                                                 export_name);
+                    reason = reason_buf;
+                    goto fail;
+                }
             }
             for (int32_t si = 0; si < seen_count; si++) {
-                if (span_same(seen_exports[si], export_name)) goto fail;
+                if (span_same(seen_exports[si], export_name)) {
+                    cold_provider_error_set_span(reason_buf, sizeof(reason_buf),
+                                                 "duplicate provider export in archive",
+                                                 export_name);
+                    reason = reason_buf;
+                    goto fail;
+                }
             }
-            if (seen_count >= (int32_t)export_count) goto fail;
+            if (seen_count >= (int32_t)export_count) {
+                reason = "provider archive export count mismatch";
+                goto fail;
+            }
             seen_exports[seen_count++] = export_name;
         }
         pos += object_size;
     }
-    if (seen_count != (int32_t)export_count || pos != (uint64_t)archive_span.len) goto fail;
+    if (seen_count != (int32_t)export_count) {
+        reason = "provider archive export count mismatch";
+        goto fail;
+    }
+    if (pos != (uint64_t)archive_span.len) {
+        reason = "provider archive trailing data";
+        goto fail;
+    }
     free(seen_exports);
     out->members = members;
     out->member_count = member_count;
@@ -18966,6 +19089,7 @@ fail:
     }
     free(members);
     free(seen_exports);
+    cold_provider_error_set(error, error_cap, reason);
     return false;
 }
 
@@ -19019,6 +19143,85 @@ static bool cold_provider_archive_find_selected_definition(ColdProviderArchiveVi
     if (found_count != 1) return false;
     if (target_word_out) *target_word_out = found_word;
     return true;
+}
+
+static bool cold_elf_symbol_is_global_text_definition(ColdElfObjectView *obj,
+                                                      int32_t sym_index) {
+    if (!obj || sym_index <= 0 || sym_index >= obj->sym_count) return false;
+    const Elf64_Sym *sym = &obj->syms[sym_index];
+    return sym->st_shndx == (uint16_t)obj->text_idx &&
+           (sym->st_info >> 4) == STB_GLOBAL;
+}
+
+static int32_t cold_elf_find_global_defined_symbol(ColdElfObjectView *obj,
+                                                   const char *name) {
+    if (!obj || !name || name[0] == '\0') return -1;
+    for (int32_t i = 1; i < obj->sym_count; i++) {
+        if (!cold_elf_symbol_is_global_text_definition(obj, i)) continue;
+        const char *sn = cold_elf_symbol_name(obj, (uint32_t)i);
+        if (sn && strcmp(sn, name) == 0) return i;
+    }
+    return -1;
+}
+
+static bool cold_macho_symbol_is_external_text_definition(ColdMachOObjectView *obj,
+                                                          int32_t sym_index) {
+    if (!obj || sym_index < 0 || sym_index >= obj->sym_count) return false;
+    const uint8_t n_type = obj->syms[sym_index].n_type;
+    return (n_type & 0x0e) == 0x0e &&
+           (n_type & N_EXT) != 0 &&
+           obj->syms[sym_index].n_sect != 0;
+}
+
+static int32_t cold_macho_find_external_defined_symbol_exact(ColdMachOObjectView *obj,
+                                                             const char *name) {
+    if (!obj || !name || name[0] == '\0') return -1;
+    for (int32_t i = 0; i < obj->sym_count; i++) {
+        if (!cold_macho_symbol_is_external_text_definition(obj, i)) continue;
+        const char *sn = cold_macho_symbol_name(obj, (uint32_t)i);
+        if (sn && strcmp(sn, name) == 0) return i;
+    }
+    return -1;
+}
+
+static bool cold_selected_elf_providers_conflict_with_primary(ColdElfObjectView *primary,
+                                                              ColdProviderArchiveView *archive,
+                                                              ColdCompileStats *stats) {
+    if (!primary || !archive) return false;
+    for (int32_t mi = 0; mi < archive->member_count; mi++) {
+        ColdProviderArchiveMember *member = &archive->members[mi];
+        if (!member->selected || member->is_macho) continue;
+        for (int32_t si = 1; si < member->view.sym_count; si++) {
+            if (!cold_elf_symbol_is_global_text_definition(&member->view, si)) continue;
+            const char *name = cold_elf_symbol_name(&member->view, (uint32_t)si);
+            if (!name || name[0] == '\0') continue;
+            if (cold_elf_find_global_defined_symbol(primary, name) >= 0) {
+                cold_stats_provider_error_name(stats, "primary/provider symbol conflict", name);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static bool cold_selected_macho_providers_conflict_with_primary(ColdMachOObjectView *primary,
+                                                                ColdProviderArchiveView *archive,
+                                                                ColdCompileStats *stats) {
+    if (!primary || !archive) return false;
+    for (int32_t mi = 0; mi < archive->member_count; mi++) {
+        ColdProviderArchiveMember *member = &archive->members[mi];
+        if (!member->selected || !member->is_macho) continue;
+        for (int32_t si = 0; si < member->macho_view.sym_count; si++) {
+            if (!cold_macho_symbol_is_external_text_definition(&member->macho_view, si)) continue;
+            const char *name = cold_macho_symbol_name(&member->macho_view, (uint32_t)si);
+            if (!name || name[0] == '\0') continue;
+            if (cold_macho_find_external_defined_symbol_exact(primary, name) >= 0) {
+                cold_stats_provider_error_name(stats, "primary/provider symbol conflict", name);
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 static bool cold_apply_elf_call_reloc(uint32_t *words,
@@ -19076,6 +19279,10 @@ static bool cold_link_relocs_for_object(ColdElfObjectView *obj,
             if (!sym_name || (reloc->r_addend % 4) != 0) return false;
             if (primary_object) {
                 int32_t member_index = cold_provider_archive_find_export(archive, sym_name);
+                if (member_index == -2) {
+                    cold_stats_provider_error_name(stats, "provider export ambiguous", sym_name);
+                    return false;
+                }
                 if (member_index >= 0) {
                     ColdProviderArchiveMember *member = &archive->members[member_index];
                     if (!member->selected) return false;
@@ -19109,6 +19316,11 @@ static bool cold_link_relocs_for_object(ColdElfObjectView *obj,
                                  sizeof(stats->first_unresolved_symbol),
                                  "%s", sym_name);
                     }
+                    cold_stats_provider_error_name(stats,
+                                                   primary_object
+                                                       ? "provider export missing"
+                                                       : "provider dependency missing",
+                                                   sym_name);
                 }
                 continue;
             }
@@ -19192,6 +19404,10 @@ static bool cold_link_relocs_for_macho_object(ColdMachOObjectView *obj,
         } else {
             if (primary_object) {
                 int32_t member_index = cold_provider_archive_find_export(archive, export_name);
+                if (member_index == -2) {
+                    cold_stats_provider_error_name(stats, "provider export ambiguous", export_name);
+                    return false;
+                }
                 if (member_index >= 0) {
                     ColdProviderArchiveMember *member = &archive->members[member_index];
                     if (!member->selected) return false;
@@ -19222,6 +19438,11 @@ static bool cold_link_relocs_for_macho_object(ColdMachOObjectView *obj,
                                  sizeof(stats->first_unresolved_symbol),
                                  "%s", sym_name);
                     }
+                    cold_stats_provider_error_name(stats,
+                                                   primary_object
+                                                       ? "provider export missing"
+                                                       : "provider dependency missing",
+                                                   export_name);
                 }
                 continue;
             }
@@ -19246,16 +19467,35 @@ static bool cold_link_elf64_object_with_provider_archive(const char *object_path
     uint32_t *words = 0;
     ColdProviderArchiveView archive = {0};
     bool ok = false;
-    if (primary_span.len <= 0 || archive_span.len <= 0) goto done;
+    if (primary_span.len <= 0) {
+        cold_stats_provider_error(stats, "link object open failed");
+        goto done;
+    }
+    if (archive_span.len <= 0) {
+        cold_stats_provider_error(stats, "provider archive open/header failed");
+        goto done;
+    }
     ColdElfObjectView primary;
-    if (!cold_read_elf64_relocatable_view(primary_span.ptr, primary_span.len, target, &primary)) goto done;
+    if (!cold_read_elf64_relocatable_view(primary_span.ptr, primary_span.len, target, &primary)) {
+        cold_stats_provider_error(stats, "link object machine mismatch");
+        goto done;
+    }
     int32_t member_count = 0;
     uint64_t archive_hash = 0;
-    if (!cold_verify_provider_archive(archive_path, target, &member_count, &archive_hash)) goto done;
+    char verify_error[COLD_NAME_CAP] = {0};
+    if (!cold_verify_provider_archive(archive_path, target, &member_count, &archive_hash,
+                                      verify_error, sizeof(verify_error))) {
+        cold_stats_provider_error(stats, verify_error);
+        goto done;
+    }
     if (member_count < 1) goto done;
+    char parse_error[COLD_NAME_CAP] = {0};
     if (!cold_parse_provider_archive_view(archive_span, target, member_count,
-                                          archive_hash, &archive)) goto done;
-
+                                          archive_hash, &archive,
+                                          parse_error, sizeof(parse_error))) {
+        cold_stats_provider_error(stats, parse_error[0] ? parse_error : "provider archive parse failed");
+        goto done;
+    }
     bool changed = true;
     int32_t guard = 0;
     while (changed) {
@@ -19270,7 +19510,10 @@ static bool cold_link_elf64_object_with_provider_archive(const char *object_path
             if (sym->st_shndx != 0) continue;
             const char *sym_name = cold_elf_symbol_name(&primary, sym_index);
             int32_t member_index = cold_provider_archive_find_export(&archive, sym_name);
-            if (member_index == -2) goto done;
+            if (member_index == -2) {
+                cold_stats_provider_error_name(stats, "provider export ambiguous", sym_name);
+                goto done;
+            }
             if (member_index >= 0 && !archive.members[member_index].selected) {
                 archive.members[member_index].selected = 1;
                 changed = true;
@@ -19289,7 +19532,10 @@ static bool cold_link_elf64_object_with_provider_archive(const char *object_path
                 int32_t primary_word = -1;
                 if (cold_elf_defined_symbol_word(&primary, sym_name, &primary_word)) continue;
                 int32_t dep_index = cold_provider_archive_find_export(&archive, sym_name);
-                if (dep_index == -2) goto done;
+                if (dep_index == -2) {
+                    cold_stats_provider_error_name(stats, "provider export ambiguous", sym_name);
+                    goto done;
+                }
                 if (dep_index >= 0 && !archive.members[dep_index].selected) {
                     archive.members[dep_index].selected = 1;
                     changed = true;
@@ -19307,6 +19553,7 @@ static bool cold_link_elf64_object_with_provider_archive(const char *object_path
         total_words += member->view.word_count;
         selected_count++;
     }
+    if (cold_selected_elf_providers_conflict_with_primary(&primary, &archive, stats)) goto done;
     words = (uint32_t *)calloc(total_words > 0 ? (size_t)total_words : 1, sizeof(uint32_t));
     if (!words) goto done;
     memcpy(words, primary.words, (size_t)primary.word_count * sizeof(uint32_t));
@@ -19362,15 +19609,34 @@ static bool cold_link_macho_object_with_provider_archive(const char *object_path
     uint32_t *words = 0;
     ColdProviderArchiveView archive = {0};
     bool ok = false;
-    if (primary_span.len <= 0 || archive_span.len <= 0) goto done;
+    if (primary_span.len <= 0) {
+        cold_stats_provider_error(stats, "link object open failed");
+        goto done;
+    }
+    if (archive_span.len <= 0) {
+        cold_stats_provider_error(stats, "provider archive open/header failed");
+        goto done;
+    }
     ColdMachOObjectView primary;
-    if (!cold_read_macho_relocatable_view(primary_span.ptr, primary_span.len, target, &primary)) goto done;
+    if (!cold_read_macho_relocatable_view(primary_span.ptr, primary_span.len, target, &primary)) {
+        cold_stats_provider_error(stats, "link object machine mismatch");
+        goto done;
+    }
     int32_t member_count = 0;
     uint64_t archive_hash = 0;
-    if (!cold_verify_provider_archive(archive_path, target, &member_count, &archive_hash)) goto done;
+    char verify_error[COLD_NAME_CAP] = {0};
+    if (!cold_verify_provider_archive(archive_path, target, &member_count, &archive_hash,
+                                      verify_error, sizeof(verify_error))) {
+        cold_stats_provider_error(stats, verify_error);
+        goto done;
+    }
     if (member_count < 1) goto done;
-    if (!cold_parse_provider_archive_view(archive_span, target, member_count, archive_hash, &archive)) goto done;
-
+    char parse_error[COLD_NAME_CAP] = {0};
+    if (!cold_parse_provider_archive_view(archive_span, target, member_count, archive_hash,
+                                          &archive, parse_error, sizeof(parse_error))) {
+        cold_stats_provider_error(stats, parse_error[0] ? parse_error : "provider archive parse failed");
+        goto done;
+    }
     {
         bool changed = true;
         int32_t guard = 0;
@@ -19386,6 +19652,10 @@ static bool cold_link_macho_object_with_provider_archive(const char *object_path
                 if (!sn || sn[0] == '\0') continue;
                 const char *export_name = (sn[0] == '_' && sn[1] != '\0') ? sn + 1 : sn;
                 int32_t mi = cold_provider_archive_find_export(&archive, export_name);
+                if (mi == -2) {
+                    cold_stats_provider_error_name(stats, "provider export ambiguous", export_name);
+                    goto done;
+                }
                 if (mi >= 0 && !archive.members[mi].selected) {
                     archive.members[mi].selected = 1;
                     changed = true;
@@ -19413,6 +19683,10 @@ static bool cold_link_macho_object_with_provider_archive(const char *object_path
                     if (defined_elsewhere) continue;
                     const char *export_name = (sn[0] == '_' && sn[1] != '\0') ? sn + 1 : sn;
                     int32_t dep = cold_provider_archive_find_export(&archive, export_name);
+                    if (dep == -2) {
+                        cold_stats_provider_error_name(stats, "provider export ambiguous", export_name);
+                        goto done;
+                    }
                     if (dep >= 0 && !archive.members[dep].selected) {
                         archive.members[dep].selected = 1;
                         changed = true;
@@ -19432,6 +19706,7 @@ static bool cold_link_macho_object_with_provider_archive(const char *object_path
         total_words += member->macho_view.word_count;
         selected_count++;
     }
+    if (cold_selected_macho_providers_conflict_with_primary(&primary, &archive, stats)) goto done;
     words = (uint32_t *)calloc(total_words > 0 ? (size_t)total_words : 1, sizeof(uint32_t));
     if (!words) goto done;
     memcpy(words, primary.words, (size_t)primary.word_count * sizeof(uint32_t));
@@ -19724,44 +19999,43 @@ static int cold_cmd_provider_archive_pack(int argc, char **argv) {
     }
     const char *format = cold_object_format_for_target_cstr(target);
     bool is_macho = (strcmp(format, "macho") == 0);
-    if (is_macho) {
-        int32_t mc = 0; uint64_t hash = 0;
-        bool ok = cold_write_provider_archive(out_path, target, (const char **)object_paths, object_count,
-                                              module, source, (const char **)export_symbols, export_count, &mc, &hash);
-        cold_write_provider_archive_pack_report(report_path, ok, target, object_path, out_path,
-                                                export_symbol, ok ? object_count : 0, ok ? export_count : 0,
-                                                hash, ok ? 0 : "pack failed");
-        return ok ? 0 : 2;
-    }
     uint16_t machine = cold_elf_machine_for_target(target);
-    if (machine == 0) {
+    if (!is_macho && machine == 0) {
         cold_write_provider_archive_pack_report(report_path, false, target, object_path, out_path,
-                                                export_symbol, 0, 0, 0, "provider archive requires ELF target");
-        fprintf(stderr, "[cheng_cold] provider-archive-pack currently requires ELF target\n");
+                                                export_symbol, 0, 0, 0, "unsupported provider archive target");
+        fprintf(stderr, "[cheng_cold] unsupported provider archive target: %s\n", target);
         return 2;
     }
     Span objects[128];
     ColdElfObjectView views[128];
+    ColdMachOObjectView macho_views[128];
+    char error_buf[COLD_NAME_CAP];
     memset(objects, 0, sizeof(objects));
     memset(views, 0, sizeof(views));
+    memset(macho_views, 0, sizeof(macho_views));
+    error_buf[0] = '\0';
     for (int32_t oi = 0; oi < object_count; oi++) {
         objects[oi] = source_open(object_paths[oi]);
         if (objects[oi].len <= 0) {
             for (int32_t ci = 0; ci <= oi; ci++) {
                 if (objects[ci].len > 0) munmap((void *)objects[ci].ptr, (size_t)objects[ci].len);
             }
-            cold_write_provider_archive_pack_report(report_path, false, target, object_path, out_path,
+            cold_write_provider_archive_pack_report(report_path, false, target, object_paths[oi], out_path,
                                                     export_symbol, 0, 0, 0, "object open failed");
             fprintf(stderr, "[cheng_cold] provider object open failed: %s\n", object_paths[oi]);
             return 2;
         }
-        if (!cold_read_elf64_relocatable_view(objects[oi].ptr, objects[oi].len, target, &views[oi])) {
+        bool object_ok = is_macho
+            ? cold_read_macho_relocatable_view(objects[oi].ptr, objects[oi].len, target, &macho_views[oi])
+            : cold_read_elf64_relocatable_view(objects[oi].ptr, objects[oi].len, target, &views[oi]);
+        if (!object_ok) {
+            const char *err = cold_provider_object_read_error(objects[oi], target);
             for (int32_t ci = 0; ci <= oi; ci++) {
                 if (objects[ci].len > 0) munmap((void *)objects[ci].ptr, (size_t)objects[ci].len);
             }
-            cold_write_provider_archive_pack_report(report_path, false, target, object_path, out_path,
-                                                    export_symbol, 0, 0, 0, "invalid provider object");
-            fprintf(stderr, "[cheng_cold] invalid provider object: %s\n", object_paths[oi]);
+            cold_write_provider_archive_pack_report(report_path, false, target, object_paths[oi], out_path,
+                                                    export_symbol, 0, 0, 0, err);
+            fprintf(stderr, "[cheng_cold] %s: %s\n", err, object_paths[oi]);
             return 2;
         }
     }
@@ -19772,23 +20046,29 @@ static int cold_cmd_provider_archive_pack(int argc, char **argv) {
                 for (int32_t oi = 0; oi < object_count; oi++) {
                     if (objects[oi].len > 0) munmap((void *)objects[oi].ptr, (size_t)objects[oi].len);
                 }
+                cold_provider_error_set_name(error_buf, sizeof(error_buf),
+                                             "duplicate provider export", name);
                 cold_write_provider_archive_pack_report(report_path, false, target, object_path, out_path,
-                                                        export_symbol, 0, 0, 0, "duplicate provider export");
+                                                        name, 0, 0, 0, error_buf);
                 fprintf(stderr, "[cheng_cold] duplicate provider export: %s\n", name);
                 return 2;
             }
         }
         int32_t def_count = 0;
         for (int32_t oi = 0; oi < object_count; oi++) {
-            if (cold_elf_find_defined_symbol(&views[oi], name) >= 0) def_count++;
+            bool found = is_macho
+                ? (cold_macho_find_defined_symbol(&macho_views[oi], name) >= 0)
+                : (cold_elf_find_defined_symbol(&views[oi], name) >= 0);
+            if (found) def_count++;
         }
         if (def_count != 1) {
             for (int32_t oi = 0; oi < object_count; oi++) {
                 if (objects[oi].len > 0) munmap((void *)objects[oi].ptr, (size_t)objects[oi].len);
             }
             const char *err = def_count == 0 ? "provider export not defined" : "provider export ambiguous";
+            cold_provider_error_set_name(error_buf, sizeof(error_buf), err, name);
             cold_write_provider_archive_pack_report(report_path, false, target, object_path, out_path,
-                                                    export_symbol, 0, 0, 0, err);
+                                                    name, 0, 0, 0, error_buf);
             fprintf(stderr, "[cheng_cold] %s: %s\n", err, name);
             return 2;
         }
@@ -19798,15 +20078,29 @@ static int cold_cmd_provider_archive_pack(int argc, char **argv) {
     }
     int32_t member_count = 0;
     uint64_t archive_hash = 0;
+    char verify_error[COLD_NAME_CAP] = {0};
     if (!cold_write_provider_archive(out_path, target,
                                      object_paths, object_count, module, source,
                                      export_symbols, export_count,
-                                     &member_count, &archive_hash) ||
-        member_count != object_count ||
-        !cold_verify_provider_archive(out_path, target, &member_count, &archive_hash)) {
+                                     &member_count, &archive_hash)) {
         cold_write_provider_archive_pack_report(report_path, false, target, object_path, out_path,
                                                 export_symbol, 0, 0, 0, "provider archive write failed");
         fprintf(stderr, "[cheng_cold] provider archive write failed: %s\n", out_path);
+        return 2;
+    }
+    if (member_count != object_count) {
+        cold_write_provider_archive_pack_report(report_path, false, target, object_path, out_path,
+                                                export_symbol, 0, 0, 0,
+                                                "provider archive member count mismatch");
+        fprintf(stderr, "[cheng_cold] provider archive member count mismatch: %s\n", out_path);
+        return 2;
+    }
+    if (!cold_verify_provider_archive(out_path, target, &member_count, &archive_hash,
+                                      verify_error, sizeof(verify_error))) {
+        const char *err = verify_error[0] ? verify_error : "provider archive verify failed";
+        cold_write_provider_archive_pack_report(report_path, false, target, object_path, out_path,
+                                                export_symbol, 0, 0, 0, err);
+        fprintf(stderr, "[cheng_cold] %s: %s\n", err, out_path);
         return 2;
     }
     cold_write_provider_archive_pack_report(report_path, true, target, object_path, out_path,
@@ -21062,9 +21356,10 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
             return 2;
         }
         if (!linked) {
+            const char *error = cold_stats_provider_error_or_default(&stats, "link object failed");
             cold_write_system_link_exec_report(report_path, false, link_object_path, provider_archive_path, out_path,
-                                               target, emit, &stats, "link object failed");
-            fprintf(stderr, "[cheng_cold] link object failed: %s\n", link_object_path);
+                                               target, emit, &stats, error);
+            fprintf(stderr, "[cheng_cold] %s: %s\n", error, link_object_path);
             return 2;
         }
         cold_write_system_link_exec_report(report_path, true, link_object_path, provider_archive_path, out_path,
@@ -21108,9 +21403,10 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
                                                                     out_path, target, &stats);
         }
         if (!linked) {
+            const char *error = cold_stats_provider_error_or_default(&stats, "provider archive link failed");
             cold_write_system_link_exec_report(report_path, false, source_path, csg_in_path, out_path,
-                                               target, emit, &stats, "provider archive link failed");
-            fprintf(stderr, "[cheng_cold] provider archive link failed: %s\n", provider_archive_path);
+                                               target, emit, &stats, error);
+            fprintf(stderr, "[cheng_cold] %s: %s\n", error, provider_archive_path);
             unlink(primary_o);
             return 2;
         }
@@ -21644,18 +21940,27 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
         }
         int32_t archive_member_count = 0;
         uint64_t archive_hash = 0;
+        char archive_verify_error[COLD_NAME_CAP] = {0};
         if (!cold_write_provider_archive(provider_archive, target,
                                          object_paths, object_path_count,
                                          "runtime_core_runtime",
                                          provider_source,
                                          export_symbols, export_count,
                                          &archive_member_count,
-                                         &archive_hash) ||
-            archive_member_count != object_path_count ||
-            !cold_verify_provider_archive(provider_archive, target,
-                                          &archive_member_count,
-                                          &archive_hash)) {
+                                         &archive_hash)) {
             error = "runtime provider archive write failed";
+            goto link_providers_done;
+        }
+        if (archive_member_count != object_path_count) {
+            error = "runtime provider archive member count mismatch";
+            goto link_providers_done;
+        }
+        if (!cold_verify_provider_archive(provider_archive, target,
+                                          &archive_member_count,
+                                          &archive_hash,
+                                          archive_verify_error,
+                                          sizeof(archive_verify_error))) {
+            error = archive_verify_error[0] ? archive_verify_error : "runtime provider archive verify failed";
             goto link_providers_done;
         }
         archive_written = true;
@@ -21664,7 +21969,8 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
                                                               out_path,
                                                               target,
                                                               &stats);
-        if (!linked) error = "runtime provider archive link failed";
+        if (!linked)
+            error = cold_stats_provider_error_or_default(&stats, "runtime provider archive link failed");
 
 link_providers_done:
         if (linked) {
