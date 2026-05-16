@@ -19194,6 +19194,29 @@ static bool cold_provider_archive_find_selected_definition(ColdProviderArchiveVi
     return true;
 }
 
+static bool cold_provider_external_dependency_symbol(const char *name) {
+    if (!name || name[0] == '\0') return false;
+    static const char *symbols[] = {
+        "write",
+        "get_nprocs",
+        "sysconf",
+        "sysinfo",
+        "__errno_location",
+        "___error",
+        "sysctlbyname",
+        "statfs",
+        "proc_pidinfo",
+        "proc_listpids",
+        "getpgid",
+        "pthread_create",
+        "pthread_detach",
+    };
+    for (size_t i = 0; i < sizeof(symbols) / sizeof(symbols[0]); i++) {
+        if (strcmp(name, symbols[i]) == 0) return true;
+    }
+    return false;
+}
+
 static bool cold_elf_symbol_is_global_text_definition(ColdElfObjectView *obj,
                                                       int32_t sym_index) {
     if (!obj || sym_index <= 0 || sym_index >= obj->sym_count) return false;
@@ -19365,11 +19388,12 @@ static bool cold_link_relocs_for_object(ColdElfObjectView *obj,
                                  sizeof(stats->first_unresolved_symbol),
                                  "%s", sym_name);
                     }
-                    cold_stats_provider_error_name(stats,
-                                                   primary_object
-                                                       ? "provider export missing"
-                                                       : "provider dependency missing",
-                                                   sym_name);
+                    const char *prefix = primary_object
+                        ? "provider export missing"
+                        : cold_provider_external_dependency_symbol(sym_name)
+                            ? "provider external dependency unsupported"
+                            : "provider dependency missing";
+                    cold_stats_provider_error_name(stats, prefix, sym_name);
                 }
                 continue;
             }
@@ -19482,16 +19506,17 @@ static bool cold_link_relocs_for_macho_object(ColdMachOObjectView *obj,
             if (target_word < 0) {
                 if (stats) {
                     stats->unresolved_symbol_count++;
-                    if (stats->first_unresolved_symbol[0] == '\0' && sym_name) {
+                    if (stats->first_unresolved_symbol[0] == '\0' && export_name) {
                         snprintf(stats->first_unresolved_symbol,
                                  sizeof(stats->first_unresolved_symbol),
-                                 "%s", sym_name);
+                                 "%s", export_name);
                     }
-                    cold_stats_provider_error_name(stats,
-                                                   primary_object
-                                                       ? "provider export missing"
-                                                       : "provider dependency missing",
-                                                   export_name);
+                    const char *prefix = primary_object
+                        ? "provider export missing"
+                        : cold_provider_external_dependency_symbol(export_name)
+                            ? "provider external dependency unsupported"
+                            : "provider dependency missing";
+                    cold_stats_provider_error_name(stats, prefix, export_name);
                 }
                 continue;
             }
@@ -21937,8 +21962,10 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
                 }
                 if (already_exported) continue;
                 if (!cold_source_has_exportc_symbol(provider_source, dep)) {
-                    snprintf(error_buf, sizeof(error_buf),
-                             "provider dependency has no export root: %s", dep);
+                    const char *prefix = cold_provider_external_dependency_symbol(dep)
+                        ? "provider external dependency unsupported"
+                        : "provider dependency has no export root";
+                    snprintf(error_buf, sizeof(error_buf), "%s: %s", prefix, dep);
                     error = error_buf;
                     goto link_providers_done;
                 }

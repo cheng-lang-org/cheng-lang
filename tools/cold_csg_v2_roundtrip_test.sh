@@ -953,6 +953,47 @@ else
     bad "darwin_provider_archive_pack"
 fi
 
+darwin_external_primary="$WORK/darwin_runtime_provider_external_primary.cheng"
+darwin_external_primary_obj="$WORK/darwin_runtime_provider_external_primary.o"
+darwin_external_primary_report="$WORK/darwin_runtime_provider_external_primary.report.txt"
+darwin_external_out="$WORK/darwin_runtime_provider_external_should_not_exist"
+darwin_external_link_report="$WORK/darwin_runtime_provider_external.report.txt"
+cat > "$darwin_external_primary" <<'CHENG'
+@importc("core_runtime_stub_trace")
+fn core_runtime_stub_trace(): int32
+fn main(): int32 = return core_runtime_stub_trace()
+CHENG
+if "$COLD" system-link-exec \
+    --root:"$ROOT" \
+    --in:"$darwin_external_primary" \
+    --emit:obj \
+    --target:arm64-apple-darwin \
+    --out:"$darwin_external_primary_obj" \
+    --report-out:"$darwin_external_primary_report" >/dev/null 2>&1 &&
+   "$COLD" system-link-exec \
+    --link-object:"$darwin_external_primary_obj" \
+    --provider-archive:"$darwin_pack_archive" \
+    --emit:exe \
+    --target:arm64-apple-darwin \
+    --out:"$darwin_external_out" \
+    --report-out:"$darwin_external_link_report" >/dev/null 2>&1; then
+    bad "darwin_provider_external_dependency_hard_fail"
+elif [ -s "$darwin_external_primary_obj" ] &&
+     grep -q '^direct_macho=1$' "$darwin_external_primary_report" &&
+     grep -q '^link_object=1$' "$darwin_external_link_report" &&
+     grep -q '^provider_archive=1$' "$darwin_external_link_report" &&
+     grep -q '^provider_object_count=1$' "$darwin_external_link_report" &&
+     grep -q '^provider_archive_member_count=1$' "$darwin_external_link_report" &&
+     grep -q '^provider_export_count=1$' "$darwin_external_link_report" &&
+     grep -q '^unresolved_symbol_count=1$' "$darwin_external_link_report" &&
+     grep -q '^first_unresolved_symbol=write$' "$darwin_external_link_report" &&
+     grep -q '^error=provider external dependency unsupported: write$' "$darwin_external_link_report" &&
+     [ ! -e "$darwin_external_out" ]; then
+    ok "darwin_provider_external_dependency_hard_fail"
+else
+    bad "darwin_provider_external_dependency_hard_fail"
+fi
+
 darwin_runtime_const_provider_obj="$WORK/core_runtime_provider_darwin_af_inet.o"
 darwin_runtime_const_provider_report="$WORK/core_runtime_provider_darwin_af_inet.report.txt"
 darwin_runtime_const_primary="$WORK/darwin_runtime_provider_primary.cheng"

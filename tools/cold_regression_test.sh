@@ -873,7 +873,7 @@ if [ "$CPU_CORES_STATUS" -ne 0 ] &&
    grep -q '^provider_archive=0$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null &&
    grep -q '^provider_object_count=0$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null &&
    grep -q '^unresolved_symbol_count=0$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null &&
-   grep -q '^error=provider dependency has no export root: get_nprocs$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null; then
+   grep -q '^error=provider external dependency unsupported: get_nprocs$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null; then
     ACT=1
 else
     ACT=0

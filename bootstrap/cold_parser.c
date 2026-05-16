@@ -7349,7 +7349,7 @@ int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32_t *kin
         /* Check builtin type names: str, int32, bool, int64, etc. */
         int32_t builtin_kind = cold_parser_slot_kind_from_type(parser->symbols, token);
         int32_t builtin_size = cold_parser_slot_size_from_type(parser->symbols, token, builtin_kind);
-        if (builtin_kind != SLOT_I32 || !span_eq(token, "int32")) {
+        if (builtin_size > 0 && cold_type_is_builtin_surface(token)) {
             /* Not the default int32 fallback — it's a recognized type */
             if (builtin_size > 0) {
                 if (cold_type_is_builtin_surface(token) || cold_span_is_simple_ident(token)) {
