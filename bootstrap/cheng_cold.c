@@ -45,6 +45,9 @@ static int32_t cold_egraph_rewrite_count = 0;
 static int32_t cold_egraph_dedup_count = 0;
 static int32_t cold_egraph_licm_hoisted = 0;
 static int32_t cold_egraph_fixed_point_iterations = 0;
+static int32_t cold_cross_block_analysis_ran = 0;
+static int32_t cold_cross_block_safe_slots = 0;
+static int32_t cold_cross_block_unsafe_slots = 0;
 
 #include "macho_direct.h"
 #include "elf64_direct.h"
@@ -16858,6 +16861,9 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
             stats->egraph_licm_hoisted = cold_egraph_licm_hoisted;
             stats->egraph_dedup_count = cold_egraph_dedup_count;
             stats->egraph_fixed_point_iterations = cold_egraph_fixed_point_iterations;
+            stats->cross_block_analysis_ran   = cold_cross_block_analysis_ran;
+            stats->cross_block_safe_slots     = cold_cross_block_safe_slots;
+            stats->cross_block_unsafe_slots   = cold_cross_block_unsafe_slots;
             stats->csg_lowering = 1;
             stats->arena_kb = arena->used / 1024;
             uint64_t end_us = cold_now_us();
@@ -17956,6 +17962,9 @@ bool cold_compile_source_path_to_macho(const char *out_path,
             stats->type_count = symbols->type_count + symbols->object_count;
             stats->egraph_rewrite_count = cold_egraph_rewrite_count;
             stats->egraph_fixed_point_iterations = cold_egraph_fixed_point_iterations;
+            stats->cross_block_analysis_ran   = cold_cross_block_analysis_ran;
+            stats->cross_block_safe_slots     = cold_cross_block_safe_slots;
+            stats->cross_block_unsafe_slots   = cold_cross_block_unsafe_slots;
             cold_collect_body_stats(symbols, function_bodies, symbols->function_count, stats);
             stats->code_words = code->count;
             stats->arena_kb = arena->used / 1024;
@@ -17982,6 +17991,9 @@ bool cold_compile_source_path_to_macho(const char *out_path,
         stats->type_count = symbols->type_count + symbols->object_count;
         stats->egraph_rewrite_count = cold_egraph_rewrite_count;
         stats->egraph_fixed_point_iterations = cold_egraph_fixed_point_iterations;
+        stats->cross_block_analysis_ran   = cold_cross_block_analysis_ran;
+        stats->cross_block_safe_slots     = cold_cross_block_safe_slots;
+        stats->cross_block_unsafe_slots   = cold_cross_block_unsafe_slots;
         if (demo_body) {
             stats->op_count = demo_body->op_count;
             stats->block_count = demo_body->block_count;
@@ -19997,6 +20009,7 @@ static bool cold_runtime_provider_linux_root_supported(const char *symbol) {
         "cheng_native_so_broadcast_bridge",
         "cheng_native_msg_waitall_bridge",
         "cheng_native_sockaddr_use_len_field_bridge",
+        "core_runtime_stub_trace",
         "cheng_native_system_cpu_logical_cores_value_bridge",
     };
     if (!symbol || symbol[0] == '\0') return false;
@@ -20058,6 +20071,8 @@ static bool cold_linux_syscall_provider_exports_symbol(const char *symbol) {
         "__cheng_linux_syscall4",
         "__cheng_linux_syscall5",
         "__cheng_linux_syscall6",
+        "write",
+        "get_nprocs",
     };
     for (size_t i = 0; i < sizeof(syscalls) / sizeof(syscalls[0]); i++) {
         if (strcmp(symbol, syscalls[i]) == 0) return true;
@@ -20089,6 +20104,69 @@ static bool cold_source_has_exportc_symbol(const char *path, const char *symbol)
     return found;
 }
 
+static void cold_emit_linux_aarch64_write_provider(Code *code) {
+    code_emit(code, a64_movz_x(R8, 64, 0));
+    code_emit(code, a64_svc(0));
+    code_emit(code, a64_ret());
+}
+
+static void cold_emit_linux_aarch64_get_nprocs_provider(Code *code) {
+    code_emit(code, a64_sub_imm(SP, SP, 128, true));
+    for (int32_t off = 0; off < 128; off += 8) {
+        code_emit(code, a64_str_imm(31, SP, off, true));
+    }
+    code_emit(code, a64_movz_x(R0, 0, 0));
+    code_emit(code, a64_movz_x(R1, 128, 0));
+    code_emit(code, a64_add_imm(R2, SP, 0, true));
+    code_emit(code, a64_movz_x(R8, 123, 0));
+    code_emit(code, a64_svc(0));
+    code_emit(code, a64_cmp_reg_x(R0, 31));
+    int32_t fail_le = code->count;
+    code_emit(code, a64_bcond(0, COND_LE));
+    code_emit(code, a64_add_imm(R1, R0, 0, true));
+    code_emit(code, a64_movz_x(R2, 0, 0));
+    code_emit(code, a64_movz(R4, 0, 0));
+    code_emit(code, a64_movz(R7, 1, 0));
+
+    int32_t byte_loop = code->count;
+    code_emit(code, a64_cmp_reg_x(R2, R1));
+    int32_t done_ge = code->count;
+    code_emit(code, a64_bcond(0, COND_GE));
+    code_emit(code, a64_ldrb_reg(R3, SP, R2));
+    int32_t bit_loop = code->count;
+    code_emit(code, a64_cmp_imm(R3, 0));
+    int32_t byte_done_eq = code->count;
+    code_emit(code, a64_bcond(0, COND_EQ));
+    code_emit(code, a64_and_reg(R6, R3, R7));
+    code_emit(code, a64_add_reg(R4, R4, R6));
+    code_emit(code, a64_lsr_imm(R3, R3, 1, false));
+    code_emit(code, a64_b(bit_loop - code->count));
+
+    int32_t byte_done = code->count;
+    a64_patch_bcond(code, byte_done_eq, byte_done);
+    code_emit(code, a64_add_imm(R2, R2, 1, true));
+    code_emit(code, a64_b(byte_loop - code->count));
+
+    int32_t done = code->count;
+    a64_patch_bcond(code, done_ge, done);
+    code_emit(code, a64_cmp_imm(R4, 0));
+    int32_t ret_zero_le = code->count;
+    code_emit(code, a64_bcond(0, COND_LE));
+    code_emit(code, a64_add_imm(R0, R4, 0, false));
+    int32_t ret_count_b = code->count;
+    code_emit(code, a64_b(0));
+
+    int32_t ret_zero = code->count;
+    a64_patch_bcond(code, fail_le, ret_zero);
+    a64_patch_bcond(code, ret_zero_le, ret_zero);
+    code_emit(code, a64_movz(R0, 0, 0));
+
+    int32_t epilogue = code->count;
+    a64_patch_b(code, ret_count_b, epilogue);
+    code_emit(code, a64_add_imm(SP, SP, 128, true));
+    code_emit(code, a64_ret());
+}
+
 static bool cold_write_linux_aarch64_syscall_provider_object(const char *out_path) {
     static const char *names[] = {
         "__cheng_linux_syscall0",
@@ -20098,14 +20176,17 @@ static bool cold_write_linux_aarch64_syscall_provider_object(const char *out_pat
         "__cheng_linux_syscall4",
         "__cheng_linux_syscall5",
         "__cheng_linux_syscall6",
+        "write",
+        "get_nprocs",
     };
     enum { NAME_COUNT = (int)(sizeof(names) / sizeof(names[0])) };
+    enum { SYSCALL_COUNT = 7, WRITE_INDEX = 7, GET_NPROCS_INDEX = 8 };
     Arena *arena = mmap(0, sizeof(Arena), PROT_READ | PROT_WRITE,
                         MAP_PRIVATE | MAP_ANON, -1, 0);
     if (arena == MAP_FAILED) return false;
-    Code *code = code_new(arena, 128);
+    Code *code = code_new(arena, 256);
     int32_t offsets[NAME_COUNT];
-    for (int32_t argc = 0; argc <= 6; argc++) {
+    for (int32_t argc = 0; argc < SYSCALL_COUNT; argc++) {
         offsets[argc] = code->count;
         code_emit(code, a64_orr_reg_x(8, 31, 0));
         for (int32_t ai = 0; ai < argc; ai++) {
@@ -20114,6 +20195,10 @@ static bool cold_write_linux_aarch64_syscall_provider_object(const char *out_pat
         code_emit(code, a64_svc(0));
         code_emit(code, a64_ret());
     }
+    offsets[WRITE_INDEX] = code->count;
+    cold_emit_linux_aarch64_write_provider(code);
+    offsets[GET_NPROCS_INDEX] = code->count;
+    cold_emit_linux_aarch64_get_nprocs_provider(code);
     bool ok = elf64_write_object(out_path, code->words, code->count,
                                  names, offsets, NAME_COUNT, 0,
                                  0, 0, 0, EM_AARCH64);
@@ -22041,6 +22126,8 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
         int32_t export_count = 0;
         bool needs_program_support_provider = false;
         bool needs_core_runtime_provider = false;
+        bool target_linux_aarch64 = target && strstr(target, "linux") && strstr(target, "aarch64");
+        bool needs_linux_syscall_provider = false;
         char roots_csv[8192];
         roots_csv[0] = '\0';
         for (int32_t ui = 0; ui < undefined_count; ui++) {
@@ -22069,8 +22156,7 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
             error = "mixed runtime provider roots unsupported";
             goto link_providers_done;
         }
-        bool use_linux_nolibc_provider = needs_program_support_provider &&
-            target && strstr(target, "linux") && strstr(target, "aarch64");
+        bool use_linux_nolibc_provider = needs_program_support_provider && target_linux_aarch64;
         const char *provider_source = use_linux_nolibc_provider
             ? "src/std/system_helpers_backend_nolibc_linux_aarch64.cheng"
             : needs_program_support_provider
@@ -22100,8 +22186,9 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
             bool added_provider_root = false;
             for (int32_t pi = 0; pi < provider_undefined_count; pi++) {
                 const char *dep = provider_undefined[pi];
-                if (use_linux_nolibc_provider &&
+                if (target_linux_aarch64 &&
                     cold_linux_syscall_provider_exports_symbol(dep)) {
+                    needs_linux_syscall_provider = true;
                     continue;
                 }
                 bool already_exported = false;
@@ -22140,7 +22227,7 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
         const char *object_paths[2];
         int32_t object_path_count = 0;
         object_paths[object_path_count++] = provider_o;
-        if (use_linux_nolibc_provider) {
+        if (needs_linux_syscall_provider) {
             static const char *syscall_exports[] = {
                 "__cheng_linux_syscall0",
                 "__cheng_linux_syscall1",
@@ -22149,6 +22236,8 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
                 "__cheng_linux_syscall4",
                 "__cheng_linux_syscall5",
                 "__cheng_linux_syscall6",
+                "write",
+                "get_nprocs",
             };
             for (size_t si = 0; si < sizeof(syscall_exports) / sizeof(syscall_exports[0]); si++) {
                 if (!cold_export_symbol_push(export_symbols, &export_count, 256,
@@ -22215,7 +22304,7 @@ link_providers_done:
         }
         if (primary_written) unlink(primary_o);
         if (provider_written) unlink(provider_o);
-        if (use_linux_nolibc_provider) unlink(provider_syscall_o);
+        if (needs_linux_syscall_provider) unlink(provider_syscall_o);
         if (archive_written) unlink(provider_archive);
         return linked ? 0 : 2;
     }

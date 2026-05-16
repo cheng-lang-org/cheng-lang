@@ -857,28 +857,55 @@ else
 fi
 assert "runtime_provider_autolink_spawn_hard_fail" 1 "$ACT"
 
-rm -f /tmp/ct_runtime/autolink_cpu_cores \
-    /tmp/ct_runtime/autolink_cpu_cores.report.txt
-$COLD system-link-exec \
-    --in:testdata/runtime_provider_autolink_cpu_cores.cheng \
+rm -f /tmp/ct_runtime/autolink_trace \
+    /tmp/ct_runtime/autolink_trace.report.txt
+quiet $COLD system-link-exec \
+    --in:testdata/runtime_provider_autolink_trace.cheng \
     --target:aarch64-unknown-linux-gnu \
-    --out:/tmp/ct_runtime/autolink_cpu_cores \
-    --report-out:/tmp/ct_runtime/autolink_cpu_cores.report.txt \
-    --link-providers >/tmp/ct_runtime/autolink_cpu_cores.stdout 2>/tmp/ct_runtime/autolink_cpu_cores.stderr
-CPU_CORES_STATUS=$?
-if [ "$CPU_CORES_STATUS" -ne 0 ] &&
-   [ ! -f /tmp/ct_runtime/autolink_cpu_cores ] &&
-   grep -q '^system_link_exec=0$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null &&
-   grep -q '^system_link_exec_scope=cold_runtime_provider_archive$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null &&
-   grep -q '^provider_archive=0$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null &&
-   grep -q '^provider_object_count=0$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null &&
-   grep -q '^unresolved_symbol_count=0$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null &&
-   grep -q '^error=provider external dependency unsupported: get_nprocs$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null; then
+    --out:/tmp/ct_runtime/autolink_trace \
+    --report-out:/tmp/ct_runtime/autolink_trace.report.txt \
+    --link-providers
+if [ -s /tmp/ct_runtime/autolink_trace ] &&
+   file /tmp/ct_runtime/autolink_trace 2>/dev/null | grep -q 'ELF 64-bit.*executable.*aarch64' &&
+   grep -q '^system_link_exec=1$' /tmp/ct_runtime/autolink_trace.report.txt 2>/dev/null &&
+   grep -q '^system_link_exec_scope=cold_runtime_provider_archive$' /tmp/ct_runtime/autolink_trace.report.txt 2>/dev/null &&
+   grep -q '^provider_archive=1$' /tmp/ct_runtime/autolink_trace.report.txt 2>/dev/null &&
+   grep -q '^provider_object_count=2$' /tmp/ct_runtime/autolink_trace.report.txt 2>/dev/null &&
+   grep -q '^provider_archive_member_count=2$' /tmp/ct_runtime/autolink_trace.report.txt 2>/dev/null &&
+   grep -q '^provider_export_count=10$' /tmp/ct_runtime/autolink_trace.report.txt 2>/dev/null &&
+   grep -Eq '^provider_resolved_symbol_count=[1-9][0-9]*$' /tmp/ct_runtime/autolink_trace.report.txt 2>/dev/null &&
+   grep -q '^unresolved_symbol_count=0$' /tmp/ct_runtime/autolink_trace.report.txt 2>/dev/null &&
+   grep -q '^system_link=0$' /tmp/ct_runtime/autolink_trace.report.txt 2>/dev/null; then
     ACT=1
 else
     ACT=0
 fi
-assert "runtime_provider_autolink_cpu_cores_hard_fail" 1 "$ACT"
+assert "runtime_provider_autolink_trace" 1 "$ACT"
+
+rm -f /tmp/ct_runtime/autolink_cpu_cores \
+    /tmp/ct_runtime/autolink_cpu_cores.report.txt
+quiet $COLD system-link-exec \
+    --in:testdata/runtime_provider_autolink_cpu_cores.cheng \
+    --target:aarch64-unknown-linux-gnu \
+    --out:/tmp/ct_runtime/autolink_cpu_cores \
+    --report-out:/tmp/ct_runtime/autolink_cpu_cores.report.txt \
+    --link-providers
+if [ -s /tmp/ct_runtime/autolink_cpu_cores ] &&
+   file /tmp/ct_runtime/autolink_cpu_cores 2>/dev/null | grep -q 'ELF 64-bit.*executable.*aarch64' &&
+   grep -q '^system_link_exec=1$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null &&
+   grep -q '^system_link_exec_scope=cold_runtime_provider_archive$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null &&
+   grep -q '^provider_archive=1$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null &&
+   grep -q '^provider_object_count=2$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null &&
+   grep -q '^provider_archive_member_count=2$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null &&
+   grep -q '^provider_export_count=10$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null &&
+   grep -Eq '^provider_resolved_symbol_count=[1-9][0-9]*$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null &&
+   grep -q '^unresolved_symbol_count=0$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null &&
+   grep -q '^system_link=0$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "runtime_provider_autolink_cpu_cores" 1 "$ACT"
 
 rm -rf /tmp/ct_runtime
 
@@ -974,6 +1001,70 @@ else
     ACT=0
 fi
 assert "egraph_convergence_output" 1 "$ACT"
+
+# 11c: Cross-block no-alias liveness analysis report fields
+rm -f /tmp/ct_xblock /tmp/ct_xblock.report
+quiet $COLD system-link-exec --in:src/tests/ownership_proof_driver_cold.cheng \
+    --target:arm64-apple-darwin --out:/tmp/ct_xblock \
+    --report-out:/tmp/ct_xblock.report
+if grep -q '^cross_block_analysis_ran=1$' /tmp/ct_xblock.report 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "cross_block_analysis_ran" 1 "$ACT"
+CB_SAFE=$(grep '^cross_block_safe_slots=' /tmp/ct_xblock.report | sed 's/.*=//')
+CB_UNSAFE=$(grep '^cross_block_unsafe_slots=' /tmp/ct_xblock.report | sed 's/.*=//')
+if [ -n "$CB_SAFE" ] && [ "$CB_SAFE" -ge 0 ] 2>/dev/null &&
+   [ -n "$CB_UNSAFE" ] && [ "$CB_UNSAFE" -ge 0 ] 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "cross_block_slot_counts_nonnegative" 1 "$ACT"
+TOTAL=$(( CB_SAFE + CB_UNSAFE ))
+if [ "$TOTAL" -gt 0 ] 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "cross_block_total_slots_gt_zero" 1 "$ACT"
+rm -f /tmp/ct_xblock /tmp/ct_xblock.report
+
+# 11d: E-Graph convergence stress test — compile a larger function
+rm -f /tmp/ct_egraph_stress /tmp/ct_egraph_stress.report
+quiet $COLD system-link-exec --in:src/tests/ownership_proof_driver_cold.cheng \
+    --target:arm64-apple-darwin --out:/tmp/ct_egraph_stress \
+    --report-out:/tmp/ct_egraph_stress.report
+if grep -q '^egraph_fixed_point_iterations=' /tmp/ct_egraph_stress.report 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "egraph_stress_convergence_report" 1 "$ACT"
+ITER=$(grep '^egraph_fixed_point_iterations=' /tmp/ct_egraph_stress.report | sed 's/.*=//')
+if [ -n "$ITER" ] && [ "$ITER" -ge 1 ] 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "egraph_stress_iter_count" 1 "$ACT"
+RWCNT=$(grep '^egraph_rewrite_count=' /tmp/ct_egraph_stress.report | sed 's/.*=//')
+if [ -n "$RWCNT" ] && [ "$RWCNT" -ge 1 ] 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "egraph_stress_rewrites_applied" 1 "$ACT"
+# Verify executable correctness under optimization stress
+if [ -x /tmp/ct_egraph_stress ] &&
+   /tmp/ct_egraph_stress >/dev/null 2>&1; then
+    ACT=$?
+else
+    ACT=1
+fi
+assert "egraph_stress_exit_zero" 0 "$ACT"
+rm -f /tmp/ct_egraph_stress /tmp/ct_egraph_stress.report
 
 # 12: emit:obj with object fields (int32 + str)
 rm -f /tmp/ct_eo_fields.cheng /tmp/ct_eo_fields /tmp/ct_eo_fields.o /tmp/ct_eo_fields_link
@@ -1990,6 +2081,22 @@ fi
 assert "function_task_cold_compile_smoke" 1 "$ACT"
 rm -f /tmp/ct_function_task.o /tmp/ct_function_task.report
 
+# --- function_task_executor.cheng cold compile smoke (exercises FunctionTaskExecuteAuto) ---
+rm -f /tmp/ct_fn_exec.o /tmp/ct_fn_exec.report
+if $COLD system-link-exec --root:"$PWD" \
+    --in:src/tests/function_task_executor_contract_smoke.cheng --target:arm64-apple-darwin \
+    --out:/tmp/ct_fn_exec.o --emit:obj \
+    --report-out:/tmp/ct_fn_exec.report >/dev/null 2>&1 &&
+   [ -s /tmp/ct_fn_exec.o ] &&
+   grep -q '^system_link_exec=1$' /tmp/ct_fn_exec.report 2>/dev/null &&
+   grep -q '^emit=obj$' /tmp/ct_fn_exec.report 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "function_task_executor_cold_compile_smoke" 1 "$ACT"
+rm -f /tmp/ct_fn_exec.o /tmp/ct_fn_exec.report
+
 # --- build_plan.cheng cold compile smoke ---
 rm -f /tmp/ct_build_plan.o /tmp/ct_build_plan.report
 if $COLD system-link-exec --root:"$PWD" \
@@ -2284,6 +2391,39 @@ else
 fi
 assert "cold_large_output_size_gt_100kb" 1 "$ACT"
 rm -f /tmp/ct_large_output.o /tmp/ct_large_output.report
+
+# --- parallel codegen determinism: BACKEND_JOBS=1 vs 4 bit-identical .o ---
+rm -f /tmp/ct_pdet_1.o /tmp/ct_pdet_4.o /tmp/ct_pdet_1.report /tmp/ct_pdet_4.report
+BACKEND_JOBS=1 $COLD system-link-exec --root:"$PWD" \
+    --in:src/tests/cold_csg_facts_exporter_smoke.cheng --target:arm64-apple-darwin \
+    --out:/tmp/ct_pdet_1.o --emit:obj \
+    --report-out:/tmp/ct_pdet_1.report >/dev/null 2>&1
+rc1=$?
+BACKEND_JOBS=4 $COLD system-link-exec --root:"$PWD" \
+    --in:src/tests/cold_csg_facts_exporter_smoke.cheng --target:arm64-apple-darwin \
+    --out:/tmp/ct_pdet_4.o --emit:obj \
+    --report-out:/tmp/ct_pdet_4.report >/dev/null 2>&1
+rc4=$?
+if [ "$rc1" -eq 0 ] && [ "$rc4" -eq 0 ] &&
+   [ -s /tmp/ct_pdet_1.o ] && [ -s /tmp/ct_pdet_4.o ] &&
+   grep -q '^function_task_job_count=1$' /tmp/ct_pdet_1.report &&
+   grep -q '^function_task_schedule=serial$' /tmp/ct_pdet_1.report &&
+   grep -q '^function_task_job_count=4$' /tmp/ct_pdet_4.report &&
+   grep -q '^function_task_schedule=ws$' /tmp/ct_pdet_4.report; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "cold_parallel_report_jobs1" 1 "$ACT"
+sha1=$(shasum -a 256 /tmp/ct_pdet_1.o | cut -d' ' -f1)
+sha4=$(shasum -a 256 /tmp/ct_pdet_4.o | cut -d' ' -f1)
+if [ "$sha1" = "$sha4" ] && [ -n "$sha1" ]; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "cold_parallel_determinism_sha" 1 "$ACT"
+rm -f /tmp/ct_pdet_1.o /tmp/ct_pdet_4.o /tmp/ct_pdet_1.report /tmp/ct_pdet_4.report
 
 echo ""
 echo "=== $PASS passed, $FAIL failed ==="

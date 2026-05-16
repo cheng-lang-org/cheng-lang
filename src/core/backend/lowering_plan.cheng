@@ -101,11 +101,8 @@ var
     loweringParallelLetCallReturnLiteralStart: int32
     loweringParallelResults: PrimaryObjectIrFunction[]
     loweringParallelDoneCount: atomic.I32
-
-type
-    LoweringWorkChunk = ref
-        funcIndexStart: int32
-        funcIndexEnd: int32
+    loweringParallelNextFuncIndex: atomic.I32
+    loweringParallelFunctionCount: int32
 
 fn LoweringCallConvInternal(): int32 =
     return 1
@@ -1457,18 +1454,15 @@ fn LoweringBuildOneFunction(plan: LoweringPlanStub,
     fnIr.callTargetCount = fnIr.callTargets.len
     return fnIr
 
-fn LoweringWorkChunkMain(raw: ptr) =
-    if raw == nil:
-        return
-    let chunk: LoweringWorkChunk = LoweringWorkChunk(raw)
-    for i in chunk.funcIndexStart..<chunk.funcIndexEnd:
-        let fnIr = LoweringBuildOneFunction(loweringParallelPlan,
-                                            loweringParallelSourceTexts,
-                                            i,
-                                            loweringParallelLetCallReturnLiteralStart)
-        loweringParallelResults[i] = fnIr
+fn LoweringWorkStealMain(raw: ptr) =
+    while true:
+        let i = atomic.AddI32(loweringParallelNextFuncIndex, 1) - 1
+        if i >= loweringParallelFunctionCount:
+            break
+        loweringParallelResults[i] = LoweringBuildOneFunction(
+            loweringParallelPlan, loweringParallelSourceTexts, i,
+            loweringParallelLetCallReturnLiteralStart)
     let _ = atomic.AddI32(loweringParallelDoneCount, 1)
-    memRelease(chunk)
 
 fn LoweringBuildPrimaryObjectIr(plan: LoweringPlanStub,
                                  sourceTexts: texpr.TypedExprSourceText[]): PrimaryObjectIr =
@@ -1486,38 +1480,27 @@ fn LoweringBuildPrimaryObjectIr(plan: LoweringPlanStub,
     loweringParallelPlan = plan
     loweringParallelSourceTexts = sourceTexts
     loweringParallelLetCallReturnLiteralStart = letCallReturnLiteralStart
-    loweringParallelResults = []
-    for i in 0..<functionCount:
-        var empty: PrimaryObjectIrFunction
-        add(loweringParallelResults, empty)
     if jobCount <= 1:
         for i in 0..<functionCount:
             let fnIr = LoweringBuildOneFunction(plan, sourceTexts, i, letCallReturnLiteralStart)
             add(ir.functions, fnIr)
-        loweringParallelResults = []
         return ir
     var actualWorkerCount = jobCount
     if actualWorkerCount > functionCount:
         actualWorkerCount = functionCount
+    loweringParallelResults = []
+    for i in 0..<functionCount:
+        var empty: PrimaryObjectIrFunction
+        add(loweringParallelResults, empty)
+    loweringParallelFunctionCount = functionCount
     loweringParallelDoneCount = atomic.NewI32(0)
-    for workerId in 0..<actualWorkerCount:
-        let start = (functionCount * workerId) / jobCount
-        let finish = (functionCount * (workerId + 1)) / jobCount
-        if start >= finish:
-            let _ = atomic.AddI32(loweringParallelDoneCount, 1)
-            continue
-        var chunk = new(LoweringWorkChunk)
-        if chunk == nil:
-            continue
-        chunk.funcIndexStart = start
-        chunk.funcIndexEnd = finish
-        memRetain(chunk)
-        async.SpawnPtr(LoweringWorkChunkMain, chunk)
+    loweringParallelNextFuncIndex = atomic.NewI32(0)
+    for w in 0..<actualWorkerCount:
+        async.SpawnPtr(LoweringWorkStealMain, nil)
     while atomic.LoadI32(loweringParallelDoneCount) < actualWorkerCount:
         thread.Yield()
     for i in 0..<functionCount:
-        let fnIr = loweringParallelResults[i]
-        add(ir.functions, fnIr)
+        add(ir.functions, loweringParallelResults[i])
     loweringParallelResults = []
     return ir
 fn LoweringIsImportcAnnotation(lineRaw: str): bool =
