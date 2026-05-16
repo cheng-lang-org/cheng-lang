@@ -70,6 +70,9 @@ wasm_compile import_native src/tests/wasm_importc_noarg_i32_native_smoke.cheng
 # 8. Function block shared
 wasm_compile func_block src/tests/wasm_func_block_shared_smoke.cheng
 
+# 8b. Ops smoke test
+wasm_compile ops_smoke src/tests/wasm_ops_smoke.cheng
+
 # 9. Verify expected exports in each wasm binary
 for wasm in "$WORK"/*.wasm; do
     base="$(basename "$wasm" .wasm)"

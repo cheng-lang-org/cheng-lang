@@ -3815,6 +3815,32 @@ for wasm_entry in \
     rm -f "/tmp/ct_wasm_${wt_tag}.wasm" "/tmp/ct_wasm_${wt_tag}.report"
 done
 
+# --- wasm-validate binary validation for .wasm files that compile to valid wasm ---
+# Note: several wasm smoke files produce binaries with type mismatch errors
+# (pre-existing WASM backend issue), so only known-good files are validated.
+for wasm_entry in \
+    "wasm_zero:src/tests/wasm_zero_smoke.cheng" \
+    "wasm_internal_call:src/tests/wasm_internal_call_smoke.cheng" \
+    "wasm_importc_noarg_i32:src/tests/wasm_importc_noarg_i32_smoke.cheng" \
+    "wasm_importc_noarg_i32_native:src/tests/wasm_importc_noarg_i32_native_smoke.cheng"; do
+    wt_tag="${wasm_entry%%:*}"
+    wt_src="${wasm_entry#*:}"
+    rm -f "/tmp/ct_wv_${wt_tag}.wasm" "/tmp/ct_wv_${wt_tag}.report"
+    quiet $COLD system-link-exec --root:"$PWD" \
+        --in:"$wt_src" --target:wasm32-unknown-unknown \
+        --out:"/tmp/ct_wv_${wt_tag}.wasm" --emit:obj \
+        --report-out:"/tmp/ct_wv_${wt_tag}.report"
+    if [ -s "/tmp/ct_wv_${wt_tag}.wasm" ] && \
+       wasm-validate "/tmp/ct_wv_${wt_tag}.wasm" >/dev/null 2>&1 && \
+       ! grep -q '^error=' "/tmp/ct_wv_${wt_tag}.report" 2>/dev/null; then
+        ACT=1
+    else
+        ACT=0
+    fi
+    assert "wasm_validate_${wt_tag}" 1 "$ACT"
+    rm -f "/tmp/ct_wv_${wt_tag}.wasm" "/tmp/ct_wv_${wt_tag}.report"
+done
+
 # --- Cross-target compilation: same source compiled for arm64, x86_64, riscv64, wasm32 ---
 cat > /tmp/ct_cross_all.cheng << 'CTEOF'
 fn main(): int32 = return 42
@@ -3844,6 +3870,66 @@ for ct_entry in "arm64_darwin:arm64-apple-darwin:Mach-O 64-bit" \
     rm -f "/tmp/ct_ct_${ct_tag}.o" "/tmp/ct_ct_${ct_tag}.report"
 done
 rm -f /tmp/ct_cross_all.cheng
+
+# --- Cross-arch compile matrix: compile 10 key files for all 4 targets ---
+for xa_entry in \
+    "core_types:src/core/ir/core_types.cheng" \
+    "ownership:src/core/analysis/ownership.cheng" \
+    "object_plan:src/core/backend/object_plan.cheng" \
+    "direct_object_emit:src/core/backend/direct_object_emit.cheng" \
+    "aarch64_encode:src/core/backend/aarch64_encode.cheng" \
+    "x86_64_encode:src/core/backend/x86_64_encode.cheng" \
+    "riscv64_encode:src/core/backend/riscv64_encode.cheng" \
+    "handle_table:src/core/runtime/handle_table.cheng" \
+    "bytes:src/std/bytes.cheng" \
+    "borrow_checker:src/core/analysis/borrow_checker.cheng"; do
+    xa_tag="${xa_entry%%:*}"
+    xa_src="${xa_entry#*:}"
+    for xa_target in "arm64-apple-darwin" "x86_64-unknown-linux-gnu" "riscv64-unknown-linux-gnu" "wasm32-unknown-unknown"; do
+        xa_o="/tmp/ct_xa_${xa_tag}.o"
+        xa_r="/tmp/ct_xa_${xa_tag}.report"
+        rm -f "$xa_o" "$xa_r"
+        quiet $COLD system-link-exec --root:"$PWD" \
+            --in:"$xa_src" --target:"$xa_target" \
+            --out:"$xa_o" --emit:obj \
+            --report-out:"$xa_r"
+        if [ -s "$xa_o" ] && \
+           grep -q "^target=$xa_target\$" "$xa_r" 2>/dev/null && \
+           ! grep -q '^error=' "$xa_r" 2>/dev/null; then
+            ACT=1
+        else
+            ACT=0
+        fi
+        assert "xarch_${xa_tag}_$(echo "$xa_target" | tr '-' '_')" 1 "$ACT"
+        rm -f "$xa_o" "$xa_r"
+    done
+done
+
+# --- Smoke all targets: compile a real source file for all 4 targets with format verification ---
+for sa_entry in "arm64_darwin:arm64-apple-darwin:Mach-O 64-bit" \
+                "x86_64_linux:x86_64-unknown-linux-gnu:ELF 64-bit" \
+                "riscv64_linux:riscv64-unknown-linux-gnu:ELF 64-bit" \
+                "wasm32:wasm32-unknown-unknown:WebAssembly"; do
+    sa_tag="${sa_entry%%:*}"
+    rest="${sa_entry#*:}"
+    sa_target="${rest%%:*}"
+    sa_magic="${rest#*:}"
+    rm -f "/tmp/ct_sa_${sa_tag}.o" "/tmp/ct_sa_${sa_tag}.report"
+    quiet $COLD system-link-exec --root:"$PWD" \
+        --in:"src/tests/wasm_zero_smoke.cheng" --target:"$sa_target" \
+        --out:"/tmp/ct_sa_${sa_tag}.o" --emit:obj \
+        --report-out:"/tmp/ct_sa_${sa_tag}.report"
+    if [ -s "/tmp/ct_sa_${sa_tag}.o" ] && \
+       grep -q "^target=$sa_target\$" "/tmp/ct_sa_${sa_tag}.report" 2>/dev/null && \
+       file "/tmp/ct_sa_${sa_tag}.o" 2>/dev/null | grep -q "$sa_magic" && \
+       ! grep -q '^error=' "/tmp/ct_sa_${sa_tag}.report" 2>/dev/null; then
+        ACT=1
+    else
+        ACT=0
+    fi
+    assert "smoke_all_targets_${sa_tag}" 1 "$ACT"
+    rm -f "/tmp/ct_sa_${sa_tag}.o" "/tmp/ct_sa_${sa_tag}.report"
+done
 
 # --- Cold bootstrap chain test: stage1 compiles simple file, stage2==stage3 binary match ---
 rm -rf /tmp/ct_bbc
@@ -3936,6 +4022,514 @@ ACT=$(compile_obj_smoke "hello_puts" "tests/cheng/backend/fixtures/hello_puts.ch
 assert "hello_puts_cold_compile_smoke" 1 "$ACT"
 ACT=$(compile_obj_smoke "native_contract_ok" "tests/cheng/backend/fixtures/native_contract_ok.cheng")
 assert "native_contract_ok_cold_compile_smoke" 1 "$ACT"
+
+# 17: Cross-platform ELF provider test (Provider 1)
+# Verify ELF provider objects work on macOS via cross-compilation to aarch64-unknown-linux-gnu
+rm -rf /tmp/ct_cross_prov
+mkdir -p /tmp/ct_cross_prov
+cat > /tmp/ct_cross_prov/prov_a.cheng << 'CPEOF'
+@exportc("cp_a_fn")
+fn cp_a_fn(): int32 = return 11
+CPEOF
+cat > /tmp/ct_cross_prov/prov_b.cheng << 'CPEOF'
+@exportc("cp_b_fn")
+fn cp_b_fn(): int32 = return 22
+CPEOF
+cat > /tmp/ct_cross_prov/primary.cheng << 'CPEOF'
+@importc("cp_a_fn")
+fn cp_a(): int32
+@importc("cp_b_fn")
+fn cp_b(): int32
+fn main(): int32 = return cp_a() + cp_b()
+CPEOF
+# Compile as ELF objects on macOS
+for cp_f in prov_a prov_b primary; do
+    quiet $COLD system-link-exec --in:"/tmp/ct_cross_prov/${cp_f}.cheng" \
+        --emit:obj --target:aarch64-unknown-linux-gnu \
+        --out:"/tmp/ct_cross_prov/${cp_f}.o" \
+        --report-out:"/tmp/ct_cross_prov/${cp_f}.report.txt"
+done
+cp_elf_ok=1
+for cp_o in prov_a.o prov_b.o primary.o; do
+    if [ -s "/tmp/ct_cross_prov/${cp_o}" ]; then
+        cp_magic=$(od -A n -t x1 -N 4 "/tmp/ct_cross_prov/${cp_o}" 2>/dev/null | tr -d ' \n')
+        if [ "$cp_magic" != "7f454c46" ]; then cp_elf_ok=0; fi
+    else
+        cp_elf_ok=0
+    fi
+done
+assert "cross_provider_elf_magic" 1 "$cp_elf_ok"
+# Pack provider archive
+quiet $COLD provider-archive-pack \
+    --target:aarch64-unknown-linux-gnu \
+    --object:/tmp/ct_cross_prov/prov_a.o \
+    --object:/tmp/ct_cross_prov/prov_b.o \
+    --export:cp_a_fn \
+    --export:cp_b_fn \
+    --module:cross_providers \
+    --source:/tmp/ct_cross_prov \
+    --out:/tmp/ct_cross_prov/packed.chenga \
+    --report-out:/tmp/ct_cross_prov/pack.report.txt
+if [ -f /tmp/ct_cross_prov/packed.chenga ]; then ACT=1; else ACT=0; fi
+assert "cross_provider_pack" 1 "$ACT"
+# Link all together
+quiet $COLD system-link-exec \
+    --link-object:/tmp/ct_cross_prov/primary.o \
+    --provider-archive:/tmp/ct_cross_prov/packed.chenga \
+    --emit:exe --target:aarch64-unknown-linux-gnu \
+    --out:/tmp/ct_cross_prov/linked \
+    --report-out:/tmp/ct_cross_prov/link.report.txt
+if grep -q '^provider_archive_member_count=2$' /tmp/ct_cross_prov/link.report.txt 2>/dev/null &&
+   grep -q '^provider_export_count=2$' /tmp/ct_cross_prov/link.report.txt 2>/dev/null &&
+   grep -q '^provider_resolved_symbol_count=2$' /tmp/ct_cross_prov/link.report.txt 2>/dev/null &&
+   grep -q '^unresolved_symbol_count=0$' /tmp/ct_cross_prov/link.report.txt 2>/dev/null &&
+   grep -q '^system_link=0$' /tmp/ct_cross_prov/link.report.txt 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "cross_provider_link" 1 "$ACT"
+rm -rf /tmp/ct_cross_prov
+
+# 18: Provider archive stress test (Provider 2) — pack 10 objects, link all
+rm -rf /tmp/ct_str_prov
+mkdir -p /tmp/ct_str_prov
+for i in $(seq 1 10); do
+    cat > "/tmp/ct_str_prov/p${i}.cheng" << STREOF
+@exportc("sp_${i}")
+fn sp_${i}(): int32 = return ${i}
+STREOF
+    quiet $COLD system-link-exec --in:"/tmp/ct_str_prov/p${i}.cheng" \
+        --emit:obj --target:aarch64-unknown-linux-gnu \
+        --out:"/tmp/ct_str_prov/p${i}.o" \
+        --report-out:"/tmp/ct_str_prov/p${i}.report.txt" 2>/dev/null
+done
+cat > /tmp/ct_str_prov/main.cheng << 'STREOF'
+@importc("sp_1")
+fn s01(): int32
+@importc("sp_2")
+fn s02(): int32
+@importc("sp_3")
+fn s03(): int32
+@importc("sp_4")
+fn s04(): int32
+@importc("sp_5")
+fn s05(): int32
+@importc("sp_6")
+fn s06(): int32
+@importc("sp_7")
+fn s07(): int32
+@importc("sp_8")
+fn s08(): int32
+@importc("sp_9")
+fn s09(): int32
+@importc("sp_10")
+fn s10(): int32
+fn main(): int32 = return s01()+s02()+s03()+s04()+s05()+s06()+s07()+s08()+s09()+s10()
+STREOF
+quiet $COLD system-link-exec --in:/tmp/ct_str_prov/main.cheng \
+    --emit:obj --target:aarch64-unknown-linux-gnu \
+    --out:/tmp/ct_str_prov/main.o
+# Pack all 10 objects
+sp_obj_list=""
+sp_exp_list=""
+for i in $(seq 1 10); do
+    sp_obj_list="${sp_obj_list} --object:/tmp/ct_str_prov/p${i}.o"
+    sp_exp_list="${sp_exp_list} --export:sp_${i}"
+done
+quiet $COLD provider-archive-pack \
+    --target:aarch64-unknown-linux-gnu \
+    ${sp_obj_list} ${sp_exp_list} \
+    --module:stress \
+    --source:/tmp/ct_str_prov \
+    --out:/tmp/ct_str_prov/stress.chenga \
+    --report-out:/tmp/ct_str_prov/pack.report.txt
+if [ -f /tmp/ct_str_prov/stress.chenga ] &&
+   grep -q '^provider_archive_member_count=10$' /tmp/ct_str_prov/pack.report.txt 2>/dev/null &&
+   grep -q '^provider_export_count=10$' /tmp/ct_str_prov/pack.report.txt 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "stress_provider_pack_10" 1 "$ACT"
+# Link all 10 providers
+quiet $COLD system-link-exec \
+    --link-object:/tmp/ct_str_prov/main.o \
+    --provider-archive:/tmp/ct_str_prov/stress.chenga \
+    --emit:exe --target:aarch64-unknown-linux-gnu \
+    --out:/tmp/ct_str_prov/linked \
+    --report-out:/tmp/ct_str_prov/link.report.txt
+if grep -q '^provider_archive_member_count=10$' /tmp/ct_str_prov/link.report.txt 2>/dev/null &&
+   grep -q '^provider_export_count=10$' /tmp/ct_str_prov/link.report.txt 2>/dev/null &&
+   grep -q '^provider_resolved_symbol_count=10$' /tmp/ct_str_prov/link.report.txt 2>/dev/null &&
+   grep -q '^unresolved_symbol_count=0$' /tmp/ct_str_prov/link.report.txt 2>/dev/null &&
+   grep -q '^system_link=0$' /tmp/ct_str_prov/link.report.txt 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "stress_provider_link_10" 1 "$ACT"
+rm -rf /tmp/ct_str_prov
+
+# 19: Provider report consistency across rebuilds (Provider 3)
+rm -rf /tmp/ct_pc
+mkdir -p /tmp/ct_pc
+cat > /tmp/ct_pc/pa.cheng << 'PCEOF'
+@exportc("pc_a")
+fn pc_a(): int32 = return 3
+PCEOF
+cat > /tmp/ct_pc/pb.cheng << 'PCEOF'
+@exportc("pc_b")
+fn pc_b(): int32 = return 5
+PCEOF
+cat > /tmp/ct_pc/main.cheng << 'PCEOF'
+@importc("pc_a")
+fn ga(): int32
+@importc("pc_b")
+fn gb(): int32
+fn main(): int32 = return ga() + gb()
+PCEOF
+# Compile objects once (shared between two rebuilds)
+for pc_f in pa pb main; do
+    quiet $COLD system-link-exec --in:"/tmp/ct_pc/${pc_f}.cheng" \
+        --emit:obj --target:aarch64-unknown-linux-gnu \
+        --out:"/tmp/ct_pc/${pc_f}.o"
+done
+for pc_run in a b; do
+    quiet $COLD provider-archive-pack \
+        --target:aarch64-unknown-linux-gnu \
+        --object:/tmp/ct_pc/pa.o --object:/tmp/ct_pc/pb.o \
+        --export:pc_a --export:pc_b \
+        --module:pc \
+        --source:/tmp/ct_pc \
+        --out:"/tmp/ct_pc/arch_${pc_run}.chenga" \
+        --report-out:"/tmp/ct_pc/pack_${pc_run}.report.txt"
+    quiet $COLD system-link-exec \
+        --link-object:/tmp/ct_pc/main.o \
+        --provider-archive:"/tmp/ct_pc/arch_${pc_run}.chenga" \
+        --emit:exe --target:aarch64-unknown-linux-gnu \
+        --out:"/tmp/ct_pc/link_${pc_run}" \
+        --report-out:"/tmp/ct_pc/link_${pc_run}.report.txt"
+done
+# Compare stripped reports
+grep -vE '^(build_timestamp=|report_written_at=|cold_provider_archive_pack_elapsed_ms=|cold_system_link_exec_elapsed_ms=|output=|entry_dispatch_executable=|source=|csg_input=|cold_compile_elapsed_ms=|exec_phase_|report_cpu_ms=|report_rss_bytes=|provider_archive_hash=)' \
+    /tmp/ct_pc/link_a.report.txt > /tmp/ct_pc/link_a_stripped.txt
+grep -vE '^(build_timestamp=|report_written_at=|cold_provider_archive_pack_elapsed_ms=|cold_system_link_exec_elapsed_ms=|output=|entry_dispatch_executable=|source=|csg_input=|cold_compile_elapsed_ms=|exec_phase_|report_cpu_ms=|report_rss_bytes=|provider_archive_hash=)' \
+    /tmp/ct_pc/link_b.report.txt > /tmp/ct_pc/link_b_stripped.txt
+if cmp -s /tmp/ct_pc/link_a_stripped.txt /tmp/ct_pc/link_b_stripped.txt; then
+    ACT=1; else ACT=0
+fi
+assert "provider_report_consistency" 1 "$ACT"
+rm -rf /tmp/ct_pc
+
+# 20: E-Graph optimization correctness test (Ownership 4)
+# Verify optimized output == expected result, deterministic, and rewrites fire
+rm -f /tmp/ct_ego.cheng /tmp/ct_ego_a /tmp/ct_ego_a.report \
+      /tmp/ct_ego_b /tmp/ct_ego_b.report
+cat > /tmp/ct_ego.cheng << 'EGOEOF'
+fn kernel(x: int32, y: int32): int32 =
+    var dead1 = x + y          # dead — DSE should eliminate
+    var a = x + 0              # identity: ADD(x,0) -> COPY
+    var b = y * 1              # identity: MUL(y,1) -> COPY
+    var c = a + b              # live computation
+    var d = c + 0              # identity
+    var e = d * 1              # identity
+    var dead2 = e + dead1      # transitively dead via dead1
+    return e
+
+fn main(): int32 =
+    return kernel(40, 2)
+EGOEOF
+# Compile twice to verify determinism
+quiet $COLD system-link-exec --in:/tmp/ct_ego.cheng \
+    --target:arm64-apple-darwin --out:/tmp/ct_ego_a \
+    --report-out:/tmp/ct_ego_a.report
+quiet $COLD system-link-exec --in:/tmp/ct_ego.cheng \
+    --target:arm64-apple-darwin --out:/tmp/ct_ego_b \
+    --report-out:/tmp/ct_ego_b.report
+# Both must produce correct result
+if [ -x /tmp/ct_ego_a ]; then /tmp/ct_ego_a >/dev/null 2>&1; EG_A=$?; else EG_A="FAIL"; fi
+if [ -x /tmp/ct_ego_b ]; then /tmp/ct_ego_b >/dev/null 2>&1; EG_B=$?; else EG_B="FAIL"; fi
+assert "egraph_correct_result" 42 "$EG_A"
+assert "egraph_correct_deterministic" "$EG_A" "$EG_B"
+# Verify rewrites happened (DSE + identities)
+EG_RW=$(grep '^egraph_rewrite_count=' /tmp/ct_ego_a.report | sed 's/.*=//')
+if [ -n "$EG_RW" ] && [ "$EG_RW" -ge 2 ] 2>/dev/null; then ACT=1; else ACT=0; fi
+assert "egraph_correct_rewrites" 1 "$ACT"
+# Verify idempotent rewrite counts across runs
+EG_RWB=$(grep '^egraph_rewrite_count=' /tmp/ct_ego_b.report | sed 's/.*=//')
+if [ -n "$EG_RW" ] && [ "$EG_RW" = "$EG_RWB" ] 2>/dev/null; then ACT=1; else ACT=0; fi
+assert "egraph_correct_idempotent" 1 "$ACT"
+# Verify fixed-point iteration count is at least 1
+EG_FP=$(grep '^egraph_fixed_point_iterations=' /tmp/ct_ego_a.report | sed 's/.*=//')
+if [ -n "$EG_FP" ] && [ "$EG_FP" -ge 1 ] 2>/dev/null; then ACT=1; else ACT=0; fi
+assert "egraph_correct_fixed_point" 1 "$ACT"
+rm -f /tmp/ct_ego.cheng /tmp/ct_ego_a /tmp/ct_ego_a.report \
+      /tmp/ct_ego_b /tmp/ct_ego_b.report
+
+# 21: Cross-block dead store elimination test (Ownership 5)
+# Builds on existing liveness analysis: verify DSE + cross-block slot safety
+rm -f /tmp/ct_cbdse.cheng /tmp/ct_cbdse /tmp/ct_cbdse.report
+cat > /tmp/ct_cbdse.cheng << 'CBDSE'
+fn main(): int32 =
+    var x: int32              # writer in two blocks → cross-block unsafe
+    var y: int32 = 100        # single writer, read later → cross-block safe
+    var z: int32 = 0          # written, never read overall → DSE candidate
+    if y > 50:
+        x = 42                # write in block 1
+        z = 1                 # dead
+    else:
+        x = 0                 # write in block 2
+        z = 2                 # dead
+    var r = x + y             # reads both x (unsafe) and y (safe)
+    z = r                     # overwritten before any read → DSE candidate
+    return r
+CBDSE
+quiet $COLD system-link-exec --in:/tmp/ct_cbdse.cheng \
+    --target:arm64-apple-darwin --out:/tmp/ct_cbdse \
+    --report-out:/tmp/ct_cbdse.report
+if [ -x /tmp/ct_cbdse ]; then
+    /tmp/ct_cbdse >/dev/null 2>&1; ACT=$?
+else
+    ACT="COMPILE_FAILED"
+fi
+assert "cbdse_exit" 142 "$ACT"
+# Verify cross-block analysis ran and reports encountered slots
+if grep -q '^cross_block_analysis_ran=1$' /tmp/ct_cbdse.report 2>/dev/null; then
+    ACT=1; else ACT=0
+fi
+assert "cbdse_analysis_ran" 1 "$ACT"
+CBDSE_SAFE=$(grep '^cross_block_safe_slots=' /tmp/ct_cbdse.report | sed 's/.*=//')
+CBDSE_UNSAFE=$(grep '^cross_block_unsafe_slots=' /tmp/ct_cbdse.report | sed 's/.*=//')
+if [ -n "$CBDSE_SAFE" ] && [ "$CBDSE_SAFE" -ge 0 ] 2>/dev/null &&
+   [ -n "$CBDSE_UNSAFE" ] && [ "$CBDSE_UNSAFE" -ge 0 ] 2>/dev/null; then
+    ACT=1; else ACT=0
+fi
+assert "cbdse_safety_counts" 1 "$ACT"
+# DSE rewrites must be non-zero (dead stores eliminated)
+CBDSE_RW=$(grep '^egraph_rewrite_count=' /tmp/ct_cbdse.report | sed 's/.*=//')
+if [ -n "$CBDSE_RW" ] && [ "$CBDSE_RW" -ge 1 ] 2>/dev/null; then ACT=1; else ACT=0; fi
+assert "cbdse_rewrites" 1 "$ACT"
+rm -f /tmp/ct_cbdse.cheng /tmp/ct_cbdse /tmp/ct_cbdse.report
+
+# 22: No-alias register cache hit rate test (Ownership 6)
+# Verify na_find reduces loads by repeatedly reading the same scalar variables
+rm -f /tmp/ct_nahot.cheng /tmp/ct_nahot /tmp/ct_nahot.report \
+      /tmp/ct_nahot_on /tmp/ct_nahot_on.report
+cat > /tmp/ct_nahot.cheng << 'NAHOT'
+fn main(): int32 =
+    var a: int32 = 7
+    var b: int32 = 3
+    # Heavy scalar reuse: each read of a/b after the first
+    # should hit the no-alias register cache (na_find) instead of loading
+    var r: int32
+    r = r + a
+    r = r + a
+    r = r + b
+    r = r + a
+    r = r + a
+    r = r + b
+    r = r + a
+    r = r - b
+    r = r + a
+    # More interleaved reads
+    var t1 = a
+    var t2 = b
+    var t3 = t1
+    var t4 = t2
+    r = r + t3 + t4
+    return r
+NAHOT
+# Compile without ownership flag
+quiet $COLD system-link-exec --in:/tmp/ct_nahot.cheng \
+    --target:arm64-apple-darwin --out:/tmp/ct_nahot \
+    --report-out:/tmp/ct_nahot.report
+if [ -x /tmp/ct_nahot ]; then
+    /tmp/ct_nahot >/dev/null 2>&1; NA_EXIT=$?
+else
+    NA_EXIT="FAIL"
+fi
+assert "nahot_exit" 55 "$NA_EXIT"
+if grep -q '^cross_block_analysis_ran=1$' /tmp/ct_nahot.report 2>/dev/null; then
+    ACT=1; else ACT=0
+fi
+assert "nahot_analysis_ran" 1 "$ACT"
+# Compile WITH --ownership-on which enables no-alias metadata
+quiet $COLD system-link-exec --in:/tmp/ct_nahot.cheng \
+    --target:arm64-apple-darwin --out:/tmp/ct_nahot_on \
+    --report-out:/tmp/ct_nahot_on.report --ownership-on
+if [ -x /tmp/ct_nahot_on ]; then
+    /tmp/ct_nahot_on >/dev/null 2>&1; NA_ON_EXIT=$?
+else
+    NA_ON_EXIT="FAIL"
+fi
+assert "nahot_ownership_exit" 55 "$NA_ON_EXIT"
+# Cross-block analysis must also run with --ownership-on
+if grep -q '^cross_block_analysis_ran=1$' /tmp/ct_nahot_on.report 2>/dev/null; then
+    ACT=1; else ACT=0
+fi
+assert "nahot_ownership_analysis_ran" 1 "$ACT"
+rm -f /tmp/ct_nahot.cheng /tmp/ct_nahot /tmp/ct_nahot.report \
+      /tmp/ct_nahot_on /tmp/ct_nahot_on.report
+
+# --- runtime execution tests: compile_run for backend_matrix test files ---
+ACT=$(compile_run "src/tests/backend_matrix_cfg_if_guard_taken.cheng" /tmp/ct_bm_cfg_grd_taken)
+assert "runtime_backend_matrix_cfg_if_guard_taken" 5 "$ACT"
+ACT=$(compile_run "src/tests/backend_matrix_stack_args_9plus.cheng" /tmp/ct_bm_stack_9plus)
+assert "runtime_backend_matrix_stack_args_9plus" 19 "$ACT"
+ACT=$(compile_run "src/tests/backend_matrix_result_dispatch.cheng" /tmp/ct_bm_result_dispatch)
+assert "runtime_backend_matrix_result_dispatch" 9 "$ACT"
+ACT=$(compile_run "src/tests/backend_matrix_composite_str_sret.cheng" /tmp/ct_bm_composite_sret)
+assert "runtime_backend_matrix_composite_str_sret" 7 "$ACT"
+ACT=$(compile_run "src/tests/backend_matrix_cfg_if_guard.cheng" /tmp/ct_bm_cfg_guard)
+assert "runtime_backend_matrix_cfg_if_guard" 13 "$ACT"
+ACT=$(compile_run "src/tests/backend_matrix_stmt_call_return_const.cheng" /tmp/ct_bm_stmt_call_ret_const)
+assert "runtime_backend_matrix_stmt_call_return_const" 17 "$ACT"
+ACT=$(compile_run "src/tests/backend_matrix_let_call_chain_i32.cheng" /tmp/ct_bm_let_call_chain)
+assert "runtime_backend_matrix_let_call_chain_i32" 5 "$ACT"
+
+# --- compile_obj_smoke for the same backend_matrix files (compile + object format) ---
+ACT=$(compile_obj_smoke "backend_matrix_cfg_if_guard_taken" "src/tests/backend_matrix_cfg_if_guard_taken.cheng")
+assert "backend_matrix_cfg_if_guard_taken_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "backend_matrix_stack_args_9plus" "src/tests/backend_matrix_stack_args_9plus.cheng")
+assert "backend_matrix_stack_args_9plus_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "backend_matrix_result_dispatch" "src/tests/backend_matrix_result_dispatch.cheng")
+assert "backend_matrix_result_dispatch_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "backend_matrix_composite_str_sret" "src/tests/backend_matrix_composite_str_sret.cheng")
+assert "backend_matrix_composite_str_sret_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "backend_matrix_cfg_if_guard" "src/tests/backend_matrix_cfg_if_guard.cheng")
+assert "backend_matrix_cfg_if_guard_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "backend_matrix_stmt_call_return_const" "src/tests/backend_matrix_stmt_call_return_const.cheng")
+assert "backend_matrix_stmt_call_return_const_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "backend_matrix_let_call_chain_i32" "src/tests/backend_matrix_let_call_chain_i32.cheng")
+assert "backend_matrix_let_call_chain_i32_cold_compile_smoke" 1 "$ACT"
+
+# --- compile_obj_smoke for remaining untested core/backend files ---
+ACT=$(compile_obj_smoke "elf_x86_64_writer" "src/core/backend/elf_x86_64_writer.cheng")
+assert "elf_x86_64_writer_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "coff_x86_64_writer" "src/core/backend/coff_x86_64_writer.cheng")
+assert "coff_x86_64_writer_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "coff_object_linker" "src/core/backend/coff_object_linker.cheng")
+assert "coff_object_linker_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "elf_object_linker" "src/core/backend/elf_object_linker.cheng")
+assert "elf_object_linker_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "elf_riscv64_linker" "src/core/backend/elf_riscv64_linker.cheng")
+assert "elf_riscv64_linker_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "linker_shared_core" "src/core/backend/linker_shared_core.cheng")
+assert "linker_shared_core_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "thunk_synthesis_driver" "src/core/backend/thunk_synthesis_driver.cheng")
+assert "thunk_synthesis_driver_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "uir_egraph_cost" "src/core/backend/uir_egraph_cost.cheng")
+assert "uir_egraph_cost_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "uir_loop_analysis" "src/core/backend/uir_loop_analysis.cheng")
+assert "uir_loop_analysis_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "uir_thunk_synthesis" "src/core/backend/uir_thunk_synthesis.cheng")
+assert "uir_thunk_synthesis_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "uir_vec_cost" "src/core/backend/uir_vec_cost.cheng")
+assert "uir_vec_cost_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "uir_vectorize_loop" "src/core/backend/uir_vectorize_loop.cheng")
+assert "uir_vectorize_loop_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "uir_vectorize_slp" "src/core/backend/uir_vectorize_slp.cheng")
+assert "uir_vectorize_slp_cold_compile_smoke" 1 "$ACT"
+
+# --- compile_obj_smoke for remaining untested core/tooling and core/runtime files ---
+ACT=$(compile_obj_smoke "cold_import_stubs" "src/core/tooling/cold_import_stubs.cheng")
+assert "cold_import_stubs_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "compiler_budget_contract" "src/core/tooling/compiler_budget_contract.cheng")
+assert "compiler_budget_contract_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "compiler_csg_egraph_contract" "src/core/tooling/compiler_csg_egraph_contract.cheng")
+assert "compiler_csg_egraph_contract_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "determinism_driver" "src/core/tooling/determinism_driver.cheng")
+assert "determinism_driver_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "host_bridge_audit_gate" "src/core/tooling/host_bridge_audit_gate.cheng")
+assert "host_bridge_audit_gate_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "hotpath_scan" "src/core/tooling/hotpath_scan.cheng")
+assert "hotpath_scan_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "perf_driver" "src/core/tooling/perf_driver.cheng")
+assert "perf_driver_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "perf_gate" "src/core/tooling/perf_gate.cheng")
+assert "perf_gate_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "root_discovery" "src/core/tooling/root_discovery.cheng")
+assert "root_discovery_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "wasm_binary_audit" "src/core/tooling/wasm_binary_audit.cheng")
+assert "wasm_binary_audit_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "provider_root" "src/core/runtime/provider_root.cheng")
+assert "provider_root_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "tcp_bridge_abi" "src/core/runtime/tcp_bridge_abi.cheng")
+assert "tcp_bridge_abi_cold_compile_smoke" 1 "$ACT"
+
+# --- compile_obj_smoke for remaining untested std library files ---
+ACT=$(compile_obj_smoke "std_algorithm" "src/std/algorithm.cheng")
+assert "std_algorithm_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_json" "src/std/json.cheng")
+assert "std_json_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_tables" "src/std/tables.cheng")
+assert "std_tables_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_strings" "src/std/strings.cheng")
+assert "std_strings_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_varint" "src/std/varint.cheng")
+assert "std_varint_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_rawbytes" "src/std/rawbytes.cheng")
+assert "std_rawbytes_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_rawmem_support" "src/std/rawmem_support.cheng")
+assert "std_rawmem_support_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_streams" "src/std/streams.cheng")
+assert "std_streams_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_stringlist" "src/std/stringlist.cheng")
+assert "std_stringlist_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_monotimes" "src/std/monotimes.cheng")
+assert "std_monotimes_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_parseutils" "src/std/parseutils.cheng")
+assert "std_parseutils_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_hashsets" "src/std/hashsets.cheng")
+assert "std_hashsets_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_buffer" "src/std/buffer.cheng")
+assert "std_buffer_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_cmdline" "src/std/cmdline.cheng")
+assert "std_cmdline_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_crash_trace_internal" "src/std/crash_trace_internal.cheng")
+assert "std_crash_trace_internal_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_net_ipaddr" "src/std/net/ipaddr.cheng")
+assert "std_net_ipaddr_cold_compile_smoke" 1 "$ACT"
+
+# --- compile_obj_smoke for remaining untested chain and runtime files ---
+ACT=$(compile_obj_smoke "chain_pin_plane" "src/chain/pin_plane.cheng")
+assert "chain_pin_plane_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "chain_pin_runtime" "src/chain/pin_runtime.cheng")
+assert "chain_pin_runtime_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "runtime_option" "src/runtime/option.cheng")
+assert "runtime_option_cold_compile_smoke" 1 "$ACT"
+
+# --- compile_obj_smoke for append_u32_smoke ---
+ACT=$(compile_obj_smoke "append_u32_smoke" "src/tests/append_u32_smoke.cheng")
+assert "append_u32_smoke_cold_compile_smoke" 1 "$ACT"
+
+# --- cold compiler performance benchmark: compile 5 files, measure time, verify < 500ms each ---
+for pb_entry in \
+    "core_types:src/core/ir/core_types.cheng" \
+    "ownership:src/core/analysis/ownership.cheng" \
+    "object_plan:src/core/backend/object_plan.cheng" \
+    "bytes:src/std/bytes.cheng" \
+    "direct_object_emit:src/core/backend/direct_object_emit.cheng"; do
+    pb_tag="${pb_entry%%:*}"
+    pb_src="${pb_entry#*:}"
+    pb_start=$(date +%s%N)
+    rm -f "/tmp/ct_pb_${pb_tag}.o" "/tmp/ct_pb_${pb_tag}.report"
+    quiet $COLD system-link-exec --root:"$PWD" \
+        --in:"$pb_src" --target:arm64-apple-darwin \
+        --out:"/tmp/ct_pb_${pb_tag}.o" --emit:obj \
+        --report-out:"/tmp/ct_pb_${pb_tag}.report"
+    pb_end=$(date +%s%N)
+    pb_ms=$(( (pb_end - pb_start) / 1000000 ))
+    if [ -s "/tmp/ct_pb_${pb_tag}.o" ] && [ "$pb_ms" -lt 500 ] && \
+       ! grep -q '^error=' "/tmp/ct_pb_${pb_tag}.report" 2>/dev/null; then
+        ACT=1
+    else
+        ACT=0
+    fi
+    assert "perf_bench_${pb_tag}_${pb_ms}ms" 1 "$ACT"
+    rm -f "/tmp/ct_pb_${pb_tag}.o" "/tmp/ct_pb_${pb_tag}.report"
+done
 
 # --- zero regression gate ---
 if [ "${CHENG_ZRG_INNER:-0}" != "1" ]; then

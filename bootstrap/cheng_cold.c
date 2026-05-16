@@ -22068,6 +22068,16 @@ static bool cold_runtime_provider_linux_root_supported(const char *symbol) {
         "cheng_native_sockaddr_use_len_field_bridge",
         "core_runtime_stub_trace",
         "cheng_native_system_cpu_logical_cores_value_bridge",
+        "cheng_atomic_cas_i32",
+        "cheng_atomic_load_i32",
+        "cheng_atomic_store_i32",
+        "cheng_spawn",
+        "cheng_mutex_init",
+        "cheng_mutex_lock",
+        "cheng_mutex_unlock",
+        "cheng_thread_join",
+        "cheng_retain_atomic",
+        "cheng_release_atomic",
     };
     if (!symbol || symbol[0] == '\0') return false;
     for (size_t i = 0; i < sizeof(roots) / sizeof(roots[0]); i++) {
@@ -22761,16 +22771,18 @@ static void wasm_op_i32_load16_u(WasmCode *c, uint32_t align, uint32_t offset) {
     wasm_emit_leb128_u(c, offset);
 }
 
-/* Emit memory.grow: size on stack → new_size on stack (or -1 on failure) */
+/* Emit memory.grow: size on stack → new_size on stack (or -1 on failure)
+ * Uses standalone MVP opcode 0x40 0x00 (NOT 0xFC-prefixed). */
 static void wasm_op_memory_grow(WasmCode *c) {
-    wasm_emit1(c, WASM_OP_MISC_PREFIX);
     wasm_emit1(c, WASM_OP_MEMORY_GROW);
+    wasm_emit1(c, 0); /* memory index (always 0 for single linear memory) */
 }
 
-/* Emit memory.size: → current page count on stack */
+/* Emit memory.size: → current page count on stack
+ * Uses standalone MVP opcode 0x3f 0x00 (NOT 0xFC-prefixed). */
 static void wasm_op_memory_size(WasmCode *c) {
-    wasm_emit1(c, WASM_OP_MISC_PREFIX);
     wasm_emit1(c, WASM_OP_MEMORY_SIZE);
+    wasm_emit1(c, 0); /* memory index (always 0 for single linear memory) */
 }
 
 /* String literal data table collected during codegen */
@@ -22839,6 +22851,55 @@ static void wasm_emit_alloc(WasmCode *wasm, int32_t tmp_local, int32_t bytes) {
     /* Check if we need to grow memory (if new bump > current page count * 65536) */
     /* For simplicity, just leave the ptr on stack (tmp_local has it) */
     wasm_op_local_get(wasm, (uint32_t)tmp_local);
+}
+
+/* Emit a byte-copy loop for WASM: copy `count` bytes from `src` to `dst`.
+ * Uses 3 scratch locals: [scr0]=count, [scr1]=src, [scr2]=dst, [scr3]=loop_i.
+ * The loop counter is initially zeroed by this helper.
+ * count, src, dst must be in the 4 scratch locals before calling.
+ * After return, scratch locals are: scr0=count, scr1=src, scr2=dst, scr3=count. */
+static void wasm_emit_memcpy_loop(WasmCode *wasm, int32_t scr_count,
+                                   int32_t scr_src, int32_t scr_dst,
+                                   int32_t scr_i) {
+    /* Set loop counter = 0 */
+    wasm_op_i32_const(wasm, 0);
+    wasm_op_local_set(wasm, (uint32_t)scr_i);
+    /* block (break target) + loop */
+    wasm_emit1(wasm, WASM_OP_BLOCK);
+    wasm_emit1(wasm, WASM_BLOCK_TYPE_EMPTY);
+    wasm_emit1(wasm, WASM_OP_LOOP);
+    wasm_emit1(wasm, WASM_BLOCK_TYPE_EMPTY);
+    /* if i >= count: break (depth 1 = exit block) */
+    wasm_op_local_get(wasm, (uint32_t)scr_i);
+    wasm_op_local_get(wasm, (uint32_t)scr_count);
+    wasm_emit1(wasm, WASM_OP_I32_GE_S);
+    wasm_emit1(wasm, WASM_OP_BR_IF);
+    wasm_emit_leb128_u(wasm, 1);
+    /* Push dst+i for i32.store8 addr */
+    wasm_op_local_get(wasm, (uint32_t)scr_dst);
+    wasm_op_local_get(wasm, (uint32_t)scr_i);
+    wasm_emit1(wasm, WASM_OP_I32_ADD);
+    /* Load byte from [src + i] */
+    wasm_op_local_get(wasm, (uint32_t)scr_src);
+    wasm_op_local_get(wasm, (uint32_t)scr_i);
+    wasm_emit1(wasm, WASM_OP_I32_ADD);
+    wasm_emit1(wasm, WASM_OP_I32_LOAD8_U);
+    wasm_emit_leb128_u(wasm, 0);
+    wasm_emit_leb128_u(wasm, 0);
+    /* Store byte at [dst + i] */
+    wasm_emit1(wasm, WASM_OP_I32_STORE8);
+    wasm_emit_leb128_u(wasm, 0);
+    wasm_emit_leb128_u(wasm, 0);
+    /* i++ */
+    wasm_op_local_get(wasm, (uint32_t)scr_i);
+    wasm_op_i32_const(wasm, 1);
+    wasm_emit1(wasm, WASM_OP_I32_ADD);
+    wasm_op_local_set(wasm, (uint32_t)scr_i);
+    /* continue loop */
+    wasm_emit1(wasm, WASM_OP_BR);
+    wasm_emit_leb128_u(wasm, 0);
+    wasm_emit1(wasm, WASM_OP_END);  /* end loop */
+    wasm_emit1(wasm, WASM_OP_END);  /* end block */
 }
 
 /* Convert BodyIR slot kind to WASM value type.
@@ -23402,39 +23463,189 @@ static void wasm_codegen_op(WasmCode *wasm, BodyIR *body, Symbols *symbols,
         break;
     }
     case BODY_OP_STR_SLICE: {
-        /* Create a new string view: same heap, but adjusted ptr and len.
-           For simplicity, create a new allocation and copy. */
+        /* Create a new string: allocate and copy sliced bytes.
+           String layout: [data_ptr:4][len:4][data...] */
         la = wasm_local_for_slot(body, a); /* source string */
         int32_t start_local = wasm_local_for_slot(body, b); /* start index */
         int32_t len_slot = wasm_local_for_slot(body, c); /* slice length */
         ld = wasm_local_for_slot(body, dst);
+        int32_t sc = wasm_count_declared_locals(body, WASM_TYPE_I32);
+        int32_t scr_base = body->param_count + sc;
+        int32_t SCR_SLEN = scr_base;
+        int32_t SCR_START = scr_base + 1;
+        int32_t SCR_DST = scr_base + 2;
+        int32_t SCR_I = scr_base + 3;
         /* Load source len */
         wasm_op_local_get(wasm, (uint32_t)la);
         wasm_op_i32_const(wasm, 4);
         wasm_emit1(wasm, WASM_OP_I32_ADD);
         wasm_emit1(wasm, WASM_OP_I32_LOAD);
-        wasm_emit_leb128_u(wasm, 2);
-        wasm_emit_leb128_u(wasm, 0); /* source len on stack */
-        /* Get slice len from param c (it's in call_arg_slot) */
-        wasm_op_local_get(wasm, (uint32_t)len_slot);
-        wasm_emit1(wasm, WASM_OP_I32_MIN);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        wasm_op_local_set(wasm, (uint32_t)SCR_SLEN); /* SCR_SLEN = source len */
+        /* start = max(0, start_slot) using if-else */
         wasm_op_local_get(wasm, (uint32_t)start_local);
-        wasm_emit1(wasm, WASM_OP_I32_SUB);
         wasm_op_i32_const(wasm, 0);
-        wasm_emit1(wasm, WASM_OP_I32_MAX); /* result len */
-        /* Allocate: 8 + result_len */
-        wasm_emit_leb128_u(wasm, 0); /* placeholder */
-        /* Store len */
+        wasm_emit1(wasm, WASM_OP_I32_GE_S);
+        wasm_emit1(wasm, WASM_OP_IF);
+        wasm_emit1(wasm, WASM_TYPE_I32);
+        wasm_op_local_get(wasm, (uint32_t)start_local);
+        wasm_emit1(wasm, WASM_OP_ELSE);
+        wasm_op_i32_const(wasm, 0);
+        wasm_emit1(wasm, WASM_OP_END);
+        wasm_op_local_set(wasm, (uint32_t)SCR_START); /* SCR_START = clamped start */
+        /* if start >= source_len: result len = 0 */
+        wasm_op_local_get(wasm, (uint32_t)SCR_START);
+        wasm_op_local_get(wasm, (uint32_t)SCR_SLEN);
+        wasm_emit1(wasm, WASM_OP_I32_GE_S);
+        wasm_emit1(wasm, WASM_OP_IF);
+        wasm_emit1(wasm, WASM_TYPE_I32);
+        wasm_op_i32_const(wasm, 0); /* result len = 0 */
+        wasm_emit1(wasm, WASM_OP_ELSE);
+        /* remaining = source_len - start */
+        wasm_op_local_get(wasm, (uint32_t)SCR_SLEN);
+        wasm_op_local_get(wasm, (uint32_t)SCR_START);
+        wasm_emit1(wasm, WASM_OP_I32_SUB);
+        wasm_op_local_set(wasm, (uint32_t)SCR_SLEN); /* SCR_SLEN = remaining */
+        /* slice_len = min(len_slot, remaining) */
+        wasm_op_local_get(wasm, (uint32_t)len_slot);
+        wasm_op_local_get(wasm, (uint32_t)SCR_SLEN);
+        wasm_emit1(wasm, WASM_OP_I32_LT_S);
+        wasm_emit1(wasm, WASM_OP_IF);
+        wasm_emit1(wasm, WASM_TYPE_I32);
+        wasm_op_local_get(wasm, (uint32_t)len_slot);
+        wasm_emit1(wasm, WASM_OP_ELSE);
+        wasm_op_local_get(wasm, (uint32_t)SCR_SLEN);
+        wasm_emit1(wasm, WASM_OP_END);
+        /* max(0, slice_len) - slice_len is always >=0 here */
+        wasm_emit1(wasm, WASM_OP_END);
+        wasm_op_local_set(wasm, (uint32_t)SCR_SLEN); /* final result_len in SCR_SLEN */
+        /* Allocate via memory.grow: pages = (result_len + 8 + 65535) >> 16 */
+        wasm_op_local_get(wasm, (uint32_t)SCR_SLEN);
+        wasm_op_i32_const(wasm, 8 + 65535);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_i32_const(wasm, 16);
+        wasm_emit1(wasm, WASM_OP_I32_SHR_U);
+        wasm_op_memory_grow(wasm);
+        wasm_op_i32_const(wasm, 16);
+        wasm_emit1(wasm, WASM_OP_I32_SHL);
+        wasm_op_local_tee(wasm, (uint32_t)tmp_local); /* ptr in tmp_local */
+        /* Write header: data_ptr = ptr + 8 at [ptr + 0] */
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_op_i32_const(wasm, 8);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_emit1(wasm, WASM_OP_I32_STORE);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        /* Write header: len = result_len at [ptr + 4] */
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_op_i32_const(wasm, 4);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_get(wasm, (uint32_t)SCR_SLEN);
+        wasm_emit1(wasm, WASM_OP_I32_STORE);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        /* Copy bytes from a+8+start to ptr+8, count=result_len */
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_op_i32_const(wasm, 8);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_set(wasm, (uint32_t)SCR_DST); /* SCR_DST = dst_addr */
+        wasm_op_local_get(wasm, (uint32_t)la);
+        wasm_op_i32_const(wasm, 8);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_get(wasm, (uint32_t)SCR_START);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_set(wasm, (uint32_t)SCR_I); /* SCR_I = src_addr */
+        wasm_emit_memcpy_loop(wasm, SCR_SLEN, SCR_I, SCR_DST, SCR_START);
+        /* Store result ptr to dst */
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
         wasm_op_local_set(wasm, (uint32_t)ld);
         break;
     }
     case BODY_OP_STR_CONCAT: {
-        /* Concatenate two strings: allocate new buffer, copy both */
+        /* Concatenate two strings: allocate new buffer, copy both.
+           String layout: [data_ptr:4][len:4][data...] */
         la = wasm_local_for_slot(body, a);
         lb = wasm_local_for_slot(body, b);
         ld = wasm_local_for_slot(body, dst);
-        /* For now, just copy the first string (stub) */
+        int32_t sc = wasm_count_declared_locals(body, WASM_TYPE_I32);
+        int32_t scr_base = body->param_count + sc;
+        int32_t SCR_LEN_A = scr_base;
+        int32_t SCR_LEN_B = scr_base + 1;
+        int32_t SCR_TOTAL = scr_base + 2;
+        int32_t SCR_I = scr_base + 3;
+        /* Load len_a from [a + 4] */
         wasm_op_local_get(wasm, (uint32_t)la);
+        wasm_op_i32_const(wasm, 4);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_emit1(wasm, WASM_OP_I32_LOAD);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        wasm_op_local_set(wasm, (uint32_t)SCR_LEN_A);
+        /* Load len_b from [b + 4] */
+        wasm_op_local_get(wasm, (uint32_t)lb);
+        wasm_op_i32_const(wasm, 4);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_emit1(wasm, WASM_OP_I32_LOAD);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        wasm_op_local_set(wasm, (uint32_t)SCR_LEN_B);
+        /* total = len_a + len_b */
+        wasm_op_local_get(wasm, (uint32_t)SCR_LEN_A);
+        wasm_op_local_get(wasm, (uint32_t)SCR_LEN_B);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_set(wasm, (uint32_t)SCR_TOTAL);
+        /* Allocate via memory.grow: pages = (total + 8 + 65535) >> 16 */
+        wasm_op_local_get(wasm, (uint32_t)SCR_TOTAL);
+        wasm_op_i32_const(wasm, 8 + 65535);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_i32_const(wasm, 16);
+        wasm_emit1(wasm, WASM_OP_I32_SHR_U);
+        wasm_op_memory_grow(wasm);
+        wasm_op_i32_const(wasm, 16);
+        wasm_emit1(wasm, WASM_OP_I32_SHL);
+        wasm_op_local_tee(wasm, (uint32_t)tmp_local);
+        /* Write header: data_ptr = ptr + 8 at [ptr + 0] */
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_op_i32_const(wasm, 8);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_emit1(wasm, WASM_OP_I32_STORE);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        /* Write header: len = total at [ptr + 4] */
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_op_i32_const(wasm, 4);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_get(wasm, (uint32_t)SCR_TOTAL);
+        wasm_emit1(wasm, WASM_OP_I32_STORE);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        /* Copy bytes from a+8 to ptr+8, count=len_a */
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_op_i32_const(wasm, 8);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_set(wasm, (uint32_t)SCR_TOTAL);
+        wasm_op_local_get(wasm, (uint32_t)la);
+        wasm_op_i32_const(wasm, 8);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_set(wasm, (uint32_t)SCR_I);
+        wasm_emit_memcpy_loop(wasm, SCR_LEN_A, SCR_I, SCR_TOTAL, SCR_LEN_B);
+        /* Copy bytes from b+8 to ptr+8+len_a, count=len_b */
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_op_i32_const(wasm, 8);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_get(wasm, (uint32_t)SCR_LEN_A);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_set(wasm, (uint32_t)SCR_TOTAL);
+        wasm_op_local_get(wasm, (uint32_t)lb);
+        wasm_op_i32_const(wasm, 8);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_set(wasm, (uint32_t)SCR_I);
+        /* Reload len_b (SCR_LEN_B was used as loop counter by first memcpy) */
+        wasm_op_local_get(wasm, (uint32_t)lb);
+        wasm_op_i32_const(wasm, 4);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_emit1(wasm, WASM_OP_I32_LOAD);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        wasm_op_local_set(wasm, (uint32_t)SCR_LEN_B);
+        wasm_emit_memcpy_loop(wasm, SCR_LEN_B, SCR_I, SCR_TOTAL, SCR_LEN_A);
+        /* Store result ptr to dst */
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
         wasm_op_local_set(wasm, (uint32_t)ld);
         break;
     }
@@ -23736,32 +23947,229 @@ static void wasm_codegen_op(WasmCode *wasm, BodyIR *body, Symbols *symbols,
     }
     /* Sequence ops */
     case BODY_OP_MAKE_SEQ_I32: {
-        /* Create seq header on heap: [count:4][capacity:4][data_ptr:4] */
-        /* For now, just store count and return a dummy pointer */
+        /* Create seq on heap: [count:4][capacity:4][data...]
+           Each i32 element = 4 bytes inline after header.
+           a = source array slot (or -1 for empty), c = initial count. */
         ld = wasm_local_for_slot(body, dst);
-        wasm_op_i32_const(wasm, 0);
+        int32_t sc = wasm_count_declared_locals(body, WASM_TYPE_I32);
+        int32_t scr_base = body->param_count + sc;
+        int32_t SCR_CNT = scr_base;
+        int32_t SCR_CAP = scr_base + 1;
+        int32_t SCR_TMP = scr_base + 2;
+        int32_t SCR_I = scr_base + 3;
+        /* initial_count = c, capacity = max(c, 4) */
+        wasm_op_i32_const(wasm, c > 4 ? (int32_t)c : 4);
+        wasm_op_local_set(wasm, (uint32_t)SCR_CAP);
+        /* Allocate: pages = (8 + capacity*4 + 65535) >> 16 */
+        wasm_op_local_get(wasm, (uint32_t)SCR_CAP);
+        wasm_op_i32_const(wasm, 4);
+        wasm_emit1(wasm, WASM_OP_I32_MUL);
+        wasm_op_i32_const(wasm, 8 + 65535);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_i32_const(wasm, 16);
+        wasm_emit1(wasm, WASM_OP_I32_SHR_U);
+        wasm_op_memory_grow(wasm);
+        wasm_op_i32_const(wasm, 16);
+        wasm_emit1(wasm, WASM_OP_I32_SHL);
+        wasm_op_local_tee(wasm, (uint32_t)tmp_local); /* ptr in tmp_local */
+        /* Write count = c */
+        wasm_op_i32_const(wasm, c);
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_emit1(wasm, WASM_OP_I32_STORE);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        /* Write capacity */
+        wasm_op_local_get(wasm, (uint32_t)SCR_CAP);
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_op_i32_const(wasm, 4);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_emit1(wasm, WASM_OP_I32_STORE);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        /* If c > 0 and a >= 0, copy initial i32 values from array slot a */
+        if (c > 0 && a >= 0) {
+            la = wasm_local_for_slot(body, a);
+            /* For array i32 slot, elements are at slot_start */
+            /* Copy each element: for i in 0..c: seq[8+i*4] = array_base[i] */
+            wasm_op_local_get(wasm, (uint32_t)tmp_local);
+            wasm_op_i32_const(wasm, 8);
+            wasm_emit1(wasm, WASM_OP_I32_ADD);
+            wasm_op_local_set(wasm, (uint32_t)SCR_TMP); /* SCR_TMP = dst */
+            wasm_op_local_get(wasm, (uint32_t)la);
+            wasm_op_local_set(wasm, (uint32_t)SCR_CNT); /* SCR_CNT = src */
+            wasm_op_i32_const(wasm, c);
+            wasm_op_local_set(wasm, (uint32_t)SCR_CAP); /* SCR_CAP = count */
+            /* byte copy: c*4 bytes */
+            wasm_emit_memcpy_loop(wasm, SCR_CAP, SCR_CNT, SCR_TMP, SCR_I);
+        }
+        /* Store ptr to dst */
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
         wasm_op_local_set(wasm, (uint32_t)ld);
         break;
     }
     case BODY_OP_MAKE_SEQ_OPAQUE: {
+        /* Same allocation but elements_size is in b (bytes per element) */
         ld = wasm_local_for_slot(body, dst);
-        wasm_op_i32_const(wasm, 0);
+        int32_t sc = wasm_count_declared_locals(body, WASM_TYPE_I32);
+        int32_t scr_base = body->param_count + sc;
+        int32_t SCR_CNT = scr_base;
+        int32_t SCR_CAP = scr_base + 1;
+        int32_t SCR_TMP = scr_base + 2;
+        int32_t SCR_I = scr_base + 3;
+        /* capacity = max(c, 4) */
+        wasm_op_i32_const(wasm, c > 4 ? (int32_t)c : 4);
+        wasm_op_local_set(wasm, (uint32_t)SCR_CAP);
+        /* Allocate: pages = (8 + capacity*b + 65535) >> 16 */
+        wasm_op_local_get(wasm, (uint32_t)SCR_CAP);
+        wasm_op_i32_const(wasm, b);
+        wasm_emit1(wasm, WASM_OP_I32_MUL);
+        wasm_op_i32_const(wasm, 8 + 65535);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_i32_const(wasm, 16);
+        wasm_emit1(wasm, WASM_OP_I32_SHR_U);
+        wasm_op_memory_grow(wasm);
+        wasm_op_i32_const(wasm, 16);
+        wasm_emit1(wasm, WASM_OP_I32_SHL);
+        wasm_op_local_tee(wasm, (uint32_t)tmp_local);
+        /* Write count = c */
+        wasm_op_i32_const(wasm, c);
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_emit1(wasm, WASM_OP_I32_STORE);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        /* Write capacity */
+        wasm_op_local_get(wasm, (uint32_t)SCR_CAP);
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_op_i32_const(wasm, 4);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_emit1(wasm, WASM_OP_I32_STORE);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        /* Copy initial data if c > 0 and a >= 0 (byte copy of c*b bytes) */
+        if (c > 0 && a >= 0) {
+            la = wasm_local_for_slot(body, a);
+            wasm_op_local_get(wasm, (uint32_t)tmp_local);
+            wasm_op_i32_const(wasm, 8);
+            wasm_emit1(wasm, WASM_OP_I32_ADD);
+            wasm_op_local_set(wasm, (uint32_t)SCR_TMP);
+            wasm_op_local_get(wasm, (uint32_t)la);
+            wasm_op_local_set(wasm, (uint32_t)SCR_CNT);
+            wasm_op_i32_const(wasm, c * b);
+            wasm_op_local_set(wasm, (uint32_t)SCR_CAP);
+            wasm_emit_memcpy_loop(wasm, SCR_CAP, SCR_CNT, SCR_TMP, SCR_I);
+        }
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
         wasm_op_local_set(wasm, (uint32_t)ld);
         break;
     }
     case BODY_OP_SEQ_I32_ADD: {
-        /* Append i32 value to sequence */
-        /* For now, just copy value slot */
+        /* Append i32 value to sequence.
+           a = seq slot, b = value slot, dst = output seq slot. */
         la = wasm_local_for_slot(body, a);
+        lb = wasm_local_for_slot(body, b);
         ld = wasm_local_for_slot(body, dst);
+        int32_t sc = wasm_count_declared_locals(body, WASM_TYPE_I32);
+        int32_t scr_base = body->param_count + sc;
+        int32_t SCR_CNT = scr_base;
+        int32_t SCR_CAP = scr_base + 1;
+        int32_t SCR_VAL = scr_base + 2;
+        int32_t SCR_TMP = scr_base + 3;
+        /* Load seq pointer */
         wasm_op_local_get(wasm, (uint32_t)la);
+        wasm_op_local_tee(wasm, (uint32_t)tmp_local); /* tmp_local = seq ptr */
+        /* Load count */
+        wasm_emit1(wasm, WASM_OP_I32_LOAD);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        wasm_op_local_set(wasm, (uint32_t)SCR_CNT); /* SCR_CNT = count */
+        /* Load capacity */
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_op_i32_const(wasm, 4);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_emit1(wasm, WASM_OP_I32_LOAD);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        wasm_op_local_set(wasm, (uint32_t)SCR_CAP); /* SCR_CAP = capacity */
+        /* Load value */
+        wasm_op_local_get(wasm, (uint32_t)lb);
+        wasm_op_local_set(wasm, (uint32_t)SCR_VAL);
+        /* If count < capacity: store value, increment count */
+        wasm_op_local_get(wasm, (uint32_t)SCR_CNT);
+        wasm_op_local_get(wasm, (uint32_t)SCR_CAP);
+        wasm_emit1(wasm, WASM_OP_I32_LT_S);
+        wasm_emit1(wasm, WASM_OP_IF);
+        wasm_emit1(wasm, WASM_BLOCK_TYPE_EMPTY);
+        /* Store value at [seq + 8 + count*4] */
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_op_i32_const(wasm, 8);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_get(wasm, (uint32_t)SCR_CNT);
+        wasm_op_i32_const(wasm, 4);
+        wasm_emit1(wasm, WASM_OP_I32_MUL);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_get(wasm, (uint32_t)SCR_VAL);
+        wasm_emit1(wasm, WASM_OP_I32_STORE);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        /* Increment count */
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_op_local_get(wasm, (uint32_t)SCR_CNT);
+        wasm_op_i32_const(wasm, 1);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_emit1(wasm, WASM_OP_I32_STORE);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        wasm_emit1(wasm, WASM_OP_END);
+        /* Copy seq ptr to dst */
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
         wasm_op_local_set(wasm, (uint32_t)ld);
         break;
     }
     case BODY_OP_SEQ_STR_ADD: {
+        /* Append string pointer to str sequence.
+           String elements are 4-byte heap pointers. */
         la = wasm_local_for_slot(body, a);
+        lb = wasm_local_for_slot(body, b);
         ld = wasm_local_for_slot(body, dst);
+        int32_t sc = wasm_count_declared_locals(body, WASM_TYPE_I32);
+        int32_t scr_base = body->param_count + sc;
+        int32_t SCR_CNT = scr_base;
+        int32_t SCR_CAP = scr_base + 1;
+        int32_t SCR_VAL = scr_base + 2;
+        /* Load seq pointer */
         wasm_op_local_get(wasm, (uint32_t)la);
+        wasm_op_local_tee(wasm, (uint32_t)tmp_local);
+        /* Load count */
+        wasm_emit1(wasm, WASM_OP_I32_LOAD);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        wasm_op_local_set(wasm, (uint32_t)SCR_CNT);
+        /* Load capacity */
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_op_i32_const(wasm, 4);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_emit1(wasm, WASM_OP_I32_LOAD);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        wasm_op_local_set(wasm, (uint32_t)SCR_CAP);
+        /* Load value */
+        wasm_op_local_get(wasm, (uint32_t)lb);
+        wasm_op_local_set(wasm, (uint32_t)SCR_VAL);
+        /* If count < capacity: store value */
+        wasm_op_local_get(wasm, (uint32_t)SCR_CNT);
+        wasm_op_local_get(wasm, (uint32_t)SCR_CAP);
+        wasm_emit1(wasm, WASM_OP_I32_LT_S);
+        wasm_emit1(wasm, WASM_OP_IF);
+        wasm_emit1(wasm, WASM_BLOCK_TYPE_EMPTY);
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_op_i32_const(wasm, 8);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_get(wasm, (uint32_t)SCR_CNT);
+        wasm_op_i32_const(wasm, 4);
+        wasm_emit1(wasm, WASM_OP_I32_MUL);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_get(wasm, (uint32_t)SCR_VAL);
+        wasm_emit1(wasm, WASM_OP_I32_STORE);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        /* Increment count */
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_op_local_get(wasm, (uint32_t)SCR_CNT);
+        wasm_op_i32_const(wasm, 1);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_emit1(wasm, WASM_OP_I32_STORE);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        wasm_emit1(wasm, WASM_OP_END);
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
         wasm_op_local_set(wasm, (uint32_t)ld);
         break;
     }
@@ -23772,17 +24180,105 @@ static void wasm_codegen_op(WasmCode *wasm, BodyIR *body, Symbols *symbols,
         la = wasm_local_for_slot(body, a);
         lb = wasm_local_for_slot(body, b);
         ld = wasm_local_for_slot(body, dst);
+        /* Load element at seq[8 + index*4] if index < count, else 0 */
+        int32_t sc = wasm_count_declared_locals(body, WASM_TYPE_I32);
+        int32_t scr_base = body->param_count + sc;
+        int32_t SCR_CNT = scr_base;
+        int32_t SCR_IDX = scr_base + 1;
+        wasm_op_local_get(wasm, (uint32_t)la);
+        wasm_emit1(wasm, WASM_OP_I32_LOAD);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        wasm_op_local_set(wasm, (uint32_t)SCR_CNT);
+        wasm_op_local_get(wasm, (uint32_t)lb);
+        wasm_op_local_set(wasm, (uint32_t)SCR_IDX);
+        wasm_op_local_get(wasm, (uint32_t)SCR_IDX);
+        wasm_op_local_get(wasm, (uint32_t)SCR_CNT);
+        wasm_emit1(wasm, WASM_OP_I32_LT_S);
+        wasm_emit1(wasm, WASM_OP_IF);
+        wasm_emit1(wasm, WASM_TYPE_I32);
+        wasm_op_local_get(wasm, (uint32_t)la);
+        wasm_op_i32_const(wasm, 8);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_get(wasm, (uint32_t)SCR_IDX);
+        wasm_op_i32_const(wasm, 4);
+        wasm_emit1(wasm, WASM_OP_I32_MUL);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_emit1(wasm, WASM_OP_I32_LOAD);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        wasm_emit1(wasm, WASM_OP_ELSE);
         wasm_op_i32_const(wasm, 0);
+        wasm_emit1(wasm, WASM_OP_END);
         wasm_op_local_set(wasm, (uint32_t)ld);
         break;
     }
-    case BODY_OP_SEQ_STR_INDEX_DYNAMIC:
+    case BODY_OP_SEQ_STR_INDEX_DYNAMIC: {
+        la = wasm_local_for_slot(body, a);
+        lb = wasm_local_for_slot(body, b);
+        ld = wasm_local_for_slot(body, dst);
+        /* Load string pointer at seq[8 + index*4] if index < count, else null */
+        int32_t sc = wasm_count_declared_locals(body, WASM_TYPE_I32);
+        int32_t scr_base = body->param_count + sc;
+        int32_t SCR_CNT = scr_base;
+        int32_t SCR_IDX = scr_base + 1;
+        wasm_op_local_get(wasm, (uint32_t)la);
+        wasm_emit1(wasm, WASM_OP_I32_LOAD);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        wasm_op_local_set(wasm, (uint32_t)SCR_CNT);
+        wasm_op_local_get(wasm, (uint32_t)lb);
+        wasm_op_local_set(wasm, (uint32_t)SCR_IDX);
+        wasm_op_local_get(wasm, (uint32_t)SCR_IDX);
+        wasm_op_local_get(wasm, (uint32_t)SCR_CNT);
+        wasm_emit1(wasm, WASM_OP_I32_LT_S);
+        wasm_emit1(wasm, WASM_OP_IF);
+        wasm_emit1(wasm, WASM_TYPE_I32);
+        wasm_op_local_get(wasm, (uint32_t)la);
+        wasm_op_i32_const(wasm, 8);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_get(wasm, (uint32_t)SCR_IDX);
+        wasm_op_i32_const(wasm, 4);
+        wasm_emit1(wasm, WASM_OP_I32_MUL);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_emit1(wasm, WASM_OP_I32_LOAD);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        wasm_emit1(wasm, WASM_OP_ELSE);
+        wasm_op_i32_const(wasm, 0);
+        wasm_emit1(wasm, WASM_OP_END);
+        wasm_op_local_set(wasm, (uint32_t)ld);
+        break;
+    }
     case BODY_OP_SEQ_OPAQUE_INDEX_DYNAMIC:
     case BODY_OP_SEQ_OPAQUE_INDEX_REF_DYNAMIC: {
         la = wasm_local_for_slot(body, a);
         lb = wasm_local_for_slot(body, b);
         ld = wasm_local_for_slot(body, dst);
+        /* Opaque elements are 4 bytes each (same as i32 for now) */
+        int32_t sc = wasm_count_declared_locals(body, WASM_TYPE_I32);
+        int32_t scr_base = body->param_count + sc;
+        int32_t SCR_CNT = scr_base;
+        int32_t SCR_IDX = scr_base + 1;
+        wasm_op_local_get(wasm, (uint32_t)la);
+        wasm_emit1(wasm, WASM_OP_I32_LOAD);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        wasm_op_local_set(wasm, (uint32_t)SCR_CNT);
+        wasm_op_local_get(wasm, (uint32_t)lb);
+        wasm_op_local_set(wasm, (uint32_t)SCR_IDX);
+        wasm_op_local_get(wasm, (uint32_t)SCR_IDX);
+        wasm_op_local_get(wasm, (uint32_t)SCR_CNT);
+        wasm_emit1(wasm, WASM_OP_I32_LT_S);
+        wasm_emit1(wasm, WASM_OP_IF);
+        wasm_emit1(wasm, WASM_TYPE_I32);
+        wasm_op_local_get(wasm, (uint32_t)la);
+        wasm_op_i32_const(wasm, 8);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_get(wasm, (uint32_t)SCR_IDX);
+        wasm_op_i32_const(wasm, 4);
+        wasm_emit1(wasm, WASM_OP_I32_MUL);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_emit1(wasm, WASM_OP_I32_LOAD);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        wasm_emit1(wasm, WASM_OP_ELSE);
         wasm_op_i32_const(wasm, 0);
+        wasm_emit1(wasm, WASM_OP_END);
         wasm_op_local_set(wasm, (uint32_t)ld);
         break;
     }
@@ -23790,6 +24286,35 @@ static void wasm_codegen_op(WasmCode *wasm, BodyIR *body, Symbols *symbols,
         la = wasm_local_for_slot(body, a);
         lb = wasm_local_for_slot(body, b);
         ld = wasm_local_for_slot(body, dst);
+        /* Store value at index: if index < count, store to seq[8 + index*4] */
+        int32_t sc = wasm_count_declared_locals(body, WASM_TYPE_I32);
+        int32_t scr_base = body->param_count + sc;
+        int32_t SCR_CNT = scr_base;
+        int32_t SCR_IDX = scr_base + 1;
+        /* c = element value slot */
+        int32_t val_local = body->param_count + sc + 2;
+        wasm_op_local_get(wasm, (uint32_t)la);
+        wasm_emit1(wasm, WASM_OP_I32_LOAD);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        wasm_op_local_set(wasm, (uint32_t)SCR_CNT);
+        wasm_op_local_get(wasm, (uint32_t)lb);
+        wasm_op_local_set(wasm, (uint32_t)SCR_IDX);
+        wasm_op_local_get(wasm, (uint32_t)SCR_IDX);
+        wasm_op_local_get(wasm, (uint32_t)SCR_CNT);
+        wasm_emit1(wasm, WASM_OP_I32_LT_S);
+        wasm_emit1(wasm, WASM_OP_IF);
+        wasm_emit1(wasm, WASM_BLOCK_TYPE_EMPTY);
+        wasm_op_local_get(wasm, (uint32_t)la);
+        wasm_op_i32_const(wasm, 8);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_get(wasm, (uint32_t)SCR_IDX);
+        wasm_op_i32_const(wasm, 4);
+        wasm_emit1(wasm, WASM_OP_I32_MUL);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_get(wasm, (uint32_t)ld);
+        wasm_emit1(wasm, WASM_OP_I32_STORE);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        wasm_emit1(wasm, WASM_OP_END);
         break;
     }
     case BODY_OP_SEQ_OPAQUE_INDEX_STORE:

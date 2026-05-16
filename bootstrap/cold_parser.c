@@ -6293,7 +6293,7 @@ bool cold_try_backend_intrinsic(Parser *parser, BodyIR *body, Span name,
         }
         return true;
     }
-    if (0 && (span_eq(name, "lower.BuildLoweringPlanStubFromCompilerCsg") ||
+    if ((span_eq(name, "lower.BuildLoweringPlanStubFromCompilerCsg") ||
         span_eq(name, "BuildLoweringPlanStubFromCompilerCsg"))) {
         if (arg_count != 4) die("BuildLoweringPlanStubFromCompilerCsg arity mismatch");
         int32_t link_plan = body->call_arg_slot[arg_start];
@@ -6431,7 +6431,7 @@ bool cold_try_backend_intrinsic(Parser *parser, BodyIR *body, Span name,
         *slot_out = ok_slot;
         return true;
     }
-    if (0 && (span_eq(name, "pobj.BuildPrimaryObjectPlan") ||
+    if ((span_eq(name, "pobj.BuildPrimaryObjectPlan") ||
         span_eq(name, "BuildPrimaryObjectPlan"))) {
         if (arg_count != 2) die("BuildPrimaryObjectPlan arity mismatch");
         int32_t link_plan = body->call_arg_slot[arg_start];
@@ -6572,7 +6572,7 @@ int32_t cold_make_csg_edge_slot(BodyIR *body, ObjectDef *edge_obj,
 bool cold_try_csg_intrinsic(Parser *parser, BodyIR *body, Span name,
                                    int32_t arg_start, int32_t arg_count,
                                    int32_t *slot_out, int32_t *kind_out) {
-    if (0 && (span_eq(name, "ccsg.BuildCompilerCsgInto") ||
+    if ((span_eq(name, "ccsg.BuildCompilerCsgInto") ||
         span_eq(name, "BuildCompilerCsgInto"))) {
         if (arg_count != 4) die("BuildCompilerCsgInto arity mismatch");
         int32_t link_plan = body->call_arg_slot[arg_start];
