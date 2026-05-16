@@ -1192,10 +1192,46 @@ fi
 
 
 # ELF object emission is pure: linking must go through the explicit link-object entry.
+ordinary_riscv_facts="$WORK/ordinary_riscv.facts"
+ordinary_riscv_writer_report="$WORK/ordinary_riscv.writer.report.txt"
+
+echo "  - csg_in_wrong_target_hard_fail"
+rm -f "$WORK/ordinary_wrong_target.o" "$WORK/ordinary_wrong_target.report.txt"
+if "$COLD" system-link-exec \
+  --csg-in:"$WORK/ordinary.facts" \
+  --emit:obj --target:riscv64-unknown-linux-gnu \
+  --out:"$WORK/ordinary_wrong_target.o" \
+  --report-out:"$WORK/ordinary_wrong_target.report.txt" \
+  > "$WORK/ordinary_wrong_target.stdout" 2>&1; then
+  echo "FAIL csg_in_wrong_target_hard_fail"
+  fail=$((fail + 1))
+else
+  echo "PASS csg_in_wrong_target_hard_fail"
+  pass=$((pass + 1))
+fi
+
+echo "  - ordinary_riscv_writer"
+if "$COLD" system-link-exec \
+  --root:"$ROOT" \
+  --in:src/tests/ordinary_zero_exit_fixture.cheng \
+  --emit:csg-v2 \
+  --out:"$ordinary_riscv_facts" \
+  --target:riscv64-unknown-linux-gnu \
+  --report-out:"$ordinary_riscv_writer_report" \
+  > "$WORK/ordinary_riscv.writer.stdout" 2>&1 &&
+   [ "$(facts_magic_kind "$ordinary_riscv_facts")" = "internal" ] &&
+   grep -q '^target=riscv64-unknown-linux-gnu$' "$ordinary_riscv_writer_report"; then
+  echo "PASS ordinary_riscv_writer"
+  pass=$((pass + 1))
+else
+  echo "FAIL ordinary_riscv_writer"
+  fail=$((fail + 1))
+fi
+
 echo "  - link_object_elf"
 rm -f "$WORK/ordinary_link.o" "$WORK/ordinary_link.o.linked" "$WORK/ordinary_link_exec"
 if "$COLD" system-link-exec \
-  --csg-in:"$WORK/ordinary.facts" \
+  --csg-in:"$ordinary_riscv_facts" \
   --emit:obj --target:riscv64-unknown-linux-gnu \
   --out:"$WORK/ordinary_link.o" \
   --report-out:"$WORK/ordinary_link.report.txt" \
@@ -1229,13 +1265,13 @@ echo "  - link_object_determinism"
 rm -f "$WORK/ordinary_link_d1.o" "$WORK/ordinary_link_d1.o.linked" "$WORK/ordinary_link_d1.exe"
 rm -f "$WORK/ordinary_link_d2.o" "$WORK/ordinary_link_d2.o.linked" "$WORK/ordinary_link_d2.exe"
 if "$COLD" system-link-exec \
-  --csg-in:"$WORK/ordinary.facts" \
+  --csg-in:"$ordinary_riscv_facts" \
   --emit:obj --target:riscv64-unknown-linux-gnu \
   --out:"$WORK/ordinary_link_d1.o" \
   --report-out:"$WORK/ordinary_link_d1.report.txt" \
   > "$WORK/ordinary_link_d1.stdout" 2>&1 &&
    "$COLD" system-link-exec \
-  --csg-in:"$WORK/ordinary.facts" \
+  --csg-in:"$ordinary_riscv_facts" \
   --emit:obj --target:riscv64-unknown-linux-gnu \
   --out:"$WORK/ordinary_link_d2.o" \
   --report-out:"$WORK/ordinary_link_d2.report.txt" \
@@ -1710,7 +1746,7 @@ elif "$COLD" system-link-exec \
   --emit:csg-v2 \
   --out:"$multi_facts" \
   --target:riscv64-unknown-linux-gnu \
-  --report-out:"$WORK/provider_multi.writer.report.txt" \
+  --report-out:"$WORK/provider_multi_primary.writer.report.txt" \
   > "$WORK/provider_multi.writer.stdout" 2>&1 &&
    "$COLD" system-link-exec \
   --csg-in:"$multi_facts" \
@@ -1785,11 +1821,11 @@ fi
 echo "  - reader_fixedpoint_exe_riscv"
 rm -f "$WORK/fp_rv_a" "$WORK/fp_rv_b"
 COLD_NO_SIGN=1 "$COLD" system-link-exec \
-  --csg-in:"$WORK/ordinary.facts" \
+  --csg-in:"$ordinary_riscv_facts" \
   --emit:exe --target:riscv64-unknown-linux-gnu \
   --out:"$WORK/fp_rv_a" > /dev/null 2>&1
 COLD_NO_SIGN=1 "$COLD" system-link-exec \
-  --csg-in:"$WORK/ordinary.facts" \
+  --csg-in:"$ordinary_riscv_facts" \
   --emit:exe --target:riscv64-unknown-linux-gnu \
   --out:"$WORK/fp_rv_b" > /dev/null 2>&1
 if [ -f "$WORK/fp_rv_a" ] && [ -f "$WORK/fp_rv_b" ] && cmp -s "$WORK/fp_rv_a" "$WORK/fp_rv_b"; then

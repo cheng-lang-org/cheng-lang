@@ -8471,6 +8471,13 @@ static int32_t cold_emit_pointer_load(Parser *parser, BodyIR *body,
         *kind = SLOT_I32;
         return dst;
     }
+    if (cold_pointer_element_is(elem, "uint16") ||
+        cold_pointer_element_is(elem, "int16")) {
+        int32_t dst = body_slot(body, SLOT_I32, 4);
+        body_op(body, BODY_OP_PTR_LOAD_U16, dst, ptr_slot, 0);
+        *kind = SLOT_I32;
+        return dst;
+    }
     if (cold_pointer_element_is(elem, "int32") ||
         cold_pointer_element_is(elem, "int") ||
         cold_pointer_element_is(elem, "uint32") ||
@@ -8509,6 +8516,13 @@ static void cold_emit_pointer_store(Parser *parser, BodyIR *body,
         body_op(body, BODY_OP_I32_CONST, len_slot, 1, 0);
         int32_t dst = body_slot(body, SLOT_I32, 4);
         body_op3(body, BODY_OP_SET_RAW, dst, ptr_slot, value_slot, len_slot);
+        return;
+    }
+    if (cold_pointer_element_is(elem, "uint16") ||
+        cold_pointer_element_is(elem, "int16")) {
+        value_slot = cold_materialize_i32_ref(body, value_slot, value_kind);
+        if (*value_kind != SLOT_I32) die("int16 pointer store value must be int32");
+        body_op(body, BODY_OP_PTR_STORE_U16, ptr_slot, value_slot, 0);
         return;
     }
     if (cold_pointer_element_is(elem, "int32") ||

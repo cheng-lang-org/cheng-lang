@@ -2744,8 +2744,8 @@ else
 fi
 assert "cold_version_flag" 1 "$ACT"
 
-# --- rapid fire: compile 5 test files sequentially, all must succeed ---
-rm -f /tmp/ct_rf_1.o /tmp/ct_rf_2.o /tmp/ct_rf_3.o /tmp/ct_rf_4.o /tmp/ct_rf_5.o
+# --- rapid fire: compile 10 test files sequentially, all must succeed ---
+rm -f /tmp/ct_rf_1.o /tmp/ct_rf_2.o /tmp/ct_rf_3.o /tmp/ct_rf_4.o /tmp/ct_rf_5.o /tmp/ct_rf_6.o /tmp/ct_rf_7.o /tmp/ct_rf_8.o /tmp/ct_rf_9.o /tmp/ct_rf_10.o
 quiet $COLD system-link-exec --root:"$PWD" \
     --in:src/tests/chain_index_field_assign_preserves_tail_smoke.cheng --target:arm64-apple-darwin \
     --out:/tmp/ct_rf_1.o --emit:obj --report-out:/tmp/ct_rf_1.report
@@ -2775,6 +2775,36 @@ quiet $COLD system-link-exec --root:"$PWD" \
     --out:/tmp/ct_rf_5.o --emit:obj --report-out:/tmp/ct_rf_5.report
 if [ -s /tmp/ct_rf_5.o ] && grep -q '^direct_macho=1$' /tmp/ct_rf_5.report 2>/dev/null; then ACT=1; else ACT=0; fi
 assert "cold_rapid_fire_5_quic_tls" 1 "$ACT"
+
+quiet $COLD system-link-exec --root:"$PWD" \
+    --in:src/tests/anti_entropy_signature_fields_smoke.cheng --target:arm64-apple-darwin \
+    --out:/tmp/ct_rf_6.o --emit:obj --report-out:/tmp/ct_rf_6.report
+if [ -s /tmp/ct_rf_6.o ] && grep -q '^direct_macho=1$' /tmp/ct_rf_6.report 2>/dev/null; then ACT=1; else ACT=0; fi
+assert "cold_rapid_fire_6_anti_entropy" 1 "$ACT"
+
+quiet $COLD system-link-exec --root:"$PWD" \
+    --in:src/tests/strings_int_to_str_smoke.cheng --target:arm64-apple-darwin \
+    --out:/tmp/ct_rf_7.o --emit:obj --report-out:/tmp/ct_rf_7.report
+if [ -s /tmp/ct_rf_7.o ] && grep -q '^direct_macho=1$' /tmp/ct_rf_7.report 2>/dev/null; then ACT=1; else ACT=0; fi
+assert "cold_rapid_fire_7_strings_int_to_str" 1 "$ACT"
+
+quiet $COLD system-link-exec --root:"$PWD" \
+    --in:src/tests/rwad_accumulator_smoke.cheng --target:arm64-apple-darwin \
+    --out:/tmp/ct_rf_8.o --emit:obj --report-out:/tmp/ct_rf_8.report
+if [ -s /tmp/ct_rf_8.o ] && grep -q '^direct_macho=1$' /tmp/ct_rf_8.report 2>/dev/null; then ACT=1; else ACT=0; fi
+assert "cold_rapid_fire_8_rwad_accumulator" 1 "$ACT"
+
+quiet $COLD system-link-exec --root:"$PWD" \
+    --in:src/tests/std_net_transport_compile_smoke.cheng --target:arm64-apple-darwin \
+    --out:/tmp/ct_rf_9.o --emit:obj --report-out:/tmp/ct_rf_9.report
+if [ -s /tmp/ct_rf_9.o ] && grep -q '^direct_macho=1$' /tmp/ct_rf_9.report 2>/dev/null; then ACT=1; else ACT=0; fi
+assert "cold_rapid_fire_9_std_net" 1 "$ACT"
+
+quiet $COLD system-link-exec --root:"$PWD" \
+    --in:src/tests/perf_gate_smoke.cheng --target:arm64-apple-darwin \
+    --out:/tmp/ct_rf_10.o --emit:obj --report-out:/tmp/ct_rf_10.report
+if [ -s /tmp/ct_rf_10.o ] && grep -q '^direct_macho=1$' /tmp/ct_rf_10.report 2>/dev/null; then ACT=1; else ACT=0; fi
+assert "cold_rapid_fire_10_perf_gate" 1 "$ACT"
 rm -f /tmp/ct_rf_*.o /tmp/ct_rf_*.report
 
 # --- nm verification for already-tested compile_obj_smoke files ---
@@ -3144,6 +3174,9 @@ assert "wasm_shadowed_local_scope_cold_compile_smoke" 1 "$ACT"
 ACT=$(compile_obj_smoke "wasm_zero" "src/tests/wasm_zero_smoke.cheng")
 assert "wasm_zero_cold_compile_smoke" 1 "$ACT"
 
+ACT=$(compile_obj_smoke "wasm_ops" "src/tests/wasm_ops_smoke.cheng")
+assert "wasm_ops_cold_compile_smoke" 1 "$ACT"
+
 # --- udp smoke tests compile_obj_smoke ---
 ACT=$(compile_obj_smoke "udp_bind_bindtext" "src/tests/udp_bind_bindtext_smoke.cheng")
 assert "udp_bind_bindtext_cold_compile_smoke" 1 "$ACT"
@@ -3364,8 +3397,50 @@ ACT=$(compile_obj_smoke "chain_depth_a" "/tmp/ct_chain/level_a.cheng")
 assert "chain_depth_a_cold_compile_smoke" 1 "$ACT"
 rm -rf /tmp/ct_chain
 
+# --- compile_obj_smoke: newly added tests ---
+ACT=$(compile_obj_smoke "debug_tools_gate_text" "src/tests/debug_tools_gate_text_smoke.cheng")
+assert "debug_tools_gate_text_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "wow_export_dependency_memory" "src/tests/wow_export_dependency_memory_smoke.cheng")
+assert "wow_export_dependency_memory_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "chain_node_zero_snapshot_replay" "src/tests/chain_node_zero_snapshot_replay_smoke.cheng")
+assert "chain_node_zero_snapshot_replay_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "lsmr_bagua_prefix_tree" "src/tests/lsmr_bagua_prefix_tree_smoke.cheng")
+assert "lsmr_bagua_prefix_tree_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "str_i32_guard_dispatch_importc_count" "src/tests/str_i32_guard_dispatch_importc_count_direct_object_smoke.cheng")
+assert "str_i32_guard_dispatch_importc_count_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "consensus_add" "src/tests/consensus_add_smoke.cheng")
+assert "consensus_add_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "backend_driver_selfhost_progress" "src/tests/backend_driver_selfhost_progress_smoke.cheng")
+assert "backend_driver_selfhost_progress_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "tailnet_control_core" "src/tests/tailnet_control_core_smoke.cheng")
+assert "tailnet_control_core_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "anti_entropy_signature_fields" "src/tests/anti_entropy_signature_fields_smoke.cheng")
+assert "anti_entropy_signature_fields_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "strings_int_to_str" "src/tests/strings_int_to_str_smoke.cheng")
+assert "strings_int_to_str_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "cfg_guard_return_direct_object" "src/tests/cfg_guard_return_direct_object_smoke.cheng")
+assert "cfg_guard_return_direct_object_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "libp2p_multiaddr_call" "src/tests/libp2p_multiaddr_call_smoke.cheng")
+assert "libp2p_multiaddr_call_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "multibase_base58" "src/tests/multibase_base58_smoke.cheng")
+assert "multibase_base58_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "ffi_handle" "src/tests/ffi_handle_smoke.cheng")
+assert "ffi_handle_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "r2c_native_platform_shell_package" "src/tests/r2c_native_platform_shell_package_smoke.cheng")
+assert "r2c_native_platform_shell_package_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "backend_matrix_stmt_call_return_i32" "src/tests/backend_matrix_stmt_call_return_i32.cheng")
+assert "backend_matrix_stmt_call_return_i32_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "rwad_accumulator" "src/tests/rwad_accumulator_smoke.cheng")
+assert "rwad_accumulator_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "std_net_transport_compile" "src/tests/std_net_transport_compile_smoke.cheng")
+assert "std_net_transport_compile_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "os_rename_file" "src/tests/os_rename_file_smoke.cheng")
+assert "os_rename_file_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "perf_gate" "src/tests/perf_gate_smoke.cheng")
+assert "perf_gate_cold_compile_smoke" 1 "$ACT"
+
 # --- nm verification for compile_obj_smoke files (expanded coverage) ---
-for nm_tag in "chain_binary_types" "chain_csg" "chain_lsmr" "oracle_plane" "oracle_types"               "r2c_schema" "r2c_react" "runtime_mobile" "runtime_mobile_app"               "native_link_exec" "system_link_exec_runtime_direct"               "tls_client_hello_parse" "thread_parallelism_runtime"               "wasm_scalar_control_flow" "udp_bind_bindtext"               "webrtc_browser_pubsub" "zrpc_integration"               "typed_expr_call_validate_probe" "test_probe"               "aarch64_encode" "borrow_checker" "bytes" "chain_content_plane"               "chain_dag_mempool" "chain_erasure_swarm" "chain_location_proof"               "compile_mode_switch" "determinism_gate" "direct_object_emit"               "handle_table" "hot_patch" "linkerless_object_writer"               "native_link_plan" "object_buffer" "object_plan" "option"               "oracle_bft_state_machine" "r2c_native_gui_runtime_generic"               "cold_csg_facts_exporter" "str_concat_prelude" "wasm_zero"; do
+for nm_tag in "chain_binary_types" "chain_csg" "chain_lsmr" "oracle_plane" "oracle_types"               "r2c_schema" "r2c_react" "runtime_mobile" "runtime_mobile_app"               "native_link_exec" "system_link_exec_runtime_direct"               "tls_client_hello_parse" "thread_parallelism_runtime"               "wasm_scalar_control_flow" "udp_bind_bindtext"               "webrtc_browser_pubsub" "zrpc_integration"               "typed_expr_call_validate_probe" "test_probe"               "aarch64_encode" "borrow_checker" "bytes" "chain_content_plane"               "chain_dag_mempool" "chain_erasure_swarm" "chain_location_proof"               "compile_mode_switch" "determinism_gate" "direct_object_emit"               "handle_table" "hot_patch" "linkerless_object_writer"               "native_link_plan" "object_buffer" "object_plan" "option"               "oracle_bft_state_machine" "r2c_native_gui_runtime_generic"               "cold_csg_facts_exporter" "str_concat_prelude" "wasm_zero"               "consensus_add" "backend_driver_selfhost_progress"               "libp2p_multiaddr_call" "multibase_base58"               "ffi_handle" "os_rename_file"               "chain_node_zero_snapshot_replay"               "debug_tools_gate_text" "str_i32_guard_dispatch_importc_count"               "wow_export_dependency_memory"; do
     case "$nm_tag" in
         chain_binary_types) nm_src="src/chain/binary_types.cheng" ;;
         chain_csg) nm_src="src/chain/csg.cheng" ;;
@@ -3408,6 +3483,16 @@ for nm_tag in "chain_binary_types" "chain_csg" "chain_lsmr" "oracle_plane" "orac
         cold_csg_facts_exporter) nm_src="src/tests/cold_csg_facts_exporter_smoke.cheng" ;;
         str_concat_prelude) nm_src="src/tests/str_concat_prelude_probe.cheng" ;;
         wasm_zero) nm_src="src/tests/wasm_zero_smoke.cheng" ;;
+        consensus_add) nm_src="src/tests/consensus_add_smoke.cheng" ;;
+        backend_driver_selfhost_progress) nm_src="src/tests/backend_driver_selfhost_progress_smoke.cheng" ;;
+        libp2p_multiaddr_call) nm_src="src/tests/libp2p_multiaddr_call_smoke.cheng" ;;
+        multibase_base58) nm_src="src/tests/multibase_base58_smoke.cheng" ;;
+        ffi_handle) nm_src="src/tests/ffi_handle_smoke.cheng" ;;
+        os_rename_file) nm_src="src/tests/os_rename_file_smoke.cheng" ;;
+        chain_node_zero_snapshot_replay) nm_src="src/tests/chain_node_zero_snapshot_replay_smoke.cheng" ;;
+        debug_tools_gate_text) nm_src="src/tests/debug_tools_gate_text_smoke.cheng" ;;
+        str_i32_guard_dispatch_importc_count) nm_src="src/tests/str_i32_guard_dispatch_importc_count_direct_object_smoke.cheng" ;;
+        wow_export_dependency_memory) nm_src="src/tests/wow_export_dependency_memory_smoke.cheng" ;;
     esac
     rm -f "/tmp/ct_nm_${nm_tag}.o" "/tmp/ct_nm_${nm_tag}.report"
     quiet $COLD system-link-exec --root:"$PWD"         --in:"$nm_src" --target:arm64-apple-darwin         --out:"/tmp/ct_nm_${nm_tag}.o" --emit:obj         --report-out:"/tmp/ct_nm_${nm_tag}.report"
@@ -3419,6 +3504,55 @@ for nm_tag in "chain_binary_types" "chain_csg" "chain_lsmr" "oracle_plane" "orac
     assert "cold_nm_${nm_tag}" 1 "$ACT"
     rm -f "/tmp/ct_nm_${nm_tag}.o" "/tmp/ct_nm_${nm_tag}.report"
 done
+
+# --- otool + nm combined verification for 10 test files ---
+for oto_tag in "anti_entropy_signature_fields" "chain_node_zero_snapshot" "lsmr_bagua_prefix" \
+               "strings_int_to_str" "consensus_add" "backend_driver_selfhost" \
+               "cfg_guard_return_direct_object" "libp2p_multiaddr_call" "multibase_base58" \
+               "ffi_handle"; do
+    case "$oto_tag" in
+        anti_entropy_signature_fields) oto_src="src/tests/anti_entropy_signature_fields_smoke.cheng" ;;
+        chain_node_zero_snapshot) oto_src="src/tests/chain_node_zero_snapshot_replay_smoke.cheng" ;;
+        lsmr_bagua_prefix) oto_src="src/tests/lsmr_bagua_prefix_tree_smoke.cheng" ;;
+        strings_int_to_str) oto_src="src/tests/strings_int_to_str_smoke.cheng" ;;
+        consensus_add) oto_src="src/tests/consensus_add_smoke.cheng" ;;
+        backend_driver_selfhost) oto_src="src/tests/backend_driver_selfhost_progress_smoke.cheng" ;;
+        cfg_guard_return_direct_object) oto_src="src/tests/cfg_guard_return_direct_object_smoke.cheng" ;;
+        libp2p_multiaddr_call) oto_src="src/tests/libp2p_multiaddr_call_smoke.cheng" ;;
+        multibase_base58) oto_src="src/tests/multibase_base58_smoke.cheng" ;;
+        ffi_handle) oto_src="src/tests/ffi_handle_smoke.cheng" ;;
+    esac
+    rm -f "/tmp/ct_oto_${oto_tag}.o" "/tmp/ct_oto_${oto_tag}.report"
+    quiet $COLD system-link-exec --root:"$PWD" \
+        --in:"$oto_src" --target:arm64-apple-darwin \
+        --out:"/tmp/ct_oto_${oto_tag}.o" --emit:obj \
+        --report-out:"/tmp/ct_oto_${oto_tag}.report"
+    if [ -s "/tmp/ct_oto_${oto_tag}.o" ] && \
+       nm "/tmp/ct_oto_${oto_tag}.o" >/dev/null 2>&1 && \
+       otool -h "/tmp/ct_oto_${oto_tag}.o" 2>/dev/null | grep -q '0xfeedfacf'; then
+        ACT=1
+    else
+        ACT=0
+    fi
+    assert "cold_otool_nm_${oto_tag}" 1 "$ACT"
+    rm -f "/tmp/ct_oto_${oto_tag}.o" "/tmp/ct_oto_${oto_tag}.report"
+done
+
+# --- cold self-compile: cold compiler compiles its own front-end source (gate_main) and verifies nm + otool ---
+rm -f /tmp/ct_selfcompile.o /tmp/ct_selfcompile.report
+quiet $COLD system-link-exec --root:"$PWD" \
+    --in:src/core/tooling/gate_main.cheng --target:arm64-apple-darwin \
+    --out:/tmp/ct_selfcompile.o --emit:obj \
+    --report-out:/tmp/ct_selfcompile.report
+if [ -s /tmp/ct_selfcompile.o ] && \
+   nm /tmp/ct_selfcompile.o >/dev/null 2>&1 && \
+   otool -h /tmp/ct_selfcompile.o 2>/dev/null | grep -q '0xfeedfacf'; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "cold_self_compile_gate_main" 1 "$ACT"
+rm -f /tmp/ct_selfcompile.o /tmp/ct_selfcompile.report
 
 # --- stress test: compile the 5 largest .cheng files sequentially ---
 rm -f /tmp/ct_stress_1.o /tmp/ct_stress_2.o /tmp/ct_stress_3.o /tmp/ct_stress_4.o /tmp/ct_stress_5.o

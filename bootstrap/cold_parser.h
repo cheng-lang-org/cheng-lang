@@ -109,6 +109,12 @@ int32_t parse_expr_from_span(Parser *owner, BodyIR *body, Locals *locals,
 int32_t parse_constructor(Parser *parser, BodyIR *body, Locals *locals,
                            Variant *variant);
 int32_t cold_arg_reg_count(int32_t kind, int32_t size);
+int32_t parse_param_specs_with_generics(Symbols *symbols, Span params,
+                                        Span *generic_names,
+                                        int32_t generic_count,
+                                        Span *names, int32_t *kinds,
+                                        int32_t *sizes, Span *types,
+                                        int32_t cap);
 int32_t parse_param_specs(Symbols *symbols, Span params, Span *names,
                           int32_t *kinds, int32_t *sizes, Span *types,
                           int32_t cap);

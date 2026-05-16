@@ -348,9 +348,17 @@ static uint32_t rv_fence(void) { return 0x0FF0000Fu; }
 static uint32_t rv_lbu(int rd, int rs1, int16_t imm) {
     return RV_I(rd, rs1, (uint32_t)(imm & 0xFFF), 4, RV_LOAD);
 }
+/* LHU rd, imm12(rs1) -- load halfword unsigned */
+static uint32_t rv_lhu(int rd, int rs1, int16_t imm) {
+    return RV_I(rd, rs1, (uint32_t)(imm & 0xFFF), 5, RV_LOAD);
+}
 /* SB rs2, imm12(rs1) -- store byte */
 static uint32_t rv_sb(int rs2, int rs1, int16_t imm) {
     return RV_S(rs2, rs1, (uint32_t)(imm & 0xFFF), 0, RV_STORE);
+}
+/* SH rs2, imm12(rs1) -- store halfword */
+static uint32_t rv_sh(int rs2, int rs1, int16_t imm) {
+    return RV_S(rs2, rs1, (uint32_t)(imm & 0xFFF), 1, RV_STORE);
 }
 /* MULW rd, rs1, rs2 (exists in original) */
 /* DIVUW rd, rs1, rs2 (unsigned 32-bit) */

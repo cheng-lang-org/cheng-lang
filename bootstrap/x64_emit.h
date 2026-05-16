@@ -541,6 +541,19 @@ static void x64_movzb_r32_mr8(X64Code *c, int reg, int base_reg) {
     x64_emit1(c, 0x0F); x64_emit1(c, 0xB6);
     x64_emit1(c, MODRM(0, reg & 7, base_reg & 7));
 }
+/* movzw [base], %r32 (load zero-extend 16-bit) */
+static void x64_movzw_r32_mr16(X64Code *c, int reg, int base_reg) {
+    if (reg >= 8 || base_reg >= 8) x64_emit1(c, (reg >= 8 ? REX_R : 0) | (base_reg >= 8 ? REX_B : 0));
+    x64_emit1(c, 0x0F); x64_emit1(c, 0xB7);
+    x64_emit1(c, MODRM(0, reg & 7, base_reg & 7));
+}
+/* movw [base], %r16 (store 16-bit) */
+static void x64_mov_mr16_r16(X64Code *c, int base_reg, int reg) {
+    x64_emit1(c, 0x66); /* operand size override */
+    if (base_reg >= 8 || reg >= 8) x64_emit1(c, (base_reg >= 8 ? REX_B : 0) | (reg >= 8 ? REX_R : 0));
+    x64_emit1(c, 0x89);
+    x64_emit1(c, MODRM(0, reg & 7, base_reg & 7));
+}
 /* push imm32 */
 static void x64_push_imm32(X64Code *c, int32_t imm) { x64_emit1(c, 0x68); x64_emit4(c, (uint32_t)imm); }
 /* int3 */

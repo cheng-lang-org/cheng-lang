@@ -3402,6 +3402,8 @@ enum {
     BODY_OP_BYTES_GET = 149,
     BODY_OP_BYTES_SET = 150,
     BODY_OP_ATOMIC_ADD_I32 = 151,
+    BODY_OP_PTR_LOAD_U16 = 152,
+    BODY_OP_PTR_STORE_U16 = 153,
 };
 
 enum {
@@ -6705,6 +6707,14 @@ static uint32_t a64_strb_imm(int rt, int rn, int32_t offset) {
     uint32_t imm = (uint32_t)(offset & 0xFFF);
     return 0x39000000u | (imm << 10) | ((uint32_t)rn << 5) | (uint32_t)rt;
 }
+static uint32_t a64_ldrh_imm(int rt, int rn, int32_t offset) {
+    uint32_t imm = (uint32_t)((offset >> 1) & 0xFFF);
+    return 0x79400000u | (imm << 10) | ((uint32_t)rn << 5) | (uint32_t)rt;
+}
+static uint32_t a64_strh_imm(int rt, int rn, int32_t offset) {
+    uint32_t imm = (uint32_t)((offset >> 1) & 0xFFF);
+    return 0x78000000u | (imm << 10) | ((uint32_t)rn << 5) | (uint32_t)rt;
+}
 __attribute__((unused))
 static uint32_t a64_ldr_reg(int rt, int rn, int rm, bool x) {
     return (x ? 0xF8606800u : 0xB8606800u) | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rt;
@@ -7947,11 +7957,7 @@ static void codegen_load_str_pair(Code *code, BodyIR *body, int32_t slot,
         a64_emit_ldr_sp_off(code, ptr_reg, body->slot_offset[slot] + COLD_STR_DATA_OFFSET, true);
         a64_emit_ldr_sp_off(code, len_reg, body->slot_offset[slot] + COLD_STR_LEN_OFFSET, false);
     } else {
-        /* Non-str slot: produce empty string (ptr=0, len=0).
-           Matches cold_require_str_value which returns 0 for non-str values. */
-        code_emit(code, a64_movz_x(ptr_reg, 0, 0));
-        code_emit(code, a64_movz_x(len_reg, 0, 0));
-        return;
+        die("codegen_load_str_pair slot kind mismatch");
     }
     /* guard: if len==0, point ptr to SP to prevent NULL deref */
     code_emit(code, a64_cmp_imm(len_reg, 0));
@@ -7967,7 +7973,7 @@ static void codegen_store_str_pair(Code *code, BodyIR *body, int32_t slot,
     a64_emit_str_sp_off(code, len_reg, body->slot_offset[slot] + COLD_STR_LEN_OFFSET, false);
     code_emit(code, a64_movz(R0, 0, 0));
     a64_emit_str_sp_off(code, R0, body->slot_offset[slot] + COLD_STR_STORE_ID_OFFSET, false);
-    a64_emit_str_sp_off(code, R0, body->slot_offset[slot] + COLD_STR_FLAGS_OFFSET, false);
+    a64_emit_str_sp_off(code, R0, body->slot_offset[slot] + COLD_STR_FLAGS_OFFSET, true);
 }
 
 static void codegen_store_empty_str(Code *code, BodyIR *body, int32_t slot) {
@@ -8033,7 +8039,7 @@ static void codegen_bytes_to_hex(Code *code, BodyIR *body, int32_t dst, int32_t 
     a64_emit_str_sp_off(code, R6, body->slot_offset[dst] + COLD_STR_DATA_OFFSET, true);
     code_emit(code, a64_movz(R0, 0, 0));
     a64_emit_str_sp_off(code, R0, body->slot_offset[dst] + COLD_STR_STORE_ID_OFFSET, false);
-    a64_emit_str_sp_off(code, R0, body->slot_offset[dst] + COLD_STR_FLAGS_OFFSET, false);
+    a64_emit_str_sp_off(code, R0, body->slot_offset[dst] + COLD_STR_FLAGS_OFFSET, true);
 
     codegen_load_bytes_pair(code, body, bytes_slot, R3, R4);
     a64_emit_ldr_sp_off(code, R6, body->slot_offset[dst] + COLD_STR_DATA_OFFSET, true);
@@ -8174,7 +8180,7 @@ static void codegen_store_exec_result(Code *code, BodyIR *body, int32_t dst,
     a64_emit_str_sp_off(code, output_len_reg, base + output_offset + COLD_STR_LEN_OFFSET, false);
     code_emit(code, a64_movz(R0, 0, 0));
     a64_emit_str_sp_off(code, R0, base + output_offset + COLD_STR_STORE_ID_OFFSET, false);
-    a64_emit_str_sp_off(code, R0, base + output_offset + COLD_STR_FLAGS_OFFSET, false);
+    a64_emit_str_sp_off(code, R0, base + output_offset + COLD_STR_FLAGS_OFFSET, true);
     a64_emit_str_sp_off(code, exit_code_reg, base + exit_offset, false);
 }
 
@@ -9155,13 +9161,15 @@ static void codegen_path_join_slots(Code *code, BodyIR *body, int32_t dst,
 
 static void codegen_str_concat(Code *code, BodyIR *body, int32_t dst, int32_t left, int32_t right) {
     if (body->slot_kind[left] != SLOT_STR || body->slot_kind[right] != SLOT_STR) {
-        codegen_zero_slot(code, body, dst);
-        return;
+        die("str concat slot kind mismatch");
     }
     a64_emit_ldr_sp_off(code, R1, body->slot_offset[left] + 8, true);
     a64_emit_ldr_sp_off(code, R2, body->slot_offset[right] + 8, true);
     code_emit(code, a64_add_reg(R1, R1, R2));
-    a64_emit_str_sp_off(code, R1, body->slot_offset[dst] + 8, true);
+    a64_emit_str_sp_off(code, R1, body->slot_offset[dst] + 8, false);
+    code_emit(code, a64_movz(R0, 0, 0));
+    a64_emit_str_sp_off(code, R0, body->slot_offset[dst] + COLD_STR_STORE_ID_OFFSET, false);
+    a64_emit_str_sp_off(code, R0, body->slot_offset[dst] + COLD_STR_FLAGS_OFFSET, true);
     code_emit(code, a64_cmp_imm(R1, 0));
     int32_t non_empty_pos = code->count;
     code_emit(code, a64_bcond(0, COND_NE));
@@ -9198,7 +9206,7 @@ static void codegen_str_concat(Code *code, BodyIR *body, int32_t dst, int32_t le
 }
 
 static void codegen_i32_to_str(Code *code, BodyIR *body, int32_t dst, int32_t src) {
-    if (body->slot_kind[src] != SLOT_I32) { codegen_zero_slot(code, body, dst); return; }
+    if (body->slot_kind[src] != SLOT_I32) die("i32_to_str slot kind mismatch");
     a64_emit_ldr_sp_off(code, R2, body->slot_offset[src], false);
 
     code_emit(code, a64_movz_x(R0, 0, 0));
@@ -9216,6 +9224,9 @@ static void codegen_i32_to_str(Code *code, BodyIR *body, int32_t dst, int32_t sr
     code_emit(code, a64_brk(6));
     a64_patch_bcond(code, mmap_ok, code->count);
     a64_emit_str_sp_off(code, R0, body->slot_offset[dst], true);
+    code_emit(code, a64_movz(7, 0, 0));
+    a64_emit_str_sp_off(code, 7, body->slot_offset[dst] + COLD_STR_STORE_ID_OFFSET, false);
+    a64_emit_str_sp_off(code, 7, body->slot_offset[dst] + COLD_STR_FLAGS_OFFSET, true);
 
     a64_emit_ldr_sp_off(code, R2, body->slot_offset[src], false);
     code_emit(code, a64_cmp_imm(R2, 0));
@@ -9224,7 +9235,7 @@ static void codegen_i32_to_str(Code *code, BodyIR *body, int32_t dst, int32_t sr
     code_emit(code, a64_movz(5, '0', 0));
     code_emit(code, a64_strb_imm(5, R0, 0));
     code_emit(code, a64_movz_x(8, 1, 0));
-    a64_emit_str_sp_off(code, 8, body->slot_offset[dst] + 8, true);
+    a64_emit_str_sp_off(code, 8, body->slot_offset[dst] + 8, false);
     int32_t zero_done = code->count;
     code_emit(code, a64_b(0));
 
@@ -9266,12 +9277,12 @@ static void codegen_i32_to_str(Code *code, BodyIR *body, int32_t dst, int32_t sr
 
     code_emit(code, a64_add_imm(6, 6, 1, true));
     a64_emit_str_sp_off(code, 6, body->slot_offset[dst], true);
-    a64_emit_str_sp_off(code, 8, body->slot_offset[dst] + 8, true);
+    a64_emit_str_sp_off(code, 8, body->slot_offset[dst] + 8, false);
     a64_patch_b(code, zero_done, code->count);
 }
 
 static void codegen_i64_to_str(Code *code, BodyIR *body, int32_t dst, int32_t src) {
-    if (body->slot_kind[src] != SLOT_I64) { codegen_zero_slot(code, body, dst); return; }
+    if (body->slot_kind[src] != SLOT_I64) die("i64_to_str slot kind mismatch");
     code_emit(code, a64_movz_x(R0, 0, 0));
     code_emit(code, a64_movz_x(R1, 32, 0));
     code_emit(code, a64_movz_x(R2, 3, 0));
@@ -9287,6 +9298,9 @@ static void codegen_i64_to_str(Code *code, BodyIR *body, int32_t dst, int32_t sr
     code_emit(code, a64_brk(82));
     a64_patch_bcond(code, mmap_ok, code->count);
     a64_emit_str_sp_off(code, R0, body->slot_offset[dst], true);
+    code_emit(code, a64_movz(7, 0, 0));
+    a64_emit_str_sp_off(code, 7, body->slot_offset[dst] + COLD_STR_STORE_ID_OFFSET, false);
+    a64_emit_str_sp_off(code, 7, body->slot_offset[dst] + COLD_STR_FLAGS_OFFSET, true);
 
     a64_emit_ldr_sp_off(code, R2, body->slot_offset[src], true);
     code_emit(code, a64_cmp_reg_x(R2, 31));
@@ -9295,7 +9309,7 @@ static void codegen_i64_to_str(Code *code, BodyIR *body, int32_t dst, int32_t sr
     code_emit(code, a64_movz(5, '0', 0));
     code_emit(code, a64_strb_imm(5, R0, 0));
     code_emit(code, a64_movz_x(8, 1, 0));
-    a64_emit_str_sp_off(code, 8, body->slot_offset[dst] + 8, true);
+    a64_emit_str_sp_off(code, 8, body->slot_offset[dst] + 8, false);
     int32_t zero_done = code->count;
     code_emit(code, a64_b(0));
 
@@ -9334,15 +9348,15 @@ static void codegen_i64_to_str(Code *code, BodyIR *body, int32_t dst, int32_t sr
 
     code_emit(code, a64_add_imm(6, 6, 1, true));
     a64_emit_str_sp_off(code, 6, body->slot_offset[dst], true);
-    a64_emit_str_sp_off(code, 8, body->slot_offset[dst] + 8, true);
+    a64_emit_str_sp_off(code, 8, body->slot_offset[dst] + 8, false);
     a64_patch_b(code, zero_done, code->count);
 }
 
 static void codegen_str_index(Code *code, BodyIR *body, int32_t dst,
                               int32_t str_slot, int32_t index_slot) {
     int32_t str_kind = body->slot_kind[str_slot];
-    if (str_kind != SLOT_STR && str_kind != SLOT_STR_REF) { codegen_zero_slot(code, body, dst); return; }
-    if (body->slot_kind[index_slot] != SLOT_I32) { codegen_zero_slot(code, body, dst); return; }
+    if (str_kind != SLOT_STR && str_kind != SLOT_STR_REF) die("str index slot kind mismatch");
+    if (body->slot_kind[index_slot] != SLOT_I32) die("str index requires int32 index");
     if (str_kind == SLOT_STR_REF) {
         a64_emit_ldr_sp_off(code, R2, body->slot_offset[str_slot], true);
         code_emit(code, a64_ldr_imm(R3, R2, 0, true));
@@ -9370,8 +9384,8 @@ static void codegen_str_index(Code *code, BodyIR *body, int32_t dst,
 static void codegen_seq_str_index(Code *code, BodyIR *body, int32_t dst,
                                   int32_t seq_slot, int32_t index_slot) {
     int32_t seq_kind = body->slot_kind[seq_slot];
-    if (seq_kind != SLOT_SEQ_STR && seq_kind != SLOT_SEQ_STR_REF) { codegen_zero_slot(code, body, dst); return; }
-    if (body->slot_kind[index_slot] != SLOT_I32) { codegen_zero_slot(code, body, dst); return; }
+    if (seq_kind != SLOT_SEQ_STR && seq_kind != SLOT_SEQ_STR_REF) die("str sequence index slot kind mismatch");
+    if (body->slot_kind[index_slot] != SLOT_I32) die("str sequence index requires int32 index");
     int header_reg = R2;
     if (seq_kind == SLOT_SEQ_STR_REF) {
         a64_emit_ldr_sp_off(code, header_reg, body->slot_offset[seq_slot], true);
@@ -9382,33 +9396,25 @@ static void codegen_seq_str_index(Code *code, BodyIR *body, int32_t dst,
     code_emit(code, a64_cmp_imm(R1, 0));
     int32_t non_negative = code->count;
     code_emit(code, a64_bcond(0, COND_GE));
-    /* Negative index: return 0 */
-    code_emit(code, a64_movz(R0, 0, 0));
-    a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
-    int32_t neg_done_jump = code->count;
-    code_emit(code, a64_b(0));
+    code_emit(code, a64_brk(9));
     a64_patch_bcond(code, non_negative, code->count);
     code_emit(code, a64_ldr_imm(R3, header_reg, 0, false));
     code_emit(code, a64_cmp_reg(R1, R3));
     int32_t in_bounds = code->count;
     code_emit(code, a64_bcond(0, COND_LT));
-    /* Index out of bounds: return 0 */
-    code_emit(code, a64_movz(R0, 0, 0));
-    a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
-    /* Jump to common epilogue */
-    int32_t oob_done_jump = code->count;
-    code_emit(code, a64_b(0));
+    code_emit(code, a64_brk(10));
     a64_patch_bcond(code, in_bounds, code->count);
     code_emit(code, a64_ldr_imm(4, header_reg, 8, true));
     codegen_mul_u64_by_24(code, 5, R1);
     code_emit(code, a64_add_reg_x(4, 4, 5));
     code_emit(code, a64_ldr_imm(6, 4, 0, true));
     code_emit(code, a64_ldr_imm(7, 4, 8, false));
-    codegen_store_str_pair(code, body, dst, 6, 7);
-    /* Patch error jumps to here */
-    int32_t seq_end = code->count;
-    code->words[neg_done_jump] = a64_b(seq_end - neg_done_jump);
-    code->words[oob_done_jump] = a64_b(seq_end - oob_done_jump);
+    a64_emit_str_sp_off(code, 6, body->slot_offset[dst] + COLD_STR_DATA_OFFSET, true);
+    a64_emit_str_sp_off(code, 7, body->slot_offset[dst] + COLD_STR_LEN_OFFSET, false);
+    code_emit(code, a64_ldr_imm(6, 4, COLD_STR_STORE_ID_OFFSET, false));
+    a64_emit_str_sp_off(code, 6, body->slot_offset[dst] + COLD_STR_STORE_ID_OFFSET, false);
+    code_emit(code, a64_ldr_imm(6, 4, COLD_STR_FLAGS_OFFSET, true));
+    a64_emit_str_sp_off(code, 6, body->slot_offset[dst] + COLD_STR_FLAGS_OFFSET, true);
 }
 
 static void codegen_seq_header_addr(Code *code, BodyIR *body, int32_t seq_slot, int reg) {
@@ -10807,14 +10813,13 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         int32_t after_data = code->count;
         code->words[adr_pos] = a64_adr(R0, data_offset - adr_pos * 4);
         code->words[skip_pos] = a64_b(after_data - skip_pos);
-        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], true);
         if (literal.len <= 0xFFFF) {
-            code_emit(code, a64_movz_x(R0, (uint16_t)literal.len, 0));
+            code_emit(code, a64_movz_x(R1, (uint16_t)literal.len, 0));
         } else {
-            code_emit(code, a64_movz_x(R0, (uint16_t)(literal.len & 0xFFFF), 0));
-            code_emit(code, a64_movk(R0, (uint16_t)((literal.len >> 16) & 0xFFFF), 1));
+            code_emit(code, a64_movz_x(R1, (uint16_t)(literal.len & 0xFFFF), 0));
+            code_emit(code, a64_movk(R1, (uint16_t)((literal.len >> 16) & 0xFFFF), 1));
         }
-        a64_emit_str_sp_off(code, R0, body->slot_offset[dst] + 8, true);
+        codegen_store_str_pair(code, body, dst, R0, R1);
     } else if (kind == BODY_OP_STR_LEN) {
         if (body->slot_kind[a] == SLOT_STR_REF) {
             a64_emit_ldr_sp_off(code, R1, body->slot_offset[a], true);
@@ -10849,13 +10854,15 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], true);
     } else if (kind == BODY_OP_STR_REF_STORE) {
         if (body->slot_kind[dst] != SLOT_STR_REF || body->slot_kind[a] != SLOT_STR) {
-            return; /* skip mismatched str ref store */
+            die("str ref store kind mismatch");
         }
         a64_emit_ldr_sp_off(code, R1, body->slot_offset[dst], true);
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], true);
         code_emit(code, a64_str_imm(R0, R1, 0, true));
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[a] + 8, true);
         code_emit(code, a64_str_imm(R0, R1, 8, true));
+        a64_emit_ldr_sp_off(code, R0, body->slot_offset[a] + 16, true);
+        code_emit(code, a64_str_imm(R0, R1, 16, true));
     } else if (kind == BODY_OP_MAKE_SEQ_I32) {
         codegen_zero_slot(code, body, dst);
         if (c > 0 && a >= 0 && body->slot_kind[a] == SLOT_ARRAY_I32) {
@@ -11224,6 +11231,10 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         a64_emit_ldr_sp_off(code, R1, body->slot_offset[a], true);
         code_emit(code, a64_ldrb_imm(R0, R1, 0));
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
+    } else if (kind == BODY_OP_PTR_LOAD_U16) {
+        a64_emit_ldr_sp_off(code, R1, body->slot_offset[a], true);
+        code_emit(code, a64_ldrh_imm(R0, R1, 0));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
     } else if (kind == BODY_OP_PTR_STORE_I32) {
         a64_emit_ldr_sp_off(code, R1, body->slot_offset[dst], true);
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
@@ -11232,6 +11243,10 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         a64_emit_ldr_sp_off(code, R1, body->slot_offset[dst], true);
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
         code_emit(code, a64_strb_imm(R0, R1, 0));
+    } else if (kind == BODY_OP_PTR_STORE_U16) {
+        a64_emit_ldr_sp_off(code, R1, body->slot_offset[dst], true);
+        a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
+        code_emit(code, a64_strh_imm(R0, R1, 0));
     } else if (kind == BODY_OP_PTR_LOAD_I64) {
         a64_emit_ldr_sp_off(code, R1, body->slot_offset[a], true);
         code_emit(code, a64_ldr_imm(R0, R1, 0, true));
@@ -11810,40 +11825,19 @@ static void x64_codegen_op(X64Code *x, BodyIR *body, Symbols *symbols,
         x64_mov_mr32_r32(x, 4, off_dst, 0);
     /* String ops */
     } else if (kind == BODY_OP_STR_LITERAL) {
-        if (a >= 0 && a < body->string_literal_count) {
-            Span literal = body->string_literal[a];
-            x64_lea_r64_mr(x, 0, 4, 0); /* placeholder, patched later with data offset */
-            x64_mov_mr64_r64(x, 4, off_dst, 0);
-            x64_mov_r32_imm32(x, 0, (int32_t)literal.len);
-            x64_mov_mr32_r32(x, 4, off_dst + 8, 0);
-        }
+        die("x86_64 str literal unsupported");
     } else if (kind == BODY_OP_STR_LEN) {
-        x64_mov_r32_mr32(x, 0, 4, body->slot_offset[a] + 8);
-        x64_mov_mr32_r32(x, 4, off_dst, 0);
+        die("x86_64 str len unsupported");
     } else if (kind == BODY_OP_STR_EQ) {
-        /* str_eq via memcmp: compare ptr+len */
-        x64_mov_r64_mr64(x, 0, 4, body->slot_offset[a]);
-        x64_mov_r64_mr64(x, 1, 4, body->slot_offset[a] + 8);
-        x64_mov_r64_mr64(x, 2, 4, body->slot_offset[b]);
-        x64_mov_r64_mr64(x, 3, 4, body->slot_offset[b] + 8);
-        /* compare lengths */
-        x64_cmp_r64_r64(x, 1, 3);
-        int32_t len_ne = x->len + 2;
-        x64_jcc_rel8(x, CC_NE, 0);
-        /* compare bytes - simplified: just check if lengths equal for now */
-        x64_mov_r32_imm32(x, 0, 0); /* result */
-        x64_mov_mr32_r32(x, 4, off_dst, 0);
+        die("x86_64 str eq unsupported");
     } else if (kind == BODY_OP_STR_CONCAT) {
-        /* str_concat: simplified - store empty string */
-        x64_mov_r32_imm32(x, 0, 0);
-        x64_mov_mr32_r32(x, 4, off_dst, 0);
-    } else if (kind == BODY_OP_I32_TO_STR || kind == BODY_OP_I64_TO_STR ||
-               kind == BODY_OP_STR_INDEX || kind == BODY_OP_STR_JOIN ||
+        die("x86_64 str concat unsupported");
+    } else if (kind == BODY_OP_I64_TO_STR) {
+        die("x86_64 i64_to_str unsupported");
+    } else if (kind == BODY_OP_I32_TO_STR || kind == BODY_OP_STR_JOIN ||
                kind == BODY_OP_STR_SPLIT_CHAR || kind == BODY_OP_STR_STRIP ||
                kind == BODY_OP_STR_SLICE || kind == BODY_OP_SHELL_QUOTE) {
-        /* Complex string ops: emit stub returning empty string */
-        x64_mov_r32_imm32(x, 0, 0);
-        x64_mov_mr32_r32(x, 4, off_dst, 0);
+        die("x86_64 string op unsupported");
     /* Load/Store */
     } else if (kind == BODY_OP_LOAD_I32) {
         x64_mov_r32_imm32(x, 0, 0);
@@ -11869,12 +11863,7 @@ static void x64_codegen_op(X64Code *x, BodyIR *body, Symbols *symbols,
         x64_lea_r64_mr(x, 0, 4, body->slot_offset[a] + b);
         x64_mov_mr64_r64(x, 4, off_dst, 0);
     } else if (kind == BODY_OP_STR_REF_STORE) {
-        x64_mov_r64_mr64(x, 0, 4, body->slot_offset[dst]);
-        x64_mov_r64_mr64(x, 1, 4, body->slot_offset[a]);
-        x64_mov_mr64_base_r64(x, 0, 1);
-        x64_mov_r64_mr64(x, 1, 4, body->slot_offset[a] + 8);
-        x64_emit1(x, REX_W | REX_R); x64_emit1(x, 0x89); x64_emit1(x, MODRM(1, 1 & 7, 0));
-        x64_emit1(x, 8);
+        die("x86_64 str ref store unsupported");
     /* Copy */
     } else if (kind == BODY_OP_COPY_COMPOSITE) {
         int32_t sz = body->slot_size[dst];
@@ -11919,6 +11908,10 @@ static void x64_codegen_op(X64Code *x, BodyIR *body, Symbols *symbols,
         x64_mov_r64_mr64(x, 0, 4, body->slot_offset[a]);
         x64_movzb_r32_mr8(x, 0, 0);
         x64_mov_mr32_r32(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_PTR_LOAD_U16) {
+        x64_mov_r64_mr64(x, 0, 4, body->slot_offset[a]);
+        x64_movzw_r32_mr16(x, 0, 0);
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
     } else if (kind == BODY_OP_PTR_STORE_I32) {
         x64_mov_r64_mr64(x, 0, 4, body->slot_offset[dst]);
         x64_mov_r32_mr32(x, 1, 4, body->slot_offset[a]);
@@ -11927,6 +11920,10 @@ static void x64_codegen_op(X64Code *x, BodyIR *body, Symbols *symbols,
         x64_mov_r64_mr64(x, 0, 4, body->slot_offset[dst]);
         x64_mov_r32_mr32(x, 1, 4, body->slot_offset[a]);
         x64_mov_mr8_r8(x, 0, 1);
+    } else if (kind == BODY_OP_PTR_STORE_U16) {
+        x64_mov_r64_mr64(x, 0, 4, body->slot_offset[dst]);
+        x64_mov_r32_mr32(x, 1, 4, body->slot_offset[a]);
+        x64_mov_mr16_r16(x, 0, 1);
     } else if (kind == BODY_OP_PTR_LOAD_I64) {
         x64_mov_r64_mr64(x, 0, 4, body->slot_offset[a]);
         x64_mov_r64_mr64_base(x, 0, 0);
@@ -12636,13 +12633,9 @@ static void rv64_codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)off_dst));
     /* String / Load / Store */
     } else if (kind == BODY_OP_STR_LITERAL) {
-        rv_li(code->words, &code->count, RV_T0, 0);
-        code_emit(code, rv_sd(RV_T0, RV_SP, (int16_t)off_dst));
-        rv_li(code->words, &code->count, RV_T0, 0);
-        code_emit(code, rv_sd(RV_T0, RV_SP, (int16_t)(off_dst + 8)));
+        die("RV64 str literal unsupported");
     } else if (kind == BODY_OP_STR_LEN) {
-        code_emit(code, rv_lw(RV_T0, RV_SP, (int16_t)(body->slot_offset[a] + 8)));
-        code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)off_dst));
+        die("RV64 str len unsupported");
     } else if (kind == BODY_OP_PAYLOAD_LOAD) {
         code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)(body->slot_offset[a] + b)));
         code_emit(code, rv_sd(RV_T0, RV_SP, (int16_t)off_dst));
@@ -12664,11 +12657,7 @@ static void rv64_codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         code_emit(code, rv_addi(RV_T0, RV_SP, (int16_t)(body->slot_offset[a] + b)));
         code_emit(code, rv_sd(RV_T0, RV_SP, (int16_t)off_dst));
     } else if (kind == BODY_OP_STR_REF_STORE) {
-        code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)body->slot_offset[dst]));
-        code_emit(code, rv_ld(RV_T1, RV_SP, (int16_t)body->slot_offset[a]));
-        code_emit(code, rv_sd(RV_T1, RV_T0, 0));
-        code_emit(code, rv_ld(RV_T1, RV_SP, (int16_t)(body->slot_offset[a] + 8)));
-        code_emit(code, rv_sd(RV_T1, RV_T0, 8));
+        die("RV64 str ref store unsupported");
     } else if (kind == BODY_OP_COPY_COMPOSITE) {
         int32_t sz = body->slot_size[dst], os = body->slot_offset[a];
         for (int32_t off = 0; off < sz; off += 8) {
@@ -12707,6 +12696,10 @@ static void rv64_codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
         code_emit(code, rv_lbu(RV_T0, RV_T0, 0));
         code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_PTR_LOAD_U16) {
+        code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_lhu(RV_T0, RV_T0, 0));
+        code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)off_dst));
     } else if (kind == BODY_OP_PTR_STORE_I32) {
         code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)body->slot_offset[dst]));
         code_emit(code, rv_lw(RV_T1, RV_SP, (int16_t)body->slot_offset[a]));
@@ -12715,6 +12708,10 @@ static void rv64_codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)body->slot_offset[dst]));
         code_emit(code, rv_lw(RV_T1, RV_SP, (int16_t)body->slot_offset[a]));
         code_emit(code, rv_sb(RV_T1, RV_T0, 0));
+    } else if (kind == BODY_OP_PTR_STORE_U16) {
+        code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)body->slot_offset[dst]));
+        code_emit(code, rv_lw(RV_T1, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_sh(RV_T1, RV_T0, 0));
     } else if (kind == BODY_OP_PTR_LOAD_I64) {
         code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
         code_emit(code, rv_ld(RV_T0, RV_T0, 0));
@@ -13157,10 +13154,134 @@ static void rv64_codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         code->words[bs_neg] = rv_blt(RV_T2, RV_ZERO, (int16_t)((bs_done - bs_neg) * 4));
         code->words[bs_high] = rv_bge(RV_T2, RV_T1, (int16_t)((bs_done - bs_high) * 4));
         code_emit(code, rv_sw(RV_T3, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_STR_INDEX) {
+        /* STR_INDEX: str[index] -> byte (i32) */
+        if (body->slot_kind[a] == SLOT_STR_REF) {
+            code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+            code_emit(code, rv_ld(RV_T1, RV_T0, 0));
+            code_emit(code, rv_lw(RV_T2, RV_T0, 8));
+        } else {
+            code_emit(code, rv_ld(RV_T1, RV_SP, (int16_t)body->slot_offset[a]));
+            code_emit(code, rv_lw(RV_T2, RV_SP, (int16_t)(body->slot_offset[a] + 8)));
+        }
+        code_emit(code, rv_lw(RV_T3, RV_SP, (int16_t)body->slot_offset[b]));
+        /* index < 0 -> trap */
+        code_emit(code, rv_bge(RV_T3, RV_ZERO, 0));
+        int32_t rv_si_neg = code->count - 1;
+        code_emit(code, rv_ebreak());
+        int32_t rv_si_neg_done = code->count;
+        /* index >= len -> trap */
+        code_emit(code, rv_blt(RV_T3, RV_T2, 0));
+        int32_t rv_si_high = code->count - 1;
+        code_emit(code, rv_ebreak());
+        int32_t rv_si_high_done = code->count;
+        code_emit(code, rv_add(RV_T0, RV_T1, RV_T3));
+        code_emit(code, rv_lbu(RV_T0, RV_T0, 0));
+        code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)off_dst));
+        code->words[rv_si_neg] = rv_bge(RV_T3, RV_ZERO, (int16_t)((rv_si_neg_done - rv_si_neg) * 4));
+        code->words[rv_si_high] = rv_blt(RV_T3, RV_T2, (int16_t)((rv_si_high_done - rv_si_high) * 4));
+    } else if (kind == BODY_OP_I64_TO_STR) {
+        /* I64_TO_STR: i64 -> COLD_STR decimal */
+        if (body->slot_kind[a] == SLOT_I64) {
+            code_emit(code, rv_add(RV_A0, RV_ZERO, RV_ZERO));
+            rv_li(code->words, &code->count, RV_A1, 32);
+            rv_li(code->words, &code->count, RV_A2, 3);
+            rv_li(code->words, &code->count, RV_A3, 0x1002);
+            rv_li(code->words, &code->count, RV_A4, -1);
+            code_emit(code, rv_add(RV_A5, RV_ZERO, RV_ZERO));
+            rv_li(code->words, &code->count, RV_A7, 222);
+            code_emit(code, rv_ecall());
+            code_emit(code, rv_sd(RV_A0, RV_SP, (int16_t)body->slot_offset[dst]));
+            code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+            /* zero case */
+            code_emit(code, rv_bne(RV_T0, RV_ZERO, 0));
+            int32_t rv_i64_nz = code->count - 1;
+            rv_li(code->words, &code->count, RV_T1, '0');
+            code_emit(code, rv_sb(RV_T1, RV_A0, 0));
+            rv_li(code->words, &code->count, RV_T1, 1);
+            code_emit(code, rv_sw(RV_T1, RV_SP, (int16_t)(body->slot_offset[dst] + 8)));
+            code_emit(code, rv_jal(RV_ZERO, 0));
+            int32_t rv_i64_zdone = code->count - 1;
+            int32_t rv_i64_nz_target = code->count;
+            code->words[rv_i64_nz] = rv_bne(RV_T0, RV_ZERO, (int16_t)((rv_i64_nz_target - rv_i64_nz) * 4));
+            code_emit(code, rv_addi(RV_T2, RV_A0, 31));
+            code_emit(code, rv_add(RV_T3, RV_ZERO, RV_ZERO));
+            code_emit(code, rv_add(RV_T5, RV_ZERO, RV_ZERO));
+            /* sign check */
+            code_emit(code, rv_bge(RV_T0, RV_ZERO, 0));
+            int32_t rv_i64_pos = code->count - 1;
+            rv_li(code->words, &code->count, RV_T5, 1);
+            code_emit(code, rv_sub(RV_T0, RV_ZERO, RV_T0));
+            int32_t rv_i64_pos_target = code->count;
+            code->words[rv_i64_pos] = rv_bge(RV_T0, RV_ZERO, (int16_t)((rv_i64_pos_target - rv_i64_pos) * 4));
+            /* digit loop */
+            rv_li(code->words, &code->count, RV_T4, 10);
+            int32_t rv_i64_dloop = code->count;
+            code_emit(code, rv_div(RV_T1, RV_T0, RV_T4));
+            code_emit(code, rv_rem(RV_T6, RV_T0, RV_T4));
+            code_emit(code, rv_addi(RV_T6, RV_T6, 48));
+            code_emit(code, rv_sb(RV_T6, RV_T2, 0));
+            code_emit(code, rv_addi(RV_T2, RV_T2, -1));
+            code_emit(code, rv_addi(RV_T3, RV_T3, 1));
+            code_emit(code, rv_addi(RV_T0, RV_T1, 0));
+            code_emit(code, rv_bne(RV_T0, RV_ZERO, 0));
+            int32_t rv_i64_dloop_end = code->count - 1;
+            code->words[rv_i64_dloop_end] = rv_bne(RV_T0, RV_ZERO, (int16_t)((rv_i64_dloop - rv_i64_dloop_end) * 4));
+            /* sign */
+            code_emit(code, rv_beq(RV_T5, RV_ZERO, 0));
+            int32_t rv_i64_nosign = code->count - 1;
+            rv_li(code->words, &code->count, RV_T6, '-');
+            code_emit(code, rv_sb(RV_T6, RV_T2, 0));
+            code_emit(code, rv_addi(RV_T2, RV_T2, -1));
+            code_emit(code, rv_addi(RV_T3, RV_T3, 1));
+            int32_t rv_i64_nosign_target = code->count;
+            code->words[rv_i64_nosign] = rv_beq(RV_T5, RV_ZERO, (int16_t)((rv_i64_nosign_target - rv_i64_nosign) * 4));
+            /* store final ptr and len */
+            code_emit(code, rv_addi(RV_T2, RV_T2, 1));
+            code_emit(code, rv_sd(RV_T2, RV_SP, (int16_t)body->slot_offset[dst]));
+            code_emit(code, rv_sw(RV_T3, RV_SP, (int16_t)(body->slot_offset[dst] + 8)));
+            int32_t rv_i64_done = code->count;
+            code->words[rv_i64_zdone] = rv_jal(RV_ZERO, (int32_t)((rv_i64_done - rv_i64_zdone) * 4));
+        } else {
+            code_emit(code, rv_sub(RV_T0, RV_T0, RV_T0));
+            code_emit(code, rv_sd(RV_T0, RV_SP, (int16_t)body->slot_offset[dst]));
+            code_emit(code, rv_sw(RV_ZERO, RV_SP, (int16_t)(body->slot_offset[dst] + 8)));
+        }
+    } else if (kind == BODY_OP_SEQ_STR_INDEX_DYNAMIC) {
+        /* SEQ_STR_INDEX_DYNAMIC: seq[index] -> COLD_STR */
+        if (body->slot_kind[a] == SLOT_SEQ_STR_REF) {
+            code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+        } else {
+            code_emit(code, rv_addi(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+        }
+        code_emit(code, rv_lw(RV_T1, RV_SP, (int16_t)body->slot_offset[b]));
+        code_emit(code, rv_bge(RV_T1, RV_ZERO, 0));
+        int32_t rv_ss_neg = code->count - 1;
+        code_emit(code, rv_ebreak());
+        int32_t rv_ss_neg_done = code->count;
+        code_emit(code, rv_lw(RV_T2, RV_T0, 0));
+        code_emit(code, rv_blt(RV_T1, RV_T2, 0));
+        int32_t rv_ss_high = code->count - 1;
+        code_emit(code, rv_ebreak());
+        int32_t rv_ss_high_done = code->count;
+        code_emit(code, rv_ld(RV_T3, RV_T0, 8));
+        rv_li(code->words, &code->count, RV_T4, 24);
+        code_emit(code, rv_mul(RV_T4, RV_T1, RV_T4));
+        code_emit(code, rv_add(RV_T3, RV_T3, RV_T4));
+        code_emit(code, rv_ld(RV_T5, RV_T3, COLD_STR_DATA_OFFSET));
+        code_emit(code, rv_sd(RV_T5, RV_SP, (int16_t)(body->slot_offset[dst] + COLD_STR_DATA_OFFSET)));
+        code_emit(code, rv_lw(RV_T5, RV_T3, COLD_STR_LEN_OFFSET));
+        code_emit(code, rv_sw(RV_T5, RV_SP, (int16_t)(body->slot_offset[dst] + COLD_STR_LEN_OFFSET)));
+        code_emit(code, rv_lw(RV_T5, RV_T3, COLD_STR_STORE_ID_OFFSET));
+        code_emit(code, rv_sw(RV_T5, RV_SP, (int16_t)(body->slot_offset[dst] + COLD_STR_STORE_ID_OFFSET)));
+        code_emit(code, rv_ld(RV_T5, RV_T3, COLD_STR_FLAGS_OFFSET));
+        code_emit(code, rv_sd(RV_T5, RV_SP, (int16_t)(body->slot_offset[dst] + COLD_STR_FLAGS_OFFSET)));
+        code->words[rv_ss_neg] = rv_bge(RV_T1, RV_ZERO, (int16_t)((rv_ss_neg_done - rv_ss_neg) * 4));
+        code->words[rv_ss_high] = rv_blt(RV_T1, RV_T2, (int16_t)((rv_ss_high_done - rv_ss_high) * 4));
     /* Remaining complex ops are not implemented for RV64. */
     } else if (kind == BODY_OP_STR_EQ || kind == BODY_OP_STR_CONCAT ||
-               kind == BODY_OP_I32_TO_STR || kind == BODY_OP_I64_TO_STR ||
-               kind == BODY_OP_STR_INDEX || kind == BODY_OP_STR_JOIN ||
+               kind == BODY_OP_I32_TO_STR ||
+               kind == BODY_OP_STR_JOIN ||
                kind == BODY_OP_STR_SPLIT_CHAR || kind == BODY_OP_STR_STRIP ||
                kind == BODY_OP_STR_SLICE || kind == BODY_OP_SHELL_QUOTE ||
                kind == BODY_OP_READ_FLAG || kind == BODY_OP_PARSE_INT ||
@@ -13175,7 +13296,6 @@ static void rv64_codegen_op(Code *code, BodyIR *body, Symbols *symbols,
                kind == BODY_OP_TIME_NS ||
                kind == BODY_OP_GETENV_STR ||
                kind == BODY_OP_SEQ_I32_ADD || kind == BODY_OP_SEQ_STR_ADD ||
-               kind == BODY_OP_SEQ_STR_INDEX_DYNAMIC ||
                kind == BODY_OP_SEQ_OPAQUE_INDEX_DYNAMIC ||
                kind == BODY_OP_SEQ_OPAQUE_ADD ||
                kind == BODY_OP_SEQ_OPAQUE_INDEX_STORE ||
@@ -13278,6 +13398,7 @@ static bool cold_op_has_side_effect(int32_t kind) {
         case BODY_OP_PTR_STORE_I32:
         case BODY_OP_PTR_STORE_I64:
         case BODY_OP_PTR_STORE_U8:
+        case BODY_OP_PTR_STORE_U16:
         case BODY_OP_SLOT_STORE_I32:
         case BODY_OP_SLOT_STORE_I64:
         case BODY_OP_SEQ_SET_LEN:
@@ -13342,6 +13463,7 @@ static bool cold_op_reads_dst_slot(int32_t kind) {
         case BODY_OP_PTR_STORE_I32:
         case BODY_OP_PTR_STORE_I64:
         case BODY_OP_PTR_STORE_U8:
+        case BODY_OP_PTR_STORE_U16:
         case BODY_OP_SLOT_STORE_I32:
         case BODY_OP_SLOT_STORE_I64:
         case BODY_OP_SEQ_I32_ADD:
@@ -16155,6 +16277,7 @@ static bool cold_load_csg_v2_facts(
     const uint8_t *data, int32_t data_len,
     BodyIR ***out_bodies, int32_t *out_count,
     Symbols *symbols, Arena *arena,
+    const char *requested_target,
     ColdCsgV2Timing *timing
 ) {
     uint64_t t_start = cold_now_us();
@@ -16179,8 +16302,23 @@ static bool cold_load_csg_v2_facts(
     if (!cold_read_u32(data, data_len, &pos, &version)) return false;
     if (version != 2) return false;
 
-    /* Skip: target_triple(32) + abi(4) + pointer_width(1) + endianness(1) + reserved(14) */
-    pos += 32 + 4 + 1 + 1 + 14;
+    Span facts_target = {data + pos, 0};
+    while (facts_target.len < 32 && facts_target.ptr[facts_target.len] != 0)
+        facts_target.len++;
+    if (requested_target && requested_target[0] != '\0' &&
+        !span_eq(facts_target, requested_target)) return false;
+    pos += 32;
+    uint32_t abi = 0;
+    if (!cold_read_u32(data, data_len, &pos, &abi)) return false;
+    if (abi != 0) return false;
+    if (pos + 16 > data_len) return false;
+    uint8_t pointer_width = data[pos++];
+    uint8_t endianness = data[pos++];
+    if (pointer_width != 8 || endianness != 0) return false;
+    for (int32_t ri = 0; ri < 14; ri++) {
+        if (data[pos + ri] != 0) return false;
+    }
+    pos += 14;
 
     /* 2. Read section index */
     uint32_t section_count;
@@ -16433,24 +16571,47 @@ static bool cold_load_csg_v2_facts(
             body->switch_term[idx] = (int32_t)sterm;
         }
 
-        /* Skip call metadata (4 u32 per call) */
+        /* Read and validate call metadata (4 u32 per call) */
         uint32_t call_count;
         if (!cold_read_u32(data, fn_sec_end, &sec_pos, &call_count)) return false;
         if (call_count > (uint32_t)((fn_sec_end - sec_pos) / 16)) return false;
-        sec_pos += (int32_t)(call_count * 16);
-        if (sec_pos > fn_sec_end) return false;
+        uint32_t *call_arg_starts = call_count > 0
+            ? arena_alloc(arena, (size_t)call_count * sizeof(uint32_t))
+            : 0;
+        uint32_t *call_arg_counts = call_count > 0
+            ? arena_alloc(arena, (size_t)call_count * sizeof(uint32_t))
+            : 0;
+        for (uint32_t ci = 0; ci < call_count; ci++) {
+            uint32_t target_fn, arg_start, arg_count, result_slot;
+            if (!cold_read_u32(data, fn_sec_end, &sec_pos, &target_fn)) return false;
+            if (!cold_read_u32(data, fn_sec_end, &sec_pos, &arg_start)) return false;
+            if (!cold_read_u32(data, fn_sec_end, &sec_pos, &arg_count)) return false;
+            if (!cold_read_u32(data, fn_sec_end, &sec_pos, &result_slot)) return false;
+            if (target_fn >= fn_count ||
+                arg_start > (uint32_t)INT32_MAX ||
+                arg_count > (uint32_t)INT32_MAX ||
+                result_slot >= slot_count) return false;
+            call_arg_starts[ci] = arg_start;
+            call_arg_counts[ci] = arg_count;
+        }
 
         /* Read call args (2 u32 per arg) */
         uint32_t call_arg_count;
         if (!cold_read_u32(data, fn_sec_end, &sec_pos, &call_arg_count)) return false;
+        if (call_arg_count > 65536) return false;
         for (uint32_t cai = 0; cai < call_arg_count; cai++) {
             uint32_t caslot, caoff;
             if (!cold_read_u32(data, fn_sec_end, &sec_pos, &caslot)) return false;
             if (!cold_read_u32(data, fn_sec_end, &sec_pos, &caoff)) return false;
+            if (caslot >= slot_count || caoff > (uint32_t)INT32_MAX) return false;
             body_ensure_call_args(body);
             int32_t idx = body->call_arg_count++;
             body->call_arg_slot[idx] = (int32_t)caslot;
             body->call_arg_offset[idx] = (int32_t)caoff;
+        }
+        for (uint32_t ci = 0; ci < call_count; ci++) {
+            if (call_arg_starts[ci] > call_arg_count ||
+                call_arg_counts[ci] > call_arg_count - call_arg_starts[ci]) return false;
         }
 
         /* Read string literal ids */
@@ -16459,13 +16620,10 @@ static bool cold_load_csg_v2_facts(
         for (uint32_t sli = 0; sli < str_lit_count; sli++) {
             uint32_t str_id;
             if (!cold_read_u32(data, fn_sec_end, &sec_pos, &str_id)) return false;
+            if (str_id >= str_count || !str_spans) return false;
             body_ensure_string_literals(body);
             int32_t idx = body->string_literal_count++;
-            if (str_id < str_count && str_spans) {
-                body->string_literal[idx] = str_spans[str_id];
-            } else {
-                body->string_literal[idx] = (Span){0};
-            }
+            body->string_literal[idx] = str_spans[str_id];
         }
 
         fn_list[fi].symbol_index = sym_idx;
@@ -16824,6 +16982,20 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
                 return false;
             }
             uint64_t obj_decode_end_us = cold_now_us();
+            if (!target || target[0] == '\0' ||
+                !obj_facts.target_triple || !obj_facts.object_format ||
+                strcmp(obj_facts.target_triple, target) != 0) {
+                munmap((void *)csg_text.ptr, (size_t)csg_text.len);
+                return false;
+            }
+            {
+                const char *expected_format = cold_csg_v2_object_format_for_target(target);
+                if (!expected_format || expected_format[0] == '\0' ||
+                    strcmp(obj_facts.object_format, expected_format) != 0) {
+                    munmap((void *)csg_text.ptr, (size_t)csg_text.len);
+                    return false;
+                }
+            }
             if (obj_facts.function_count <= 0 || obj_facts.word_count <= 0) {
                 munmap((void *)csg_text.ptr, (size_t)csg_text.len);
                 return false;
@@ -16981,7 +17153,7 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
 
         if (!cold_load_csg_v2_facts(csg_text.ptr, csg_text.len,
                                      &function_bodies, &function_count,
-                                     symbols, arena, &csg_timing)) {
+                                     symbols, arena, target, &csg_timing)) {
             return false;
         }
 
@@ -17054,7 +17226,8 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
             int32_t reloc_count = 0;
             for (int32_t pi = 0; pi < function_patches.count; pi++) {
                 FunctionPatch patch = function_patches.items[pi];
-                if (patch.target_function < 0 || patch.target_function >= func_count) continue;
+                if (patch.target_function < 0 || patch.target_function >= func_count)
+                    die("cold object invalid function patch target");
                 int32_t target_off = symbol_offset[patch.target_function];
                 if (target_off < 0) {
                     if (patch.kind == FUNCTION_PATCH_ADDR)
@@ -21253,6 +21426,15 @@ static int cold_cmd_provider_archive_pack(int argc, char **argv) {
 #define WASM_OP_I64_GT_S 0x55
 #define WASM_OP_I64_LE_S 0x57
 #define WASM_OP_I64_GE_S 0x59
+#define WASM_OP_LOCAL_TEE  0x22
+#define WASM_OP_I64_LOAD   0x29
+#define WASM_OP_I32_LOAD8_U  0x2D
+#define WASM_OP_I32_LOAD16_U 0x2F
+#define WASM_OP_I64_STORE  0x37
+#define WASM_OP_I32_STORE8   0x3A
+#define WASM_OP_I32_STORE16  0x3B
+#define WASM_OP_I32_SHR_U    0x76
+#define WASM_OP_I64_SHR_U    0x88
 
 /* WASM section IDs */
 #define WASM_SECTION_TYPE     1
@@ -21346,8 +21528,8 @@ static uint8_t wasm_valtype_for_slot(int32_t slot_kind) {
         return WASM_TYPE_F32;
     if (slot_kind == SLOT_F64)
         return WASM_TYPE_F64;
-    /* SLOT_STR, SLOT_VARIANT, SLOT_SEQ_*, etc. => i32 (wasm32 pointer) */
-    return WASM_TYPE_I32;
+    die("unsupported WASM non-scalar slot kind");
+    return 0;
 }
 
 /* Determine WASM result type from FnDef return type span */
@@ -21518,6 +21700,12 @@ static void wasm_codegen_op(WasmCode *wasm, BodyIR *body, Symbols *symbols,
             /* a >= b  =>  !(a < b), use LT and eqz */
             wasm_emit1(wasm, is64 ? WASM_OP_I64_LT_S : WASM_OP_I32_LT_S);
             wasm_emit1(wasm, is64 ? WASM_OP_I64_EQZ : WASM_OP_I32_EQZ);
+        } else if (c == COND_GT) {
+            wasm_emit1(wasm, is64 ? WASM_OP_I64_GT_S : WASM_OP_I32_GT_S);
+        } else if (c == COND_LE) {
+            /* a <= b  =>  !(a > b), use GT and eqz */
+            wasm_emit1(wasm, is64 ? WASM_OP_I64_GT_S : WASM_OP_I32_GT_S);
+            wasm_emit1(wasm, is64 ? WASM_OP_I64_EQZ : WASM_OP_I32_EQZ);
         } else {
             wasm_emit1(wasm, is64 ? WASM_OP_I64_GT_S : WASM_OP_I32_GT_S);
         }
@@ -21641,22 +21829,77 @@ static void wasm_codegen_op(WasmCode *wasm, BodyIR *body, Symbols *symbols,
         wasm_emit_leb128_u(wasm, 2); /* align=2 (4-byte) */
         wasm_emit_leb128_u(wasm, 0); /* offset=0 */
         break;
+    case BODY_OP_PTR_LOAD_I64:
+        la = wasm_local_for_slot(body, a);
+        ld = wasm_local_for_slot(body, dst);
+        wasm_op_local_get(wasm, (uint32_t)la);
+        wasm_emit1(wasm, WASM_OP_I64_LOAD);
+        wasm_emit_leb128_u(wasm, 3); /* align=3 (8-byte) */
+        wasm_emit_leb128_u(wasm, 0);
+        wasm_op_local_set(wasm, (uint32_t)ld);
+        break;
+    case BODY_OP_PTR_STORE_I64:
+        la = wasm_local_for_slot(body, a);
+        ld = wasm_local_for_slot(body, dst);
+        wasm_op_local_get(wasm, (uint32_t)ld);
+        wasm_op_local_get(wasm, (uint32_t)la);
+        wasm_emit1(wasm, WASM_OP_I64_STORE);
+        wasm_emit_leb128_u(wasm, 3); /* align=3 (8-byte) */
+        wasm_emit_leb128_u(wasm, 0);
+        break;
+    case BODY_OP_PTR_LOAD_U8:
+        la = wasm_local_for_slot(body, a);
+        ld = wasm_local_for_slot(body, dst);
+        wasm_op_local_get(wasm, (uint32_t)la);
+        wasm_emit1(wasm, WASM_OP_I32_LOAD8_U);
+        wasm_emit_leb128_u(wasm, 0);
+        wasm_emit_leb128_u(wasm, 0);
+        wasm_op_local_set(wasm, (uint32_t)ld);
+        break;
+    case BODY_OP_PTR_STORE_U8:
+        la = wasm_local_for_slot(body, a);
+        ld = wasm_local_for_slot(body, dst);
+        wasm_op_local_get(wasm, (uint32_t)ld);
+        wasm_op_local_get(wasm, (uint32_t)la);
+        wasm_emit1(wasm, WASM_OP_I32_STORE8);
+        wasm_emit_leb128_u(wasm, 0);
+        wasm_emit_leb128_u(wasm, 0);
+        break;
+    case BODY_OP_PTR_LOAD_U16:
+        la = wasm_local_for_slot(body, a);
+        ld = wasm_local_for_slot(body, dst);
+        wasm_op_local_get(wasm, (uint32_t)la);
+        wasm_emit1(wasm, WASM_OP_I32_LOAD16_U);
+        wasm_emit_leb128_u(wasm, 1);
+        wasm_emit_leb128_u(wasm, 0);
+        wasm_op_local_set(wasm, (uint32_t)ld);
+        break;
+    case BODY_OP_PTR_STORE_U16:
+        la = wasm_local_for_slot(body, a);
+        ld = wasm_local_for_slot(body, dst);
+        wasm_op_local_get(wasm, (uint32_t)ld);
+        wasm_op_local_get(wasm, (uint32_t)la);
+        wasm_emit1(wasm, WASM_OP_I32_STORE16);
+        wasm_emit_leb128_u(wasm, 1);
+        wasm_emit_leb128_u(wasm, 0);
+        break;
+    case BODY_OP_SLOT_STORE_I32:
+        la = wasm_local_for_slot(body, a);
+        ld = wasm_local_for_slot(body, dst);
+        wasm_op_local_get(wasm, (uint32_t)la);
+        wasm_op_local_set(wasm, (uint32_t)(ld + c));
+        break;
+    case BODY_OP_SLOT_STORE_I64:
+        la = wasm_local_for_slot(body, a);
+        ld = wasm_local_for_slot(body, dst);
+        wasm_op_local_get(wasm, (uint32_t)la);
+        wasm_op_local_set(wasm, (uint32_t)(ld + c));
+        break;
     case BODY_OP_STR_LITERAL:
     case BODY_OP_STR_LEN:
-        /* Stub: store null/0 */
-        wasm_op_i32_const(wasm, 0);
-        wasm_op_local_set(wasm, (uint32_t)wasm_local_for_slot(body, dst));
-        wasm_op_i32_const(wasm, 0);
-        if (wasm_local_for_slot(body, dst) + 1 < body->slot_count)
-            wasm_op_local_set(wasm, (uint32_t)(wasm_local_for_slot(body, dst) + 1));
-        break;
+        die("unsupported WASM string op");
     default:
-        /* Unsupported op: stub with store-0 for the destination slot */
-        if (dst >= 0 && dst < body->slot_count) {
-            wasm_op_i32_const(wasm, 0);
-            wasm_op_local_set(wasm, (uint32_t)wasm_local_for_slot(body, dst));
-        }
-        break;
+        die("unsupported WASM BodyIR op");
     }
 }
 
@@ -22035,7 +22278,8 @@ static bool wasm_write_object(const char *out_path, WasmCode *func_bodies,
 __attribute__((unused)) static int wasm_unused_ops[] = {
     WASM_OP_I64_DIV_S, WASM_OP_I64_REM_S, WASM_OP_I64_SUB,
     WASM_OP_I64_EQ, WASM_OP_I64_NE, WASM_OP_I64_LT_S, WASM_OP_I64_GT_S,
-    WASM_OP_I64_LE_S, WASM_OP_I64_GE_S, WASM_OP_I64_EQZ
+    WASM_OP_I64_LE_S, WASM_OP_I64_GE_S, WASM_OP_I64_EQZ,
+    WASM_OP_LOCAL_TEE, WASM_OP_I32_SHR_U, WASM_OP_I64_SHR_U
 };
 
 /* Compile source to relocatable object file (.o/.obj) with symbol table. */
@@ -22758,14 +23002,12 @@ static bool cold_emit_csg_v2_facts(const char *path, BodyIR **function_bodies,
         }
     }
     if (root_count == 0) {
-        for (int32_t i = 0; i < func_count; i++) {
-            BodyIR *b = function_bodies[i];
-            if (b && !b->has_fallback && !queued_function[i]) {
-                queued_function[i] = true;
-                stack[stack_count++] = i;
-                root_count++;
-            }
-        }
+        free(emit_function);
+        free(queued_function);
+        free(referenced_external);
+        free(function_index_map);
+        free(stack);
+        return false;
     }
 
     while (stack_count > 0) {
@@ -22793,10 +23035,25 @@ static bool cold_emit_csg_v2_facts(const char *path, BodyIR **function_bodies,
             if (ok != BODY_OP_CALL_I32 && ok != BODY_OP_CALL_COMPOSITE &&
                 ok != BODY_OP_FN_ADDR) continue;
             int32_t target_fn = b->op_a[oi];
-            if (target_fn < 0 || target_fn >= func_count) continue;
+            if (target_fn < 0 || target_fn >= func_count) {
+                free(emit_function);
+                free(queued_function);
+                free(referenced_external);
+                free(function_index_map);
+                free(stack);
+                return false;
+            }
             if (target_fn < symbols->function_count &&
                 symbols->functions[target_fn].is_external &&
                 (!function_bodies[target_fn] || function_bodies[target_fn]->has_fallback)) {
+                if (ok == BODY_OP_FN_ADDR) {
+                    free(emit_function);
+                    free(queued_function);
+                    free(referenced_external);
+                    free(function_index_map);
+                    free(stack);
+                    return false;
+                }
                 referenced_external[target_fn] = true;
                 continue;
             }
@@ -22879,6 +23136,17 @@ static bool cold_emit_csg_v2_facts(const char *path, BodyIR **function_bodies,
     if (total_str_slots > 0) {
         unique_strs = (Span *)malloc((size_t)total_str_slots * sizeof(Span));
         str_id_map = (int32_t *)malloc((size_t)total_str_slots * sizeof(int32_t));
+        if (!unique_strs || !str_id_map) {
+            fclose(f);
+            free(unique_strs);
+            free(str_id_map);
+            free(emit_function);
+            free(queued_function);
+            free(referenced_external);
+            free(function_index_map);
+            free(stack);
+            return false;
+        }
     }
 
     {
@@ -22887,10 +23155,31 @@ static bool cold_emit_csg_v2_facts(const char *path, BodyIR **function_bodies,
             BodyIR *b = function_bodies[fi];
             if (!emit_function[fi] || !b || b->has_fallback) continue;
             if (b->string_literal_count < 0 || b->string_literal_count > 65536 ||
-                !b->string_literal) continue;
+                (b->string_literal_count > 0 && !b->string_literal)) {
+                fclose(f);
+                free(unique_strs);
+                free(str_id_map);
+                free(emit_function);
+                free(queued_function);
+                free(referenced_external);
+                free(function_index_map);
+                free(stack);
+                return false;
+            }
             for (int32_t si = 0; si < b->string_literal_count; si++) {
                 Span s = b->string_literal[si];
-                if (s.ptr == NULL || s.len <= 0) continue;
+                if (s.len < 0 || (s.len > 0 && s.ptr == NULL) ||
+                    map_idx >= total_str_slots) {
+                    fclose(f);
+                    free(unique_strs);
+                    free(str_id_map);
+                    free(emit_function);
+                    free(queued_function);
+                    free(referenced_external);
+                    free(function_index_map);
+                    free(stack);
+                    return false;
+                }
                 int32_t id = -1;
                 for (int32_t ui = 0; ui < unique_str_count; ui++) {
                     if (unique_strs[ui].len == s.len &&
@@ -22962,8 +23251,19 @@ static bool cold_emit_csg_v2_facts(const char *path, BodyIR **function_bodies,
             cold_emit_csg_v2_u32(f, (uint32_t)b->param_count);
             for (int32_t pi = 0; pi < b->param_count; pi++) {
                 int32_t ps = b->param_slot[pi];
-                int32_t pk = (ps >= 0 && ps < b->slot_count) ? b->slot_kind[ps] : SLOT_I32;
-                int32_t pz = (ps >= 0 && ps < b->slot_count) ? b->slot_size[ps] : cold_slot_size_for_kind(pk);
+                if (ps < 0 || ps >= b->slot_count) {
+                    fclose(f);
+                    free(unique_strs);
+                    free(str_id_map);
+                    free(emit_function);
+                    free(queued_function);
+                    free(referenced_external);
+                    free(function_index_map);
+                    free(stack);
+                    return false;
+                }
+                int32_t pk = b->slot_kind[ps];
+                int32_t pz = b->slot_size[ps];
                 cold_emit_csg_v2_u32(f, (uint32_t)pk);
                 cold_emit_csg_v2_u32(f, (uint32_t)pz);
                 cold_emit_csg_v2_u32(f, (uint32_t)ps);
@@ -22979,8 +23279,19 @@ static bool cold_emit_csg_v2_facts(const char *path, BodyIR **function_bodies,
                 int32_t op_a = b->op_a[oi];
                 if ((op_kind == BODY_OP_CALL_I32 ||
                      op_kind == BODY_OP_CALL_COMPOSITE ||
-                     op_kind == BODY_OP_FN_ADDR) &&
-                    op_a >= 0 && op_a < func_count) {
+                     op_kind == BODY_OP_FN_ADDR)) {
+                    if (op_a < 0 || op_a >= func_count ||
+                        (op_kind == BODY_OP_FN_ADDR && !emit_function[op_a])) {
+                        fclose(f);
+                        free(emit_function);
+                        free(queued_function);
+                        free(referenced_external);
+                        free(function_index_map);
+                        free(stack);
+                        free(unique_strs);
+                        free(str_id_map);
+                        return false;
+                    }
                     op_a = function_index_map[op_a];
                     if (op_a < 0) {
                         fclose(f);
@@ -23044,13 +23355,24 @@ static bool cold_emit_csg_v2_facts(const char *path, BodyIR **function_bodies,
                     int32_t ok = b->op_kind[oi];
                     if (ok != BODY_OP_CALL_I32 && ok != BODY_OP_CALL_COMPOSITE)
                         continue;
-                    int32_t target_fn = b->op_a[oi];
-                    int32_t emitted_target = target_fn;
-                    if (target_fn >= 0 && target_fn < func_count) {
-                        emitted_target = function_index_map[target_fn];
-                        if (emitted_target < 0) {
-                            fclose(f);
-                            free(emit_function);
+	                    int32_t target_fn = b->op_a[oi];
+	                    int32_t emitted_target = target_fn;
+	                    if (target_fn >= 0 && target_fn < func_count) {
+	                        if (ok == BODY_OP_FN_ADDR && !emit_function[target_fn]) {
+	                            fclose(f);
+	                            free(emit_function);
+	                            free(queued_function);
+	                            free(referenced_external);
+	                            free(function_index_map);
+	                            free(stack);
+	                            free(unique_strs);
+	                            free(str_id_map);
+	                            return false;
+	                        }
+	                        emitted_target = function_index_map[target_fn];
+	                        if (emitted_target < 0) {
+	                            fclose(f);
+	                            free(emit_function);
                             free(queued_function);
                             free(referenced_external);
                             free(function_index_map);
@@ -23058,38 +23380,106 @@ static bool cold_emit_csg_v2_facts(const char *path, BodyIR **function_bodies,
                             free(unique_strs);
                             free(str_id_map);
                             return false;
-                        }
-                    }
-                    int32_t arg_start  = b->op_b[oi];
-                    int32_t arg_count;
-                    if (ok == BODY_OP_CALL_I32) {
-                        if (target_fn >= 0 && target_fn < symbols->function_count)
-                            arg_count = symbols->functions[target_fn].arity;
-                        else
-                            arg_count = 0;
-                    } else {
-                        arg_count = b->op_c[oi];
-                    }
-                    int32_t result_slot = b->op_dst[oi];
-                    cold_emit_csg_v2_u32(f, (uint32_t)emitted_target);
-                    cold_emit_csg_v2_u32(f, (uint32_t)arg_start);
-                    cold_emit_csg_v2_u32(f, (uint32_t)arg_count);
+	                        }
+	                    } else {
+	                        fclose(f);
+	                        free(emit_function);
+	                        free(queued_function);
+	                        free(referenced_external);
+	                        free(function_index_map);
+	                        free(stack);
+	                        free(unique_strs);
+	                        free(str_id_map);
+	                        return false;
+	                    }
+	                    int32_t arg_start  = b->op_b[oi];
+	                    int32_t arg_count;
+	                    if (ok == BODY_OP_CALL_I32) {
+	                        if (target_fn < 0 || target_fn >= symbols->function_count) {
+	                            fclose(f);
+	                            free(emit_function);
+	                            free(queued_function);
+	                            free(referenced_external);
+	                            free(function_index_map);
+	                            free(stack);
+	                            free(unique_strs);
+	                            free(str_id_map);
+	                            return false;
+	                        }
+	                        arg_count = symbols->functions[target_fn].arity;
+	                    } else {
+	                        arg_count = b->op_c[oi];
+	                    }
+	                    int32_t result_slot = b->op_dst[oi];
+	                    if (arg_start < 0 || arg_count < 0 ||
+	                        arg_start > b->call_arg_count ||
+	                        arg_count > b->call_arg_count - arg_start ||
+	                        result_slot < 0 || result_slot >= b->slot_count) {
+	                        fclose(f);
+	                        free(emit_function);
+	                        free(queued_function);
+	                        free(referenced_external);
+	                        free(function_index_map);
+	                        free(stack);
+	                        free(unique_strs);
+	                        free(str_id_map);
+	                        return false;
+	                    }
+	                    cold_emit_csg_v2_u32(f, (uint32_t)emitted_target);
+	                    cold_emit_csg_v2_u32(f, (uint32_t)arg_start);
+	                    cold_emit_csg_v2_u32(f, (uint32_t)arg_count);
                     cold_emit_csg_v2_u32(f, (uint32_t)result_slot);
                 }
             }
             /* call_arg_count + call args (2 x u32 = 8 bytes each) */
-            {
-                int32_t cac = b->call_arg_count;
-                if (cac < 0 || cac > 65536) cac = 0;
-                cold_emit_csg_v2_u32(f, (uint32_t)cac);
-                for (int32_t cai = 0; cai < cac; cai++) {
-                cold_emit_csg_v2_u32(f, (uint32_t)b->call_arg_slot[cai]);
-                cold_emit_csg_v2_u32(f, (uint32_t)b->call_arg_offset[cai]);
-                }
-            }
+	            {
+	                int32_t cac = b->call_arg_count;
+	                if (cac < 0 || cac > 65536) {
+	                    fclose(f);
+	                    free(emit_function);
+	                    free(queued_function);
+	                    free(referenced_external);
+	                    free(function_index_map);
+	                    free(stack);
+	                    free(unique_strs);
+	                    free(str_id_map);
+	                    return false;
+	                }
+	                cold_emit_csg_v2_u32(f, (uint32_t)cac);
+	                for (int32_t cai = 0; cai < cac; cai++) {
+	                    int32_t arg_slot = b->call_arg_slot[cai];
+	                    int32_t arg_offset = b->call_arg_offset[cai];
+	                    if (arg_slot < 0 || arg_slot >= b->slot_count || arg_offset < 0) {
+	                        fclose(f);
+	                        free(emit_function);
+	                        free(queued_function);
+	                        free(referenced_external);
+	                        free(function_index_map);
+	                        free(stack);
+	                        free(unique_strs);
+	                        free(str_id_map);
+	                        return false;
+	                    }
+	                    cold_emit_csg_v2_u32(f, (uint32_t)arg_slot);
+	                    cold_emit_csg_v2_u32(f, (uint32_t)arg_offset);
+	                }
+	            }
             /* string_literal_count + string literal IDs */
             cold_emit_csg_v2_u32(f, (uint32_t)b->string_literal_count);
             for (int32_t si = 0; si < b->string_literal_count; si++) {
+                if (!str_id_map || map_idx >= total_str_slots ||
+                    str_id_map[map_idx] < 0 ||
+                    str_id_map[map_idx] >= unique_str_count) {
+                    fclose(f);
+                    free(emit_function);
+                    free(queued_function);
+                    free(referenced_external);
+                    free(function_index_map);
+                    free(stack);
+                    free(unique_strs);
+                    free(str_id_map);
+                    return false;
+                }
                 cold_emit_csg_v2_u32(f, (uint32_t)str_id_map[map_idx++]);
             }
         }
@@ -23597,7 +23987,7 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
             ColdCsgV2Timing rp_timing = {0};
             bool rp_ok = cold_load_csg_v2_facts(rp_data.ptr, rp_data.len,
                                                  &rp_bodies, &rp_count,
-                                                 rp_sym, rp_arena, &rp_timing);
+                                                 rp_sym, rp_arena, target, &rp_timing);
             if (rp_ok) {
                 /* Apply dead-store elimination (the primary BodyIR mutation) */
                 for (int32_t i = 0; i < rp_count; i++) {
