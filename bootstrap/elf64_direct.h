@@ -328,8 +328,8 @@ static bool elf64_write_object(const char *path,
     return true;
 }
 
-/* Minimal ELF64 static executable writer. Writes code words at 0x400000
-   with a single PT_LOAD segment covering the code. No dynamic linking. */
+/* Minimal ELF64 static executable writer. Maps headers + code in one PT_LOAD.
+   Code starts at 0x400000 + code_off. No dynamic linking. */
 static bool elf_write_exec(const char *path, const uint32_t *code,
                             int32_t code_words, uint16_t machine) {
     int32_t code_sz = code_words * 4;
@@ -367,20 +367,21 @@ static bool elf_write_exec(const char *path, const uint32_t *code,
     buf[0x3C] = 0; buf[0x3D] = 0;
     buf[0x3E] = 0; buf[0x3F] = 0;
 
-    /* Program Header: PT_LOAD covering code segment */
+    /* Program Header: PT_LOAD covering headers + code.
+       p_offset and p_vaddr must be congruent modulo p_align. */
     {
         uint32_t *ph = (uint32_t *)(buf + phdr_off);
         ph[0] = 1;                    /* p_type = PT_LOAD */
         ph[1] = 5;                    /* p_flags = PF_R | PF_X */
-        ph[2] = (uint32_t)code_off;   /* p_offset (low) */
+        ph[2] = 0;                    /* p_offset (low) */
         ph[3] = 0;                    /* p_offset (high) */
         ph[4] = (uint32_t)0x400000;   /* p_vaddr (low) */
         ph[5] = 0;                    /* p_vaddr (high) */
         ph[6] = (uint32_t)0x400000;   /* p_paddr (low) */
         ph[7] = 0;                    /* p_paddr (high) */
-        ph[8] = (uint32_t)code_sz;    /* p_filesz (low) */
+        ph[8] = (uint32_t)total_sz;   /* p_filesz (low) */
         ph[9] = 0;                    /* p_filesz (high) */
-        ph[10] = (uint32_t)code_sz;   /* p_memsz (low) */
+        ph[10] = (uint32_t)total_sz;  /* p_memsz (low) */
         ph[11] = 0;                   /* p_memsz (high) */
         ph[12] = 0x1000;              /* p_align (low) */
         ph[13] = 0;                   /* p_align (high) */

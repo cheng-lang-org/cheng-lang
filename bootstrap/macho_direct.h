@@ -19,7 +19,16 @@
 #include <stdlib.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#ifdef __APPLE__
 #include <mach/machine.h>
+#else
+#ifndef CPU_TYPE_ARM64
+#define CPU_TYPE_ARM64 0x0100000c
+#endif
+#ifndef CPU_SUBTYPE_ARM64_ALL
+#define CPU_SUBTYPE_ARM64_ALL 0
+#endif
+#endif
 
 /* Mach-O constants */
 #define MH_MAGIC_64   0xFEEDFACF
