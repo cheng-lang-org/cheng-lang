@@ -319,6 +319,56 @@ else
     ACT="COMPILE_FAILED"
 fi
 assert "build_backend_driver_cold_candidate_system_link_while_only" 62 "$ACT"
+
+# 9b: backend driver self-build fixed-point test (reproducibility)
+rm -rf /tmp/ct_bd_fp
+mkdir -p /tmp/ct_bd_fp
+$COLD build-backend-driver --out:/tmp/ct_bd_fp/cheng_v1 \
+    --report-out:/tmp/ct_bd_fp/v1.report.txt --map-out:/tmp/ct_bd_fp/v1.map.txt \
+    --index-out:/tmp/ct_bd_fp/v1.index.txt >/tmp/ct_bd_fp/v1.stdout 2>/tmp/ct_bd_fp/v1.stderr
+if [ -x /tmp/ct_bd_fp/cheng_v1 ] &&
+   grep -q '^real_backend_codegen=1$' /tmp/ct_bd_fp/v1.report.txt 2>/dev/null; then
+    ACT=1; else ACT=0
+fi
+assert "bd_fp_v1_build" 1 "$ACT"
+ACT=$(compile_run_timed /tmp/ct_bd_fp/cheng_v1 /tmp/ct_while_only.cheng /tmp/ct_bd_fp/v1_while 10)
+assert "bd_fp_v1_while_only" 62 "$ACT"
+# Fixed-point: rebuild and verify same behavior
+$COLD build-backend-driver --out:/tmp/ct_bd_fp/cheng_v2 \
+    --report-out:/tmp/ct_bd_fp/v2.report.txt --map-out:/tmp/ct_bd_fp/v2.map.txt \
+    --index-out:/tmp/ct_bd_fp/v2.index.txt >/tmp/ct_bd_fp/v2.stdout 2>/tmp/ct_bd_fp/v2.stderr
+if [ -x /tmp/ct_bd_fp/cheng_v2 ] &&
+   grep -q '^real_backend_codegen=1$' /tmp/ct_bd_fp/v2.report.txt 2>/dev/null; then
+    ACT=1; else ACT=0
+fi
+assert "bd_fp_v2_rebuild" 1 "$ACT"
+ACT=$(compile_run_timed /tmp/ct_bd_fp/cheng_v2 /tmp/ct_while_only.cheng /tmp/ct_bd_fp/v2_while 10)
+assert "bd_fp_v2_while_only" 62 "$ACT"
+# Matching contracts: V1 and V2 report scopes must be identical
+V1_SCOPE=$(grep '^system_link_exec_scope=' /tmp/ct_bd_fp/v1.report.txt 2>/dev/null)
+V2_SCOPE=$(grep '^system_link_exec_scope=' /tmp/ct_bd_fp/v2.report.txt 2>/dev/null)
+if [ "$V1_SCOPE" = "$V2_SCOPE" ] && [ -n "$V1_SCOPE" ]; then
+    ACT=1; else ACT=0
+fi
+assert "bd_fp_matching_contracts" 1 "$ACT"
+rm -rf /tmp/ct_bd_fp
+
+# 9c: backend driver cross-version report fields
+rm -f /tmp/ct_bd_xv /tmp/ct_bd_xv.report.txt
+$COLD build-backend-driver --out:/tmp/ct_bd_xv \
+    --report-out:/tmp/ct_bd_xv.report.txt >/dev/null 2>&1
+if [ -x /tmp/ct_bd_xv ] &&
+   grep -q '^backend_driver_candidate=cold_subset_backend$' /tmp/ct_bd_xv.report.txt 2>/dev/null &&
+   grep -q '^real_backend_codegen=1$' /tmp/ct_bd_xv.report.txt 2>/dev/null &&
+   grep -q '^system_link_exec=1$' /tmp/ct_bd_xv.report.txt 2>/dev/null &&
+   grep -q '^system_link_exec_scope=cold_subset_direct_macho$' /tmp/ct_bd_xv.report.txt 2>/dev/null &&
+   grep -q '^direct_macho=1$' /tmp/ct_bd_xv.report.txt 2>/dev/null &&
+   ! grep -q '^error=' /tmp/ct_bd_xv.report.txt 2>/dev/null; then
+    ACT=1; else ACT=0
+fi
+assert "bd_cross_version_report" 1 "$ACT"
+rm -f /tmp/ct_bd_xv /tmp/ct_bd_xv.report.txt
+
 rm -f /tmp/ct_pure_backend_driver /tmp/ct_pure_backend_driver.report \
     /tmp/ct_pure_backend_driver.stdout /tmp/ct_pure_backend_driver.stderr
 timeout 30 "$COLD" system-link-exec --root:"$PWD" \
@@ -1223,6 +1273,156 @@ else
 fi
 assert "gate_main_cold_compile_smoke" 1 "$ACT"
 rm -f /tmp/ct_gate_main_smoke.o /tmp/ct_gate_main_smoke.report
+
+# --- concurrent_assembly.cheng cold compile smoke ---
+rm -f /tmp/ct_concurrent_assembly.o /tmp/ct_concurrent_assembly.report
+if $COLD system-link-exec --root:"$PWD" \
+    --in:src/core/backend/concurrent_assembly.cheng --target:arm64-apple-darwin \
+    --out:/tmp/ct_concurrent_assembly.o --emit:obj \
+    --report-out:/tmp/ct_concurrent_assembly.report 2>&1 &&
+   [ -s /tmp/ct_concurrent_assembly.o ] &&
+   grep -q '^system_link_exec=1$' /tmp/ct_concurrent_assembly.report 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "concurrent_assembly_cold_compile_smoke" 1 "$ACT"
+rm -f /tmp/ct_concurrent_assembly.o /tmp/ct_concurrent_assembly.report
+
+# --- target_matrix.cheng cold compile smoke ---
+rm -f /tmp/ct_target_matrix.o /tmp/ct_target_matrix.report
+if $COLD system-link-exec --root:"$PWD" \
+    --in:src/core/backend/target_matrix.cheng --target:arm64-apple-darwin \
+    --out:/tmp/ct_target_matrix.o --emit:obj \
+    --report-out:/tmp/ct_target_matrix.report 2>&1 &&
+   [ -s /tmp/ct_target_matrix.o ] &&
+   grep -q '^system_link_exec=1$' /tmp/ct_target_matrix.report 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "target_matrix_cold_compile_smoke" 1 "$ACT"
+rm -f /tmp/ct_target_matrix.o /tmp/ct_target_matrix.report
+
+# --- function_task_executor.cheng cold compile smoke ---
+rm -f /tmp/ct_func_task_exec.o /tmp/ct_func_task_exec.report
+if $COLD system-link-exec --root:"$PWD" \
+    --in:src/core/ir/function_task_executor.cheng --target:arm64-apple-darwin \
+    --out:/tmp/ct_func_task_exec.o --emit:obj \
+    --report-out:/tmp/ct_func_task_exec.report 2>&1 &&
+   [ -s /tmp/ct_func_task_exec.o ] &&
+   grep -q '^system_link_exec=1$' /tmp/ct_func_task_exec.report 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "func_task_exec_cold_compile_smoke" 1 "$ACT"
+rm -f /tmp/ct_func_task_exec.o /tmp/ct_func_task_exec.report
+
+# --- program_support.cheng cold compile smoke ---
+rm -f /tmp/ct_program_support.o /tmp/ct_program_support.report
+if $COLD system-link-exec --root:"$PWD" \
+    --in:src/core/runtime/program_support.cheng --target:arm64-apple-darwin \
+    --out:/tmp/ct_program_support.o --emit:obj \
+    --report-out:/tmp/ct_program_support.report 2>&1 &&
+   [ -s /tmp/ct_program_support.o ] &&
+   grep -q '^system_link_exec=1$' /tmp/ct_program_support.report 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "program_support_cold_compile_smoke" 1 "$ACT"
+rm -f /tmp/ct_program_support.o /tmp/ct_program_support.report
+
+# --- compiler_request.cheng cold compile smoke ---
+rm -f /tmp/ct_compiler_request.o /tmp/ct_compiler_request.report
+if $COLD system-link-exec --root:"$PWD" \
+    --in:src/core/tooling/compiler_request.cheng --target:arm64-apple-darwin \
+    --out:/tmp/ct_compiler_request.o --emit:obj \
+    --report-out:/tmp/ct_compiler_request.report 2>&1 &&
+   [ -s /tmp/ct_compiler_request.o ] &&
+   grep -q '^system_link_exec=1$' /tmp/ct_compiler_request.report 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "compiler_request_cold_compile_smoke" 1 "$ACT"
+rm -f /tmp/ct_compiler_request.o /tmp/ct_compiler_request.report
+
+# --- bootstrap_contracts.cheng cold compile smoke ---
+rm -f /tmp/ct_bootstrap_contracts.o /tmp/ct_bootstrap_contracts.report
+if $COLD system-link-exec --root:"$PWD" \
+    --in:src/core/tooling/bootstrap_contracts.cheng --target:arm64-apple-darwin \
+    --out:/tmp/ct_bootstrap_contracts.o --emit:obj \
+    --report-out:/tmp/ct_bootstrap_contracts.report 2>&1 &&
+   [ -s /tmp/ct_bootstrap_contracts.o ] &&
+   grep -q '^system_link_exec=1$' /tmp/ct_bootstrap_contracts.report 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "bootstrap_contracts_cold_compile_smoke" 1 "$ACT"
+rm -f /tmp/ct_bootstrap_contracts.o /tmp/ct_bootstrap_contracts.report
+
+# --- support_matrix.cheng cold compile smoke ---
+rm -f /tmp/ct_support_matrix.o /tmp/ct_support_matrix.report
+if $COLD system-link-exec --root:"$PWD" \
+    --in:src/core/tooling/support_matrix.cheng --target:arm64-apple-darwin \
+    --out:/tmp/ct_support_matrix.o --emit:obj \
+    --report-out:/tmp/ct_support_matrix.report 2>&1 &&
+   [ -s /tmp/ct_support_matrix.o ] &&
+   grep -q '^system_link_exec=1$' /tmp/ct_support_matrix.report 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "support_matrix_cold_compile_smoke" 1 "$ACT"
+rm -f /tmp/ct_support_matrix.o /tmp/ct_support_matrix.report
+
+# --- strutils.cheng cold compile smoke ---
+rm -f /tmp/ct_strutils.o /tmp/ct_strutils.report
+if $COLD system-link-exec --root:"$PWD" \
+    --in:src/std/strutils.cheng --target:arm64-apple-darwin \
+    --out:/tmp/ct_strutils.o --emit:obj \
+    --report-out:/tmp/ct_strutils.report 2>&1 &&
+   [ -s /tmp/ct_strutils.o ] &&
+   grep -q '^system_link_exec=1$' /tmp/ct_strutils.report 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "strutils_cold_compile_smoke" 1 "$ACT"
+rm -f /tmp/ct_strutils.o /tmp/ct_strutils.report
+
+# --- strformat.cheng cold compile smoke ---
+rm -f /tmp/ct_strformat.o /tmp/ct_strformat.report
+if $COLD system-link-exec --root:"$PWD" \
+    --in:src/std/strformat.cheng --target:arm64-apple-darwin \
+    --out:/tmp/ct_strformat.o --emit:obj \
+    --report-out:/tmp/ct_strformat.report 2>&1 &&
+   [ -s /tmp/ct_strformat.o ] &&
+   grep -q '^system_link_exec=1$' /tmp/ct_strformat.report 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "strformat_cold_compile_smoke" 1 "$ACT"
+rm -f /tmp/ct_strformat.o /tmp/ct_strformat.report
+
+# --- result.cheng cold compile smoke ---
+rm -f /tmp/ct_result.o /tmp/ct_result.report
+if $COLD system-link-exec --root:"$PWD" \
+    --in:src/std/result.cheng --target:arm64-apple-darwin \
+    --out:/tmp/ct_result.o --emit:obj \
+    --report-out:/tmp/ct_result.report 2>&1 &&
+   [ -s /tmp/ct_result.o ] &&
+   grep -q '^system_link_exec=1$' /tmp/ct_result.report 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "result_cold_compile_smoke" 1 "$ACT"
+rm -f /tmp/ct_result.o /tmp/ct_result.report
 
 # --- for_range_inclusive_leq ---
 cat > /tmp/ct_range_leq.cheng << 'CHENG'

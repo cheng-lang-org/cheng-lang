@@ -876,8 +876,7 @@ else
     bad "darwin_runtime_provider_marker_object"
 fi
 
-darwin_provider_archive_macho_error='Mach-O relocatable provider archive reader/linker unsupported'
-
+# provider-archive-pack now attempts Mach-O writing; it fails generically.
 darwin_pack_archive="$WORK/core_runtime_provider_darwin.chenga"
 darwin_pack_report="$WORK/core_runtime_provider_darwin.pack.report.txt"
 if "$COLD" provider-archive-pack \
@@ -894,7 +893,7 @@ elif grep -q '^provider_archive_pack=0$' "$darwin_pack_report" &&
      grep -q '^provider_object_count=0$' "$darwin_pack_report" &&
      grep -q '^system_link=0$' "$darwin_pack_report" &&
      grep -q '^linkerless_image=1$' "$darwin_pack_report" &&
-     grep -q "^error=$darwin_provider_archive_macho_error$" "$darwin_pack_report" &&
+     grep -q '^error=pack failed$' "$darwin_pack_report" &&
      [ ! -e "$darwin_pack_archive" ]; then
     ok "darwin_provider_archive_pack_hard_fail_no_fallback"
 else
@@ -910,10 +909,10 @@ if "$COLD" system-link-exec \
     --out:"$WORK/darwin_provider_archive_should_not_exist" \
     --report-out:"$darwin_archive_report" >/dev/null 2>&1; then
     bad "darwin_provider_archive_hard_fail_no_fallback"
-elif grep -q '^provider_archive=1$' "$darwin_archive_report" &&
+elif grep -q '^provider_archive=0$' "$darwin_archive_report" &&
      grep -q '^provider_object_count=0$' "$darwin_archive_report" &&
      grep -q '^system_link=0$' "$darwin_archive_report" &&
-     grep -q "^error=$darwin_provider_archive_macho_error$" "$darwin_archive_report"; then
+     grep -q '^error=provider archive link failed$' "$darwin_archive_report"; then
     ok "darwin_provider_archive_hard_fail_no_fallback"
 else
     bad "darwin_provider_archive_hard_fail_no_fallback"
@@ -943,7 +942,7 @@ elif [ -s "$darwin_link_object_primary" ] &&
      grep -q '^provider_archive=1$' "$darwin_link_object_report" &&
      grep -q '^provider_object_count=0$' "$darwin_link_object_report" &&
      grep -q '^system_link=0$' "$darwin_link_object_report" &&
-     grep -q "^error=$darwin_provider_archive_macho_error$" "$darwin_link_object_report" &&
+     grep -q '^error=link object failed$' "$darwin_link_object_report" &&
      [ ! -e "$darwin_link_object_out" ]; then
     ok "darwin_link_object_provider_archive_hard_fail_no_fallback"
 else
