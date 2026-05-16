@@ -1312,6 +1312,66 @@ fi
 assert "cross_block_safety_field_values" 1 "$ACT"
 rm -f /tmp/ct_cbsafety /tmp/ct_cbsafety.report
 
+# 11h: Cross-block constant propagation test
+rm -f /tmp/ct_xb_const.cheng /tmp/ct_xb_const /tmp/ct_xb_const.report
+cat > /tmp/ct_xb_const.cheng << 'EOF'
+fn main(): int32 =
+    let z = 0
+    let o = 1
+    let x = 42
+    if x > 0:
+        let r1 = x + z
+        let r2 = r1 * o
+        let r3 = r2 + z
+        return r3
+    else:
+        return 999
+EOF
+quiet $COLD system-link-exec --in:/tmp/ct_xb_const.cheng \
+    --target:arm64-apple-darwin --out:/tmp/ct_xb_const \
+    --report-out:/tmp/ct_xb_const.report
+if [ -x /tmp/ct_xb_const ]; then
+    /tmp/ct_xb_const >/dev/null 2>&1; ACT=$?
+else
+    ACT="COMPILE_FAILED"
+fi
+assert "cross_block_constprop_exit" 42 "$ACT"
+if grep -q '^egraph_fixed_point_iterations=' /tmp/ct_xb_const.report 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "cross_block_constprop_report_field" 1 "$ACT"
+ITER=$(grep '^egraph_fixed_point_iterations=' /tmp/ct_xb_const.report | sed 's/.*=//')
+if [ -n "$ITER" ] && [ "$ITER" -ge 1 ] 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "cross_block_constprop_iter_count" 1 "$ACT"
+RWCNT=$(grep '^egraph_rewrite_count=' /tmp/ct_xb_const.report | sed 's/.*=//')
+# At minimum: ADD(x,0)->COPY (1), MUL(r1,1)->COPY (1), ADD(r2,0)->COPY (1),
+# plus DSE of unused slots: at least 2 cross-block rewrites expected
+if [ -n "$RWCNT" ] && [ "$RWCNT" -ge 2 ] 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "cross_block_constprop_rewrites" 1 "$ACT"
+if grep -q '^cross_block_analysis_ran=1$' /tmp/ct_xb_const.report 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "cross_block_constprop_xblock_ran" 1 "$ACT"
+if grep -q '^cross_block_safe_slots=' /tmp/ct_xb_const.report 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "cross_block_constprop_safe_field" 1 "$ACT"
+rm -f /tmp/ct_xb_const.cheng /tmp/ct_xb_const /tmp/ct_xb_const.report
+
 # 12: emit:obj with object fields (int32 + str)
 rm -f /tmp/ct_eo_fields.cheng /tmp/ct_eo_fields /tmp/ct_eo_fields.o /tmp/ct_eo_fields_link
 cat > /tmp/ct_eo_fields.cheng << 'EOF'
@@ -2568,6 +2628,10 @@ assert "bigint_result_probe_cold_compile_smoke" 1 "$ACT"
 # --- cold_csg_facts_exporter_smoke.cheng cold compile smoke ---
 ACT=$(compile_obj_smoke "cold_csg_facts_exporter" "src/tests/cold_csg_facts_exporter_smoke.cheng")
 assert "cold_csg_facts_exporter_cold_compile_smoke" 1 "$ACT"
+
+# --- CSG v2 writer reloc source contract cold compile smoke ---
+ACT=$(compile_obj_smoke "csg_v2_writer_reloc_source_contract" "tests/cheng/backend/fixtures/csg_v2_writer_reloc_source_contract.cheng")
+assert "csg_v2_writer_reloc_source_contract_cold_compile_smoke" 1 "$ACT"
 
 # --- vpn_proxy_socks_smoke.cheng cold compile smoke ---
 ACT=$(compile_obj_smoke "vpn_proxy_socks" "src/tests/vpn_proxy_socks_smoke.cheng")

@@ -3409,6 +3409,7 @@ enum {
     BODY_TERM_BR = 2,
     BODY_TERM_CBR = 3,
     BODY_TERM_SWITCH = 4,
+    BODY_TERM_UNREACHABLE = 5,
 };
 
 enum {
@@ -4440,7 +4441,9 @@ static Span cold_call_arg_type_for_generic(Symbols *symbols, BodyIR *body,
     if (arg_index >= 0 && arg_index < body->call_arg_count - arg_start) {
         int32_t slot = body->call_arg_slot[arg_start + arg_index];
         if (slot >= 0 && slot < body->slot_count) {
-            if (body->slot_type[slot].len > 0) return body->slot_type[slot];
+            if (body->slot_type[slot].len > 0) {
+                return body->slot_type[slot];
+            }
             switch (body->slot_kind[slot]) {
                 case SLOT_I32: return cold_cstr_span("int32");
                 case SLOT_I64: return cold_cstr_span("int64");
@@ -4461,11 +4464,28 @@ static Span cold_call_arg_type_for_generic(Symbols *symbols, BodyIR *body,
     return cold_cstr_span("o");
 }
 
+static Span cold_type_strip_var(Span type, bool *is_var);
+
 static Span cold_specialize_fn_type(Symbols *symbols, FnDef *tmpl, Span type,
                                     BodyIR *body, int32_t arg_start,
                                     int32_t arg_count) {
     type = span_trim(type);
     if (type.len <= 0) return type;
+    /* Handle "var " prefix: strip, specialize inner, re-add */
+    {
+        bool is_var = false;
+        Span stripped = cold_type_strip_var(type, &is_var);
+        if (is_var) {
+            Span inner = cold_specialize_fn_type(symbols, tmpl, stripped, body,
+                                                  arg_start, arg_count);
+            if (inner.len > 0 && !span_same(inner, stripped)) {
+                uint8_t *buf = arena_alloc(symbols->arena, (size_t)(4 + inner.len));
+                memcpy(buf, "var ", 4);
+                memcpy(buf + 4, inner.ptr, (size_t)inner.len);
+                return (Span){buf, 4 + inner.len};
+            }
+        }
+    }
     for (int32_t gi = 0; gi < tmpl->generic_count; gi++) {
         if (!span_same(type, tmpl->generic_names[gi])) continue;
         int32_t arg_index = cold_generic_param_index(tmpl, tmpl->generic_names[gi]);
@@ -4499,12 +4519,40 @@ static int32_t cold_ensure_specialized(Symbols *symbols, int32_t template_idx,
         arg_kinds[p] = body->slot_kind[slot];
         arg_sizes[p] = body->slot_size[slot];
     }
+    /* Convert arg kinds to param kinds: "var T" params need REF variants */
+    int32_t param_kinds[COLD_MAX_I32_PARAMS];
+    int32_t param_sizes[COLD_MAX_I32_PARAMS];
+    for (int32_t p = 0; p < tmpl->arity && p < COLD_MAX_I32_PARAMS; p++) {
+        bool is_var = false;
+        cold_type_strip_var(tmpl->param_type[p], &is_var);
+        if (is_var) {
+            int32_t ak = arg_kinds[p];
+            int32_t rk = ak;
+            switch (ak) {
+                case SLOT_I32: rk = SLOT_I32_REF; break;
+                case SLOT_I64: rk = SLOT_I64_REF; break;
+                case SLOT_STR: rk = SLOT_STR_REF; break;
+                case SLOT_SEQ_I32: rk = SLOT_SEQ_I32_REF; break;
+                case SLOT_SEQ_STR: rk = SLOT_SEQ_STR_REF; break;
+                case SLOT_SEQ_OPAQUE: rk = SLOT_SEQ_OPAQUE_REF; break;
+                case SLOT_OBJECT: rk = SLOT_OBJECT_REF; break;
+                case SLOT_OPAQUE: rk = SLOT_OPAQUE_REF; break;
+            }
+            param_kinds[p] = rk;
+            param_sizes[p] = 8; /* ref params are pointer-sized */
+        } else {
+            param_kinds[p] = arg_kinds[p];
+            param_sizes[p] = arg_sizes[p];
+        }
+    }
     char spec_name[COLD_NAME_CAP];
     cold_specialized_fn_name(tmpl->name, tmpl->generic_count, tmpl->generic_names,
-                             arg_kinds, arg_count, spec_name, sizeof(spec_name));
+                             param_kinds, arg_count, spec_name, sizeof(spec_name));
     Span name_span = cold_cstr_span(spec_name);
     for (int32_t i = 0; i < symbols->function_count; i++) {
-        if (span_same(symbols->functions[i].name, name_span)) return i;
+        if (span_same(symbols->functions[i].name, name_span)) {
+            return i;
+        }
     }
     Span spec_ret = cold_specialize_fn_type(symbols, tmpl, tmpl->ret, body,
                                             arg_start, arg_count);
@@ -4514,7 +4562,7 @@ static int32_t cold_ensure_specialized(Symbols *symbols, int32_t template_idx,
                                                       body, arg_start, arg_count);
     }
     int32_t spec_idx = symbols_add_fn(symbols, name_span, tmpl->arity,
-                                      arg_kinds, arg_sizes, spec_ret);
+                                      param_kinds, param_sizes, spec_ret);
     if (spec_idx >= 0 && spec_idx < symbols->function_count) {
         symbols_set_fn_param_types(symbols, spec_idx, spec_param_types, tmpl->arity);
         symbols->functions[spec_idx].generic_count = 0;
@@ -5127,6 +5175,7 @@ static int32_t cold_slot_kind_from_type_with_symbols(Symbols *symbols, Span type
     }
     if (cold_type_has_qualified_name(type)) return SLOT_OPAQUE;
     if (type.len > 1 && type.ptr[0] >= 'A' && type.ptr[0] <= 'Z') return SLOT_VARIANT;
+    if (is_var) return SLOT_OBJECT_REF;
     /* Unknown type: treat as opaque */
     return SLOT_OPAQUE;
     return SLOT_I32;
@@ -7656,8 +7705,9 @@ static void codegen_copy_slot_from_offset(Code *code, BodyIR *body,
     int32_t src_kind = body->slot_kind[src_slot];
     if (src_kind == SLOT_OBJECT_REF || src_kind == SLOT_SEQ_I32_REF ||
         src_kind == SLOT_SEQ_STR_REF || src_kind == SLOT_SEQ_OPAQUE_REF ||
-        src_kind == SLOT_STR_REF ||
-        src_kind == SLOT_PTR) {
+        src_kind == SLOT_STR_REF || src_kind == SLOT_PTR ||
+        src_kind == SLOT_I32_REF || src_kind == SLOT_I64_REF ||
+        src_kind == SLOT_OPAQUE_REF) {
         a64_emit_ldr_sp_off(code, R2, body->slot_offset[src_slot], true);
         /* Null check: if pointer is NULL, zero dst and return */
         code_emit(code, a64_cmp_reg_x(R2, 31));
@@ -7760,7 +7810,9 @@ static void codegen_store_slot_to_payload(Code *code, BodyIR *body,
     }
     if (dst_kind != SLOT_OBJECT_REF && dst_kind != SLOT_SEQ_I32_REF &&
         dst_kind != SLOT_SEQ_STR_REF && dst_kind != SLOT_SEQ_OPAQUE_REF &&
-        dst_kind != SLOT_STR_REF && dst_kind != SLOT_PTR) {
+        dst_kind != SLOT_STR_REF && dst_kind != SLOT_PTR &&
+        dst_kind != SLOT_I32_REF && dst_kind != SLOT_I64_REF &&
+        dst_kind != SLOT_OPAQUE_REF) {
         /* Non-object slot: write source directly to SP + base + field_offset */
         int32_t base_off = body->slot_offset[dst_slot];
         int32_t total_off = base_off + dst_offset;
@@ -13064,6 +13116,92 @@ static bool cold_is_same_block_as(BodyIR *body, int32_t idx_a, int32_t idx_b) {
     return false;
 }
 
+static int32_t cold_block_index_for_op(BodyIR *body, int32_t op_index) {
+    if (!body || op_index < 0) return -1;
+    for (int32_t b = 0; b < body->block_count; b++) {
+        int32_t start = body->block_op_start[b];
+        int32_t end = start + body->block_op_count[b];
+        if (op_index >= start && op_index < end) return b;
+    }
+    return -1;
+}
+
+static bool *cold_build_block_dominators(BodyIR *body) {
+    if (!body || body->block_count <= 0) return NULL;
+    int32_t n = body->block_count;
+    bool *pred = (bool *)calloc((size_t)n * (size_t)n, sizeof(bool));
+    bool *dom = (bool *)calloc((size_t)n * (size_t)n, sizeof(bool));
+    if (!pred || !dom) {
+        free(pred);
+        free(dom);
+        return NULL;
+    }
+
+    for (int32_t b = 0; b < n; b++) {
+        int32_t term = body->block_term[b];
+        if (term < 0 || term >= body->term_count) continue;
+        int32_t tk = body->term_kind[term];
+        int32_t tb = body->term_true_block[term];
+        int32_t fb = body->term_false_block[term];
+        if ((tk == BODY_TERM_BR || tk == BODY_TERM_CBR) && tb >= 0 && tb < n)
+            pred[tb * n + b] = true;
+        if (tk == BODY_TERM_CBR && fb >= 0 && fb < n)
+            pred[fb * n + b] = true;
+    }
+
+    for (int32_t b = 0; b < n; b++) {
+        for (int32_t d = 0; d < n; d++) {
+            dom[b * n + d] = (b == 0) ? (d == 0) : true;
+        }
+    }
+
+    bool changed = true;
+    bool *new_row = (bool *)calloc((size_t)n, sizeof(bool));
+    if (!new_row) {
+        free(pred);
+        free(dom);
+        return NULL;
+    }
+    while (changed) {
+        changed = false;
+        for (int32_t b = 1; b < n; b++) {
+            bool has_pred = false;
+            for (int32_t d = 0; d < n; d++) new_row[d] = true;
+            for (int32_t p = 0; p < n; p++) {
+                if (!pred[b * n + p]) continue;
+                has_pred = true;
+                for (int32_t d = 0; d < n; d++)
+                    new_row[d] = new_row[d] && dom[p * n + d];
+            }
+            if (!has_pred) {
+                for (int32_t d = 0; d < n; d++) new_row[d] = false;
+            }
+            new_row[b] = true;
+            for (int32_t d = 0; d < n; d++) {
+                if (dom[b * n + d] != new_row[d]) {
+                    dom[b * n + d] = new_row[d];
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    free(new_row);
+    free(pred);
+    return dom;
+}
+
+static bool cold_op_dominates_op(BodyIR *body, const bool *dom,
+                                 int32_t def_op, int32_t use_op) {
+    if (!body || def_op < 0 || use_op < 0) return false;
+    int32_t def_block = cold_block_index_for_op(body, def_op);
+    int32_t use_block = cold_block_index_for_op(body, use_op);
+    if (def_block < 0 || use_block < 0) return false;
+    if (def_block == use_block) return def_op < use_op;
+    if (!dom) return false;
+    return dom[use_block * body->block_count + def_block];
+}
+
 /* Cross-block slot liveness analysis.
    For each slot, track which basic blocks write it and which read it.
    A no_alias slot written in exactly one block and read in at least one
@@ -13213,6 +13351,7 @@ static void cold_apply_identity_rewrites(BodyIR *body) {
     int32_t *cur_writer = (int32_t *)calloc((size_t)slot_count, sizeof(int32_t));
     if (!cur_writer) { free(writer_count); return; }
     for (int32_t s = 0; s < slot_count; s++) cur_writer[s] = -1;
+    bool *block_dom = cold_build_block_dominators(body);
 
     for (int32_t i = 0; i < op_count; i++) {
         int32_t kind = body->op_kind[i];
@@ -13221,15 +13360,15 @@ static void cold_apply_identity_rewrites(BodyIR *body) {
         int32_t a = body->op_a[i], b = body->op_b[i];
 
         /* Check that operand b's last writer is in the same block as this op.
-           This is provably safe even when other blocks write different values
-           to the same slot: within a basic block, execution is sequential, so
-           the writer must execute before this read and the value is guaranteed
-           to be the constant produced by that writer. */
+           Single-writer is not enough: a non-dominating writer in another
+           block may never execute on this path. */
         bool b_safe = false;
         if (b >= 0 && b < slot_count) {
             int32_t b_def = cur_writer[b];
             if (b_def >= 0) {
                 b_safe = cold_is_same_block_as(body, b_def, i);
+                if (!b_safe && writer_count[b] == 1)
+                    b_safe = cold_op_dominates_op(body, block_dom, b_def, i);
             }
         }
 
@@ -13240,11 +13379,32 @@ static void cold_apply_identity_rewrites(BodyIR *body) {
             int32_t a_def = cur_writer[a];
             if (a_def >= 0) {
                 a_safe = cold_is_same_block_as(body, a_def, i);
+                if (!a_safe && writer_count[a] == 1)
+                    a_safe = cold_op_dominates_op(body, block_dom, a_def, i);
             }
         }
 
-        if (dst >= 0 && dst < slot_count && writer_count[dst] == 1 && b_safe) {
+        /* Algebraic identity rewrites are value-preserving: they change
+           HOW a value is computed (e.g., ADD(x,0) -> COPY(x)) without
+           changing the computed value itself. Therefore they are safe
+           regardless of how many writers the dst slot has. Only operand
+           b's safety matters: we must know its value is deterministic. */
+        if (dst >= 0 && dst < slot_count && b_safe) {
             int32_t def = cur_writer[b];
+            /* Trace through COPY_I32/COPY_I64: the frontend lowers
+               'let z = 0' as CONST -> COPY -> use. When b's sole writer
+               is a COPY from another slot with a unique writer, follow
+               the chain to find the ultimate CONST producer. */
+            if (def >= 0 && writer_count[b] == 1) {
+                int32_t bk = body->op_kind[def];
+                if (bk == BODY_OP_COPY_I32 || bk == BODY_OP_COPY_I64) {
+                    int32_t src = body->op_a[def];
+                    if (src >= 0 && src < slot_count && writer_count[src] == 1) {
+                        int32_t src_def = cur_writer[src];
+                        if (src_def >= 0 && cold_op_dominates_op(body, block_dom, src_def, def)) def = src_def;
+                    }
+                }
+            }
 
             switch (kind) {
                 case BODY_OP_I32_ADD:
@@ -13265,7 +13425,9 @@ static void cold_apply_identity_rewrites(BodyIR *body) {
                             int32_t inner_a = body->op_a[def];
                             if (inner_a >= 0 && inner_a < slot_count) {
                                 int32_t inner_inner_a_def = cur_writer[inner_a];
-                                if (inner_inner_a_def >= 0 && body->op_kind[inner_inner_a_def] == BODY_OP_I32_CONST &&
+                                if (inner_inner_a_def >= 0 &&
+                                    cold_op_dominates_op(body, block_dom, inner_inner_a_def, def) &&
+                                    body->op_kind[inner_inner_a_def] == BODY_OP_I32_CONST &&
                                     body->op_a[inner_inner_a_def] == 0) {
                                     body->op_kind[i] = BODY_OP_COPY_I32;
                                     body->op_a[i] = body->op_b[def];
@@ -13324,7 +13486,9 @@ static void cold_apply_identity_rewrites(BodyIR *body) {
                             int32_t inner_a = body->op_a[def];
                             if (inner_a >= 0 && inner_a < slot_count) {
                                 int32_t inner_a_def = cur_writer[inner_a];
-                                if (inner_a_def >= 0 && body->op_kind[inner_a_def] == BODY_OP_I64_CONST &&
+                                if (inner_a_def >= 0 &&
+                                    cold_op_dominates_op(body, block_dom, inner_a_def, def) &&
+                                    body->op_kind[inner_a_def] == BODY_OP_I64_CONST &&
                                     body->op_a[inner_a_def] == 0 && body->op_b[inner_a_def] == 0) {
                                     body->op_kind[i] = BODY_OP_COPY_I64;
                                     body->op_a[i] = body->op_b[def];
@@ -13402,7 +13566,9 @@ static void cold_apply_identity_rewrites(BodyIR *body) {
                             int32_t inner_b = body->op_b[inner_xor_idx];
                             if (inner_b >= 0 && inner_b < slot_count) {
                                 int32_t inner_b_def = cur_writer[inner_b];
-                                if (inner_b_def >= 0 && body->op_kind[inner_b_def] == BODY_OP_I32_CONST &&
+                                if (inner_b_def >= 0 && writer_count[inner_b] == 1 &&
+                                    cold_op_dominates_op(body, block_dom, inner_b_def, inner_xor_idx) &&
+                                    body->op_kind[inner_b_def] == BODY_OP_I32_CONST &&
                                     body->op_a[inner_b_def] == -1) {
                                     body->op_kind[i] = BODY_OP_COPY_I32;
                                     body->op_a[i] = body->op_a[inner_xor_idx];
@@ -13451,7 +13617,9 @@ static void cold_apply_identity_rewrites(BodyIR *body) {
                             int32_t inner_b = body->op_b[a_def];
                             if (inner_b >= 0 && inner_b < slot_count) {
                                 int32_t inner_b_def = cur_writer[inner_b];
-                                if (inner_b_def >= 0 && body->op_kind[inner_b_def] == BODY_OP_I64_CONST &&
+                                if (inner_b_def >= 0 && writer_count[inner_b] == 1 &&
+                                    cold_op_dominates_op(body, block_dom, inner_b_def, a_def) &&
+                                    body->op_kind[inner_b_def] == BODY_OP_I64_CONST &&
                                     body->op_a[inner_b_def] == -1 && body->op_b[inner_b_def] == -1) {
                                     body->op_kind[i] = BODY_OP_COPY_I64;
                                     body->op_a[i] = body->op_a[a_def];
@@ -13490,6 +13658,7 @@ static void cold_apply_identity_rewrites(BodyIR *body) {
         }
     }
 
+    free(block_dom);
     free(cur_writer);
     free(writer_count);
 }
@@ -15792,31 +15961,36 @@ static bool cold_load_csg_v2_facts(
     for (uint32_t si = 0; si < section_count; si++) {
         if (sec_kind[si] == 5) {
             int32_t spos = (int32_t)sec_offset[si];
-            if (!cold_read_u32(data, data_len, &spos, &str_count)) return false;
+            int32_t send = (int32_t)(sec_offset[si] + (uint64_t)sec_size[si]);
+            if (!cold_read_u32(data, send, &spos, &str_count)) return false;
             if (str_count > 0) {
                 str_spans = arena_alloc(arena, (size_t)str_count * sizeof(Span));
                 memset(str_spans, 0, (size_t)str_count * sizeof(Span));
                 for (uint32_t i = 0; i < str_count; i++) {
                     uint32_t id, slen;
-                    if (!cold_read_u32(data, data_len, &spos, &id)) return false;
-                    if (!cold_read_u32(data, data_len, &spos, &slen)) return false;
-                    if ((int32_t)(spos + (int32_t)slen) > data_len) return false;
+                    if (!cold_read_u32(data, send, &spos, &id)) return false;
+                    if (!cold_read_u32(data, send, &spos, &slen)) return false;
+                    if (slen > (uint32_t)INT32_MAX) return false;
+                    if ((int32_t)(spos + (int32_t)slen) > send) return false;
                     if (id < str_count) {
                         str_spans[id] = (Span){data + spos, (int32_t)slen};
                     }
                     spos += (int32_t)slen;
                 }
             }
+            if (spos != send) return false;
             break;
         }
     }
 
     /* 4. Parse function section (kind=1) */
     int32_t sec_pos = 0;
+    int32_t fn_sec_end = 0;
     bool found_fn_section = false;
     for (uint32_t si = 0; si < section_count; si++) {
         if (sec_kind[si] == 1) {
             sec_pos = (int32_t)sec_offset[si];
+            fn_sec_end = (int32_t)(sec_offset[si] + (uint64_t)sec_size[si]);
             found_fn_section = true;
             break;
         }
@@ -15824,7 +15998,7 @@ static bool cold_load_csg_v2_facts(
     if (!found_fn_section) return false;
 
     uint32_t fn_count;
-    if (!cold_read_u32(data, data_len, &sec_pos, &fn_count)) return false;
+    if (!cold_read_u32(data, fn_sec_end, &sec_pos, &fn_count)) return false;
     if (fn_count == 0) return false;
     if (fn_count > CSG_V2_BUDGET_MAX_FN_COUNT) {
         fprintf(stderr, "[CSG-V2] budget exceeded: fn_count=%u > max=%d\n",
@@ -15844,29 +16018,29 @@ static bool cold_load_csg_v2_facts(
     for (uint32_t fi = 0; fi < fn_count; fi++) {
         /* Read function name */
         Span fn_name;
-        if (!cold_read_str(data, data_len, &sec_pos, &fn_name)) return false;
+        if (!cold_read_str(data, fn_sec_end, &sec_pos, &fn_name)) return false;
 
         uint32_t param_count, return_kind, frame_size, op_count;
-        if (!cold_read_u32(data, data_len, &sec_pos, &param_count)) return false;
+        if (!cold_read_u32(data, fn_sec_end, &sec_pos, &param_count)) return false;
         if (param_count > COLD_MAX_I32_PARAMS) return false;
         int32_t param_kinds[COLD_MAX_I32_PARAMS];
         int32_t param_sizes[COLD_MAX_I32_PARAMS];
         int32_t param_slots[COLD_MAX_I32_PARAMS];
         for (uint32_t pi = 0; pi < param_count; pi++) {
             uint32_t pk, pz, ps;
-            if (!cold_read_u32(data, data_len, &sec_pos, &pk)) return false;
-            if (!cold_read_u32(data, data_len, &sec_pos, &pz)) return false;
-            if (!cold_read_u32(data, data_len, &sec_pos, &ps)) return false;
+            if (!cold_read_u32(data, fn_sec_end, &sec_pos, &pk)) return false;
+            if (!cold_read_u32(data, fn_sec_end, &sec_pos, &pz)) return false;
+            if (!cold_read_u32(data, fn_sec_end, &sec_pos, &ps)) return false;
             if (pk > (uint32_t)INT32_MAX ||
                 pz > (uint32_t)INT32_MAX ||
-                ps > (uint32_t)INT32_MAX) return false;
+                (ps != UINT32_MAX && ps > (uint32_t)INT32_MAX)) return false;
             param_kinds[pi] = (int32_t)pk;
             param_sizes[pi] = (int32_t)pz;
-            param_slots[pi] = (int32_t)ps;
+            param_slots[pi] = ps == UINT32_MAX ? -1 : (int32_t)ps;
         }
-        if (!cold_read_u32(data, data_len, &sec_pos, &return_kind)) return false;
-        if (!cold_read_u32(data, data_len, &sec_pos, &frame_size)) return false;
-        if (!cold_read_u32(data, data_len, &sec_pos, &op_count)) return false;
+        if (!cold_read_u32(data, fn_sec_end, &sec_pos, &return_kind)) return false;
+        if (!cold_read_u32(data, fn_sec_end, &sec_pos, &frame_size)) return false;
+        if (!cold_read_u32(data, fn_sec_end, &sec_pos, &op_count)) return false;
         if (op_count > CSG_V2_BUDGET_MAX_OP_COUNT) {
             fprintf(stderr, "[CSG-V2] budget exceeded: op_count=%u > max=%d\n",
                     op_count, CSG_V2_BUDGET_MAX_OP_COUNT);
@@ -15911,17 +16085,17 @@ static bool cold_load_csg_v2_facts(
         /* Read ops (5 u32 per op) */
         for (uint32_t oi = 0; oi < op_count; oi++) {
             uint32_t kind, dst, a, b, c;
-            if (!cold_read_u32(data, data_len, &sec_pos, &kind)) return false;
-            if (!cold_read_u32(data, data_len, &sec_pos, &dst)) return false;
-            if (!cold_read_u32(data, data_len, &sec_pos, &a)) return false;
-            if (!cold_read_u32(data, data_len, &sec_pos, &b)) return false;
-            if (!cold_read_u32(data, data_len, &sec_pos, &c)) return false;
+            if (!cold_read_u32(data, fn_sec_end, &sec_pos, &kind)) return false;
+            if (!cold_read_u32(data, fn_sec_end, &sec_pos, &dst)) return false;
+            if (!cold_read_u32(data, fn_sec_end, &sec_pos, &a)) return false;
+            if (!cold_read_u32(data, fn_sec_end, &sec_pos, &b)) return false;
+            if (!cold_read_u32(data, fn_sec_end, &sec_pos, &c)) return false;
             body_op3(body, (int32_t)kind, (int32_t)dst, (int32_t)a, (int32_t)b, (int32_t)c);
         }
 
         /* Read slots (3 u32 per slot) */
         uint32_t slot_count;
-        if (!cold_read_u32(data, data_len, &sec_pos, &slot_count)) return false;
+        if (!cold_read_u32(data, fn_sec_end, &sec_pos, &slot_count)) return false;
         if (slot_count > CSG_V2_BUDGET_MAX_SLOT_COUNT) {
             fprintf(stderr, "[CSG-V2] budget exceeded: slot_count=%u > max=%d\n",
                     slot_count, CSG_V2_BUDGET_MAX_SLOT_COUNT);
@@ -15929,9 +16103,9 @@ static bool cold_load_csg_v2_facts(
         }
         for (uint32_t si = 0; si < slot_count; si++) {
             uint32_t skind, soff, ssize;
-            if (!cold_read_u32(data, data_len, &sec_pos, &skind)) return false;
-            if (!cold_read_u32(data, data_len, &sec_pos, &soff)) return false;
-            if (!cold_read_u32(data, data_len, &sec_pos, &ssize)) return false;
+            if (!cold_read_u32(data, fn_sec_end, &sec_pos, &skind)) return false;
+            if (!cold_read_u32(data, fn_sec_end, &sec_pos, &soff)) return false;
+            if (!cold_read_u32(data, fn_sec_end, &sec_pos, &ssize)) return false;
             body_ensure_slots(body);
             int32_t idx = body->slot_count++;
             body->slot_kind[idx] = (int32_t)skind;
@@ -15941,19 +16115,21 @@ static bool cold_load_csg_v2_facts(
             body->slot_type[idx] = (Span){0};
             body->slot_no_alias[idx] = 0;
         }
-        for (uint32_t pi = 0; pi < param_count; pi++) {
-            int32_t slot = body->param_slot[pi];
-            if (slot < 0 || slot >= body->slot_count) return false;
+        if (op_count > 0) {
+            for (uint32_t pi = 0; pi < param_count; pi++) {
+                int32_t slot = body->param_slot[pi];
+                if (slot < 0 || slot >= body->slot_count) return false;
+            }
         }
 
         /* Read blocks (3 u32 per block) */
         uint32_t block_count;
-        if (!cold_read_u32(data, data_len, &sec_pos, &block_count)) return false;
+        if (!cold_read_u32(data, fn_sec_end, &sec_pos, &block_count)) return false;
         for (uint32_t bi = 0; bi < block_count; bi++) {
             uint32_t bop_start, bop_cnt, bterm;
-            if (!cold_read_u32(data, data_len, &sec_pos, &bop_start)) return false;
-            if (!cold_read_u32(data, data_len, &sec_pos, &bop_cnt)) return false;
-            if (!cold_read_u32(data, data_len, &sec_pos, &bterm)) return false;
+            if (!cold_read_u32(data, fn_sec_end, &sec_pos, &bop_start)) return false;
+            if (!cold_read_u32(data, fn_sec_end, &sec_pos, &bop_cnt)) return false;
+            if (!cold_read_u32(data, fn_sec_end, &sec_pos, &bterm)) return false;
             body_ensure_blocks(body);
             int32_t idx = body->block_count++;
             body->block_op_start[idx] = (int32_t)bop_start;
@@ -15963,15 +16139,15 @@ static bool cold_load_csg_v2_facts(
 
         /* Read terms (6 u32 per term) */
         uint32_t term_count;
-        if (!cold_read_u32(data, data_len, &sec_pos, &term_count)) return false;
+        if (!cold_read_u32(data, fn_sec_end, &sec_pos, &term_count)) return false;
         for (uint32_t ti = 0; ti < term_count; ti++) {
             uint32_t tkind, tval, tcase_start, tcase_count, ttrue, tfalse;
-            if (!cold_read_u32(data, data_len, &sec_pos, &tkind)) return false;
-            if (!cold_read_u32(data, data_len, &sec_pos, &tval)) return false;
-            if (!cold_read_u32(data, data_len, &sec_pos, &tcase_start)) return false;
-            if (!cold_read_u32(data, data_len, &sec_pos, &tcase_count)) return false;
-            if (!cold_read_u32(data, data_len, &sec_pos, &ttrue)) return false;
-            if (!cold_read_u32(data, data_len, &sec_pos, &tfalse)) return false;
+            if (!cold_read_u32(data, fn_sec_end, &sec_pos, &tkind)) return false;
+            if (!cold_read_u32(data, fn_sec_end, &sec_pos, &tval)) return false;
+            if (!cold_read_u32(data, fn_sec_end, &sec_pos, &tcase_start)) return false;
+            if (!cold_read_u32(data, fn_sec_end, &sec_pos, &tcase_count)) return false;
+            if (!cold_read_u32(data, fn_sec_end, &sec_pos, &ttrue)) return false;
+            if (!cold_read_u32(data, fn_sec_end, &sec_pos, &tfalse)) return false;
             body_ensure_terms(body);
             int32_t idx = body->term_count++;
             body->term_kind[idx] = (int32_t)tkind;
@@ -15989,12 +16165,12 @@ static bool cold_load_csg_v2_facts(
 
         /* Read switch cases (3 u32 per case) */
         uint32_t switch_count;
-        if (!cold_read_u32(data, data_len, &sec_pos, &switch_count)) return false;
+        if (!cold_read_u32(data, fn_sec_end, &sec_pos, &switch_count)) return false;
         for (uint32_t si = 0; si < switch_count; si++) {
             uint32_t stag, sblock, sterm;
-            if (!cold_read_u32(data, data_len, &sec_pos, &stag)) return false;
-            if (!cold_read_u32(data, data_len, &sec_pos, &sblock)) return false;
-            if (!cold_read_u32(data, data_len, &sec_pos, &sterm)) return false;
+            if (!cold_read_u32(data, fn_sec_end, &sec_pos, &stag)) return false;
+            if (!cold_read_u32(data, fn_sec_end, &sec_pos, &sblock)) return false;
+            if (!cold_read_u32(data, fn_sec_end, &sec_pos, &sterm)) return false;
             body_ensure_switches(body);
             int32_t idx = body->switch_count++;
             body->switch_tag[idx] = (int32_t)stag;
@@ -16004,17 +16180,18 @@ static bool cold_load_csg_v2_facts(
 
         /* Skip call metadata (4 u32 per call) */
         uint32_t call_count;
-        if (!cold_read_u32(data, data_len, &sec_pos, &call_count)) return false;
+        if (!cold_read_u32(data, fn_sec_end, &sec_pos, &call_count)) return false;
+        if (call_count > (uint32_t)((fn_sec_end - sec_pos) / 16)) return false;
         sec_pos += (int32_t)(call_count * 16);
-        if (sec_pos > data_len) return false;
+        if (sec_pos > fn_sec_end) return false;
 
         /* Read call args (2 u32 per arg) */
         uint32_t call_arg_count;
-        if (!cold_read_u32(data, data_len, &sec_pos, &call_arg_count)) return false;
+        if (!cold_read_u32(data, fn_sec_end, &sec_pos, &call_arg_count)) return false;
         for (uint32_t cai = 0; cai < call_arg_count; cai++) {
             uint32_t caslot, caoff;
-            if (!cold_read_u32(data, data_len, &sec_pos, &caslot)) return false;
-            if (!cold_read_u32(data, data_len, &sec_pos, &caoff)) return false;
+            if (!cold_read_u32(data, fn_sec_end, &sec_pos, &caslot)) return false;
+            if (!cold_read_u32(data, fn_sec_end, &sec_pos, &caoff)) return false;
             body_ensure_call_args(body);
             int32_t idx = body->call_arg_count++;
             body->call_arg_slot[idx] = (int32_t)caslot;
@@ -16023,10 +16200,10 @@ static bool cold_load_csg_v2_facts(
 
         /* Read string literal ids */
         uint32_t str_lit_count;
-        if (!cold_read_u32(data, data_len, &sec_pos, &str_lit_count)) return false;
+        if (!cold_read_u32(data, fn_sec_end, &sec_pos, &str_lit_count)) return false;
         for (uint32_t sli = 0; sli < str_lit_count; sli++) {
             uint32_t str_id;
-            if (!cold_read_u32(data, data_len, &sec_pos, &str_id)) return false;
+            if (!cold_read_u32(data, fn_sec_end, &sec_pos, &str_id)) return false;
             body_ensure_string_literals(body);
             int32_t idx = body->string_literal_count++;
             if (str_id < str_count && str_spans) {
@@ -16040,24 +16217,27 @@ static bool cold_load_csg_v2_facts(
         /* External functions: no codegen, left as undefined symbol */
         fn_list[fi].body = (op_count == 0) ? NULL : body;
     }
+    if (sec_pos != fn_sec_end) return false;
 
     /* 4.5. Parse global variable section (kind=6) */
     for (uint32_t si = 0; si < section_count; si++) {
         if (sec_kind[si] != 6) continue;
         int32_t gpos = (int32_t)sec_offset[si];
+        int32_t gend = (int32_t)(sec_offset[si] + (uint64_t)sec_size[si]);
         uint32_t global_count;
-        if (!cold_read_u32(data, data_len, &gpos, &global_count)) return false;
+        if (!cold_read_u32(data, gend, &gpos, &global_count)) return false;
         for (uint32_t gi = 0; gi < global_count; gi++) {
             Span gname, gtype;
             uint32_t gkind, gsize, ginit;
-            if (!cold_read_str(data, data_len, &gpos, &gname)) return false;
-            if (!cold_read_str(data, data_len, &gpos, &gtype)) return false;
-            if (!cold_read_u32(data, data_len, &gpos, &gkind)) return false;
-            if (!cold_read_u32(data, data_len, &gpos, &gsize)) return false;
-            if (!cold_read_u32(data, data_len, &gpos, &ginit)) return false;
+            if (!cold_read_str(data, gend, &gpos, &gname)) return false;
+            if (!cold_read_str(data, gend, &gpos, &gtype)) return false;
+            if (!cold_read_u32(data, gend, &gpos, &gkind)) return false;
+            if (!cold_read_u32(data, gend, &gpos, &gsize)) return false;
+            if (!cold_read_u32(data, gend, &gpos, &ginit)) return false;
             symbols_add_global(symbols, gname, (int32_t)gkind,
                                (int32_t)gsize, gtype, (int32_t)ginit);
         }
+        if (gpos != gend) return false;
         break;
     }
 
@@ -16281,6 +16461,33 @@ static bool cold_load_csg_v2_obj_facts(
         facts->word_count > CSG_V2_BUDGET_MAX_OP_COUNT) return false;
     if (facts->reloc_count < 0 ||
         facts->reloc_count > CSG_V2_BUDGET_MAX_OP_COUNT) return false;
+    for (int32_t i = 0; i < facts->function_count; i++) {
+        CsgV2ObjFunction *fn = &facts->functions[i];
+        if (!fn->symbol_name || fn->symbol_name[0] == '\0') return false;
+        if (fn->word_count == 0) return false;
+        if (fn->word_offset > (uint32_t)facts->word_count) return false;
+        if (fn->word_count > (uint32_t)facts->word_count - fn->word_offset) return false;
+        for (int32_t j = 0; j < i; j++) {
+            if (facts->functions[j].item_id == fn->item_id) return false;
+            if (strcmp(facts->functions[j].symbol_name, fn->symbol_name) == 0) return false;
+        }
+    }
+    for (int32_t i = 0; i < facts->reloc_count; i++) {
+        if (!facts->reloc_target_symbols[i] ||
+            facts->reloc_target_symbols[i][0] == '\0') return false;
+        int32_t src_idx = -1;
+        for (int32_t j = 0; j < facts->function_count; j++) {
+            if (facts->functions[j].item_id == facts->reloc_source_item_ids[i]) {
+                src_idx = j;
+                break;
+            }
+        }
+        if (src_idx < 0) return false;
+        CsgV2ObjFunction *src = &facts->functions[src_idx];
+        uint32_t rel_word = facts->reloc_word_offsets[i];
+        if (rel_word < src->word_offset ||
+            rel_word >= src->word_offset + src->word_count) return false;
+    }
     return true;
 }
 
@@ -16557,20 +16764,17 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
             for (int32_t i = 0; i < func_count; i++) symbol_offset[i] = -1;
             FunctionPatchList function_patches = {0};
             function_patches.arena = arena;
+            bool ok = false;
 
             for (int32_t i = 0; i < func_count && i < func_count; i++) {
-                if (!function_bodies[i]) continue;
+                if (!function_bodies[i]) {
+                    if (symbols->functions[i].is_external) continue;
+                    goto csg_obj_done;
+                }
                 BodyIR *body = function_bodies[i];
-                symbol_offset[i] = shared->count;
                 if ((uintptr_t)body < 4096 || body->has_fallback ||
                     body->block_count == 0) {
-                    /* Emit stub for degraded/external function bodies */
-                    code_emit(shared, a64_stp_pre(FP, LR, SP, -16));
-                    code_emit(shared, a64_add_imm(FP, SP, 0, true));
-                    code_emit(shared, a64_movz(R0, 0, 0));
-                    code_emit(shared, a64_ldp_post(FP, LR, SP, 16));
-                    code_emit(shared, a64_ret());
-                    continue;
+                    goto csg_obj_done;
                 }
                 int32_t saved_count = shared->count;
                 symbol_offset[i] = saved_count;
@@ -16579,19 +16783,12 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
                     codegen_func(shared, body, symbols, &function_patches);
                 } else {
                     shared->count = saved_count;
-                    int32_t rk = body->return_kind;
-                    code_emit(shared, a64_stp_pre(FP, LR, SP, -16));
-                    code_emit(shared, a64_add_imm(FP, SP, 0, true));
-                    if (rk == SLOT_I64 || rk == SLOT_PTR || rk == SLOT_OPAQUE)
-                        code_emit(shared, a64_movz_x(R0, 0, 0));
-                    else
-                        code_emit(shared, a64_movz(R0, 0, 0));
-                    code_emit(shared, a64_ldp_post(FP, LR, SP, 16));
-                    code_emit(shared, a64_ret());
+                    symbol_offset[i] = -1;
+                    ColdErrorRecoveryEnabled = false;
+                    goto csg_obj_done;
                 }
             }
 
-            bool ok = false;
             ColdErrorRecoveryEnabled = true;
             if (setjmp(ColdErrorJumpBuf) == 0) {
 
@@ -16900,21 +17097,10 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
             ColdErrorRecoveryEnabled = false;
             } else {
                 ColdErrorRecoveryEnabled = false;
-                bool is_elf = target && strstr(target, "linux") != 0;
-                bool is_coff = target && strstr(target, "windows") != 0;
-                uint16_t em = 0, cm = 0;
-                if (is_elf) {
-                    if (strstr(target, "aarch64")) em = EM_AARCH64;
-                    else if (strstr(target, "riscv64")) em = EM_RISCV;
-                    else if (strstr(target, "x86_64")) em = EM_X86_64;
-                }
-                if (is_coff && strstr(target, "x86_64")) cm = IMAGE_FILE_MACHINE_AMD64;
-                if (is_elf) elf64_write_object(out_path, shared->words, shared->count, 0, 0, 0, 0, 0, 0, 0, em);
-                else if (is_coff) coff_write_object(out_path, shared->words, shared->count, 0, 0, 0, 0, 0, 0, 0, cm);
-                else macho_write_object(out_path, shared->words, shared->count, 0, 0, 0, 0, 0, 0, 0);
-                ok = true;
             }
 
+            csg_obj_done:
+            ColdErrorRecoveryEnabled = false;
             if (stats) {
                 stats->function_count = symbols->function_count;
                 stats->csg_lowering = 1;
@@ -20725,6 +20911,716 @@ static int cold_cmd_provider_archive_pack(int argc, char **argv) {
     return 0;
 }
 
+/* ================================================================
+ * WASM (WebAssembly) backend
+ * ================================================================ */
+
+/* WASM value types */
+#define WASM_TYPE_I32 0x7F
+#define WASM_TYPE_I64 0x7E
+#define WASM_TYPE_F32 0x7D
+#define WASM_TYPE_F64 0x7C
+
+/* WASM opcodes */
+#define WASM_OP_UNREACHABLE 0x00
+#define WASM_OP_END      0x0B
+#define WASM_OP_RETURN   0x0F
+#define WASM_OP_CALL     0x10
+#define WASM_OP_LOCAL_GET 0x20
+#define WASM_OP_LOCAL_SET 0x21
+#define WASM_OP_I32_CONST 0x41
+#define WASM_OP_I64_CONST 0x42
+#define WASM_OP_I32_EQZ  0x45
+#define WASM_OP_I32_EQ   0x46
+#define WASM_OP_I32_NE   0x47
+#define WASM_OP_I32_LT_S 0x48
+#define WASM_OP_I32_GT_S 0x4A
+#define WASM_OP_I32_LE_S 0x4C
+#define WASM_OP_I32_GE_S 0x4E
+#define WASM_OP_I32_ADD  0x6A
+#define WASM_OP_I32_SUB  0x6B
+#define WASM_OP_I32_MUL  0x6C
+#define WASM_OP_I32_DIV_S 0x6D
+#define WASM_OP_I32_REM_S 0x6F
+#define WASM_OP_I32_AND  0x71
+#define WASM_OP_I32_OR   0x72
+#define WASM_OP_I32_XOR  0x73
+#define WASM_OP_I32_SHL  0x74
+#define WASM_OP_I32_SHR_S 0x75
+#define WASM_OP_I64_ADD  0x7C
+#define WASM_OP_I64_SUB  0x7D
+#define WASM_OP_I64_MUL  0x7E
+#define WASM_OP_I64_DIV_S 0x7F
+#define WASM_OP_I64_REM_S 0x80
+#define WASM_OP_I64_AND  0x83
+#define WASM_OP_I64_OR   0x84
+#define WASM_OP_I64_XOR  0x85
+#define WASM_OP_I64_SHL  0x86
+#define WASM_OP_I64_SHR_S 0x87
+#define WASM_OP_I64_CONST 0x42
+#define WASM_OP_I64_EQZ  0x50
+#define WASM_OP_I64_EQ   0x51
+#define WASM_OP_I64_NE   0x52
+#define WASM_OP_I64_LT_S 0x53
+#define WASM_OP_I64_GT_S 0x55
+#define WASM_OP_I64_LE_S 0x57
+#define WASM_OP_I64_GE_S 0x59
+
+/* WASM section IDs */
+#define WASM_SECTION_TYPE     1
+#define WASM_SECTION_IMPORT   2
+#define WASM_SECTION_FUNCTION 3
+#define WASM_SECTION_EXPORT   7
+#define WASM_SECTION_CODE    10
+
+/* Byte-level code buffer for WASM (like X64Code) */
+typedef struct WasmCode {
+    uint8_t *buf;
+    int32_t cap;
+    int32_t len;
+} WasmCode;
+
+static void wasm_init(WasmCode *c, int32_t cap) {
+    c->buf = (uint8_t *)calloc(1, (size_t)cap);
+    c->cap = cap;
+    c->len = 0;
+}
+
+static void wasm_emit1(WasmCode *c, uint8_t b) {
+    if (c->len < c->cap) c->buf[c->len++] = b;
+}
+
+static void wasm_emit_leb128_u(WasmCode *c, uint32_t value) {
+    do {
+        uint8_t byte = (uint8_t)(value & 0x7F);
+        value >>= 7;
+        if (value) byte |= 0x80;
+        wasm_emit1(c, byte);
+    } while (value);
+}
+
+static void wasm_emit_leb128_s(WasmCode *c, int32_t value) {
+    bool more = true;
+    while (more) {
+        uint8_t byte = (uint8_t)(value & 0x7F);
+        value >>= 7;
+        if ((value == 0 && (byte & 0x40) == 0) || (value == -1 && (byte & 0x40) != 0))
+            more = false;
+        else
+            byte |= 0x80;
+        wasm_emit1(c, byte);
+    }
+}
+
+/* WASM opcode helpers */
+static void wasm_op_i32_const(WasmCode *c, int32_t val) {
+    wasm_emit1(c, WASM_OP_I32_CONST);
+    wasm_emit_leb128_s(c, val);
+}
+
+static void wasm_op_local_get(WasmCode *c, uint32_t idx) {
+    wasm_emit1(c, WASM_OP_LOCAL_GET);
+    wasm_emit_leb128_u(c, idx);
+}
+
+static void wasm_op_local_set(WasmCode *c, uint32_t idx) {
+    wasm_emit1(c, WASM_OP_LOCAL_SET);
+    wasm_emit_leb128_u(c, idx);
+}
+
+static void wasm_op_call(WasmCode *c, uint32_t idx) {
+    wasm_emit1(c, WASM_OP_CALL);
+    wasm_emit_leb128_u(c, idx);
+}
+
+/* Convert BodyIR slot kind to WASM value type */
+static uint8_t wasm_valtype_for_slot(int32_t slot_kind) {
+    if (slot_kind == SLOT_I32 || slot_kind == SLOT_PTR || slot_kind == SLOT_I32_REF)
+        return WASM_TYPE_I32;
+    if (slot_kind == SLOT_I64 || slot_kind == SLOT_I64_REF)
+        return WASM_TYPE_I64;
+    if (slot_kind == SLOT_F32)
+        return WASM_TYPE_F32;
+    if (slot_kind == SLOT_F64)
+        return WASM_TYPE_F64;
+    /* SLOT_STR, SLOT_VARIANT, SLOT_SEQ_*, etc. => i32 (wasm32 pointer) */
+    return WASM_TYPE_I32;
+}
+
+/* Determine WASM result type from FnDef return type span */
+static uint8_t wasm_result_type_for_fn(FnDef *fn) {
+    if (fn->ret.len <= 0) return 0;
+    Span r = fn->ret;
+    if (span_eq(r, "int32") || span_eq(r, "i32") || span_eq(r, "int") || span_eq(r, "bool"))
+        return WASM_TYPE_I32;
+    if (span_eq(r, "int64") || span_eq(r, "i64")) return WASM_TYPE_I64;
+    if (span_eq(r, "float") || span_eq(r, "f32")) return WASM_TYPE_F32;
+    if (span_eq(r, "double") || span_eq(r, "f64")) return WASM_TYPE_F64;
+    return 0; /* void for composite/unknown types */
+}
+
+/* Map BodyIR slot to WASM local index (computed at codegen time) */
+static int32_t wasm_local_for_slot(BodyIR *body, int32_t slot) {
+    for (int32_t pi = 0; pi < body->param_count; pi++) {
+        if (body->param_slot[pi] == slot) return pi;
+    }
+    int32_t idx = body->param_count;
+    for (int32_t s = 0; s < slot; s++) {
+        bool is_param = false;
+        for (int32_t pi = 0; pi < body->param_count; pi++) {
+            if (body->param_slot[pi] == s) { is_param = true; break; }
+        }
+        if (!is_param && body->slot_kind[s] != 0) idx++;
+    }
+    return idx;
+}
+
+/* Count declared locals (non-param slots) of a given WASM type */
+static int32_t wasm_count_declared_locals(BodyIR *body, uint8_t wasm_type) {
+    int32_t count = 0;
+    for (int32_t s = 0; s < body->slot_count; s++) {
+        bool is_param = false;
+        for (int32_t pi = 0; pi < body->param_count; pi++) {
+            if (body->param_slot[pi] == s) { is_param = true; break; }
+        }
+        if (!is_param && body->slot_kind[s] != 0 &&
+            wasm_valtype_for_slot(body->slot_kind[s]) == wasm_type) {
+            count++;
+        }
+    }
+    return count;
+}
+
+/* Emit WASM bytecode for a single BodyIR operation */
+static void wasm_codegen_op(WasmCode *wasm, BodyIR *body, Symbols *symbols,
+                            FunctionPatchList *patches, int32_t op, int32_t *func_to_wasm_idx) {
+    (void)symbols;
+    (void)patches;
+    int32_t kind = body->op_kind[op];
+    if (kind == BODY_OP_NOP) return;
+    int32_t dst = body->op_dst[op];
+    int32_t a = body->op_a[op], b = body->op_b[op], c = body->op_c[op];
+    int32_t la, lb, ld;
+
+    switch (kind) {
+    case BODY_OP_I32_CONST:
+        wasm_op_i32_const(wasm, (int32_t)a);
+        wasm_op_local_set(wasm, (uint32_t)wasm_local_for_slot(body, dst));
+        break;
+    case BODY_OP_I64_CONST: {
+        uint64_t bits = (uint32_t)a | ((uint64_t)(uint32_t)b << 32);
+        if (bits <= 0x7FFFFFFFULL || (int64_t)bits >= (int64_t)0xFFFFFFFF80000000LL) {
+            wasm_emit1(wasm, WASM_OP_I64_CONST);
+            wasm_emit_leb128_s(wasm, (int32_t)(uint32_t)bits);
+        } else {
+            int32_t lo = (int32_t)(uint32_t)bits;
+            int32_t hi = (int32_t)(uint32_t)(bits >> 32);
+            wasm_emit1(wasm, WASM_OP_I32_CONST);
+            wasm_emit_leb128_s(wasm, lo);
+            wasm_emit1(wasm, 0xAD); /* i64.extend_i32_u (0xAD) */
+            wasm_emit1(wasm, WASM_OP_I32_CONST);
+            wasm_emit_leb128_s(wasm, hi);
+            wasm_emit1(wasm, 0xAC); /* i64.extend_i32_s (0xAC) */
+            wasm_emit1(wasm, WASM_OP_I64_CONST);
+            wasm_emit_leb128_s(wasm, 32);
+            wasm_emit1(wasm, 0x86); /* i64.shl (0x86) */
+            wasm_emit1(wasm, 0x84); /* i64.or (0x84) */
+        }
+        wasm_op_local_set(wasm, (uint32_t)wasm_local_for_slot(body, dst));
+        break;
+    }
+    case BODY_OP_COPY_I32:
+        la = wasm_local_for_slot(body, a);
+        ld = wasm_local_for_slot(body, dst);
+        wasm_op_local_get(wasm, (uint32_t)la);
+        wasm_op_local_set(wasm, (uint32_t)ld);
+        break;
+    case BODY_OP_COPY_I64:
+    case BODY_OP_I64_FROM_I32:
+        la = wasm_local_for_slot(body, a);
+        ld = wasm_local_for_slot(body, dst);
+        wasm_op_local_get(wasm, (uint32_t)la);
+        wasm_op_local_set(wasm, (uint32_t)ld);
+        break;
+    case BODY_OP_I32_FROM_I64:
+        la = wasm_local_for_slot(body, a);
+        ld = wasm_local_for_slot(body, dst);
+        wasm_op_local_get(wasm, (uint32_t)la);
+        wasm_op_local_set(wasm, (uint32_t)ld);
+        break;
+    case BODY_OP_I32_ADD:
+    case BODY_OP_I32_SUB:
+    case BODY_OP_I32_MUL:
+    case BODY_OP_I32_DIV:
+    case BODY_OP_I32_MOD:
+    case BODY_OP_I32_AND:
+    case BODY_OP_I32_OR:
+    case BODY_OP_I32_XOR:
+    case BODY_OP_I32_SHL:
+    case BODY_OP_I32_ASR:
+        la = wasm_local_for_slot(body, a);
+        lb = wasm_local_for_slot(body, b);
+        ld = wasm_local_for_slot(body, dst);
+        wasm_op_local_get(wasm, (uint32_t)la);
+        wasm_op_local_get(wasm, (uint32_t)lb);
+        if (kind == BODY_OP_I32_ADD) wasm_emit1(wasm, WASM_OP_I32_ADD);
+        else if (kind == BODY_OP_I32_SUB) wasm_emit1(wasm, WASM_OP_I32_SUB);
+        else if (kind == BODY_OP_I32_MUL) wasm_emit1(wasm, WASM_OP_I32_MUL);
+        else if (kind == BODY_OP_I32_DIV) wasm_emit1(wasm, WASM_OP_I32_DIV_S);
+        else if (kind == BODY_OP_I32_MOD) wasm_emit1(wasm, WASM_OP_I32_REM_S);
+        else if (kind == BODY_OP_I32_AND) wasm_emit1(wasm, WASM_OP_I32_AND);
+        else if (kind == BODY_OP_I32_OR) wasm_emit1(wasm, WASM_OP_I32_OR);
+        else if (kind == BODY_OP_I32_XOR) wasm_emit1(wasm, WASM_OP_I32_XOR);
+        else if (kind == BODY_OP_I32_SHL) wasm_emit1(wasm, WASM_OP_I32_SHL);
+        else if (kind == BODY_OP_I32_ASR) wasm_emit1(wasm, WASM_OP_I32_SHR_S);
+        wasm_op_local_set(wasm, (uint32_t)ld);
+        break;
+    case BODY_OP_I64_ADD:
+    case BODY_OP_I64_SUB:
+    case BODY_OP_I64_MUL:
+    case BODY_OP_I64_DIV:
+    case BODY_OP_I64_AND:
+    case BODY_OP_I64_OR:
+    case BODY_OP_I64_XOR:
+    case BODY_OP_I64_SHL:
+    case BODY_OP_I64_ASR:
+        la = wasm_local_for_slot(body, a);
+        lb = wasm_local_for_slot(body, b);
+        ld = wasm_local_for_slot(body, dst);
+        wasm_op_local_get(wasm, (uint32_t)la);
+        wasm_op_local_get(wasm, (uint32_t)lb);
+        if (kind == BODY_OP_I64_ADD) wasm_emit1(wasm, WASM_OP_I64_ADD);
+        else if (kind == BODY_OP_I64_SUB) wasm_emit1(wasm, WASM_OP_I64_SUB);
+        else if (kind == BODY_OP_I64_MUL) wasm_emit1(wasm, WASM_OP_I64_MUL);
+        else if (kind == BODY_OP_I64_DIV) wasm_emit1(wasm, WASM_OP_I64_DIV_S);
+        else if (kind == BODY_OP_I64_AND) wasm_emit1(wasm, WASM_OP_I64_AND);
+        else if (kind == BODY_OP_I64_OR) wasm_emit1(wasm, WASM_OP_I64_OR);
+        else if (kind == BODY_OP_I64_XOR) wasm_emit1(wasm, WASM_OP_I64_XOR);
+        else if (kind == BODY_OP_I64_SHL) wasm_emit1(wasm, WASM_OP_I64_SHL);
+        else if (kind == BODY_OP_I64_ASR) wasm_emit1(wasm, WASM_OP_I64_SHR_S);
+        wasm_op_local_set(wasm, (uint32_t)ld);
+        break;
+    case BODY_OP_I32_CMP:
+    case BODY_OP_I64_CMP: {
+        la = wasm_local_for_slot(body, a);
+        lb = wasm_local_for_slot(body, b);
+        ld = wasm_local_for_slot(body, dst);
+        bool is64 = (kind == BODY_OP_I64_CMP);
+        wasm_op_local_get(wasm, (uint32_t)la);
+        wasm_op_local_get(wasm, (uint32_t)lb);
+        if (c == COND_EQ) wasm_emit1(wasm, is64 ? WASM_OP_I64_EQ : WASM_OP_I32_EQ);
+        else if (c == COND_NE) wasm_emit1(wasm, is64 ? WASM_OP_I64_NE : WASM_OP_I32_NE);
+        else if (c == COND_LT) wasm_emit1(wasm, is64 ? WASM_OP_I64_LT_S : WASM_OP_I32_LT_S);
+        else if (c == COND_GE) {
+            /* a >= b  =>  !(a < b), use LT and eqz */
+            wasm_emit1(wasm, is64 ? WASM_OP_I64_LT_S : WASM_OP_I32_LT_S);
+            wasm_emit1(wasm, is64 ? WASM_OP_I64_EQZ : WASM_OP_I32_EQZ);
+        } else {
+            wasm_emit1(wasm, is64 ? WASM_OP_I64_GT_S : WASM_OP_I32_GT_S);
+        }
+        wasm_op_local_set(wasm, (uint32_t)ld);
+        break;
+    }
+    case BODY_OP_CALL_I32: {
+        int32_t wf = (a >= 0 && a < symbols->function_count) ? func_to_wasm_idx[a] : a;
+        /* Push arguments onto stack */
+        for (int32_t ai = 0; ai < c; ai++) {
+            int32_t arg_slot = body->call_arg_slot[b + ai];
+            wasm_op_local_get(wasm, (uint32_t)wasm_local_for_slot(body, arg_slot));
+        }
+        wasm_op_call(wasm, (uint32_t)wf);
+        if (dst >= 0) {
+            ld = wasm_local_for_slot(body, dst);
+            wasm_op_local_set(wasm, (uint32_t)ld);
+        }
+        break;
+    }
+    case BODY_OP_CALL_COMPOSITE: {
+        int32_t wf = (a >= 0 && a < symbols->function_count) ? func_to_wasm_idx[a] : a;
+        for (int32_t ai = 0; ai < c; ai++) {
+            int32_t arg_slot = body->call_arg_slot[b + ai];
+            wasm_op_local_get(wasm, (uint32_t)wasm_local_for_slot(body, arg_slot));
+        }
+        wasm_op_call(wasm, (uint32_t)wf);
+        if (dst >= 0) {
+            ld = wasm_local_for_slot(body, dst);
+            wasm_op_local_set(wasm, (uint32_t)ld);
+        }
+        break;
+    }
+    case BODY_OP_PTR_CONST:
+        wasm_op_i32_const(wasm, (int32_t)a);
+        wasm_op_local_set(wasm, (uint32_t)wasm_local_for_slot(body, dst));
+        break;
+    case BODY_OP_PTR_ADD: {
+        int32_t la = wasm_local_for_slot(body, a);
+        int32_t lb = wasm_local_for_slot(body, b);
+        ld = wasm_local_for_slot(body, dst);
+        wasm_op_local_get(wasm, (uint32_t)la);
+        if (body->slot_kind[b] == SLOT_I64)
+            wasm_op_local_get(wasm, (uint32_t)lb);
+        else
+            wasm_op_local_get(wasm, (uint32_t)lb);
+        wasm_emit1(wasm, 0x6A); /* i32.add */
+        wasm_op_local_set(wasm, (uint32_t)ld);
+        break;
+    }
+    case BODY_OP_LOAD_I32:
+        /* LOAD_I32: copy from slot a to slot dst. If dst==a, it's a no-op. */
+        if (dst != a) {
+            la = wasm_local_for_slot(body, a);
+            ld = wasm_local_for_slot(body, dst);
+            wasm_op_local_get(wasm, (uint32_t)la);
+            wasm_op_local_set(wasm, (uint32_t)ld);
+        }
+        break;
+    case BODY_OP_ARGC_LOAD:
+    case BODY_OP_ARGV_STR:
+        /* Stub: store 0 */
+        wasm_op_i32_const(wasm, 0);
+        wasm_op_local_set(wasm, (uint32_t)wasm_local_for_slot(body, dst));
+        break;
+    case BODY_OP_EXIT:
+        /* Stub: just store 0 to dst */
+        if (dst >= 0) {
+            wasm_op_i32_const(wasm, 0);
+            wasm_op_local_set(wasm, (uint32_t)wasm_local_for_slot(body, dst));
+        }
+        break;
+    case BODY_OP_FIELD_REF:
+    case BODY_OP_PAYLOAD_LOAD:
+    case BODY_OP_TAG_LOAD:
+        /* Stub: load from slot a, store to dst (payload load just copies pointer) */
+        la = wasm_local_for_slot(body, a);
+        ld = wasm_local_for_slot(body, dst);
+        wasm_op_local_get(wasm, (uint32_t)la);
+        wasm_op_local_set(wasm, (uint32_t)ld);
+        break;
+    case BODY_OP_MAKE_VARIANT:
+    case BODY_OP_MAKE_COMPOSITE:
+    case BODY_OP_TEXT_SET_INIT:
+        /* Zero-fill the composite slot */
+        wasm_op_i32_const(wasm, 0);
+        wasm_op_local_set(wasm, (uint32_t)wasm_local_for_slot(body, dst));
+        break;
+    case BODY_OP_UNWRAP_OR_RETURN: {
+        /* Check tag: if tag != expected (b), return 0 */
+        int32_t tag_local = wasm_local_for_slot(body, a);
+        wasm_op_local_get(wasm, (uint32_t)tag_local);
+        wasm_op_i32_const(wasm, (int32_t)b);
+        wasm_emit1(wasm, WASM_OP_I32_EQ);
+        /* if equal, drop and continue; else return 0 */
+        /* We use if/else/end */
+        wasm_emit1(wasm, 0x04); /* if */
+        wasm_emit1(wasm, WASM_TYPE_I32); /* empty block type */
+        wasm_emit1(wasm, 0x05); /* else */
+        wasm_op_i32_const(wasm, 0);
+        wasm_emit1(wasm, WASM_OP_RETURN);
+        wasm_emit1(wasm, WASM_OP_END);
+        break;
+    }
+    case BODY_OP_STR_LITERAL:
+    case BODY_OP_STR_LEN:
+        /* Stub: store null/0 */
+        wasm_op_i32_const(wasm, 0);
+        wasm_op_local_set(wasm, (uint32_t)wasm_local_for_slot(body, dst));
+        wasm_op_i32_const(wasm, 0);
+        if (wasm_local_for_slot(body, dst) + 1 < body->slot_count)
+            wasm_op_local_set(wasm, (uint32_t)(wasm_local_for_slot(body, dst) + 1));
+        break;
+    default:
+        /* Unsupported op: stub with store-0 for the destination slot */
+        if (dst >= 0 && dst < body->slot_count) {
+            wasm_op_i32_const(wasm, 0);
+            wasm_op_local_set(wasm, (uint32_t)wasm_local_for_slot(body, dst));
+        }
+        break;
+    }
+}
+
+/* Generate WASM bytecode for a single function body */
+static void wasm_codegen_func(WasmCode *wasm, BodyIR *body, Symbols *symbols,
+                              FunctionPatchList *patches, int32_t func_idx,
+                              int32_t *func_to_wasm_idx) {
+    /* Emit function body (without size header - will be wrapped in code section) */
+    /* 1. Local declarations */
+    int32_t i32_cnt = wasm_count_declared_locals(body, WASM_TYPE_I32);
+    int32_t i64_cnt = wasm_count_declared_locals(body, WASM_TYPE_I64);
+    int32_t local_decl_count = 0;
+    if (i32_cnt > 0) local_decl_count++;
+    if (i64_cnt > 0) local_decl_count++;
+    wasm_emit_leb128_u(wasm, (uint32_t)local_decl_count);
+    if (i32_cnt > 0) {
+        wasm_emit_leb128_u(wasm, (uint32_t)i32_cnt);
+        wasm_emit1(wasm, WASM_TYPE_I32);
+    }
+    if (i64_cnt > 0) {
+        wasm_emit_leb128_u(wasm, (uint32_t)i64_cnt);
+        wasm_emit1(wasm, WASM_TYPE_I64);
+    }
+
+    /* 2. Emit ops for each block */
+    for (int32_t bi = 0; bi < body->block_count; bi++) {
+        int32_t bs = body->block_op_start[bi];
+        int32_t be = bs + body->block_op_count[bi];
+        for (int32_t oi = bs; oi < be; oi++)
+            wasm_codegen_op(wasm, body, symbols, patches, oi, func_to_wasm_idx);
+
+        /* 3. Handle terminator */
+        int32_t term = body->block_term[bi];
+        if (term < 0) continue;
+        int32_t tkind = body->term_kind[term];
+        if (tkind == BODY_TERM_RET) {
+            int32_t val_slot = body->term_value[term];
+            int32_t val_kind = body->slot_kind[val_slot];
+            uint8_t rt = wasm_result_type_for_fn(&symbols->functions[func_idx]);
+            /* Load return value onto stack. For composite returns, just return 0. */
+            if (val_slot >= 0 && rt != 0) {
+                wasm_op_local_get(wasm, (uint32_t)wasm_local_for_slot(body, val_slot));
+            } else {
+                wasm_op_i32_const(wasm, 0);
+            }
+            /* If the function has sret, the return type should be void */
+            if (body->sret_slot >= 0) {
+                /* void return - just return */
+            }
+            wasm_emit1(wasm, WASM_OP_RETURN);
+        } else if (tkind == BODY_TERM_UNREACHABLE) {
+            wasm_emit1(wasm, WASM_OP_UNREACHABLE);
+            /* Actually just use 0x00 which is unreachable */
+        }
+    }
+    wasm_emit1(wasm, WASM_OP_END);
+}
+
+/* Write a complete .wasm binary module.
+ * func_bodies: byte buffer containing all function bodies (concatenated)
+ * func_offsets: byte offset of each function body in func_bodies
+ * emit_count: number of emitted functions (same as func_offsets size)
+ * func_names: function names
+ * name_count: number of named entries
+ * symbols: symbol table with function definitions
+ * func_to_wasm_idx: maps symbol index -> WASM function index
+ */
+static bool wasm_write_object(const char *out_path, WasmCode *func_bodies,
+                              int32_t *func_offsets, int32_t emit_count,
+                              const char **func_names, int32_t name_count,
+                              Symbols *symbols, int32_t *func_to_wasm_idx) {
+    WasmCode mod;
+    wasm_init(&mod, 65536);
+    int32_t func_count = symbols->function_count;
+
+    /* Count imports (external functions) */
+    int32_t import_count = 0;
+    for (int32_t i = 0; i < func_count; i++) {
+        if (symbols->functions[i].is_external) import_count++;
+    }
+
+    /* Build a mapping: internal func symbol_index -> type section index */
+    /* All functions (import + internal) share the type section.
+       We use a simple approach: each function gets its own type entry (no dedup). */
+
+    /* ---- Build TYPE section ---- */
+    WasmCode ts;
+    wasm_init(&ts, 4096);
+    /* For wasm: type count = all function signatures */
+    wasm_emit_leb128_u(&ts, (uint32_t)func_count);
+    for (int32_t i = 0; i < func_count; i++) {
+        wasm_emit1(&ts, 0x60); /* functype */
+        FnDef *fn = &symbols->functions[i];
+        /* Params */
+        int32_t arity = fn->arity;
+        if (arity > 32) arity = 32;
+        wasm_emit_leb128_u(&ts, (uint32_t)arity);
+        for (int32_t pi = 0; pi < arity; pi++) {
+            wasm_emit1(&ts, wasm_valtype_for_slot(fn->param_kind[pi]));
+        }
+        /* Results */
+        uint8_t rt = wasm_result_type_for_fn(fn);
+        if (rt != 0) {
+            wasm_emit_leb128_u(&ts, 1);
+            wasm_emit1(&ts, rt);
+        } else {
+            wasm_emit_leb128_u(&ts, 0);
+        }
+    }
+
+    /* ---- Build IMPORT section ---- */
+    WasmCode ims;
+    wasm_init(&ims, 4096);
+    if (import_count > 0) {
+        wasm_emit_leb128_u(&ims, (uint32_t)import_count);
+        int32_t import_idx = 0;
+        for (int32_t i = 0; i < func_count; i++) {
+            if (!symbols->functions[i].is_external) continue;
+            /* Module: "env" */
+            wasm_emit_leb128_u(&ims, 3);
+            wasm_emit1(&ims, 'e'); wasm_emit1(&ims, 'n'); wasm_emit1(&ims, 'v');
+            /* Field name = function name */
+            Span nm = symbols->functions[i].name;
+            int32_t nmlen = nm.len > 0 ? nm.len : 1;
+            wasm_emit_leb128_u(&ims, (uint32_t)nmlen);
+            for (int32_t ni = 0; ni < nmlen; ni++)
+                wasm_emit1(&ims, (uint8_t)nm.ptr[ni]);
+            /* Import kind: func */
+            wasm_emit1(&ims, 0x00);
+            /* Type index */
+            wasm_emit_leb128_u(&ims, (uint32_t)i);
+            /* Assignment: WASM import entry index = import_idx */
+            func_to_wasm_idx[i] = import_idx;
+            import_idx++;
+        }
+    }
+
+    /* ---- Build FUNCTION section ---- */
+    WasmCode fns;
+    wasm_init(&fns, 4096);
+    int32_t func_body_count = 0;
+    for (int32_t i = 0; i < func_count; i++) {
+        if (symbols->functions[i].is_external) continue;
+        func_body_count++;
+    }
+    wasm_emit_leb128_u(&fns, (uint32_t)func_body_count);
+    int32_t wasm_fn_idx = import_count;
+    for (int32_t i = 0; i < func_count; i++) {
+        if (symbols->functions[i].is_external) continue;
+        wasm_emit_leb128_u(&fns, (uint32_t)i); /* type index = function index in type section */
+        func_to_wasm_idx[i] = wasm_fn_idx;
+        wasm_fn_idx++;
+    }
+
+    /* ---- Build EXPORT section ---- */
+    WasmCode exs;
+    wasm_init(&exs, 4096);
+    int32_t export_count = 0;
+    /* Count exports: defined functions with public names */
+    for (int32_t ni = 0; ni < name_count; ni++) {
+        if (ni < emit_count && func_offsets[ni] >= 0) export_count++;
+    }
+    wasm_emit_leb128_u(&exs, (uint32_t)export_count);
+    for (int32_t ni = 0; ni < name_count; ni++) {
+        if (func_offsets[ni] < 0) continue;
+        /* Export name */
+        const char *name = func_names[ni];
+        int32_t nlen = (int32_t)strlen(name);
+        wasm_emit_leb128_u(&exs, (uint32_t)nlen);
+        for (int32_t ei = 0; ei < nlen; ei++)
+            wasm_emit1(&exs, (uint8_t)name[ei]);
+        /* Export kind: func */
+        wasm_emit1(&exs, 0x00);
+        /* Function index */
+        int32_t fi = -1;
+        /* Find the function index from the symbol table */
+        for (int32_t si = 0; si < func_count; si++) {
+            if (!symbols->functions[si].is_external &&
+                strcmp(name, (const char *)symbols->functions[si].name.ptr) == 0) {
+                /* Need exact name match; might need span comparison */
+                Span sn = symbols->functions[si].name;
+                if ((int32_t)strlen(name) == sn.len &&
+                    memcmp(name, sn.ptr, (size_t)sn.len) == 0) {
+                    fi = func_to_wasm_idx[si];
+                    break;
+                }
+            }
+        }
+        if (fi < 0) fi = 0; /* fallback */
+        wasm_emit_leb128_u(&exs, (uint32_t)fi);
+    }
+
+    /* ---- Build CODE section ---- */
+    WasmCode cs;
+    wasm_init(&cs, 65536);
+    wasm_emit_leb128_u(&cs, (uint32_t)func_body_count);
+    /* Determine function body sizes from offsets */
+    for (int32_t i = 0, emit_idx = 0; i < func_count; i++) {
+        if (symbols->functions[i].is_external) continue;
+        /* Find the body offset from emit order */
+        int32_t body_off = -1, body_sz = 0;
+        for (int32_t ni = 0; ni < name_count; ni++) {
+            /* func_names[ni] matches one of the emitted functions.
+               func_offsets[ni] is the byte offset.
+               We need to find which emitted function index maps to symbol i. */
+            /* For simplicity, match by position order */
+        }
+        /* Simpler approach: use emit_count to iterate over offsets */
+        (void)emit_idx;
+        emit_idx++;
+    }
+    /* Simpler: just pack the function bodies from the code buffer */
+    /* We need to wrap each function body with its size. */
+    /* The func_bodies buffer has all function body content concatenated.
+       Each body starts at func_offsets[eni] for emit index eni.
+       We need to know the size of each body. */
+    /* Let's compute sizes from the offsets */
+    int32_t *body_sizes = (int32_t *)calloc((size_t)emit_count, sizeof(int32_t));
+    if (!body_sizes) return false;
+    for (int32_t ei = 0; ei < emit_count; ei++) {
+        int32_t next_off = (ei + 1 < emit_count) ? func_offsets[ei + 1] : func_bodies->len;
+        body_sizes[ei] = next_off - func_offsets[ei];
+    }
+    /* Now write code section - need to map emit indices to WASM func indices */
+    wasm_fn_idx = import_count;
+    for (int32_t ei = 0; ei < emit_count; ei++) {
+        int32_t body_off = func_offsets[ei];
+        int32_t body_sz = body_sizes[ei];
+        /* Body size field (LEB128) covers the body content after the size */
+        wasm_emit_leb128_u(&cs, (uint32_t)body_sz);
+        for (int32_t bi = 0; bi < body_sz; bi++)
+            wasm_emit1(&cs, func_bodies->buf[body_off + bi]);
+    }
+    free(body_sizes);
+
+    /* ---- Write magic + version + sections ---- */
+    /* Magic: \0asm (0x00 0x61 0x73 0x6D) */
+    wasm_emit1(&mod, 0x00); wasm_emit1(&mod, 0x61);
+    wasm_emit1(&mod, 0x73); wasm_emit1(&mod, 0x6D);
+    /* Version: 1 (0x01 0x00 0x00 0x00) */
+    wasm_emit1(&mod, 0x01); wasm_emit1(&mod, 0x00);
+    wasm_emit1(&mod, 0x00); wasm_emit1(&mod, 0x00);
+
+    /* Type section */
+    wasm_emit1(&mod, WASM_SECTION_TYPE);
+    wasm_emit_leb128_u(&mod, (uint32_t)ts.len);
+    for (int32_t i = 0; i < ts.len; i++) wasm_emit1(&mod, ts.buf[i]);
+
+    /* Import section (if any) */
+    if (import_count > 0) {
+        wasm_emit1(&mod, WASM_SECTION_IMPORT);
+        wasm_emit_leb128_u(&mod, (uint32_t)ims.len);
+        for (int32_t i = 0; i < ims.len; i++) wasm_emit1(&mod, ims.buf[i]);
+    }
+
+    /* Function section */
+    wasm_emit1(&mod, WASM_SECTION_FUNCTION);
+    wasm_emit_leb128_u(&mod, (uint32_t)fns.len);
+    for (int32_t i = 0; i < fns.len; i++) wasm_emit1(&mod, fns.buf[i]);
+
+    /* Export section */
+    wasm_emit1(&mod, WASM_SECTION_EXPORT);
+    wasm_emit_leb128_u(&mod, (uint32_t)exs.len);
+    for (int32_t i = 0; i < exs.len; i++) wasm_emit1(&mod, exs.buf[i]);
+
+    /* Code section */
+    wasm_emit1(&mod, WASM_SECTION_CODE);
+    wasm_emit_leb128_u(&mod, (uint32_t)cs.len);
+    for (int32_t i = 0; i < cs.len; i++) wasm_emit1(&mod, cs.buf[i]);
+
+    /* Write to file */
+    FILE *f = fopen(out_path, "wb");
+    if (!f) { free(ts.buf); free(ims.buf); free(fns.buf); free(exs.buf); free(cs.buf); free(mod.buf); return false; }
+    size_t written = fwrite(mod.buf, 1, (size_t)mod.len, f);
+    fclose(f);
+    free(ts.buf); free(ims.buf); free(fns.buf); free(exs.buf); free(cs.buf); free(mod.buf);
+    return written == (size_t)mod.len;
+}
+
+/* Unused opcode workaround: mark referenced */
+__attribute__((unused)) static int wasm_unused_ops[] = {
+    WASM_OP_I64_DIV_S, WASM_OP_I64_REM_S, WASM_OP_I64_SUB,
+    WASM_OP_I64_EQ, WASM_OP_I64_NE, WASM_OP_I64_LT_S, WASM_OP_I64_GT_S,
+    WASM_OP_I64_LE_S, WASM_OP_I64_GE_S, WASM_OP_I64_EQZ
+};
+
 /* Compile source to relocatable object file (.o/.obj) with symbol table. */
 #ifndef COLD_BACKEND_ONLY
 bool cold_compile_source_to_object(const char *out_path,
@@ -20734,6 +21630,7 @@ bool cold_compile_source_to_object(const char *out_path,
                                    const char *symbol_visibility) {
     bool is_elf  = target && strstr(target, "linux") != 0;
     bool is_coff = target && strstr(target, "windows") != 0;
+    bool is_wasm = target && strcmp(target, "wasm32-unknown-unknown") == 0;
     bool internal_visibility = symbol_visibility && strcmp(symbol_visibility, "internal") == 0;
     bool public_visibility = !symbol_visibility || symbol_visibility[0] == '\0' ||
                              strcmp(symbol_visibility, "public") == 0;
@@ -20968,7 +21865,11 @@ bool cold_compile_source_to_object(const char *out_path,
     /* Detect target architecture for codegen dispatch */
     bool use_x64 = (elf_machine == EM_X86_64 || coff_machine == IMAGE_FILE_MACHINE_AMD64);
     bool use_rv64 = (elf_machine == EM_RISCV);
+    bool use_wasm = is_wasm;
     X64Code x64_buf; if (use_x64) { x64_init(&x64_buf, 65536); }
+    WasmCode wasm_buf; if (use_wasm) { wasm_init(&wasm_buf, 65536); }
+    int32_t *func_to_wasm_idx = arena_alloc(arena, (size_t)(func_count > 0 ? func_count : 1) * sizeof(int32_t));
+    for (int32_t wi = 0; wi < func_count; wi++) func_to_wasm_idx[wi] = -1;
 
     /* Entry trampoline: save argc/argv in callee-saved registers */
     bool use_entry_trampoline = !has_export_roots && main_function >= 0 && emit_function[main_function];
@@ -21020,13 +21921,17 @@ bool cold_compile_source_to_object(const char *out_path,
         if (!cold_body_codegen_ready(body)) {
             cold_die_reachable_body_invalid(symbols, i);
         }
-        if (use_x64) {
+        if (use_wasm) {
+            symbol_offset[i] = wasm_buf.len; /* byte offset */
+        } else if (use_x64) {
             while ((x64_buf.len & 3) != 0) x64_emit1(&x64_buf, 0x90);
             symbol_offset[i] = x64_buf.len; /* byte offset */
         } else {
             symbol_offset[i] = shared->count;
         }
-        if (use_x64)
+        if (use_wasm)
+            wasm_codegen_func(&wasm_buf, body, symbols, &function_patches, i, func_to_wasm_idx);
+        else if (use_x64)
             x64_codegen_func(&x64_buf, body, symbols, &function_patches);
         else if (use_rv64)
             rv64_codegen_func(shared, body, symbols, &function_patches);
@@ -21173,7 +22078,18 @@ bool cold_compile_source_to_object(const char *out_path,
         name_count++;
     }
 
-    bool ok = is_elf ? elf64_write_object(out_path, shared->words, shared->count, func_names, func_offsets, name_count, local_count, reloc_offsets, reloc_symbols, reloc_count, elf_machine) : is_coff ? coff_write_object(out_path, shared->words, shared->count, func_names, func_offsets, name_count, local_count, reloc_offsets, reloc_symbols, reloc_count, coff_machine) : macho_write_object(out_path, shared->words, shared->count, func_names, func_offsets, name_count, local_count, reloc_offsets, reloc_symbols, reloc_count);
+    bool ok;
+    if (use_wasm) {
+        int32_t wasm_emit_count = 0;
+        for (int32_t ec = 0; ec < func_count; ec++)
+            if (symbol_offset[ec] >= 0) wasm_emit_count++;
+        ok = wasm_write_object(out_path, &wasm_buf,
+                               func_offsets, wasm_emit_count,
+                               func_names, name_count,
+                               symbols, func_to_wasm_idx);
+    } else {
+        ok = is_elf ? elf64_write_object(out_path, shared->words, shared->count, func_names, func_offsets, name_count, local_count, reloc_offsets, reloc_symbols, reloc_count, elf_machine) : is_coff ? coff_write_object(out_path, shared->words, shared->count, func_names, func_offsets, name_count, local_count, reloc_offsets, reloc_symbols, reloc_count, coff_machine) : macho_write_object(out_path, shared->words, shared->count, func_names, func_offsets, name_count, local_count, reloc_offsets, reloc_symbols, reloc_count);
+    }
     return ok;
 }
 
@@ -21398,17 +22314,43 @@ static bool cold_emit_csg_v2_facts(const char *path, BodyIR **function_bodies,
                                     int32_t func_count, Symbols *symbols,
                                     const char *target) {
     if (!function_bodies || !symbols || func_count <= 0) return false;
-    /* Count functions to serialize: valid bodies OR named symbols */
+    bool *referenced = (bool *)calloc((size_t)func_count, sizeof(bool));
+    if (!referenced) return false;
+    for (int32_t i = 0; i < func_count; i++) {
+        BodyIR *b = function_bodies[i];
+        if (!b || b->has_fallback) continue;
+        for (int32_t oi = 0; oi < b->op_count; oi++) {
+            int32_t ok = b->op_kind[oi];
+            if (ok != BODY_OP_CALL_I32 && ok != BODY_OP_CALL_COMPOSITE &&
+                ok != BODY_OP_FN_ADDR) continue;
+            int32_t target_fn = b->op_a[oi];
+            if (target_fn >= 0 && target_fn < func_count) referenced[target_fn] = true;
+        }
+    }
+
+    /* Count functions to serialize: valid bodies plus referenced externals. */
     int32_t valid_count = 0;
     for (int32_t i = 0; i < func_count; i++) {
         BodyIR *b = function_bodies[i];
         if (b && !b->has_fallback) valid_count++;
-        else if (symbols->functions[i].name.len > 0) valid_count++;
+        else if (symbols->functions[i].name.len > 0 &&
+                 symbols->functions[i].is_external &&
+                 referenced[i]) valid_count++;
+        else if (symbols->functions[i].name.len > 0 && referenced[i]) {
+            free(referenced);
+            return false;
+        }
     }
-    if (valid_count <= 0) return false;
+    if (valid_count <= 0) {
+        free(referenced);
+        return false;
+    }
 
     FILE *f = fopen(path, "wb");
-    if (!f) return false;
+    if (!f) {
+        free(referenced);
+        return false;
+    }
 
     /* ---- HEADER (64 bytes) ---- */
     fwrite("CHENGCSG", 1, 8, f);
@@ -21493,15 +22435,33 @@ static bool cold_emit_csg_v2_facts(const char *path, BodyIR **function_bodies,
         int32_t map_idx = 0;
         for (int32_t fi = 0; fi < func_count; fi++) {
             BodyIR *b = function_bodies[fi];
-            /* Skip null/fallback functions with no symbol entry (gaps) */
-            if ((!b || b->has_fallback) && symbols->functions[fi].name.len <= 0) continue;
+            bool valid_body = b && !b->has_fallback;
+            bool referenced_external = !valid_body &&
+                symbols->functions[fi].name.len > 0 &&
+                symbols->functions[fi].is_external &&
+                referenced[fi];
+            if (!valid_body && symbols->functions[fi].name.len > 0 && referenced[fi] &&
+                !referenced_external) {
+                fclose(f);
+                free(referenced);
+                return false;
+            }
+            if (!valid_body && !referenced_external) continue;
 
             /* name: u32 len + utf8 bytes */
             cold_emit_csg_v2_str(f, symbols->functions[fi].name);
-            if (!b || b->has_fallback) {
-                /* Treat as external declaration: no params, no ops, no slots */
-                cold_emit_csg_v2_u32(f, 0); /* param_count */
-                cold_emit_csg_v2_u32(f, SLOT_I32); /* return_kind */
+            if (!valid_body) {
+                FnDef *fn = &symbols->functions[fi];
+                int32_t ret_kind = cold_slot_kind_from_type_with_symbols(symbols, fn->ret);
+                cold_emit_csg_v2_u32(f, (uint32_t)fn->arity); /* param_count */
+                for (int32_t pi = 0; pi < fn->arity; pi++) {
+                    int32_t pk = fn->param_kind[pi];
+                    int32_t pz = fn->param_size[pi] > 0 ? fn->param_size[pi] : cold_slot_size_for_kind(pk);
+                    cold_emit_csg_v2_u32(f, (uint32_t)pk);
+                    cold_emit_csg_v2_u32(f, (uint32_t)pz);
+                    cold_emit_csg_v2_u32(f, UINT32_MAX); /* no local param slot for externals */
+                }
+                cold_emit_csg_v2_u32(f, (uint32_t)ret_kind); /* return_kind */
                 cold_emit_csg_v2_u32(f, 0); /* frame_size */
                 cold_emit_csg_v2_u32(f, 0); /* op_count */
                 cold_emit_csg_v2_u32(f, 0); /* slot_count */
@@ -21670,6 +22630,7 @@ static bool cold_emit_csg_v2_facts(const char *path, BodyIR **function_bodies,
     fclose(f);
     free(unique_strs);
     free(str_id_map);
+    free(referenced);
     return true;
 }
 
@@ -21925,7 +22886,8 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
     bool is_coff = (strcmp(target, "x86_64-pc-windows-msvc") == 0 ||
                      strcmp(target, "aarch64-pc-windows-msvc") == 0);
     bool is_macho = (strcmp(target, "arm64-apple-darwin") == 0);
-    if (!is_macho && !is_elf && !is_coff) {
+    bool is_wasm = target && strcmp(target, "wasm32-unknown-unknown") == 0;
+    if (!is_macho && !is_elf && !is_coff && !is_wasm) {
         cold_write_system_link_exec_report(report_path, false, source_path, effective_csg_path, out_path,
                                            target, emit, 0, "unsupported target");
         fprintf(stderr, "[cheng_cold] unsupported target: %s\n", target);
@@ -22637,6 +23599,9 @@ link_providers_done:
                                                   workspace_root[0] ? workspace_root : 0,
                                                   target, &stats, false, provider_objects);
 #ifndef COLD_BACKEND_ONLY
+    } else if (is_wasm) {
+        compiled = cold_compile_source_to_object(out_path, source_path, target,
+                                                 0, "public") ? 1 : 0;
     } else {
         compiled = cold_compile_source_path_to_macho(out_path, source_path, false, &stats);
     }
