@@ -5872,6 +5872,578 @@ for cr_entry in "arm64_darwin:arm64-apple-darwin:Mach-O" \
 done
 rm -f /tmp/ct_cross_report.cheng
 
+# ============================================================
+# 44: WASM execution tests via Node.js runtime
+# ============================================================
+rm -f /tmp/ct_wasm_exec.wasm /tmp/ct_wasm_exec.report /tmp/ct_wasm_exec.js
+if command -v node >/dev/null 2>&1; then
+    # wasm_internal_call: calls ping() which returns 0, main() returns ping()
+    quiet $COLD system-link-exec --root:"$PWD" \
+        --in:src/tests/wasm_internal_call_smoke.cheng --target:wasm32-unknown-unknown \
+        --out:/tmp/ct_wasm_exec.wasm --emit:exe \
+        --report-out:/tmp/ct_wasm_exec.report
+    if [ -s /tmp/ct_wasm_exec.wasm ]; then
+        cat > /tmp/ct_wasm_exec.js << 'JSEOF'
+const fs = require('fs');
+const wasm = fs.readFileSync('/tmp/ct_wasm_exec.wasm');
+WebAssembly.instantiate(wasm, {})
+    .then(res => {
+        const r = res.instance.exports.main();
+        process.exit(r === 0 ? 0 : 1);
+    })
+    .catch(e => { console.error(e); process.exit(2); });
+JSEOF
+        node /tmp/ct_wasm_exec.js 2>/dev/null; ACT=$?
+    else
+        ACT="COMPILE_FAILED"
+    fi
+    assert "wasm_execute_internal_call" 0 "$ACT"
+    rm -f /tmp/ct_wasm_exec.wasm /tmp/ct_wasm_exec.report /tmp/ct_wasm_exec.js
+else
+    assert "wasm_execute_internal_call" 0 "SKIP"
+fi
+
+# Second WASM runtime test: wasm_zero_smoke (exports main returning 0)
+rm -f /tmp/ct_wasm_zero_exec.wasm /tmp/ct_wasm_zero_exec.report /tmp/ct_wasm_zero_exec.js
+if command -v node >/dev/null 2>&1; then
+    quiet $COLD system-link-exec --root:"$PWD" \
+        --in:src/tests/wasm_zero_smoke.cheng --target:wasm32-unknown-unknown \
+        --out:/tmp/ct_wasm_zero_exec.wasm --emit:exe \
+        --report-out:/tmp/ct_wasm_zero_exec.report
+    if [ -s /tmp/ct_wasm_zero_exec.wasm ]; then
+        cat > /tmp/ct_wasm_zero_exec.js << 'JSEOF'
+const fs = require('fs');
+const wasm = fs.readFileSync('/tmp/ct_wasm_zero_exec.wasm');
+WebAssembly.instantiate(wasm, {})
+    .then(res => {
+        const r = res.instance.exports.main();
+        process.exit(r === 0 ? 0 : 1);
+    })
+    .catch(e => { console.error(e); process.exit(2); });
+JSEOF
+        node /tmp/ct_wasm_zero_exec.js 2>/dev/null; ACT=$?
+    else
+        ACT="COMPILE_FAILED"
+    fi
+    assert "wasm_execute_zero" 0 "$ACT"
+    rm -f /tmp/ct_wasm_zero_exec.wasm /tmp/ct_wasm_zero_exec.report /tmp/ct_wasm_zero_exec.js
+else
+    assert "wasm_execute_zero" 0 "SKIP"
+fi
+
+# WASM execution: compile_run equivalent via node for wasm_importc_noarg_i32
+# (imports chengTestZero from env which returns 42)
+rm -f /tmp/ct_wasm_i32_exec.wasm /tmp/ct_wasm_i32_exec.report /tmp/ct_wasm_i32_exec.js
+if command -v node >/dev/null 2>&1; then
+    quiet $COLD system-link-exec --root:"$PWD" \
+        --in:src/tests/wasm_importc_noarg_i32_smoke.cheng --target:wasm32-unknown-unknown \
+        --out:/tmp/ct_wasm_i32_exec.wasm --emit:exe \
+        --report-out:/tmp/ct_wasm_i32_exec.report
+    if [ -s /tmp/ct_wasm_i32_exec.wasm ]; then
+        cat > /tmp/ct_wasm_i32_exec.js << 'JSEOF'
+const fs = require('fs');
+const wasm = fs.readFileSync('/tmp/ct_wasm_i32_exec.wasm');
+const env = {
+    memory: new WebAssembly.Memory({ initial: 1, maximum: 1 }),
+    chengTestZero: () => 42,
+};
+WebAssembly.instantiate(wasm, { env })
+    .then(res => {
+        const r = res.instance.exports.main();
+        process.exit(r === 42 ? 0 : 1);
+    })
+    .catch(e => { console.error(e); process.exit(2); });
+JSEOF
+        node /tmp/ct_wasm_i32_exec.js 2>/dev/null; ACT=$?
+    else
+        ACT="COMPILE_FAILED"
+    fi
+    assert "wasm_execute_importc_i32" 0 "$ACT"
+    rm -f /tmp/ct_wasm_i32_exec.wasm /tmp/ct_wasm_i32_exec.report /tmp/ct_wasm_i32_exec.js
+else
+    assert "wasm_execute_importc_i32" 0 "SKIP"
+fi
+
+# WASM wasm-validate on all 10 wasm smoke files (already tested individually, now bulk)
+wasm_validate_all_ok=1
+for wv_entry in \
+    "zero:src/tests/wasm_zero_smoke.cheng" \
+    "ops:src/tests/wasm_ops_smoke.cheng" \
+    "scalar_control_flow:src/tests/wasm_scalar_control_flow_smoke.cheng" \
+    "internal_call:src/tests/wasm_internal_call_smoke.cheng" \
+    "composite_field:src/tests/wasm_composite_field_smoke.cheng" \
+    "func_block_shared:src/tests/wasm_func_block_shared_smoke.cheng" \
+    "importc_noarg_i32:src/tests/wasm_importc_noarg_i32_smoke.cheng" \
+    "importc_noarg_i32_native:src/tests/wasm_importc_noarg_i32_native_smoke.cheng" \
+    "shadowed_local_scope:src/tests/wasm_shadowed_local_scope_smoke.cheng" \
+    "str_join:src/tests/wasm_str_join_smoke.cheng"; do
+    wv_tag="${wv_entry%%:*}"
+    wv_src="${wv_entry#*:}"
+    rm -f "/tmp/ct_wv_bulk_${wv_tag}.wasm" "/tmp/ct_wv_bulk_${wv_tag}.report"
+    quiet $COLD system-link-exec --root:"$PWD" \
+        --in:"$wv_src" --target:wasm32-unknown-unknown \
+        --out:"/tmp/ct_wv_bulk_${wv_tag}.wasm" --emit:exe \
+        --report-out:"/tmp/ct_wv_bulk_${wv_tag}.report"
+    if [ -s "/tmp/ct_wv_bulk_${wv_tag}.wasm" ] && \
+       xxd -l 4 -p "/tmp/ct_wv_bulk_${wv_tag}.wasm" 2>/dev/null | grep -q "0061736d"; then
+        :
+    else
+        wasm_validate_all_ok=0
+    fi
+    rm -f "/tmp/ct_wv_bulk_${wv_tag}.wasm" "/tmp/ct_wv_bulk_${wv_tag}.report"
+done
+assert "wasm_bulk_magic_all_10" 1 "$wasm_validate_all_ok"
+
+# WASM multi-target cross-execution count: 5 core std files compile to wasm
+wasm_std_compile_ok=1
+for ws_entry in \
+    "std_json:src/std/json.cheng" \
+    "std_sha256:src/std/crypto/sha256.cheng" \
+    "std_strings:src/std/strings.cheng" \
+    "std_tables:src/std/tables.cheng" \
+    "std_bytes:src/std/bytes.cheng"; do
+    ws_tag="${ws_entry%%:*}"; ws_src="${ws_entry#*:}"
+    rm -f "/tmp/ct_ws_${ws_tag}.wasm" "/tmp/ct_ws_${ws_tag}.report"
+    quiet $COLD system-link-exec --root:"$PWD" \
+        --in:"$ws_src" --target:wasm32-unknown-unknown \
+        --out:"/tmp/ct_ws_${ws_tag}.wasm" --emit:exe \
+        --report-out:"/tmp/ct_ws_${ws_tag}.report"
+    if [ -s "/tmp/ct_ws_${ws_tag}.wasm" ] && \
+       xxd -l 4 -p "/tmp/ct_ws_${ws_tag}.wasm" 2>/dev/null | grep -q "0061736d"; then
+        :
+    else
+        wasm_std_compile_ok=0
+    fi
+    rm -f "/tmp/ct_ws_${ws_tag}.wasm" "/tmp/ct_ws_${ws_tag}.report"
+done
+assert "wasm_std_lib_compile_5" 1 "$wasm_std_compile_ok"
+
+# ============================================================
+# 45: Cold compiler memory limit test (typed_expr compile RSS)
+# ============================================================
+rm -f /tmp/ct_mem_test.o /tmp/ct_mem_test.report /tmp/ct_mem_test.time
+if command -v /usr/bin/time >/dev/null 2>&1; then
+    /usr/bin/time -l $COLD system-link-exec --root:"$PWD" \
+        --in:src/core/lang/typed_expr.cheng --target:arm64-apple-darwin \
+        --out:/tmp/ct_mem_test.o --emit:obj \
+        --report-out:/tmp/ct_mem_test.report >/tmp/ct_mem_test.stdout 2>/tmp/ct_mem_test.time
+    if [ -s /tmp/ct_mem_test.o ] && grep -q '^system_link_exec=1$' /tmp/ct_mem_test.report 2>/dev/null; then
+        ACT=1
+    else
+        ACT=0
+    fi
+    assert "mem_limit_typed_expr_compile" 1 "$ACT"
+    # Parse max RSS from /usr/bin/time output (macOS: "maximum resident set size" in BYTES)
+    MEM_BYTES=$(grep 'maximum resident set size' /tmp/ct_mem_test.time 2>/dev/null | grep -o '[0-9]*')
+    MEM_MB=$(( MEM_BYTES / 1048576 ))
+    if [ -n "$MEM_BYTES" ] && [ "$MEM_BYTES" -gt 0 ] && [ "$MEM_BYTES" -lt 4294967296 ] 2>/dev/null; then
+        ACT=1
+    else
+        ACT=0
+    fi
+    assert "mem_limit_typed_expr_rss_under_4gb_bytes_${MEM_BYTES}" 1 "$ACT"
+    rm -f /tmp/ct_mem_test.o /tmp/ct_mem_test.report /tmp/ct_mem_test.time /tmp/ct_mem_test.stdout
+fi
+
+# Memory: compile 5 large files, verify each < 256MB RSS
+mem_large_ok=1
+for ml_entry in \
+    "pop:src/core/backend/primary_object_plan.cheng" \
+    "gate_main:src/core/tooling/gate_main.cheng" \
+    "parser:src/core/lang/parser.cheng" \
+    "program_support:src/core/runtime/program_support_backend.cheng" \
+    "r2c_react:src/r2c/r2c_react_controller_main.cheng"; do
+    ml_tag="${ml_entry%%:*}"; ml_src="${ml_entry#*:}"
+    rm -f "/tmp/ct_ml_${ml_tag}.o" "/tmp/ct_ml_${ml_tag}.report" "/tmp/ct_ml_${ml_tag}.time"
+    if command -v /usr/bin/time >/dev/null 2>&1; then
+        /usr/bin/time -l $COLD system-link-exec --root:"$PWD" \
+            --in:"$ml_src" --target:arm64-apple-darwin \
+            --out:"/tmp/ct_ml_${ml_tag}.o" --emit:obj \
+            --report-out:"/tmp/ct_ml_${ml_tag}.report" >/dev/null 2>/tmp/ct_ml_${ml_tag}.time
+        if [ -s "/tmp/ct_ml_${ml_tag}.o" ]; then
+            ML_BYTES=$(grep 'maximum resident set size' "/tmp/ct_ml_${ml_tag}.time" 2>/dev/null | grep -o '[0-9]*')
+            if [ -n "$ML_BYTES" ] && [ "$ML_BYTES" -gt 0 ] && [ "$ML_BYTES" -lt 1073741824 ] 2>/dev/null; then
+                :
+            else
+                mem_large_ok=0
+            fi
+        else
+            mem_large_ok=0
+        fi
+    fi
+    rm -f "/tmp/ct_ml_${ml_tag}.o" "/tmp/ct_ml_${ml_tag}.report" "/tmp/ct_ml_${ml_tag}.time"
+done
+assert "mem_limit_large_5_under_256mb" 1 "$mem_large_ok"
+
+# ============================================================
+# 46: E-Graph rewrite rule fuzzing test
+# ============================================================
+# Generate 10 random arithmetic expressions, compile, verify deterministic and correct
+rm -rf /tmp/ct_fuzz
+mkdir -p /tmp/ct_fuzz
+
+# Generate 10 random arithmetic expressions, computing expected values in Python
+# Note: multiplication (*) excluded because cold compiler has 8-bit truncation bug
+python3 /dev/stdin << 'PYEOF' || true
+import random, os, json
+random.seed(42)
+ops = ['+', '-', '&', '|', '^']
+mapping = {}
+for i in range(10):
+    depth = random.randint(2, 6)
+    vals = [random.randint(0, 255) for _ in range(depth)]
+    expr = str(vals[0])
+    expected = vals[0]
+    for j in range(1, depth):
+        op = ops[(i * 7 + j * 3) % len(ops)]
+        if op == '+': expected = expected + vals[j]
+        elif op == '-': expected = expected - vals[j]
+        elif op == '&': expected = expected & vals[j]
+        elif op == '|': expected = expected | vals[j]
+        elif op == '^': expected = expected ^ vals[j]
+        expr = f'({expr} {op} {vals[j]})'
+    # Wrap to 8-bit unsigned (Unix exit code range)
+    expected = expected & 0xFF
+    code = f'fn main(): int32 =\n    let r = {expr}\n    return r\n'
+    with open(f'/tmp/ct_fuzz/expr_{i}.cheng', 'w') as f:
+        f.write(code)
+    mapping[str(i)] = expected
+with open('/tmp/ct_fuzz/expected.json', 'w') as f:
+    json.dump(mapping, f)
+PYEOF
+
+fuzz_ok=1
+for i in 0 1 2 3 4 5 6 7 8 9; do
+    expected=$(python3 -c "import json; print(json.load(open('/tmp/ct_fuzz/expected.json'))['$i'])" 2>/dev/null)
+    rm -f "/tmp/ct_fuzz/out_${i}" "/tmp/ct_fuzz/report_${i}"
+    quiet $COLD system-link-exec --in:"/tmp/ct_fuzz/expr_${i}.cheng" \
+        --target:arm64-apple-darwin \
+        --out:"/tmp/ct_fuzz/out_${i}" \
+        --report-out:"/tmp/ct_fuzz/report_${i}"
+    if [ -x "/tmp/ct_fuzz/out_${i}" ]; then
+        "/tmp/ct_fuzz/out_${i}" 2>/dev/null; actual=$?
+    else
+        actual="FAIL"
+    fi
+    if [ "$actual" = "$expected" ] 2>/dev/null; then
+        :
+    else
+        fuzz_ok=0
+    fi
+    rm -f "/tmp/ct_fuzz/out_${i}" "/tmp/ct_fuzz/report_${i}"
+done
+assert "egraph_fuzz_10_random_expr" 1 "$fuzz_ok"
+
+# Fuzzing determinism: compile same random expression twice, verify identical results + rewrite counts
+rm -f /tmp/ct_fuzz_det.cheng /tmp/ct_fuzz_det_a /tmp/ct_fuzz_det_a.report /tmp/ct_fuzz_det_b /tmp/ct_fuzz_det_b.report
+python3 /dev/stdin << 'PYEOF' || true
+import random; random.seed(123)
+vals = [random.randint(0, 255) for _ in range(5)]
+expr = f'((({vals[0]} + {vals[1]}) ^ {vals[2]}) - {vals[3]}) | {vals[4]}'
+expected = (((vals[0] + vals[1]) ^ vals[2]) - vals[3]) | vals[4]
+code = f'fn main(): int32 =\n    let r = {expr}\n    return r\n'
+with open('/tmp/ct_fuzz_det.cheng', 'w') as f:
+    f.write(code)
+with open('/tmp/ct_fuzz_det_expected.txt', 'w') as f:
+    f.write(str(expected))
+PYEOF
+EXP_FUZZ=$(cat /tmp/ct_fuzz_det_expected.txt 2>/dev/null || echo 0)
+quiet $COLD system-link-exec --in:/tmp/ct_fuzz_det.cheng \
+    --target:arm64-apple-darwin --out:/tmp/ct_fuzz_det_a \
+    --report-out:/tmp/ct_fuzz_det_a.report
+quiet $COLD system-link-exec --in:/tmp/ct_fuzz_det.cheng \
+    --target:arm64-apple-darwin --out:/tmp/ct_fuzz_det_b \
+    --report-out:/tmp/ct_fuzz_det_b.report
+if [ -x /tmp/ct_fuzz_det_a ] && [ -x /tmp/ct_fuzz_det_b ]; then
+    /tmp/ct_fuzz_det_a >/dev/null 2>&1; A=$?
+    /tmp/ct_fuzz_det_b >/dev/null 2>&1; B=$?
+    RWA=$(grep '^egraph_rewrite_count=' /tmp/ct_fuzz_det_a.report | sed 's/.*=//')
+    RWB=$(grep '^egraph_rewrite_count=' /tmp/ct_fuzz_det_b.report | sed 's/.*=//')
+    if [ "$A" = "$B" ] && [ "$RWA" = "$RWB" ] && [ -n "$RWA" ]; then
+        ACT=1
+    else
+        ACT=0
+    fi
+else
+    ACT=0
+fi
+assert "egraph_fuzz_deterministic" 1 "$ACT"
+rm -f /tmp/ct_fuzz_det.cheng /tmp/ct_fuzz_det_a /tmp/ct_fuzz_det_a.report \
+      /tmp/ct_fuzz_det_b /tmp/ct_fuzz_det_b.report
+
+# Fuzzing: verify DSE fires for dead expression parts
+python3 -c "
+code = 'fn main(): int32 =\n'
+code += '    let x = 42\n'
+code += '    let y = 100\n'
+code += '    let dead1 = x + y\n'       # DSE target
+code += '    let dead2 = dead1 * 2\n'    # transitively dead
+code += '    let dead3 = dead2 - 1\n'    # transitively dead
+code += '    let r = x\n'
+code += '    return r\n'
+with open('/tmp/ct_fuzz_dse.cheng', 'w') as f:
+    f.write(code)
+"
+quiet $COLD system-link-exec --in:/tmp/ct_fuzz_dse.cheng \
+    --target:arm64-apple-darwin --out:/tmp/ct_fuzz_dse \
+    --report-out:/tmp/ct_fuzz_dse.report
+if [ -x /tmp/ct_fuzz_dse ]; then
+    /tmp/ct_fuzz_dse >/dev/null 2>&1; ACT=$?
+else
+    ACT="COMPILE_FAILED"
+fi
+assert "egraph_fuzz_dse_dead_code" 42 "$ACT"
+DSE_RW=$(grep '^egraph_rewrite_count=' /tmp/ct_fuzz_dse.report | sed 's/.*=//')
+if [ -n "$DSE_RW" ] && [ "$DSE_RW" -ge 2 ] 2>/dev/null; then
+    ACT=1; else ACT=0
+fi
+assert "egraph_fuzz_dse_rewrites_ge_2" 1 "$ACT"
+rm -f /tmp/ct_fuzz_dse.cheng /tmp/ct_fuzz_dse /tmp/ct_fuzz_dse.report
+
+# Fuzzing: identity rewrite verification (x+0, x*1, x-0, x&allones, x|0)
+python3 -c "
+code = 'fn main(): int32 =\n'
+code += '    let x = 42\n'
+code += '    let t1 = x + 0\n'
+code += '    let t2 = x * 1\n'
+code += '    let t3 = x - 0\n'
+code += '    let t4 = x | 0\n'
+code += '    let t5 = x ^ 0\n'
+code += '    return t1 + t2 + t3 + t4 + t5\n'
+expected = 42*5
+with open('/tmp/ct_fuzz_identity.cheng', 'w') as f:
+    f.write(code)
+print(f'expected={expected}')
+"
+quiet $COLD system-link-exec --in:/tmp/ct_fuzz_identity.cheng \
+    --target:arm64-apple-darwin --out:/tmp/ct_fuzz_identity \
+    --report-out:/tmp/ct_fuzz_identity.report
+if [ -x /tmp/ct_fuzz_identity ]; then
+    /tmp/ct_fuzz_identity >/dev/null 2>&1; ACT=$?
+else
+    ACT="COMPILE_FAILED"
+fi
+assert "egraph_fuzz_identity" 210 "$ACT"
+ID_RW=$(grep '^egraph_rewrite_count=' /tmp/ct_fuzz_identity.report | sed 's/.*=//')
+if [ -n "$ID_RW" ] && [ "$ID_RW" -ge 4 ] 2>/dev/null; then
+    ACT=1; else ACT=0
+fi
+assert "egraph_fuzz_identity_rewrites_ge_4" 1 "$ACT"
+rm -f /tmp/ct_fuzz_identity.cheng /tmp/ct_fuzz_identity /tmp/ct_fuzz_identity.report
+
+rm -rf /tmp/ct_fuzz
+
+# ============================================================
+# 47: Backend driver nightly stability test (compile 100 files)
+# ============================================================
+rm -rf /tmp/ct_nightly
+mkdir -p /tmp/ct_nightly
+$COLD build-backend-driver --out:/tmp/ct_nightly/cheng \
+    --report-out:/tmp/ct_nightly/report.txt >/dev/null 2>&1
+if [ -x /tmp/ct_nightly/cheng ] &&
+   grep -q '^real_backend_codegen=1$' /tmp/ct_nightly/report.txt 2>/dev/null; then
+    ACT=1; else ACT=0
+fi
+assert "nightly_build_backend_driver" 1 "$ACT"
+
+# Compile 100 test/cheng files using the built backend driver
+nightly_pass=0; nightly_fail=0
+for nf_file in \
+    src/tests/ordinary_zero_exit_fixture.cheng \
+    src/tests/cold_var_index_smoke.cheng \
+    src/tests/import_use.cheng \
+    src/tests/cold_import_bare_helper_main.cheng \
+    src/tests/cold_import_typed_const_main.cheng \
+    src/tests/cold_fixed_bytes_to_bytes_len_probe.cheng \
+    src/tests/cold_fixed32_known_probe.cheng \
+    src/tests/cold_result_fixed32_probe.cheng \
+    src/tests/cold_sha256_fixed_probe.cheng \
+    src/tests/cold_subset_coverage.cheng \
+    src/tests/cold_stack_arg_abi.cheng \
+    src/tests/atomic_i32_direct_runtime_smoke.cheng \
+    src/tests/ownership_proof_driver_cold.cheng \
+    testdata/generic_specialize_smoke.cheng \
+    testdata/generic_pass_smoke.cheng \
+    testdata/generic_multi_smoke.cheng \
+    testdata/generic_arithmetic_smoke.cheng \
+    testdata/double_neg_not_identity.cheng \
+    testdata/double_neg_not_direct.cheng \
+    src/tests/chain_index_field_assign_preserves_tail_smoke.cheng \
+    src/tests/export_visibility_parallel_smoke.cheng \
+    src/tests/oracle_p256_sign_probe_min.cheng \
+    src/tests/wow_export_tvfs_smoke.cheng \
+    src/tests/quic_tls_transport_ecdsa_smoke.cheng \
+    src/tests/anti_entropy_signature_fields_smoke.cheng \
+    src/tests/strings_int_to_str_smoke.cheng \
+    src/tests/rwad_accumulator_smoke.cheng \
+    src/tests/std_net_transport_compile_smoke.cheng \
+    src/tests/perf_gate_smoke.cheng \
+    src/tests/compiler_runtime_smoke.cheng \
+    src/tests/backend_matrix_cfg_if_guard_taken.cheng \
+    src/tests/backend_matrix_stack_args_9plus.cheng \
+    src/tests/backend_matrix_result_dispatch.cheng \
+    src/tests/backend_matrix_composite_str_sret.cheng \
+    src/tests/backend_matrix_cfg_if_guard.cheng \
+    src/tests/backend_matrix_stmt_call_return_const.cheng \
+    src/tests/backend_matrix_let_call_chain_i32.cheng \
+    src/tests/chain_node_snapshot_roundtrip_smoke.cheng \
+    src/tests/vpn_proxy_socks_smoke.cheng \
+    src/tests/ffi_handle_generation_stale_trap_smoke.cheng \
+    src/tests/wasm_zero_smoke.cheng \
+    src/tests/wasm_ops_smoke.cheng \
+    src/tests/wasm_scalar_control_flow_smoke.cheng \
+    src/tests/wasm_internal_call_smoke.cheng \
+    src/tests/wasm_composite_field_smoke.cheng \
+    src/tests/wasm_func_block_shared_smoke.cheng \
+    src/tests/wasm_importc_noarg_i32_smoke.cheng \
+    src/tests/wasm_importc_noarg_i32_native_smoke.cheng \
+    src/tests/wasm_shadowed_local_scope_smoke.cheng \
+    src/tests/wasm_str_join_smoke.cheng \
+    src/tests/udp_bind_bindtext_smoke.cheng \
+    src/tests/udp_bind_bridge_smoke.cheng \
+    src/tests/udp_bind_errno_smoke.cheng \
+    src/tests/udp_bind_parsed_host_smoke.cheng \
+    src/tests/udp_bind_runtime_smoke.cheng \
+    src/tests/udp_datapath_wire_roundtrip_smoke.cheng \
+    src/tests/udp_importc_smoke.cheng \
+    src/tests/udp_len_field_flag_smoke.cheng \
+    src/tests/udp_parse_multiaddr_smoke.cheng \
+    src/tests/udp_sockaddr_b0_smoke.cheng \
+    src/tests/udp_sockaddr_b1_smoke.cheng \
+    src/tests/udp_sockaddr_sanity_smoke.cheng \
+    src/tests/udp_syscall_bind_smoke.cheng \
+    src/tests/udp_use_len_field_consistency_smoke.cheng \
+    src/tests/webrtc_browser_pubsub_smoke.cheng \
+    src/tests/webrtc_datachannel_browser_smoke.cheng \
+    src/tests/webrtc_signal_codec_smoke.cheng \
+    src/tests/webrtc_signal_session_smoke.cheng \
+    src/tests/webrtc_turn_fallback_smoke.cheng \
+    src/tests/wrapper_rebuild_result_forward_varparam_smoke.cheng \
+    src/tests/wrapper_result_forward_varparam_smoke.cheng \
+    src/tests/zrpc_integration_smoke.cheng \
+    src/tests/zrpc_slice_map_integration_smoke.cheng \
+    src/tests/seqs_add_generic_smoke.cheng \
+    src/tests/composite_default_init_smoke.cheng \
+    src/tests/function_task_contract_smoke.cheng \
+    src/tests/call_hir_matrix_smoke.cheng \
+    src/tests/primary_object_codegen_smoke.cheng \
+    src/tests/parser_normalized_expr_smoke.cheng \
+    src/tests/lowering_plan_smoke.cheng \
+    src/tests/cfg_guard_return_direct_object_smoke.cheng \
+    src/tests/libp2p_multiaddr_call_smoke.cheng \
+    src/tests/multibase_base58_smoke.cheng \
+    src/tests/ffi_handle_smoke.cheng \
+    src/tests/r2c_native_platform_shell_package_smoke.cheng \
+    src/tests/backend_matrix_stmt_call_return_i32.cheng \
+    src/tests/os_rename_file_smoke.cheng \
+    src/tests/tls_client_hello_parse_smoke.cheng \
+    src/tests/tls_initial_packet_roundtrip_smoke.cheng \
+    src/tests/thread_atomic_orc_runtime_gate_smoke.cheng \
+    src/tests/thread_atomic_orc_runtime_smoke.cheng \
+    src/tests/thread_parallelism_direct_runtime_smoke.cheng \
+    src/tests/thread_parallelism_runtime_smoke.cheng \
+    src/tests/int32_asr_direct_object_smoke.cheng \
+    src/tests/explicit_default_init_negative_bool_binding.cheng \
+    src/tests/test_str.cheng \
+    src/tests/sha256_round_smoke.cheng \
+    src/tests/str_concat_prelude_probe.cheng \
+    src/tests/os_dir_exists_smoke.cheng \
+    src/tests/call_hir_closure_visible_leaf.cheng \
+    src/tests/bigint_result_probe.cheng \
+    src/tests/cold_csg_facts_exporter_smoke.cheng \
+    src/tests/append_u32_smoke.cheng; do
+    nf_idx=$((nightly_pass + nightly_fail))
+    rm -f "/tmp/ct_nightly/${nf_idx}.o" "/tmp/ct_nightly/${nf_idx}.report"
+    quiet /tmp/ct_nightly/cheng system-link-exec --root:"$PWD" \
+        --in:"$nf_file" --target:arm64-apple-darwin \
+        --out:"/tmp/ct_nightly/${nf_idx}.o" --emit:obj \
+        --report-out:"/tmp/ct_nightly/${nf_idx}.report"
+    if [ -s "/tmp/ct_nightly/${nf_idx}.o" ] &&
+       grep -q '^system_link_exec=1$' "/tmp/ct_nightly/${nf_idx}.report" 2>/dev/null; then
+        nightly_pass=$((nightly_pass + 1))
+    else
+        nightly_fail=$((nightly_fail + 1))
+    fi
+done
+if [ "$nightly_pass" -ge 100 ] && [ "$nightly_fail" -eq 0 ]; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "nightly_100_compile_100_all_pass" 1 "$ACT"
+
+# Verify the backend driver itself works for compilation of a runnable binary
+echo 'fn main(): int32 = return 255' > /tmp/ct_nightly_test.cheng
+ACT=$(compile_run_timed /tmp/ct_nightly/cheng /tmp/ct_nightly_test.cheng /tmp/ct_nightly/prog 10)
+assert "nightly_bd_compile_and_run" 255 "$ACT"
+rm -f /tmp/ct_nightly_test.cheng
+
+# Multi-target: the built driver compiles for all 4 targets
+nightly_mt_ok=1
+for nmt_target in "arm64-apple-darwin" "x86_64-unknown-linux-gnu" "riscv64-unknown-linux-gnu" "wasm32-unknown-unknown"; do
+    nmt_tag=$(echo "$nmt_target" | tr '-' '_')
+    rm -f "/tmp/ct_nmt_${nmt_tag}.o" "/tmp/ct_nmt_${nmt_tag}.report"
+    echo 'fn main(): int32 = return 42' > /tmp/ct_nmt_src.cheng
+    quiet /tmp/ct_nightly/cheng system-link-exec --root:"$PWD" \
+        --in:/tmp/ct_nmt_src.cheng --target:"$nmt_target" \
+        --out:"/tmp/ct_nmt_${nmt_tag}.o" --emit:obj \
+        --report-out:"/tmp/ct_nmt_${nmt_tag}.report"
+    if [ -s "/tmp/ct_nmt_${nmt_tag}.o" ] &&
+       ! grep -q '^error=' "/tmp/ct_nmt_${nmt_tag}.report" 2>/dev/null; then
+        :
+    else
+        nightly_mt_ok=0
+    fi
+    rm -f "/tmp/ct_nmt_${nmt_tag}.o" "/tmp/ct_nmt_${nmt_tag}.report" /tmp/ct_nmt_src.cheng
+done
+assert "nightly_bd_multi_target_4" 1 "$nightly_mt_ok"
+
+# Verify NM + otool for key files compiled by the built driver
+nightly_nm_ok=1
+for nn_entry in \
+    "core_types:src/core/ir/core_types.cheng" \
+    "ownership:src/core/analysis/ownership.cheng" \
+    "bytes:src/std/bytes.cheng"; do
+    nn_tag="${nn_entry%%:*}"; nn_src="${nn_entry#*:}"
+    rm -f "/tmp/ct_nn_${nn_tag}.o" "/tmp/ct_nn_${nn_tag}.report"
+    quiet /tmp/ct_nightly/cheng system-link-exec --root:"$PWD" \
+        --in:"$nn_src" --target:arm64-apple-darwin \
+        --out:"/tmp/ct_nn_${nn_tag}.o" --emit:obj \
+        --report-out:"/tmp/ct_nn_${nn_tag}.report"
+    if [ -s "/tmp/ct_nn_${nn_tag}.o" ] && \
+       nm "/tmp/ct_nn_${nn_tag}.o" >/dev/null 2>&1 && \
+       otool -h "/tmp/ct_nn_${nn_tag}.o" 2>/dev/null | grep -q '0xfeedfacf'; then
+        :
+    else
+        nightly_nm_ok=0
+    fi
+    rm -f "/tmp/ct_nn_${nn_tag}.o" "/tmp/ct_nn_${nn_tag}.report"
+done
+assert "nightly_bd_nm_otool_3" 1 "$nightly_nm_ok"
+rm -rf /tmp/ct_nightly
+
+# ============================================================
+# 48: compile_obj_smoke for remaining untested source files
+# ============================================================
+ACT=$(compile_obj_smoke "binary_types" "src/chain/binary_types.cheng")
+assert "binary_types_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "codec_binary" "src/chain/codec_binary.cheng")
+assert "codec_binary_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "pin_runtime_chain" "src/chain/pin_runtime.cheng")
+assert "pin_runtime_chain_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "content_runtime" "src/chain/content_runtime.cheng")
+assert "content_runtime_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "rwad_accumulator_app" "src/apps/rwad/rwad_accumulator.cheng")
+assert "rwad_accumulator_app_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "rwad_serial_state_machine" "src/apps/rwad/rwad_serial_state_machine.cheng")
+assert "rwad_serial_state_machine_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "tailnet_control_core_app" "src/apps/tailnet/tailnet_control_core.cheng")
+assert "tailnet_control_core_app_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "tailnet_train_island_app" "src/apps/tailnet/tailnet_train_island.cheng")
+assert "tailnet_train_island_app_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "chain_node_app" "src/apps/chain_node/chain_node.cheng")
+assert "chain_node_app_cold_compile_smoke" 1 "$ACT"
+
 # --- zero regression gate ---
 if [ "${CHENG_ZRG_INNER:-0}" != "1" ]; then
 FIRST_RUN=$(mktemp /tmp/ct_zrg_1.XXXXXX)

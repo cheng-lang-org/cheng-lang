@@ -25929,17 +25929,27 @@ static bool wasm_write_object(const char *out_path, WasmCode *func_bodies,
     /* ---- Build CODE section ---- */
     /* Must emit bodies in the same order as FUNCTION section: symbol-index order,
        skipping external functions. Use symbol_offset[i] (which IS in symbol-index
-       order) rather than func_offsets (which is in visibility-sorted order). */
+       order) rather than func_offsets (which is in visibility-sorted order).
+       Functions with symbol_offset[i] < 0 were skipped (e.g. duplicate exports)
+       but still count in the function section; emit empty bodies to avoid
+       out-of-bounds reads on func_bodies->buf and keep section counts matching. */
     WasmCode cs;
     wasm_init(&cs, 65536);
     wasm_emit_leb128_u(&cs, (uint32_t)func_body_count);
     for (int32_t i = 0; i < func_count; i++) {
         if (symbols->functions[i].is_external) continue;
         int32_t body_off = symbol_offset[i];
-        /* Compute body size from gap to next non-external function's offset */
+        if (body_off < 0) {
+            wasm_emit_leb128_u(&cs, 2);
+            wasm_emit1(&cs, 0x00); /* no local declarations */
+            wasm_emit1(&cs, 0x0B); /* end */
+            continue;
+        }
+        /* Compute body size from gap to next non-external function with a body */
         int32_t next_off = func_bodies->len;
         for (int32_t j = i + 1; j < func_count; j++) {
             if (symbols->functions[j].is_external) continue;
+            if (symbol_offset[j] < 0) continue;
             next_off = symbol_offset[j];
             break;
         }
