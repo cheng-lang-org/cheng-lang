@@ -513,6 +513,32 @@ static Span cold_span_strip_generic_suffix(Span name) {
     return name;
 }
 
+static bool cold_call_name_generic_suffix(Span name, Span *base_out,
+                                          Span *args_out) {
+    if (base_out) *base_out = name;
+    if (args_out) *args_out = (Span){0};
+    if (name.len <= 2 || name.ptr[name.len - 1] != ']') return false;
+    int32_t depth = 0;
+    int32_t bracket = -1;
+    for (int32_t i = 0; i < name.len; i++) {
+        uint8_t c = name.ptr[i];
+        if (c == '[') {
+            if (depth == 0) bracket = i;
+            depth++;
+        } else if (c == ']') {
+            depth--;
+            if (depth < 0) die("malformed explicit generic call");
+        }
+    }
+    if (depth != 0) die("malformed explicit generic call");
+    if (bracket <= 0) return false;
+    Span args = span_trim(span_sub(name, bracket + 1, name.len - 1));
+    if (args.len <= 0) die("explicit generic call has no type arguments");
+    if (base_out) *base_out = span_sub(name, 0, bracket);
+    if (args_out) *args_out = args;
+    return true;
+}
+
 Span cold_qualify_import_type(Arena *arena, Span alias, Span type) {
     bool is_var = false;
     Span stripped = cold_type_strip_var(type, &is_var);
@@ -2646,6 +2672,89 @@ static void cold_materialize_specialized_body_if_needed(Parser *parser, int32_t 
     if (body && fn_index < parser->function_body_cap) parser->function_bodies[fn_index] = body;
 }
 
+static Span cold_canonical_explicit_generic_type(Span type) {
+    type = span_trim(cold_type_strip_var(type, 0));
+    if (span_eq(type, "i") || span_eq(type, "int")) return cold_cstr_span("int32");
+    if (span_eq(type, "s")) return cold_cstr_span("str");
+    return type;
+}
+
+static bool cold_bind_generic_type(Span template_type, Span concrete_type,
+                                   Span generic_name, Span *actual_out) {
+    template_type = span_trim(cold_type_strip_var(template_type, 0));
+    concrete_type = span_trim(cold_type_strip_var(concrete_type, 0));
+    if (span_same(template_type, generic_name)) {
+        if (actual_out) *actual_out = concrete_type;
+        return concrete_type.len > 0;
+    }
+    Span template_base = {0}, template_args_span = {0};
+    Span concrete_base = {0}, concrete_args_span = {0};
+    if (!cold_type_parse_generic_instance(template_type, &template_base,
+                                          &template_args_span) ||
+        !cold_type_parse_generic_instance(concrete_type, &concrete_base,
+                                          &concrete_args_span) ||
+        !span_same(template_base, concrete_base)) {
+        return false;
+    }
+    Span template_args[COLD_MAX_VARIANT_FIELDS];
+    Span concrete_args[COLD_MAX_VARIANT_FIELDS];
+    int32_t template_count = cold_split_top_level_commas(template_args_span,
+                                                        template_args,
+                                                        COLD_MAX_VARIANT_FIELDS);
+    int32_t concrete_count = cold_split_top_level_commas(concrete_args_span,
+                                                        concrete_args,
+                                                        COLD_MAX_VARIANT_FIELDS);
+    if (template_count != concrete_count) return false;
+    for (int32_t i = 0; i < template_count; i++) {
+        if (cold_bind_generic_type(template_args[i], concrete_args[i],
+                                   generic_name, actual_out)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void cold_validate_explicit_generic_call(Parser *parser, FnDef *resolved_fn,
+                                                Span explicit_args_span) {
+    if (explicit_args_span.len <= 0) return;
+    if (!parser || !parser->symbols || !resolved_fn)
+        die("explicit generic call cannot be validated");
+    if (resolved_fn->template_index < 0)
+        die(resolved_fn->generic_count > 0
+                ? "explicit generic call did not specialize"
+                : "explicit generic args on non-generic function");
+    if (resolved_fn->template_index >= parser->symbols->function_count)
+        die("generic template index out of range");
+    FnDef *template_fn = &parser->symbols->functions[resolved_fn->template_index];
+    if (template_fn->generic_count <= 0)
+        die("explicit generic args on non-generic function");
+
+    Span explicit_args[COLD_MAX_VARIANT_FIELDS];
+    int32_t explicit_count = cold_split_top_level_commas(explicit_args_span,
+                                                        explicit_args,
+                                                        COLD_MAX_VARIANT_FIELDS);
+    if (explicit_count != template_fn->generic_count)
+        die("explicit generic arg count mismatch");
+
+    for (int32_t gi = 0; gi < template_fn->generic_count; gi++) {
+        Span actual = {0};
+        for (int32_t pi = 0; pi < template_fn->arity && pi < resolved_fn->arity; pi++) {
+            if (cold_bind_generic_type(template_fn->param_type[pi],
+                                       resolved_fn->param_type[pi],
+                                       template_fn->generic_names[gi],
+                                       &actual)) {
+                break;
+            }
+        }
+        if (actual.len <= 0)
+            die("explicit generic arg is not inferable from call args");
+        Span expected = parser_scope_type(parser, explicit_args[gi]);
+        expected = cold_canonical_explicit_generic_type(expected);
+        actual = cold_canonical_explicit_generic_type(actual);
+        if (!span_same(expected, actual)) die("explicit generic arg mismatch");
+    }
+}
+
 int32_t cold_make_error_result_slot(Parser *parser, BodyIR *body,
                                            Span result_type, const char *message);
 int32_t cold_make_i32_const_slot(BodyIR *body, int32_t value);
@@ -2786,11 +2895,10 @@ static bool cold_try_type_alias_pointer_cast(Parser *parser, BodyIR *body, Span 
 int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *locals,
                                      Span name, int32_t *kind_out) {
     Span stripped_name = name;
-    int32_t bracket = -1;
-    for (int32_t bi = 0; bi < name.len; bi++)
-        if (name.ptr[bi] == '[') { bracket = bi; break; }
-    if (bracket > 0 && name.ptr[name.len - 1] == ']')
-        stripped_name = span_sub(name, 0, bracket);
+    Span explicit_generic_args = {0};
+    bool has_explicit_generic = cold_call_name_generic_suffix(name, &stripped_name,
+                                                             &explicit_generic_args);
+    Span intrinsic_name = has_explicit_generic ? name : stripped_name;
     if (!parser_take(parser, "(")) die("expected ( after function name");
     int32_t arg_slots[COLD_MAX_I32_PARAMS];
     int32_t arg_count = 0;
@@ -2832,23 +2940,23 @@ int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *locals,
     int32_t arg_start = body->call_arg_count;
     for (int32_t i = 0; i < arg_count; i++) body_call_arg(body, arg_slots[i]);
     int32_t intrinsic_slot = -1;
-    if (cold_try_ref_object_cast(parser, body, stripped_name, arg_start, arg_count,
+    if (cold_try_ref_object_cast(parser, body, intrinsic_name, arg_start, arg_count,
                                  &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_try_type_alias_pointer_cast(parser, body, stripped_name, arg_start, arg_count,
+    if (cold_try_type_alias_pointer_cast(parser, body, intrinsic_name, arg_start, arg_count,
                                          &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_try_str_len_intrinsic(body, stripped_name, arg_start, arg_count,
+    if (cold_try_str_len_intrinsic(body, intrinsic_name, arg_start, arg_count,
                                    &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_try_str_slice_intrinsic(body, stripped_name, arg_start, arg_count,
+    if (cold_try_str_slice_intrinsic(body, intrinsic_name, arg_start, arg_count,
                                      &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_is_i32_to_str_intrinsic(stripped_name)) {
+    if (cold_is_i32_to_str_intrinsic(intrinsic_name)) {
         if (arg_count != 1) die("int to str intrinsic arity mismatch");
         int32_t arg_slot = body->call_arg_slot[arg_start];
         if (body->slot_kind[arg_slot] != SLOT_I32 && body->slot_kind[arg_slot] != SLOT_I64) {
@@ -2864,39 +2972,39 @@ int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *locals,
         if (kind_out) *kind_out = SLOT_STR;
         return slot;
     }
-    if (cold_try_parse_int_intrinsic(body, stripped_name, arg_start, arg_count,
+    if (cold_try_parse_int_intrinsic(body, intrinsic_name, arg_start, arg_count,
                                      &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_try_str_join_intrinsic(body, stripped_name, arg_start, arg_count,
+    if (cold_try_str_join_intrinsic(body, intrinsic_name, arg_start, arg_count,
                                     &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_try_str_split_intrinsic(body, stripped_name, arg_start, arg_count,
+    if (cold_try_str_split_intrinsic(body, intrinsic_name, arg_start, arg_count,
                                      &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_try_str_strip_intrinsic(body, stripped_name, arg_start, arg_count,
+    if (cold_try_str_strip_intrinsic(body, intrinsic_name, arg_start, arg_count,
                                      &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_try_result_intrinsic(parser, body, stripped_name, arg_start, arg_count,
+    if (cold_try_result_intrinsic(parser, body, intrinsic_name, arg_start, arg_count,
                                   &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_try_os_intrinsic(parser, body, stripped_name, arg_start, arg_count,
+    if (cold_try_os_intrinsic(parser, body, intrinsic_name, arg_start, arg_count,
                               &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_try_path_intrinsic(parser, body, stripped_name, arg_start, arg_count,
+    if (cold_try_path_intrinsic(parser, body, intrinsic_name, arg_start, arg_count,
                                 &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_try_csg_intrinsic(parser, body, stripped_name, arg_start, arg_count,
+    if (cold_try_csg_intrinsic(parser, body, intrinsic_name, arg_start, arg_count,
                                &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_try_slplan_intrinsic(parser, body, stripped_name, arg_start, arg_count,
+    if (cold_try_slplan_intrinsic(parser, body, intrinsic_name, arg_start, arg_count,
                                   &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
@@ -2928,15 +3036,15 @@ int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *locals,
         if (kind_out) *kind_out = SLOT_I32;
         return slot;
     }
-    if (cold_try_backend_intrinsic(parser, body, stripped_name, arg_start, arg_count,
+    if (cold_try_backend_intrinsic(parser, body, intrinsic_name, arg_start, arg_count,
                                    &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_try_assert_intrinsic(body, stripped_name, arg_start, arg_count,
+    if (cold_try_assert_intrinsic(body, intrinsic_name, arg_start, arg_count,
                                   &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_try_bootstrap_intrinsic(body, stripped_name, arg_start, arg_count,
+    if (cold_try_bootstrap_intrinsic(body, intrinsic_name, arg_start, arg_count,
                                      &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
@@ -2984,7 +3092,7 @@ int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *locals,
       }
     }
     /* ptr(x) intrinsic: type conversion to ptr (generic pointer) */
-    if (span_eq(stripped_name, "ptr")) {
+    if (span_eq(intrinsic_name, "ptr")) {
         if (arg_count != 1) die("ptr() expects 1 arg");
         int32_t src = body->call_arg_slot[arg_start];
         int32_t src_kind = body->slot_kind[src];
@@ -3138,8 +3246,9 @@ int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *locals,
                                              arg_start, arg_count);
         die("unresolved function call");
     }
-	    FnDef *fn = &parser->symbols->functions[fn_index];
-        cold_materialize_specialized_body_if_needed(parser, fn_index);
+		    FnDef *fn = &parser->symbols->functions[fn_index];
+        cold_validate_explicit_generic_call(parser, fn, explicit_generic_args);
+	        cold_materialize_specialized_body_if_needed(parser, fn_index);
 	    cold_apply_contextual_empty_sequence_args(body, parser->symbols, fn, arg_start, arg_count);
 	    if (!cold_validate_call_args(body, fn, arg_start, arg_count, parser->import_mode)) {
 	        cold_die_call_arg_mismatch(body, fn, arg_start, arg_count);
@@ -3177,11 +3286,10 @@ int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *locals,
 int32_t parse_call_from_args_span(Parser *owner, BodyIR *body, Locals *locals,
                                          Span name, Span args, int32_t *kind_out) {
     Span stripped_name = name;
-    int32_t bracket = -1;
-    for (int32_t bi = 0; bi < name.len; bi++)
-        if (name.ptr[bi] == '[') { bracket = bi; break; }
-    if (bracket > 0 && name.ptr[name.len - 1] == ']')
-        stripped_name = span_sub(name, 0, bracket);
+    Span explicit_generic_args = {0};
+    bool has_explicit_generic = cold_call_name_generic_suffix(name, &stripped_name,
+                                                             &explicit_generic_args);
+    Span intrinsic_name = has_explicit_generic ? name : stripped_name;
     Span object_slot_type = {0};
     ObjectDef *object = parser_resolve_object_constructor(owner, name,
                                                           &object_slot_type);
@@ -3237,23 +3345,23 @@ int32_t parse_call_from_args_span(Parser *owner, BodyIR *body, Locals *locals,
     int32_t arg_start = body->call_arg_count;
     for (int32_t i = 0; i < arg_count; i++) body_call_arg(body, arg_slots[i]);
     int32_t intrinsic_slot = -1;
-    if (cold_try_ref_object_cast(owner, body, stripped_name, arg_start, arg_count,
+    if (cold_try_ref_object_cast(owner, body, intrinsic_name, arg_start, arg_count,
                                  &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_try_type_alias_pointer_cast(owner, body, stripped_name, arg_start, arg_count,
+    if (cold_try_type_alias_pointer_cast(owner, body, intrinsic_name, arg_start, arg_count,
                                          &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_try_str_len_intrinsic(body, stripped_name, arg_start, arg_count,
+    if (cold_try_str_len_intrinsic(body, intrinsic_name, arg_start, arg_count,
                                    &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_try_str_slice_intrinsic(body, stripped_name, arg_start, arg_count,
+    if (cold_try_str_slice_intrinsic(body, intrinsic_name, arg_start, arg_count,
                                      &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_is_i32_to_str_intrinsic(stripped_name)) {
+    if (cold_is_i32_to_str_intrinsic(intrinsic_name)) {
         if (arg_count != 1) die("int to str intrinsic arity mismatch");
         int32_t arg_slot = body->call_arg_slot[arg_start];
         if (body->slot_kind[arg_slot] != SLOT_I32) {
@@ -3269,43 +3377,43 @@ int32_t parse_call_from_args_span(Parser *owner, BodyIR *body, Locals *locals,
         if (kind_out) *kind_out = SLOT_STR;
         return slot;
     }
-    if (cold_try_parse_int_intrinsic(body, stripped_name, arg_start, arg_count,
+    if (cold_try_parse_int_intrinsic(body, intrinsic_name, arg_start, arg_count,
                                      &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_try_str_join_intrinsic(body, stripped_name, arg_start, arg_count,
+    if (cold_try_str_join_intrinsic(body, intrinsic_name, arg_start, arg_count,
                                     &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_try_str_split_intrinsic(body, stripped_name, arg_start, arg_count,
+    if (cold_try_str_split_intrinsic(body, intrinsic_name, arg_start, arg_count,
                                      &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_try_str_strip_intrinsic(body, stripped_name, arg_start, arg_count,
+    if (cold_try_str_strip_intrinsic(body, intrinsic_name, arg_start, arg_count,
                                      &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_try_result_intrinsic(owner, body, stripped_name, arg_start, arg_count,
+    if (cold_try_result_intrinsic(owner, body, intrinsic_name, arg_start, arg_count,
                                   &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_try_os_intrinsic(owner, body, stripped_name, arg_start, arg_count,
+    if (cold_try_os_intrinsic(owner, body, intrinsic_name, arg_start, arg_count,
                               &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_try_path_intrinsic(owner, body, stripped_name, arg_start, arg_count,
+    if (cold_try_path_intrinsic(owner, body, intrinsic_name, arg_start, arg_count,
                                 &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_try_csg_intrinsic(owner, body, stripped_name, arg_start, arg_count,
+    if (cold_try_csg_intrinsic(owner, body, intrinsic_name, arg_start, arg_count,
                                &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_try_slplan_intrinsic(owner, body, stripped_name, arg_start, arg_count,
+    if (cold_try_slplan_intrinsic(owner, body, intrinsic_name, arg_start, arg_count,
                                   &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (span_eq(stripped_name, "atomicLoadI32")) {
+    if (span_eq(intrinsic_name, "atomicLoadI32")) {
         if (arg_count != 1) die("atomicLoadI32 expects 1 arg");
         int32_t ptr = body->call_arg_slot[arg_start];
         int32_t slot = body_slot(body, SLOT_I32, 4);
@@ -3313,7 +3421,7 @@ int32_t parse_call_from_args_span(Parser *owner, BodyIR *body, Locals *locals,
         if (kind_out) *kind_out = SLOT_I32;
         return slot;
     }
-    if (span_eq(stripped_name, "atomicStoreI32")) {
+    if (span_eq(intrinsic_name, "atomicStoreI32")) {
         if (arg_count != 2) die("atomicStoreI32 expects 2 args");
         int32_t ptr = body->call_arg_slot[arg_start];
         int32_t val = body->call_arg_slot[arg_start + 1];
@@ -3321,7 +3429,7 @@ int32_t parse_call_from_args_span(Parser *owner, BodyIR *body, Locals *locals,
         if (kind_out) *kind_out = SLOT_I32;
         return cold_make_i32_const_slot(body, 0);
     }
-    if (span_eq(stripped_name, "atomicCasI32")) {
+    if (span_eq(intrinsic_name, "atomicCasI32")) {
         if (arg_count != 3) die("atomicCasI32 arity mismatch");
         int32_t ptr = body->call_arg_slot[arg_start];
         int32_t expect = body->call_arg_slot[arg_start + 1];
@@ -3331,7 +3439,7 @@ int32_t parse_call_from_args_span(Parser *owner, BodyIR *body, Locals *locals,
         if (kind_out) *kind_out = SLOT_I32;
         return slot;
     }
-    if (span_eq(stripped_name, "ptr")) {
+    if (span_eq(intrinsic_name, "ptr")) {
         if (arg_count != 1) die("ptr() expects 1 arg");
         int32_t src = body->call_arg_slot[arg_start];
         int32_t src_kind = body->slot_kind[src];
@@ -3349,15 +3457,15 @@ int32_t parse_call_from_args_span(Parser *owner, BodyIR *body, Locals *locals,
         if (kind_out) *kind_out = SLOT_PTR;
         return slot;
     }
-    if (cold_try_backend_intrinsic(owner, body, stripped_name, arg_start, arg_count,
+    if (cold_try_backend_intrinsic(owner, body, intrinsic_name, arg_start, arg_count,
                                    &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_try_assert_intrinsic(body, stripped_name, arg_start, arg_count,
+    if (cold_try_assert_intrinsic(body, intrinsic_name, arg_start, arg_count,
                                   &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
-    if (cold_try_bootstrap_intrinsic(body, stripped_name, arg_start, arg_count,
+    if (cold_try_bootstrap_intrinsic(body, intrinsic_name, arg_start, arg_count,
                                      &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
@@ -3436,8 +3544,9 @@ int32_t parse_call_from_args_span(Parser *owner, BodyIR *body, Locals *locals,
                                              arg_start, arg_count);
         die("unresolved function call");
     }
-	    FnDef *fn = &owner->symbols->functions[fn_index];
-        cold_materialize_specialized_body_if_needed(owner, fn_index);
+		    FnDef *fn = &owner->symbols->functions[fn_index];
+        cold_validate_explicit_generic_call(owner, fn, explicit_generic_args);
+	        cold_materialize_specialized_body_if_needed(owner, fn_index);
 	    cold_apply_contextual_empty_sequence_args(body, owner->symbols, fn, arg_start, arg_count);
 	    if (!cold_validate_call_args(body, fn, arg_start, arg_count, owner->import_mode)) {
 	        cold_die_call_arg_mismatch(body, fn, arg_start, arg_count);
@@ -3566,14 +3675,9 @@ int32_t parse_object_constructor_typed(Parser *parser, BodyIR *body, Locals *loc
     memset(seen, 0, sizeof(seen));
     while (!span_eq(parser_peek(parser), curly ? "}" : ")")) {
         Span field_name = parser_token(parser);
-        if (field_name.len <= 0) return 0; /* skip empty field name */;
+        if (field_name.len <= 0) die("empty object constructor field name");
         ObjectField *field = object_find_field(object, field_name);
-        if (!field) {
-            /* Unknown field, skip */
-            int32_t skip_kind = SLOT_I32;
-            (void)parse_expr(parser, body, locals, &skip_kind);
-            continue;
-        }
+        if (!field) die("unknown object constructor field");
         int32_t field_index = (int32_t)(field - object->fields);
         if (field_index < 0 || field_index >= object->field_count) die("object field index out of range");
         if (seen[field_index]) die("duplicate object constructor field");
@@ -3581,15 +3685,6 @@ int32_t parse_object_constructor_typed(Parser *parser, BodyIR *body, Locals *loc
         if (!parser_take(parser, ":")) die("expected : in object constructor field");
         int32_t value_kind = SLOT_I32;
         int32_t value_slot = parse_expr(parser, body, locals, &value_kind);
-        if (field->kind == SLOT_SEQ_I32 && value_kind == SLOT_ARRAY_I32) {
-            int32_t count = body->slot_aux[value_slot];
-            int32_t seq_slot = body_slot(body, SLOT_SEQ_I32, 16);
-            body_slot_set_type(body, seq_slot, cold_cstr_span("int32[]"));
-            body_slot_set_array_len(body, seq_slot, count);
-            body_op3(body, BODY_OP_MAKE_SEQ_I32, seq_slot, value_slot, -1, count);
-            value_slot = seq_slot;
-            value_kind = SLOT_SEQ_I32;
-        }
         if (field->kind == SLOT_SEQ_I32 && value_kind == SLOT_ARRAY_I32) {
             int32_t count = body->slot_aux[value_slot];
             int32_t seq_slot = body_slot(body, SLOT_SEQ_I32, 16);
@@ -3612,10 +3707,7 @@ int32_t parse_object_constructor_typed(Parser *parser, BodyIR *body, Locals *loc
             value_slot = tag_slot;
             value_kind = SLOT_I32;
         }
-        if (value_kind != field->kind) {
-            /* Skip mismatched field */
-            continue;
-        }
+        if (value_kind != field->kind) die("object constructor field type mismatch");
         if (field->kind == SLOT_ARRAY_I32 && body->slot_aux[value_slot] != field->array_len) {
             die("object constructor array length mismatch");
         }
@@ -3628,7 +3720,7 @@ int32_t parse_object_constructor_typed(Parser *parser, BodyIR *body, Locals *loc
         }
         break;
     }
-    if (!parser_take(parser, curly ? "}" : ")")) return 0; /* skip malformed object constructor */
+    if (!parser_take(parser, curly ? "}" : ")")) die("malformed object constructor");
     int32_t payload_start = payload_count > 0 ? body->call_arg_count : -1;
     for (int32_t i = 0; i < payload_count; i++) {
         body_call_arg_with_offset(body, payload_slots[i], payload_offsets[i]);

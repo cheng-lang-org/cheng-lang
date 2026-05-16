@@ -238,7 +238,7 @@ static void x64_pop_r64(X64Code *c, int reg) {
 
 /* xchg %rax, %reg (for saving/restoring) */
 static void x64_mov_r64_r64(X64Code *c, int dst, int src) {
-    x64_emit1(c, REX_W | (dst >= 8 ? REX_R : 0) | (src >= 8 ? REX_B : 0));
+    x64_emit1(c, REX_W | (src >= 8 ? REX_R : 0) | (dst >= 8 ? REX_B : 0));
     x64_emit1(c, 0x89);
     x64_emit1(c, MODRM(3, src & 7, dst & 7));
 }
@@ -560,6 +560,79 @@ static void x64_push_imm32(X64Code *c, int32_t imm) { x64_emit1(c, 0x68); x64_em
 static void x64_int3(X64Code *c) { x64_emit1(c, 0xCC); }
 /* syscall (x86_64) */
 static void x64_syscall(X64Code *c) { x64_emit1(c, 0x0F); x64_emit1(c, 0x05); }
+
+/* mov %r64, [base_reg + disp8] (load 64-bit, disp8 form) */
+static void x64_mov_r64_mr64_base_disp8(X64Code *c, int reg, int base_reg, int8_t disp) {
+    x64_emit1(c, REX_W | (reg >= 8 ? REX_R : 0) | (base_reg >= 8 ? REX_B : 0));
+    x64_emit1(c, 0x8B);
+    if ((base_reg & 7) == 4) {
+        x64_emit1(c, MODRM(1, reg & 7, 4));
+        x64_emit1(c, SIB(0, 4, 4));
+    } else {
+        x64_emit1(c, MODRM(1, reg & 7, base_reg & 7));
+    }
+    x64_emit1(c, (uint8_t)disp);
+}
+/* mov [base_reg + disp8], %r64 (store 64-bit, disp8 form) */
+static void x64_mov_mr64_base_disp8_r64(X64Code *c, int base_reg, int8_t disp, int reg) {
+    x64_emit1(c, REX_W | (reg >= 8 ? REX_R : 0) | (base_reg >= 8 ? REX_B : 0));
+    x64_emit1(c, 0x89);
+    if ((base_reg & 7) == 4) {
+        x64_emit1(c, MODRM(1, reg & 7, 4));
+        x64_emit1(c, SIB(0, 4, 4));
+    } else {
+        x64_emit1(c, MODRM(1, reg & 7, base_reg & 7));
+    }
+    x64_emit1(c, (uint8_t)disp);
+}
+/* mov %r32, [base_reg + disp8] (load 32-bit, disp8 form) */
+static void x64_mov_r32_mr32_base_disp8(X64Code *c, int reg, int base_reg, int8_t disp) {
+    if (reg >= 8 || base_reg >= 8) x64_emit1(c, (reg >= 8 ? REX_R : 0) | (base_reg >= 8 ? REX_B : 0));
+    x64_emit1(c, 0x8B);
+    if ((base_reg & 7) == 4) {
+        x64_emit1(c, MODRM(1, reg & 7, 4));
+        x64_emit1(c, SIB(0, 4, 4));
+    } else {
+        x64_emit1(c, MODRM(1, reg & 7, base_reg & 7));
+    }
+    x64_emit1(c, (uint8_t)disp);
+}
+/* mov [base_reg + disp8], %r32 (store 32-bit, disp8 form) */
+static void x64_mov_mr32_base_disp8_r32(X64Code *c, int base_reg, int8_t disp, int reg) {
+    if (base_reg >= 8 || reg >= 8) x64_emit1(c, (base_reg >= 8 ? REX_B : 0) | (reg >= 8 ? REX_R : 0));
+    x64_emit1(c, 0x89);
+    if ((base_reg & 7) == 4) {
+        x64_emit1(c, MODRM(1, reg & 7, 4));
+        x64_emit1(c, SIB(0, 4, 4));
+    } else {
+        x64_emit1(c, MODRM(1, reg & 7, base_reg & 7));
+    }
+    x64_emit1(c, (uint8_t)disp);
+}
+/* movzb [base_reg + disp8], %r32 (load zero-extend byte from disp8) */
+static void x64_movzb_r32_mr8_base_disp8(X64Code *c, int reg, int base_reg, int8_t disp) {
+    if (reg >= 8 || base_reg >= 8) x64_emit1(c, (reg >= 8 ? REX_R : 0) | (base_reg >= 8 ? REX_B : 0));
+    x64_emit1(c, 0x0F); x64_emit1(c, 0xB6);
+    if ((base_reg & 7) == 4) {
+        x64_emit1(c, MODRM(1, reg & 7, 4));
+        x64_emit1(c, SIB(0, 4, 4));
+    } else {
+        x64_emit1(c, MODRM(1, reg & 7, base_reg & 7));
+    }
+    x64_emit1(c, (uint8_t)disp);
+}
+/* movb [base_reg + disp8], %r8 (store byte, disp8 form) */
+static void x64_mov_mr8_base_disp8_r8(X64Code *c, int base_reg, int8_t disp, int reg) {
+    if (base_reg >= 8 || reg >= 8) x64_emit1(c, (base_reg >= 8 ? REX_B : 0) | (reg >= 8 ? REX_R : 0));
+    x64_emit1(c, 0x88);
+    if ((base_reg & 7) == 4) {
+        x64_emit1(c, MODRM(1, reg & 7, 4));
+        x64_emit1(c, SIB(0, 4, 4));
+    } else {
+        x64_emit1(c, MODRM(1, reg & 7, base_reg & 7));
+    }
+    x64_emit1(c, (uint8_t)disp);
+}
 
 /* ---- float (SSE) helpers ---- */
 /* movss [base+disp32], %xmm (store scalar single) */

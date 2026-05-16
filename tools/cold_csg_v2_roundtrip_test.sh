@@ -1206,8 +1206,16 @@ if "$COLD" system-link-exec \
   echo "FAIL csg_in_wrong_target_hard_fail"
   fail=$((fail + 1))
 else
-  echo "PASS csg_in_wrong_target_hard_fail"
-  pass=$((pass + 1))
+  if [ ! -e "$WORK/ordinary_wrong_target.o" ] &&
+     grep -q '^system_link_exec=0$' "$WORK/ordinary_wrong_target.report.txt" 2>/dev/null &&
+     grep -q '^direct_macho=0$' "$WORK/ordinary_wrong_target.report.txt" 2>/dev/null &&
+     grep -q '^error=csg target mismatch$' "$WORK/ordinary_wrong_target.report.txt" 2>/dev/null; then
+    echo "PASS csg_in_wrong_target_hard_fail"
+    pass=$((pass + 1))
+  else
+    echo "FAIL csg_in_wrong_target_hard_fail"
+    fail=$((fail + 1))
+  fi
 fi
 
 echo "  - ordinary_riscv_writer"

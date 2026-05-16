@@ -93,6 +93,26 @@ compile_obj_smoke() {
     rm -f "$o" "$r"
 }
 
+compile_obj_hard_fail_target() {
+    local tag="$1" src="$2" target="$3" pattern="$4"
+    local o="/tmp/ct_${tag}.o" r="/tmp/ct_${tag}.report"
+    rm -f "$o" "$r"
+    if $COLD system-link-exec --root:"$PWD" \
+        --in:"$src" --target:"$target" \
+        --out:"$o" --emit:obj \
+        --report-out:"$r" >/dev/null 2>&1; then
+        echo 0
+    elif [ ! -e "$o" ] &&
+         grep -q '^system_link_exec=0$' "$r" 2>/dev/null &&
+         grep -q '^direct_macho=0$' "$r" 2>/dev/null &&
+         grep -Eq "$pattern" "$r" 2>/dev/null; then
+        echo 1
+    else
+        echo 0
+    fi
+    rm -f "$o" "$r"
+}
+
 # 1-3: Core tests
 ACT=$(compile_run src/tests/ordinary_zero_exit_fixture.cheng /tmp/ct_oz)
 assert "ordinary_zero" 0 "$ACT"
@@ -144,6 +164,48 @@ else
     ACT="WRONG_FAILURE"
 fi
 assert "import_unresolved_hard_fail" "HARD_FAIL" "$ACT"
+
+rm -f /tmp/ct_object_unknown_field /tmp/ct_object_unknown_field.report
+if $COLD system-link-exec --in:src/tests/cold_object_unknown_field_hard_fail.cheng \
+    --target:arm64-apple-darwin --out:/tmp/ct_object_unknown_field \
+    --report-out:/tmp/ct_object_unknown_field.report >/dev/null 2>&1; then
+    ACT="UNEXPECTED_SUCCESS"
+elif [ ! -e /tmp/ct_object_unknown_field ] &&
+     grep -Eq 'unknown object constructor field|^error=' /tmp/ct_object_unknown_field.report 2>/dev/null; then
+    ACT="HARD_FAIL"
+else
+    ACT="WRONG_FAILURE"
+fi
+assert "object_unknown_field_hard_fail" "HARD_FAIL" "$ACT"
+
+rm -f /tmp/ct_object_field_type_mismatch /tmp/ct_object_field_type_mismatch.report
+if $COLD system-link-exec --in:src/tests/cold_object_field_type_mismatch_hard_fail.cheng \
+    --target:arm64-apple-darwin --out:/tmp/ct_object_field_type_mismatch \
+    --report-out:/tmp/ct_object_field_type_mismatch.report >/dev/null 2>&1; then
+    ACT="UNEXPECTED_SUCCESS"
+elif [ ! -e /tmp/ct_object_field_type_mismatch ] &&
+     grep -Eq 'object constructor field type mismatch|^error=' /tmp/ct_object_field_type_mismatch.report 2>/dev/null; then
+    ACT="HARD_FAIL"
+else
+    ACT="WRONG_FAILURE"
+fi
+assert "object_field_type_mismatch_hard_fail" "HARD_FAIL" "$ACT"
+
+ACT=$(compile_run src/tests/cold_explicit_generic_match_smoke.cheng /tmp/ct_explicit_generic_match)
+assert "explicit_generic_match" 7 "$ACT"
+
+rm -f /tmp/ct_explicit_generic_mismatch /tmp/ct_explicit_generic_mismatch.report
+if $COLD system-link-exec --in:src/tests/cold_explicit_generic_mismatch_hard_fail.cheng \
+    --target:arm64-apple-darwin --out:/tmp/ct_explicit_generic_mismatch \
+    --report-out:/tmp/ct_explicit_generic_mismatch.report >/dev/null 2>&1; then
+    ACT="UNEXPECTED_SUCCESS"
+elif [ ! -e /tmp/ct_explicit_generic_mismatch ] &&
+     grep -Eq 'explicit generic arg mismatch|^error=' /tmp/ct_explicit_generic_mismatch.report 2>/dev/null; then
+    ACT="HARD_FAIL"
+else
+    ACT="WRONG_FAILURE"
+fi
+assert "explicit_generic_mismatch_hard_fail" "HARD_FAIL" "$ACT"
 
 rm -f /tmp/ct_bare_helper /tmp/ct_bare_helper.report
 quiet $COLD system-link-exec --in:src/tests/cold_import_bare_helper_main.cheng \
@@ -3128,8 +3190,9 @@ assert "typed_expr_fact_importc_nested_cold_compile_smoke" 1 "$ACT"
 ACT=$(compile_obj_smoke "uir_thunk_synthesis" "src/tests/uir_thunk_synthesis_smoke.cheng")
 assert "uir_thunk_synthesis_cold_compile_smoke" 1 "$ACT"
 
-ACT=$(compile_obj_smoke "x64_linux_probe_tmp" "src/tests/x64_linux_probe_tmp.cheng")
-assert "x64_linux_probe_tmp_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_hard_fail_target "x64_linux_probe_tmp" "src/tests/x64_linux_probe_tmp.cheng" \
+    "x86_64-unknown-linux-gnu" '^error=x86_64 str literal unsupported$')
+assert "x64_linux_probe_tmp_real_target_hard_fail" 1 "$ACT"
 
 ACT=$(compile_obj_smoke "tls_client_hello_parse" "src/tests/tls_client_hello_parse_smoke.cheng")
 assert "tls_client_hello_parse_cold_compile_smoke" 1 "$ACT"
@@ -3576,6 +3639,292 @@ quiet $COLD system-link-exec --root:"$PWD"     --in:src/core/tooling/gate_main.c
 if [ -s /tmp/ct_stress_5.o ] && grep -q '^direct_macho=1$' /tmp/ct_stress_5.report 2>/dev/null; then ACT=1; else ACT=0; fi
 assert "cold_stress_5_gate_main" 1 "$ACT"
 rm -f /tmp/ct_stress_*.o /tmp/ct_stress_*.report
+
+# --- nm + otool verification for ALL compile_obj_smoke production-core files ---
+for nv_entry in \
+    "arena:src/core/runtime/arena.cheng" \
+    "backend_driver_dispatch_min:src/core/backend/backend_driver_dispatch_min.cheng" \
+    "body_ir_loop:src/core/ir/body_ir_loop.cheng" \
+    "body_ir_noalias:src/core/ir/body_ir_noalias.cheng" \
+    "body_ir_opt:src/core/ir/body_ir_opt.cheng" \
+    "body_kind_parse:src/core/backend/body_kind_parse.cheng" \
+    "borrow_ir:src/core/analysis/borrow_ir.cheng" \
+    "browser_abi_rule:src/core/lang/browser_abi_rule.cheng" \
+    "chain_anti_entropy:src/chain/anti_entropy.cheng" \
+    "chain_codec_binary:src/chain/codec_binary.cheng" \
+    "chain_consensus:src/chain/consensus.cheng" \
+    "chain_content_fetch:src/chain/content_fetch.cheng" \
+    "chain_lsmr_types:src/chain/lsmr_types.cheng" \
+    "chain_pin_plane:src/chain/pin_plane.cheng" \
+    "chain_plumtree:src/chain/plumtree.cheng" \
+    "chain_pubsub:src/chain/pubsub.cheng" \
+    "coff_object_writer:src/core/backend/coff_object_writer.cheng" \
+    "compiler_world_bundle:src/core/tooling/compiler_world_bundle.cheng" \
+    "core_runtime_provider_darwin:src/core/runtime/core_runtime_provider_darwin.cheng" \
+    "core_types:src/core/ir/core_types.cheng" \
+    "csg_v2_writer_reloc_source_contract:tests/cheng/backend/fixtures/csg_v2_writer_reloc_source_contract.cheng" \
+    "debug_runtime_stub:src/core/runtime/debug_runtime_stub.cheng" \
+    "debug_tools_gate:src/core/tooling/debug_tools_gate.cheng" \
+    "direct_exe_emit:src/core/backend/direct_exe_emit.cheng" \
+    "elf_object_writer:src/core/backend/elf_object_writer.cheng" \
+    "elf_riscv64_writer:src/core/backend/elf_riscv64_writer.cheng" \
+    "export_visibility_gate:src/core/tooling/export_visibility_gate.cheng" \
+    "host_ops:src/core/tooling/host_ops.cheng" \
+    "host_smoke_gate:src/core/tooling/host_smoke_gate.cheng" \
+    "intern:src/core/lang/intern.cheng" \
+    "line_map:src/core/backend/line_map.cheng" \
+    "low_uir:src/core/ir/low_uir.cheng" \
+    "lowering_plan:src/core/backend/lowering_plan.cheng" \
+    "macho_object_linker:src/core/backend/macho_object_linker.cheng" \
+    "macho_object_writer:src/core/backend/macho_object_writer.cheng" \
+    "object_debug_report:src/core/tooling/object_debug_report.cheng" \
+    "object_relocs:src/core/backend/object_relocs.cheng" \
+    "object_symbols:src/core/backend/object_symbols.cheng" \
+    "oracle_bft_state_host:src/oracle/oracle_bft_state_host.cheng" \
+    "oracle_bft_state_machine_main:src/oracle/oracle_bft_state_machine_main.cheng" \
+    "oracle_fixture:src/oracle/oracle_fixture.cheng" \
+    "outline_parser:src/core/lang/outline_parser.cheng" \
+    "ownership:src/core/analysis/ownership.cheng" \
+    "path:src/core/tooling/path.cheng" \
+    "perf_memory_gate:src/core/tooling/perf_memory_gate.cheng" \
+    "primary_object_emit:src/core/backend/primary_object_emit.cheng" \
+    "r2c_native_gui_software_framebuffer:src/r2c/native_gui_software_framebuffer.cheng" \
+    "r2c_native_platform_shell_project:src/r2c/native_platform_shell_project.cheng" \
+    "r2c_native_platform_shell_runtime:src/r2c/native_platform_shell_runtime.cheng" \
+    "r2c_process:src/r2c/r2c_process.cheng" \
+    "r2c_react_controller_main:src/r2c/r2c_react_controller_main.cheng" \
+    "r2c_react_smoke_support:src/r2c/r2c_react_smoke_support.cheng" \
+    "r2c_react_status_support:src/r2c/r2c_react_status_support.cheng" \
+    "r2c_react_surface_main:src/r2c/r2c_react_surface_main.cheng" \
+    "riscv64_encode:src/core/backend/riscv64_encode.cheng" \
+    "runtime_c_baseline_contract:src/core/tooling/runtime_c_baseline_contract.cheng" \
+    "runtime_json_ast:src/runtime/json_ast.cheng" \
+    "runtime_scalars:src/runtime/scalars.cheng" \
+    "seed_app_build_gate:src/core/tooling/seed_app_build_gate.cheng" \
+    "seed_cross_target_gate:src/core/tooling/seed_cross_target_gate.cheng"; do
+    nv_tag="${nv_entry%%:*}"
+    nv_src="${nv_entry#*:}"
+    rm -f "/tmp/ct_nv_${nv_tag}.o" "/tmp/ct_nv_${nv_tag}.report"
+    quiet $COLD system-link-exec --root:"$PWD" \
+        --in:"$nv_src" --target:arm64-apple-darwin \
+        --out:"/tmp/ct_nv_${nv_tag}.o" --emit:obj \
+        --report-out:"/tmp/ct_nv_${nv_tag}.report"
+    if [ -s "/tmp/ct_nv_${nv_tag}.o" ] && \
+       nm "/tmp/ct_nv_${nv_tag}.o" >/dev/null 2>&1 && \
+       otool -h "/tmp/ct_nv_${nv_tag}.o" 2>/dev/null | grep -q '0xfeedfacf' && \
+       otool -l "/tmp/ct_nv_${nv_tag}.o" 2>/dev/null | grep -q '__text'; then
+        ACT=1
+    else
+        ACT=0
+    fi
+    assert "cold_nm_otool_${nv_tag}" 1 "$ACT"
+    rm -f "/tmp/ct_nv_${nv_tag}.o" "/tmp/ct_nv_${nv_tag}.report"
+done
+
+# --- nm + otool for key test files ---
+for nv_entry in \
+    "anti_entropy_signature_fields:src/tests/anti_entropy_signature_fields_smoke.cheng" \
+    "bigint_result_probe:src/tests/bigint_result_probe.cheng" \
+    "browser_host_probe_abi_rule:src/tests/browser_host_probe_abi_rule_smoke.cheng" \
+    "call_hir_closure_visible_leaf:src/tests/call_hir_closure_visible_leaf.cheng" \
+    "call_hir_matrix:src/tests/call_hir_matrix_smoke.cheng" \
+    "chain_index_field_assign_preserves_tail:src/tests/chain_index_field_assign_preserves_tail_smoke.cheng" \
+    "chain_node_cell_dump_probe:src/tests/chain_node_cell_dump_probe.cheng" \
+    "compiler_world_fresh_node_selfhost:src/tests/compiler_world_fresh_node_selfhost_smoke.cheng" \
+    "compiler_world_line_value_symbol:src/tests/compiler_world_line_value_symbol_smoke.cheng" \
+    "export_surface_parse_probe:src/tests/export_surface_parse_probe.cheng" \
+    "export_visibility_parallel:src/tests/export_visibility_parallel_smoke.cheng" \
+    "ffi_handle_gen_stale_trap:src/tests/ffi_handle_generation_stale_trap_smoke.cheng" \
+    "int32_asr_direct_object:src/tests/int32_asr_direct_object_smoke.cheng" \
+    "lsmr_bagua_prefix_tree:src/tests/lsmr_bagua_prefix_tree_smoke.cheng" \
+    "lsmr_locality_storage:src/tests/lsmr_locality_storage_smoke.cheng" \
+    "oracle_p256_sign_probe_min:src/tests/oracle_p256_sign_probe_min.cheng" \
+    "quic_tls_transport_ecdsa:src/tests/quic_tls_transport_ecdsa_smoke.cheng" \
+    "rwad_accumulator:src/tests/rwad_accumulator_smoke.cheng" \
+    "seqs_add_generic:src/tests/seqs_add_generic_smoke.cheng" \
+    "sha256_round:src/tests/sha256_round_smoke.cheng" \
+    "strings_int_to_str:src/tests/strings_int_to_str_smoke.cheng" \
+    "tailnet_control_core:src/tests/tailnet_control_core_smoke.cheng" \
+    "tailnet_train_island:src/tests/tailnet_train_island_smoke.cheng" \
+    "thread_parallelism_direct_runtime:src/tests/thread_parallelism_direct_runtime_smoke.cheng" \
+    "tls_client_hello_parse:src/tests/tls_client_hello_parse_smoke.cheng" \
+    "tls_initial_packet_roundtrip:src/tests/tls_initial_packet_roundtrip_smoke.cheng" \
+    "udp_bind_bindtext:src/tests/udp_bind_bindtext_smoke.cheng" \
+    "vpn_proxy_socks:src/tests/vpn_proxy_socks_smoke.cheng" \
+    "wasm_composite_field:src/tests/wasm_composite_field_smoke.cheng" \
+    "webrtc_browser_pubsub:src/tests/webrtc_browser_pubsub_smoke.cheng" \
+    "wow_export_tvfs:src/tests/wow_export_tvfs_smoke.cheng" \
+    "zrpc_integration:src/tests/zrpc_integration_smoke.cheng"; do
+    nv_tag="${nv_entry%%:*}"
+    nv_src="${nv_entry#*:}"
+    rm -f "/tmp/ct_nv_${nv_tag}.o" "/tmp/ct_nv_${nv_tag}.report"
+    quiet $COLD system-link-exec --root:"$PWD" \
+        --in:"$nv_src" --target:arm64-apple-darwin \
+        --out:"/tmp/ct_nv_${nv_tag}.o" --emit:obj \
+        --report-out:"/tmp/ct_nv_${nv_tag}.report"
+    if [ -s "/tmp/ct_nv_${nv_tag}.o" ] && \
+       nm "/tmp/ct_nv_${nv_tag}.o" >/dev/null 2>&1 && \
+       otool -h "/tmp/ct_nv_${nv_tag}.o" 2>/dev/null | grep -q '0xfeedfacf' && \
+       otool -l "/tmp/ct_nv_${nv_tag}.o" 2>/dev/null | grep -q '__text'; then
+        ACT=1
+    else
+        ACT=0
+    fi
+    assert "cold_nm_otool_${nv_tag}" 1 "$ACT"
+    rm -f "/tmp/ct_nv_${nv_tag}.o" "/tmp/ct_nv_${nv_tag}.report"
+done
+
+# --- WASM regression test suite: compile key smoke files with wasm32 target ---
+for wasm_entry in \
+    "wasm_zero:src/tests/wasm_zero_smoke.cheng" \
+    "wasm_ops:src/tests/wasm_ops_smoke.cheng" \
+    "wasm_scalar_control_flow:src/tests/wasm_scalar_control_flow_smoke.cheng" \
+    "wasm_internal_call:src/tests/wasm_internal_call_smoke.cheng" \
+    "wasm_composite_field:src/tests/wasm_composite_field_smoke.cheng" \
+    "wasm_func_block_shared:src/tests/wasm_func_block_shared_smoke.cheng" \
+    "wasm_importc_noarg_i32:src/tests/wasm_importc_noarg_i32_smoke.cheng" \
+    "wasm_importc_noarg_i32_native:src/tests/wasm_importc_noarg_i32_native_smoke.cheng" \
+    "wasm_shadowed_local_scope:src/tests/wasm_shadowed_local_scope_smoke.cheng"; do
+    wt_tag="${wasm_entry%%:*}"
+    wt_src="${wasm_entry#*:}"
+    rm -f "/tmp/ct_wasm_${wt_tag}.wasm" "/tmp/ct_wasm_${wt_tag}.report"
+    quiet $COLD system-link-exec --root:"$PWD" \
+        --in:"$wt_src" --target:wasm32-unknown-unknown \
+        --out:"/tmp/ct_wasm_${wt_tag}.wasm" --emit:obj \
+        --report-out:"/tmp/ct_wasm_${wt_tag}.report"
+    if [ -s "/tmp/ct_wasm_${wt_tag}.wasm" ] && \
+       grep -q '^target=wasm32-unknown-unknown' "/tmp/ct_wasm_${wt_tag}.report" 2>/dev/null && \
+       grep -q '^system_link_exec=1' "/tmp/ct_wasm_${wt_tag}.report" 2>/dev/null && \
+       ! grep -q '^error=' "/tmp/ct_wasm_${wt_tag}.report" 2>/dev/null; then
+        ACT=1
+    else
+        ACT=0
+    fi
+    assert "wasm_compile_${wt_tag}" 1 "$ACT"
+    rm -f "/tmp/ct_wasm_${wt_tag}.wasm" "/tmp/ct_wasm_${wt_tag}.report"
+done
+
+# --- Cross-target compilation: same source compiled for arm64, x86_64, riscv64, wasm32 ---
+cat > /tmp/ct_cross_all.cheng << 'CTEOF'
+fn main(): int32 = return 42
+CTEOF
+for ct_entry in "arm64_darwin:arm64-apple-darwin:Mach-O 64-bit" \
+                "x86_64_linux:x86_64-unknown-linux-gnu:ELF 64-bit" \
+                "riscv64_linux:riscv64-unknown-linux-gnu:ELF 64-bit" \
+                "wasm32:wasm32-unknown-unknown:WebAssembly"; do
+    ct_tag="${ct_entry%%:*}"
+    rest="${ct_entry#*:}"
+    ct_target="${rest%%:*}"
+    ct_magic="${rest#*:}"
+    rm -f "/tmp/ct_ct_${ct_tag}.o" "/tmp/ct_ct_${ct_tag}.report"
+    quiet $COLD system-link-exec --root:"$PWD" \
+        --in:/tmp/ct_cross_all.cheng --target:"$ct_target" \
+        --out:"/tmp/ct_ct_${ct_tag}.o" --emit:obj \
+        --report-out:"/tmp/ct_ct_${ct_tag}.report"
+    if [ -s "/tmp/ct_ct_${ct_tag}.o" ] && \
+       grep -q "^target=$ct_target\$" "/tmp/ct_ct_${ct_tag}.report" 2>/dev/null && \
+       file "/tmp/ct_ct_${ct_tag}.o" 2>/dev/null | grep -q "$ct_magic" && \
+       ! grep -q '^error=' "/tmp/ct_ct_${ct_tag}.report" 2>/dev/null; then
+        ACT=1
+    else
+        ACT=0
+    fi
+    assert "cross_target_${ct_tag}" 1 "$ACT"
+    rm -f "/tmp/ct_ct_${ct_tag}.o" "/tmp/ct_ct_${ct_tag}.report"
+done
+rm -f /tmp/ct_cross_all.cheng
+
+# --- Cold bootstrap chain test: stage1 compiles simple file, stage2==stage3 binary match ---
+rm -rf /tmp/ct_bbc
+mkdir -p /tmp/ct_bbc
+timeout 300 $COLD bootstrap-bridge --out-dir:/tmp/ct_bbc >/tmp/ct_bbc/stdout 2>/tmp/ct_bbc/stderr
+if [ -x /tmp/ct_bbc/cheng.stage1 ] && \
+   [ -x /tmp/ct_bbc/cheng.stage2 ] && \
+   [ -x /tmp/ct_bbc/cheng.stage3 ]; then
+    echo 'fn main(): int32 = return 42' > /tmp/ct_bbc_simple.cheng
+    quiet /tmp/ct_bbc/cheng.stage1 system-link-exec --root:"$PWD" \
+        --in:/tmp/ct_bbc_simple.cheng --target:arm64-apple-darwin \
+        --out:/tmp/ct_bbc_simple.o --emit:obj \
+        --report-out:/tmp/ct_bbc_simple.report
+    if [ -s /tmp/ct_bbc_simple.o ] && \
+       nm /tmp/ct_bbc_simple.o >/dev/null 2>&1 && \
+       otool -h /tmp/ct_bbc_simple.o 2>/dev/null | grep -q '0xfeedfacf'; then
+        ACT=1
+    else
+        ACT=0
+    fi
+    rm -f /tmp/ct_bbc_simple.cheng /tmp/ct_bbc_simple.o /tmp/ct_bbc_simple.report
+else
+    ACT=0
+fi
+assert "cold_bootstrap_chain_stage1_compile" 1 "$ACT"
+if [ -x /tmp/ct_bbc/cheng.stage2 ] && [ -x /tmp/ct_bbc/cheng.stage3 ]; then
+    sz2=$(wc -c < /tmp/ct_bbc/cheng.stage2 2>/dev/null || echo 0)
+    sz3=$(wc -c < /tmp/ct_bbc/cheng.stage3 2>/dev/null || echo 0)
+    if [ "$sz2" -gt 0 ] && [ "$sz2" = "$sz3" ] 2>/dev/null; then ACT=1; else ACT=0; fi
+else
+    ACT=0
+fi
+assert "cold_bootstrap_chain_stage2_stage3_size_match" 1 "$ACT"
+if [ -x /tmp/ct_bbc/cheng.stage3 ]; then
+    echo 'fn main(): int32 = return 42' > /tmp/ct_bbc_fp.cheng
+    quiet /tmp/ct_bbc/cheng.stage3 system-link-exec --root:"$PWD" \
+        --in:/tmp/ct_bbc_fp.cheng --target:arm64-apple-darwin \
+        --out:/tmp/ct_bbc_fp.exe
+    if [ -x /tmp/ct_bbc_fp.exe ]; then
+        /tmp/ct_bbc_fp.exe 2>/dev/null; ACT=$?
+    else
+        ACT="COMPILE_FAILED"
+    fi
+    rm -f /tmp/ct_bbc_fp.cheng /tmp/ct_bbc_fp.exe
+else
+    ACT=0
+fi
+assert "cold_bootstrap_chain_stage3_compile" 42 "$ACT"
+rm -rf /tmp/ct_bbc
+
+# --- compile_obj_smoke for remaining key untested files ---
+ACT=$(compile_obj_smoke "runtime_program_support_backend" "src/core/runtime/program_support_backend.cheng")
+assert "runtime_program_support_backend_cold_compile_smoke" 1 "$ACT"
+# --- object format recognition: system_link_exec emits correct binary format per target ---
+cat > /tmp/ct_obj_format.cheng << 'CTEOF'
+fn main(): int32 = return 42
+CTEOF
+for fmt_entry in "macho:arm64-apple-darwin:Mach-O 64-bit" \
+                 "elf:x86_64-unknown-linux-gnu:ELF 64-bit" \
+                 "wasm:wasm32-unknown-unknown:WebAssembly"; do
+    fmt_tag="${fmt_entry%%:*}"
+    rest="${fmt_entry#*:}"
+    fmt_target="${rest%%:*}"
+    fmt_magic="${rest#*:}"
+    rm -f "/tmp/ct_fmt_${fmt_tag}.o" "/tmp/ct_fmt_${fmt_tag}.report"
+    quiet $COLD system-link-exec --root:"$PWD" \
+        --in:/tmp/ct_obj_format.cheng --target:"$fmt_target" \
+        --out:"/tmp/ct_fmt_${fmt_tag}.o" --emit:obj \
+        --report-out:"/tmp/ct_fmt_${fmt_tag}.report"
+    if [ -s "/tmp/ct_fmt_${fmt_tag}.o" ] && \
+       file "/tmp/ct_fmt_${fmt_tag}.o" 2>/dev/null | grep -q "$fmt_magic" && \
+       ! grep -q '^error=' "/tmp/ct_fmt_${fmt_tag}.report" 2>/dev/null; then
+        ACT=1
+    else
+        ACT=0
+    fi
+    assert "obj_format_${fmt_tag}" 1 "$ACT"
+    rm -f "/tmp/ct_fmt_${fmt_tag}.o" "/tmp/ct_fmt_${fmt_tag}.report"
+done
+rm -f /tmp/ct_obj_format.cheng
+
+# --- remaining tests ---
+ACT=$(compile_obj_smoke "hotpatch_provider_slot_v1" "tests/cheng/backend/fixtures/hotpatch_slot_v1.cheng")
+assert "hotpatch_slot_v1_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "hotpatch_provider_slot_v2" "tests/cheng/backend/fixtures/hotpatch_slot_v2.cheng")
+assert "hotpatch_slot_v2_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "util_add" "tests/cheng/backend/fixtures/util_add.cheng")
+assert "util_add_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "hello_puts" "tests/cheng/backend/fixtures/hello_puts.cheng")
+assert "hello_puts_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "native_contract_ok" "tests/cheng/backend/fixtures/native_contract_ok.cheng")
+assert "native_contract_ok_cold_compile_smoke" 1 "$ACT"
 
 # --- zero regression gate ---
 if [ "${CHENG_ZRG_INNER:-0}" != "1" ]; then
