@@ -11470,6 +11470,46 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         na_clobber(4); na_clobber(5); na_clobber(6); na_clobber(7);
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
         if (body->slot_no_alias && body->slot_no_alias[dst]) na_set(0, dst);
+    } else if (kind == BODY_OP_SEQ_OPAQUE_INDEX_REF_DYNAMIC) {
+        /* Get pointer-to-element in opaque seq (like index but returns addr).
+           a: seq slot, b: index slot, c: element_size (or 0 for auto-detect). */
+        int32_t es = codegen_seq_opaque_element_size(body, a, c);
+        codegen_seq_opaque_header_addr(code, body, a, R2);
+        a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], false);
+        code_emit(code, a64_cmp_imm(R1, 0));
+        code_emit(code, a64_bcond(2, COND_GE));
+        code_emit(code, a64_brk(145));
+        code_emit(code, a64_ldr_imm(R0, R2, 0, false));
+        code_emit(code, a64_cmp_reg(R1, R0));
+        code_emit(code, a64_bcond(2, COND_LT));
+        code_emit(code, a64_brk(145));
+        code_emit(code, a64_ldr_imm(R3, R2, 8, true));
+        codegen_mov_i32_const(code, 6, es);
+        code_emit(code, a64_mul_reg_x(6, R1, 6));
+        code_emit(code, a64_add_reg_x(R3, R3, 6));
+        a64_emit_str_sp_off(code, R3, body->slot_offset[dst], true);
+    } else if (kind == BODY_OP_HEAP_ALLOC) {
+        /* mmap-based heap alloc: a=size slot (I32/I64), dst=ptr */
+        if (body->slot_kind[a] == SLOT_I32) {
+            a64_emit_ldr_sp_off(code, R1, body->slot_offset[a], false);
+            code_emit(code, a64_sxtw(R1, R1));
+        } else {
+            a64_emit_ldr_sp_off(code, R1, body->slot_offset[a], true);
+        }
+        codegen_mmap_len_reg(code, R1, R0, 146);
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], true);
+    } else if (kind == BODY_OP_HEAP_FREE) {
+        /* munmap-based heap free: a=ptr slot, b=size slot (I32/I64), dst=result */
+        a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], true);
+        if (body->slot_kind[b] == SLOT_I32) {
+            a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], false);
+            code_emit(code, a64_sxtw(R1, R1));
+        } else {
+            a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], true);
+        }
+        code_emit(code, a64_movz_x(16, 215, 0));
+        code_emit(code, a64_svc(0x80));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
     } else {
         fprintf(stderr, "cheng_cold: unsupported AArch64 BodyIR op kind=%d\n", kind);
         die("unsupported AArch64 BodyIR op");
@@ -11981,7 +12021,9 @@ static void x64_codegen_op(X64Code *x, BodyIR *body, Symbols *symbols,
                kind == BODY_OP_CHMOD_X || kind == BODY_OP_COLD_SELF_EXEC ||
                kind == BODY_OP_MKDIR_ONE || kind == BODY_OP_TEXT_CONTAINS ||
                kind == BODY_OP_EXEC_SHELL || kind == BODY_OP_ARGV_STR ||
-               kind == BODY_OP_STR_SELECT_NONEMPTY || kind == BODY_OP_ASSERT) {
+               kind == BODY_OP_STR_SELECT_NONEMPTY || kind == BODY_OP_ASSERT ||
+               kind == BODY_OP_SEQ_OPAQUE_INDEX_REF_DYNAMIC ||
+               kind == BODY_OP_HEAP_ALLOC || kind == BODY_OP_HEAP_FREE) {
         fprintf(stderr, "cheng_cold: unsupported x86_64 BodyIR op kind=%d\n", kind);
         die("unsupported x86_64 BodyIR op");
     } else {
@@ -12464,7 +12506,9 @@ static void rv64_codegen_op(Code *code, BodyIR *body, Symbols *symbols,
                kind == BODY_OP_SEQ_OPAQUE_INDEX_DYNAMIC ||
                kind == BODY_OP_SEQ_OPAQUE_ADD ||
                kind == BODY_OP_SEQ_OPAQUE_INDEX_STORE ||
-               kind == BODY_OP_SEQ_OPAQUE_REMOVE) {
+               kind == BODY_OP_SEQ_OPAQUE_REMOVE ||
+               kind == BODY_OP_SEQ_OPAQUE_INDEX_REF_DYNAMIC ||
+               kind == BODY_OP_HEAP_ALLOC || kind == BODY_OP_HEAP_FREE) {
         fprintf(stderr, "cheng_cold: unsupported RV64 BodyIR op kind=%d\n", kind);
         die("unsupported RV64 BodyIR op");
     } else {
@@ -18077,8 +18121,6 @@ done:
 #define COLD_PROVIDER_ARCHIVE_VERSION 1u
 #define COLD_PROVIDER_ARCHIVE_HASH_OFFSET 28u
 #define COLD_PROVIDER_ARCHIVE_HEADER_SIZE 36u
-#define COLD_PROVIDER_ARCHIVE_MACHO_ERROR "Mach-O relocatable provider archive reader/linker unsupported"
-
 /* Mach-O relocatable object view (MH_OBJECT) */
 typedef struct ColdMachOObjectView {
 const uint8_t *data;
@@ -18440,7 +18482,7 @@ static bool cold_read_macho_relocatable_view(const uint8_t *data,
     memset(out, 0, sizeof(*out));
     /* MH_OBJECT header */
     uint32_t magic = cold_u32le(data);
-    if (magic != 0xfeedfacf) { fprintf(stderr, "[macho] bad magic %08x\n", magic); return false; }
+    if (magic != 0xfeedfacf) return false;
     uint32_t cputype = cold_u32le(data + 4);
     if (cputype != 0x0100000c) return false; /* CPU_TYPE_ARM64 */
     uint32_t filetype = cold_u32le(data + 12);
@@ -18460,8 +18502,8 @@ static bool cold_read_macho_relocatable_view(const uint8_t *data,
         
         if (cmd == 0x19) { /* LC_SEGMENT_64 */
             if (cmdsize < 72) return false;
-            uint64_t fileoff = cold_u64le(cmds + cmd_pos + 48);
-            uint64_t filesize = cold_u64le(cmds + cmd_pos + 56);
+            uint64_t fileoff = cold_u64le(cmds + cmd_pos + 40);
+            uint64_t filesize = cold_u64le(cmds + cmd_pos + 48);
             if (fileoff > (uint64_t)len || filesize > (uint64_t)(len - (int32_t)fileoff)) return false;
             if (filesize > (uint64_t)INT32_MAX) return false;
             out->text_offset = (int32_t)fileoff;

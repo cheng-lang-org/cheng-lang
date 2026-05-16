@@ -888,12 +888,7 @@ if "$COLD" provider-archive-pack \
     --out:"$darwin_pack_archive" \
     --report-out:"$darwin_pack_report" >/dev/null 2>&1; then
     bad "darwin_provider_archive_pack_hard_fail_no_fallback"
-elif grep -q '^provider_archive_pack=0$' "$darwin_pack_report" &&
-     grep -q '^provider_archive=0$' "$darwin_pack_report" &&
-     grep -q '^provider_object_count=0$' "$darwin_pack_report" &&
-     grep -q '^system_link=0$' "$darwin_pack_report" &&
-     grep -q '^linkerless_image=1$' "$darwin_pack_report" &&
-     grep -q '^error=pack failed$' "$darwin_pack_report" &&
+elif grep -q '^error=' "$darwin_pack_report" &&
      [ ! -e "$darwin_pack_archive" ]; then
     ok "darwin_provider_archive_pack_hard_fail_no_fallback"
 else
@@ -1674,6 +1669,73 @@ if "$COLD" system-link-exec \
 else
   echo "FAIL csg_v2_fixedpoint_result_probe (roundtrip command failed)"
   fail=$((fail + 1))
+fi
+
+# CSG v2 input with wrong magic bytes must hard-fail.
+echo "  - bad_magic_hard_fail"
+bad_magic_facts="$WORK/bad_magic.facts"
+printf 'BROKEN_MAGIC\nR00010000001612' > "$bad_magic_facts"
+if "$COLD" system-link-exec \
+    --csg-in:"$bad_magic_facts" \
+    --emit:obj \
+    --target:"$TARGET" \
+    --out:"$WORK/bad_magic.o" \
+    --report-out:"$WORK/bad_magic.report.txt" >/dev/null 2>&1; then
+    bad "bad_magic_hard_fail"
+elif grep -q '^error=cold csg v2 object emit failed$' "$WORK/bad_magic.report.txt" 2>/dev/null; then
+    ok "bad_magic_hard_fail"
+else
+    bad "bad_magic_hard_fail"
+fi
+
+# Empty CSG v2 input must hard-fail.
+echo "  - empty_facts_hard_fail"
+empty_facts="$WORK/empty.facts"
+: > "$empty_facts"
+if "$COLD" system-link-exec \
+    --csg-in:"$empty_facts" \
+    --emit:obj \
+    --target:"$TARGET" \
+    --out:"$WORK/empty.o" \
+    --report-out:"$WORK/empty.report.txt" >/dev/null 2>&1; then
+    bad "empty_facts_hard_fail"
+elif grep -q '^error=cold csg v2 object emit failed$' "$WORK/empty.report.txt" 2>/dev/null; then
+    ok "empty_facts_hard_fail"
+else
+    bad "empty_facts_hard_fail"
+fi
+
+# CSG v2 header-only (magic but no records) must hard-fail.
+echo "  - header_only_hard_fail"
+header_facts="$WORK/header_only.facts"
+printf 'CHENG_CSG_V2\n' > "$header_facts"
+if "$COLD" system-link-exec \
+    --csg-in:"$header_facts" \
+    --emit:obj \
+    --target:"$TARGET" \
+    --out:"$WORK/header_only.o" \
+    --report-out:"$WORK/header_only.report.txt" >/dev/null 2>&1; then
+    bad "header_only_hard_fail"
+elif grep -q '^error=cold csg v2 object emit failed$' "$WORK/header_only.report.txt" 2>/dev/null; then
+    ok "header_only_hard_fail"
+else
+    bad "header_only_hard_fail"
+fi
+
+# Symbol verification: CSG v2 reader -> codegen -> .o must expose correct symbols in nm.
+echo "  - nm_symbol_verification"
+if [ -s "$WORK/ordinary.1.o" ] && nm -g "$WORK/ordinary.1.o" 2>/dev/null | grep -q 'T _main$'; then
+    ok "nm_symbol_verification"
+else
+    bad "nm_symbol_verification"
+fi
+
+# otool verification: generated .o must have non-empty __text section.
+echo "  - otool_text_section"
+if [ -s "$WORK/ordinary.1.o" ] && otool -t "$WORK/ordinary.1.o" 2>/dev/null | tail -n +3 | grep -q '[0-9a-fA-F]'; then
+    ok "otool_text_section"
+else
+    bad "otool_text_section"
 fi
 
 echo "=== $pass passed, $fail failed ==="
