@@ -876,7 +876,8 @@ else
     bad "darwin_runtime_provider_marker_object"
 fi
 
-# provider-archive-pack now attempts Mach-O writing; it fails generically.
+# provider-archive-pack now handles Mach-O (cold_write_provider_archive reads
+# Mach-O objects and writes Chenga archives successfully).
 darwin_pack_archive="$WORK/core_runtime_provider_darwin.chenga"
 darwin_pack_report="$WORK/core_runtime_provider_darwin.pack.report.txt"
 if "$COLD" provider-archive-pack \
@@ -886,13 +887,12 @@ if "$COLD" provider-archive-pack \
     --module:runtime/core_runtime \
     --source:"$darwin_runtime_provider_source" \
     --out:"$darwin_pack_archive" \
-    --report-out:"$darwin_pack_report" >/dev/null 2>&1; then
-    bad "darwin_provider_archive_pack_hard_fail_no_fallback"
-elif grep -q '^error=' "$darwin_pack_report" &&
-     [ ! -e "$darwin_pack_archive" ]; then
-    ok "darwin_provider_archive_pack_hard_fail_no_fallback"
+    --report-out:"$darwin_pack_report" >/dev/null 2>&1 &&
+   [ -s "$darwin_pack_archive" ] &&
+   grep -q '^provider_archive_pack=1$' "$darwin_pack_report" 2>/dev/null; then
+    ok "darwin_provider_archive_pack"
 else
-    bad "darwin_provider_archive_pack_hard_fail_no_fallback"
+    bad "darwin_provider_archive_pack"
 fi
 
 darwin_archive_report="$WORK/darwin_provider_archive_hard_fail.report.txt"
@@ -1736,6 +1736,110 @@ if [ -s "$WORK/ordinary.1.o" ] && otool -t "$WORK/ordinary.1.o" 2>/dev/null | ta
     ok "otool_text_section"
 else
     bad "otool_text_section"
+fi
+
+# CSG v2 roundtrip: compile a minimal source via CSG v2 writer + reader, verify .o.
+echo "  - csg_v2_roundtrip_dispatch_min"
+dispatch_min_source="$WORK/csg_v2_dispatch_min.cheng"
+dispatch_min_facts="$WORK/csg_v2_dispatch_min.facts"
+dispatch_min_obj="$WORK/csg_v2_dispatch_min.o"
+cat > "$dispatch_min_source" <<'CHENG'
+fn main(): int32 =
+    return 0
+CHENG
+if "$COLD" system-link-exec \
+    --root:"$ROOT" \
+    --in:"$dispatch_min_source" \
+    --emit:csg-v2 \
+    --out:"$dispatch_min_facts" \
+    --target:"$TARGET" \
+    --report-out:"$WORK/csg_v2_dispatch_min.writer.report.txt" >/dev/null 2>&1 &&
+   "$COLD" system-link-exec \
+    --csg-in:"$dispatch_min_facts" \
+    --emit:obj \
+    --target:"$TARGET" \
+    --out:"$dispatch_min_obj" \
+    --report-out:"$WORK/csg_v2_dispatch_min.reader.report.txt" >/dev/null 2>&1 &&
+   [ -s "$dispatch_min_obj" ] &&
+   grep -q '^cold_csg_v2_writer_status=ok$' "$WORK/csg_v2_dispatch_min.writer.report.txt" &&
+   grep -q '^emit=obj$' "$WORK/csg_v2_dispatch_min.reader.report.txt" &&
+   grep -q '^system_link=0$' "$WORK/csg_v2_dispatch_min.reader.report.txt" &&
+   grep -q '^linkerless_image=1$' "$WORK/csg_v2_dispatch_min.reader.report.txt"; then
+    ok "csg_v2_roundtrip_dispatch_min"
+else
+    bad "csg_v2_roundtrip_dispatch_min"
+fi
+
+# CSG v2 roundtrip: function with empty body compiles via CSG v2.
+echo "  - csg_v2_empty_body_function"
+empty_source="$WORK/csg_v2_empty_body.cheng"
+empty_facts="$WORK/csg_v2_empty_body.facts"
+empty_obj="$WORK/csg_v2_empty_body.o"
+cat > "$empty_source" <<'CHENG'
+fn empty_body() =
+    return
+
+fn main(): int32 =
+    empty_body()
+    return 0
+CHENG
+if "$COLD" system-link-exec \
+    --root:"$ROOT" \
+    --in:"$empty_source" \
+    --emit:csg-v2 \
+    --out:"$empty_facts" \
+    --target:"$TARGET" \
+    --report-out:"$WORK/csg_v2_empty_body.writer.report.txt" >/dev/null 2>&1 &&
+   "$COLD" system-link-exec \
+    --csg-in:"$empty_facts" \
+    --emit:obj \
+    --target:"$TARGET" \
+    --out:"$empty_obj" \
+    --report-out:"$WORK/csg_v2_empty_body.reader.report.txt" >/dev/null 2>&1 &&
+   [ -s "$empty_obj" ] &&
+   grep -q '^cold_csg_v2_writer_status=ok$' "$WORK/csg_v2_empty_body.writer.report.txt" &&
+   grep -q '^emit=obj$' "$WORK/csg_v2_empty_body.reader.report.txt" &&
+   grep -q '^system_link=0$' "$WORK/csg_v2_empty_body.reader.report.txt" &&
+   grep -q '^linkerless_image=1$' "$WORK/csg_v2_empty_body.reader.report.txt"; then
+    ok "csg_v2_empty_body_function"
+else
+    bad "csg_v2_empty_body_function"
+fi
+
+# CSG v2 roundtrip: function with 200+ char string literal via CSG v2.
+echo "  - csg_v2_large_string_literal"
+large_source="$WORK/csg_v2_large_string.cheng"
+large_facts="$WORK/csg_v2_large_string.facts"
+large_obj="$WORK/csg_v2_large_string.o"
+big_str=""
+i=0
+while [ "$i" -lt 250 ]; do big_str="${big_str}A"; i=$((i + 1)); done
+cat > "$large_source" <<CHENG
+fn main(): int32 =
+    let s = "$big_str"
+    return 250
+CHENG
+if "$COLD" system-link-exec \
+    --root:"$ROOT" \
+    --in:"$large_source" \
+    --emit:csg-v2 \
+    --out:"$large_facts" \
+    --target:"$TARGET" \
+    --report-out:"$WORK/csg_v2_large_string.writer.report.txt" >/dev/null 2>&1 &&
+   "$COLD" system-link-exec \
+    --csg-in:"$large_facts" \
+    --emit:obj \
+    --target:"$TARGET" \
+    --out:"$large_obj" \
+    --report-out:"$WORK/csg_v2_large_string.reader.report.txt" >/dev/null 2>&1 &&
+   [ -s "$large_obj" ] &&
+   grep -q '^cold_csg_v2_writer_status=ok$' "$WORK/csg_v2_large_string.writer.report.txt" &&
+   grep -q '^emit=obj$' "$WORK/csg_v2_large_string.reader.report.txt" &&
+   grep -q '^system_link=0$' "$WORK/csg_v2_large_string.reader.report.txt" &&
+   grep -q '^linkerless_image=1$' "$WORK/csg_v2_large_string.reader.report.txt"; then
+    ok "csg_v2_large_string_literal"
+else
+    bad "csg_v2_large_string_literal"
 fi
 
 echo "=== $pass passed, $fail failed ==="

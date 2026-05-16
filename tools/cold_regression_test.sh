@@ -1807,6 +1807,120 @@ ACT=$(compile_run /tmp/ct_many_params.cheng /tmp/ct_many_params_out)
 assert "many_params" 55 "$ACT"
 rm -f /tmp/ct_many_params.cheng /tmp/ct_many_params_out
 
+# --- debug_runtime.cheng cold compile smoke ---
+rm -f /tmp/ct_debug_runtime.o /tmp/ct_debug_runtime.report
+if $COLD system-link-exec --root:"$PWD" \
+    --in:src/core/runtime/debug_runtime.cheng --target:arm64-apple-darwin \
+    --out:/tmp/ct_debug_runtime.o --emit:obj \
+    --report-out:/tmp/ct_debug_runtime.report >/dev/null 2>&1 &&
+   [ -s /tmp/ct_debug_runtime.o ] &&
+   grep -q '^system_link_exec=1$' /tmp/ct_debug_runtime.report 2>/dev/null &&
+   grep -q '^emit=obj$' /tmp/ct_debug_runtime.report 2>/dev/null &&
+   grep -q '^direct_macho=1$' /tmp/ct_debug_runtime.report 2>/dev/null &&
+   grep -q '^system_link=0$' /tmp/ct_debug_runtime.report 2>/dev/null &&
+   grep -q '^linkerless_image=1$' /tmp/ct_debug_runtime.report 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "debug_runtime_cold_compile_smoke" 1 "$ACT"
+rm -f /tmp/ct_debug_runtime.o /tmp/ct_debug_runtime.report
+
+# --- std_atomic.cheng cold compile smoke ---
+rm -f /tmp/ct_std_atomic.o /tmp/ct_std_atomic.report
+if $COLD system-link-exec --root:"$PWD" \
+    --in:src/std/atomic.cheng --target:arm64-apple-darwin \
+    --out:/tmp/ct_std_atomic.o --emit:obj \
+    --report-out:/tmp/ct_std_atomic.report >/dev/null 2>&1 &&
+   [ -s /tmp/ct_std_atomic.o ] &&
+   grep -q '^system_link_exec=1$' /tmp/ct_std_atomic.report 2>/dev/null &&
+   grep -q '^emit=obj$' /tmp/ct_std_atomic.report 2>/dev/null &&
+   grep -q '^direct_macho=1$' /tmp/ct_std_atomic.report 2>/dev/null &&
+   grep -q '^system_link=0$' /tmp/ct_std_atomic.report 2>/dev/null &&
+   grep -q '^linkerless_image=1$' /tmp/ct_std_atomic.report 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "std_atomic_cold_compile_smoke" 1 "$ACT"
+rm -f /tmp/ct_std_atomic.o /tmp/ct_std_atomic.report
+
+# --- std_thread.cheng cold compile smoke ---
+rm -f /tmp/ct_std_thread.o /tmp/ct_std_thread.report
+if $COLD system-link-exec --root:"$PWD" \
+    --in:src/std/thread.cheng --target:arm64-apple-darwin \
+    --out:/tmp/ct_std_thread.o --emit:obj \
+    --report-out:/tmp/ct_std_thread.report >/dev/null 2>&1 &&
+   [ -s /tmp/ct_std_thread.o ] &&
+   grep -q '^system_link_exec=1$' /tmp/ct_std_thread.report 2>/dev/null &&
+   grep -q '^emit=obj$' /tmp/ct_std_thread.report 2>/dev/null &&
+   grep -q '^direct_macho=1$' /tmp/ct_std_thread.report 2>/dev/null &&
+   grep -q '^system_link=0$' /tmp/ct_std_thread.report 2>/dev/null &&
+   grep -q '^linkerless_image=1$' /tmp/ct_std_thread.report 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "std_thread_cold_compile_smoke" 1 "$ACT"
+rm -f /tmp/ct_std_thread.o /tmp/ct_std_thread.report
+
+# --- compiler_runtime.cheng cold compile smoke ---
+rm -f /tmp/ct_compiler_runtime.o /tmp/ct_compiler_runtime.report
+if $COLD system-link-exec --root:"$PWD" \
+    --in:src/core/tooling/compiler_runtime.cheng --target:arm64-apple-darwin \
+    --out:/tmp/ct_compiler_runtime.o --emit:obj \
+    --report-out:/tmp/ct_compiler_runtime.report >/dev/null 2>&1 &&
+   [ -s /tmp/ct_compiler_runtime.o ] &&
+   grep -q '^system_link_exec=1$' /tmp/ct_compiler_runtime.report 2>/dev/null &&
+   grep -q '^emit=obj$' /tmp/ct_compiler_runtime.report 2>/dev/null &&
+   grep -q '^direct_macho=1$' /tmp/ct_compiler_runtime.report 2>/dev/null &&
+   grep -q '^system_link=0$' /tmp/ct_compiler_runtime.report 2>/dev/null &&
+   grep -q '^linkerless_image=1$' /tmp/ct_compiler_runtime.report 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "compiler_runtime_cold_compile_smoke" 1 "$ACT"
+rm -f /tmp/ct_compiler_runtime.o /tmp/ct_compiler_runtime.report
+
+# --- function_task.cheng cold compile smoke ---
+rm -f /tmp/ct_function_task.o /tmp/ct_function_task.report
+if $COLD system-link-exec --root:"$PWD" \
+    --in:src/core/ir/function_task.cheng --target:arm64-apple-darwin \
+    --out:/tmp/ct_function_task.o --emit:obj \
+    --report-out:/tmp/ct_function_task.report >/dev/null 2>&1 &&
+   [ -s /tmp/ct_function_task.o ] &&
+   grep -q '^system_link_exec=1$' /tmp/ct_function_task.report 2>/dev/null &&
+   grep -q '^emit=obj$' /tmp/ct_function_task.report 2>/dev/null &&
+   grep -q '^direct_macho=1$' /tmp/ct_function_task.report 2>/dev/null &&
+   grep -q '^system_link=0$' /tmp/ct_function_task.report 2>/dev/null &&
+   grep -q '^linkerless_image=1$' /tmp/ct_function_task.report 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "function_task_cold_compile_smoke" 1 "$ACT"
+rm -f /tmp/ct_function_task.o /tmp/ct_function_task.report
+
+# --- build_plan.cheng cold compile smoke ---
+rm -f /tmp/ct_build_plan.o /tmp/ct_build_plan.report
+if $COLD system-link-exec --root:"$PWD" \
+    --in:src/core/backend/build_plan.cheng --target:arm64-apple-darwin \
+    --out:/tmp/ct_build_plan.o --emit:obj \
+    --report-out:/tmp/ct_build_plan.report >/dev/null 2>&1 &&
+   [ -s /tmp/ct_build_plan.o ] &&
+   grep -q '^system_link_exec=1$' /tmp/ct_build_plan.report 2>/dev/null &&
+   grep -q '^emit=obj$' /tmp/ct_build_plan.report 2>/dev/null &&
+   grep -q '^direct_macho=1$' /tmp/ct_build_plan.report 2>/dev/null &&
+   grep -q '^system_link=0$' /tmp/ct_build_plan.report 2>/dev/null &&
+   grep -q '^linkerless_image=1$' /tmp/ct_build_plan.report 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "build_plan_cold_compile_smoke" 1 "$ACT"
+rm -f /tmp/ct_build_plan.o /tmp/ct_build_plan.report
+
 echo ""
 echo "=== $PASS passed, $FAIL failed ==="
 [ "$FAIL" -eq 0 ]
