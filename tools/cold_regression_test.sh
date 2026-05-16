@@ -1271,6 +1271,13 @@ else
     ACT=0
 fi
 assert "parser_cold_compile_smoke_nm_valid" 1 "$ACT"
+# Verify .o has __TEXT/__text section via otool
+if [ -s /tmp/ct_parser_smoke.o ] && otool -l /tmp/ct_parser_smoke.o 2>/dev/null | grep -q '__text'; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "parser_cold_compile_smoke_otool_sections" 1 "$ACT"
 rm -f /tmp/ct_parser_smoke.o /tmp/ct_parser_smoke.report
 
 # --- primary_object_plan.cheng cold compile smoke ---
@@ -1318,6 +1325,13 @@ else
     ACT=0
 fi
 assert "gate_main_cold_compile_smoke_nm_valid" 1 "$ACT"
+# Verify .o has __TEXT/__text section via otool
+if [ -s /tmp/ct_gate_main_smoke.o ] && otool -l /tmp/ct_gate_main_smoke.o 2>/dev/null | grep -q '__text'; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "gate_main_cold_compile_smoke_otool_sections" 1 "$ACT"
 rm -f /tmp/ct_gate_main_smoke.o /tmp/ct_gate_main_smoke.report
 
 # --- concurrent_assembly.cheng cold compile smoke ---
@@ -2165,6 +2179,111 @@ else
 fi
 assert "cross_compile_macho_magic" 1 "$ACT"
 rm -f /tmp/ct_cross_target.cheng /tmp/ct_cross_target.o /tmp/ct_cross_target.report
+
+# --- int32_asr_direct_object_smoke.cheng cold compile smoke ---
+ACT=$(compile_obj_smoke "int32_asr_direct_object" "src/tests/int32_asr_direct_object_smoke.cheng")
+assert "int32_asr_direct_object_cold_compile_smoke" 1 "$ACT"
+
+# --- explicit_default_init_negative_bool_binding.cheng cold compile smoke ---
+ACT=$(compile_obj_smoke "explicit_default_init_neg_bool" "src/tests/explicit_default_init_negative_bool_binding.cheng")
+assert "explicit_default_init_neg_bool_cold_compile_smoke" 1 "$ACT"
+
+# --- test_str.cheng cold compile smoke ---
+ACT=$(compile_obj_smoke "test_str" "src/tests/test_str.cheng")
+assert "test_str_cold_compile_smoke" 1 "$ACT"
+
+# --- sha256_round_smoke.cheng cold compile smoke ---
+ACT=$(compile_obj_smoke "sha256_round" "src/tests/sha256_round_smoke.cheng")
+assert "sha256_round_cold_compile_smoke" 1 "$ACT"
+
+# --- str_concat_prelude_probe.cheng cold compile smoke ---
+ACT=$(compile_obj_smoke "str_concat_prelude" "src/tests/str_concat_prelude_probe.cheng")
+assert "str_concat_prelude_cold_compile_smoke" 1 "$ACT"
+
+# --- os_dir_exists_smoke.cheng cold compile smoke ---
+ACT=$(compile_obj_smoke "os_dir_exists" "src/tests/os_dir_exists_smoke.cheng")
+assert "os_dir_exists_cold_compile_smoke" 1 "$ACT"
+
+# --- call_hir_closure_visible_leaf.cheng cold compile smoke ---
+ACT=$(compile_obj_smoke "call_hir_closure_visible_leaf" "src/tests/call_hir_closure_visible_leaf.cheng")
+assert "call_hir_closure_visible_leaf_cold_compile_smoke" 1 "$ACT"
+
+# --- bigint_result_probe.cheng cold compile smoke ---
+ACT=$(compile_obj_smoke "bigint_result_probe" "src/tests/bigint_result_probe.cheng")
+assert "bigint_result_probe_cold_compile_smoke" 1 "$ACT"
+
+# --- cold_csg_facts_exporter_smoke.cheng cold compile smoke ---
+ACT=$(compile_obj_smoke "cold_csg_facts_exporter" "src/tests/cold_csg_facts_exporter_smoke.cheng")
+assert "cold_csg_facts_exporter_cold_compile_smoke" 1 "$ACT"
+
+# --- vpn_proxy_socks_smoke.cheng cold compile smoke ---
+ACT=$(compile_obj_smoke "vpn_proxy_socks" "src/tests/vpn_proxy_socks_smoke.cheng")
+assert "vpn_proxy_socks_cold_compile_smoke" 1 "$ACT"
+
+# --- runtime/scalars.cheng cold compile smoke ---
+ACT=$(compile_obj_smoke "runtime_scalars" "src/runtime/scalars.cheng")
+assert "runtime_scalars_cold_compile_smoke" 1 "$ACT"
+
+# --- runtime/json_ast.cheng cold compile smoke ---
+ACT=$(compile_obj_smoke "runtime_json_ast" "src/runtime/json_ast.cheng")
+assert "runtime_json_ast_cold_compile_smoke" 1 "$ACT"
+
+# --- ffi_handle_generation_stale_trap_smoke.cheng cold compile smoke ---
+ACT=$(compile_obj_smoke "ffi_handle_gen_stale_trap" "src/tests/ffi_handle_generation_stale_trap_smoke.cheng")
+assert "ffi_handle_gen_stale_trap_cold_compile_smoke" 1 "$ACT"
+
+# --- chain_node_snapshot_roundtrip_smoke.cheng cold compile smoke ---
+ACT=$(compile_obj_smoke "chain_node_snapshot_roundtrip" "src/tests/chain_node_snapshot_roundtrip_smoke.cheng")
+assert "chain_node_snapshot_roundtrip_cold_compile_smoke" 1 "$ACT"
+
+# --- cold compile chain test: compile file with multiple imports ---
+rm -f /tmp/ct_chain_smoke.o /tmp/ct_chain_smoke.report
+if $COLD system-link-exec --root:"$PWD" \
+    --in:src/tests/chain_node_snapshot_roundtrip_smoke.cheng --target:arm64-apple-darwin \
+    --out:/tmp/ct_chain_smoke.o --emit:obj \
+    --report-out:/tmp/ct_chain_smoke.report >/dev/null 2>&1 &&
+   [ -s /tmp/ct_chain_smoke.o ] &&
+   grep -q '^system_link_exec=1$' /tmp/ct_chain_smoke.report 2>/dev/null &&
+   grep -q '^emit=obj$' /tmp/ct_chain_smoke.report 2>/dev/null &&
+   grep -q '^direct_macho=1$' /tmp/ct_chain_smoke.report 2>/dev/null &&
+   grep -q '^system_link=0$' /tmp/ct_chain_smoke.report 2>/dev/null &&
+   grep -q '^linkerless_image=1$' /tmp/ct_chain_smoke.report 2>/dev/null &&
+   ! grep -q '^error=' /tmp/ct_chain_smoke.report 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "cold_compile_chain_imports_resolve" 1 "$ACT"
+# Verify .o has valid symbols via nm
+if [ -s /tmp/ct_chain_smoke.o ] && nm /tmp/ct_chain_smoke.o >/dev/null 2>&1; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "cold_compile_chain_nm_valid" 1 "$ACT"
+rm -f /tmp/ct_chain_smoke.o /tmp/ct_chain_smoke.report
+
+# --- cold compile large output: verify .o > 100KB ---
+rm -f /tmp/ct_large_output.o /tmp/ct_large_output.report
+if $COLD system-link-exec --root:"$PWD" \
+    --in:src/tests/cold_csg_facts_exporter_smoke.cheng --target:arm64-apple-darwin \
+    --out:/tmp/ct_large_output.o --emit:obj \
+    --report-out:/tmp/ct_large_output.report >/dev/null 2>&1 &&
+   [ -s /tmp/ct_large_output.o ] &&
+   grep -q '^system_link_exec=1$' /tmp/ct_large_output.report 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "cold_large_output_compile" 1 "$ACT"
+o_sz=$(wc -c < /tmp/ct_large_output.o 2>/dev/null || echo 0)
+if [ "$o_sz" -gt 102400 ]; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "cold_large_output_size_gt_100kb" 1 "$ACT"
+rm -f /tmp/ct_large_output.o /tmp/ct_large_output.report
 
 echo ""
 echo "=== $PASS passed, $FAIL failed ==="
