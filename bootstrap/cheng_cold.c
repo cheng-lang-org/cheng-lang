@@ -12034,6 +12034,18 @@ static void x64_codegen_op(X64Code *x, BodyIR *body, Symbols *symbols,
         x64_mov_r32_imm32(x, 0, 0x20000C5);      /* RAX = mmap syscall */
         x64_syscall(x);
         x64_mov_mr64_r64(x, 4, off_dst, 0);      /* store result ptr */
+    } else if (kind == BODY_OP_STR_SELECT_NONEMPTY) {
+        x64_mov_r64_mr64(x, 0, 4, body->slot_offset[a]);       /* rax = pref ptr */
+        x64_mov_r32_mr32(x, 1, 4, body->slot_offset[a] + 8);   /* ecx = pref len */
+        x64_test_r32_r32(x, 1, 1);                               /* test len */
+        int32_t sel_jcc = x->len;
+        x64_jcc_rel8(x, CC_NE, 0);                                /* if non-empty, skip alt */
+        x64_mov_r64_mr64(x, 0, 4, body->slot_offset[b]);       /* rax = alt ptr */
+        x64_mov_r32_mr32(x, 1, 4, body->slot_offset[b] + 8);   /* ecx = alt len */
+        int32_t sel_store = x->len;
+        x->buf[sel_jcc + 1] = (uint8_t)(sel_store - (sel_jcc + 2));
+        x64_mov_mr64_r64(x, 4, off_dst, 0);                     /* store ptr */
+        x64_mov_mr32_r32(x, 4, off_dst + 8, 1);                 /* store len */
     /* Remaining target-specific ops are not implemented for x86_64. */
     } else if (kind == BODY_OP_MAKE_SEQ_I32 ||
                kind == BODY_OP_TIME_NS || kind == BODY_OP_GETRUSAGE ||
@@ -12047,7 +12059,6 @@ static void x64_codegen_op(X64Code *x, BodyIR *body, Symbols *symbols,
                kind == BODY_OP_CHMOD_X || kind == BODY_OP_COLD_SELF_EXEC ||
                kind == BODY_OP_MKDIR_ONE || kind == BODY_OP_TEXT_CONTAINS ||
                kind == BODY_OP_EXEC_SHELL || kind == BODY_OP_ARGV_STR ||
-               kind == BODY_OP_STR_SELECT_NONEMPTY || kind == BODY_OP_ASSERT ||
                kind == BODY_OP_SEQ_OPAQUE_INDEX_REF_DYNAMIC ||
                kind == BODY_OP_HEAP_ALLOC || kind == BODY_OP_HEAP_FREE) {
         fprintf(stderr, "cheng_cold: unsupported x86_64 BodyIR op kind=%d\n", kind);
@@ -12527,13 +12538,23 @@ static void rv64_codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         rv_li(code->words, &code->count, RV_A7, 222);     /* a7 = mmap syscall */
         code_emit(code, rv_ecall());
         code_emit(code, rv_sd(RV_A0, RV_SP, (int16_t)off_dst)); /* store result ptr */
+    } else if (kind == BODY_OP_STR_SELECT_NONEMPTY) {
+        int32_t rv_bne_pos;
+        code_emit(code, rv_lw(RV_T1, RV_SP, (int16_t)(body->slot_offset[a] + 8))); /* t1 = pref len */
+        code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));       /* t0 = pref ptr */
+        rv_bne_pos = code->count;
+        code_emit(code, rv_bne(RV_T1, RV_ZERO, 0));  /* if len != 0, skip alt */
+        code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)body->slot_offset[b]));       /* t0 = alt ptr */
+        code_emit(code, rv_lw(RV_T1, RV_SP, (int16_t)(body->slot_offset[b] + 8))); /* t1 = alt len */
+        code->words[rv_bne_pos] = rv_bne(RV_T1, RV_ZERO, (int16_t)((code->count - rv_bne_pos) * 4));
+        code_emit(code, rv_sd(RV_T0, RV_SP, (int16_t)off_dst));                    /* store ptr */
+        code_emit(code, rv_sw(RV_T1, RV_SP, (int16_t)(off_dst + 8)));              /* store len */
     /* Remaining complex ops are not implemented for RV64. */
     } else if (kind == BODY_OP_STR_EQ || kind == BODY_OP_STR_CONCAT ||
                kind == BODY_OP_I32_TO_STR || kind == BODY_OP_I64_TO_STR ||
                kind == BODY_OP_STR_INDEX || kind == BODY_OP_STR_JOIN ||
                kind == BODY_OP_STR_SPLIT_CHAR || kind == BODY_OP_STR_STRIP ||
                kind == BODY_OP_STR_SLICE || kind == BODY_OP_SHELL_QUOTE ||
-               kind == BODY_OP_STR_SELECT_NONEMPTY ||
                kind == BODY_OP_READ_FLAG || kind == BODY_OP_PARSE_INT ||
                kind == BODY_OP_TEXT_SET_INSERT ||
                kind == BODY_OP_CWD_STR || kind == BODY_OP_PATH_JOIN ||
