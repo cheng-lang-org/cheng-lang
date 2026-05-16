@@ -856,6 +856,45 @@ roundtrip_fixture return_nested_control tests/cheng/backend/fixtures/return_nest
 # Boolean logical expressions: && and ||
 roundtrip_fixture return_logical_expr tests/cheng/backend/fixtures/return_logical_expr.cheng 8192
 
+# Bitwise operations: OR, XOR
+roundtrip_fixture return_bitwise tests/cheng/backend/fixtures/return_bitwise.cheng 4096
+
+# Shift operations: SHL (<<) and ASR (>>)
+roundtrip_fixture return_shift tests/cheng/backend/fixtures/return_shift.cheng 4096
+
+# Addition: 40 + 2 - 42
+roundtrip_fixture return_add tests/cheng/backend/fixtures/return_add.cheng 4096
+
+# Ternary conditional: if expression
+roundtrip_fixture return_if tests/cheng/backend/fixtures/return_if.cheng 4096
+
+# Pointer dereference: & and *
+roundtrip_fixture return_deref tests/cheng/backend/fixtures/return_deref.cheng 4096
+
+# I32 type casting: int32() expression
+roundtrip_fixture return_cast_i32 tests/cheng/backend/fixtures/return_cast_i32.cheng 4096
+
+# I64 type casting: int64() expression
+roundtrip_fixture return_cast_i64 tests/cheng/backend/fixtures/return_cast_i64.cheng 4096
+
+# Logical and expression: (1 < 2 && 2 < 3) - 1
+roundtrip_fixture return_and_expr tests/cheng/backend/fixtures/return_and_expr.cheng 4096
+
+# If statement: var x, if cond then x=1 else x=2, return x-1
+roundtrip_fixture return_if_stmt tests/cheng/backend/fixtures/return_if_stmt.cheng 4096
+
+# I64 arithmetic: sub, const
+roundtrip_fixture return_i64 tests/cheng/backend/fixtures/return_i64.cheng 4096
+
+# And-assign: var x; x = 1 < 2 && 2 < 3; return x - 1
+roundtrip_fixture return_and_assign tests/cheng/backend/fixtures/return_and_assign.cheng 4096
+
+# Unsigned division: uint32/uint64 div
+roundtrip_fixture return_udiv tests/cheng/backend/fixtures/return_udiv.cheng 4096
+
+# Unsigned modulo: uint32/uint64 mod
+roundtrip_fixture return_umod tests/cheng/backend/fixtures/return_umod.cheng 4096
+
 # Import chain with unqualified cross-module bare call must hard-fail in cold.
 echo "  - import_chain_bare_hard_fail"
 import_chain_report="$WORK/import_chain_a.writer.report.txt"

@@ -15,6 +15,15 @@
  * Build: cc -std=c11 -Wall -Wextra -pedantic -O2 -o /tmp/cheng_cold bootstrap/cheng_cold.c
  */
 
+#ifndef __APPLE__
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+#endif
+
 #include <ctype.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -12049,6 +12058,87 @@ static void x64_codegen_op(X64Code *x, BodyIR *body, Symbols *symbols,
         x->buf[sel_jcc + 1] = (uint8_t)(sel_store - (sel_jcc + 2));
         x64_mov_mr64_r64(x, 4, off_dst, 0);                     /* store ptr */
         x64_mov_mr32_r32(x, 4, off_dst + 8, 1);                 /* store len */
+    /* Thread yield: lightweight syscall (getpid = syscall 0x2000014) */
+    } else if (kind == BODY_OP_THREAD_YIELD) {
+        x64_mov_r32_imm32(x, 0, 0x2000014); /* SYS_getpid */
+        x64_syscall(x);
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
+    /* Pointer add: ptr + offset (sign-extend i32 offset to 64-bit) */
+    } else if (kind == BODY_OP_PTR_ADD) {
+        x64_mov_r64_mr64(x, 0, 4, body->slot_offset[a]);
+        if (body->slot_kind[b] == SLOT_I32) {
+            x64_mov_r32_mr32(x, 1, 4, body->slot_offset[b]);
+            x64_movsxd_r64_r32(x, 1, 1);
+        } else {
+            x64_mov_r64_mr64(x, 1, 4, body->slot_offset[b]);
+        }
+        x64_add_r64_r64(x, 0, 1);
+        x64_mov_mr64_r64(x, 4, off_dst, 0);
+    /* Seq i32 index: load element at byte offset b from seq data ptr */
+    } else if (kind == BODY_OP_SEQ_I32_INDEX) {
+        x64_mov_r64_mr64(x, 0, 4, body->slot_offset[a] + 8); /* rax = data ptr from seq+8 */
+        if (b > 0) {
+            x64_mov_r64_imm64(x, 1, b);
+            x64_add_r64_r64(x, 0, 1);
+        }
+        x64_mov_r32_mr32_base(x, 1, 0); /* ecx = [rax] (i32 at byte offset) */
+        x64_mov_mr32_r32(x, 4, off_dst, 1);
+    /* Assert: compare condition + trap on false + write message */
+    } else if (kind == BODY_OP_ASSERT) {
+        if (body->slot_kind[a] == SLOT_I32_REF) {
+            x64_mov_r64_mr64(x, 1, 4, body->slot_offset[a]);
+            x64_mov_r32_mr32_base(x, 0, 1);
+        } else {
+            x64_mov_r32_mr32(x, 0, 4, body->slot_offset[a]);
+        }
+        x64_test_r32_r32(x, 0, 0);
+        int32_t assert_ok = x->len;
+        x64_jcc_rel8(x, CC_NE, 0); /* skip trap if condition true (non-zero) */
+        /* Trap: write assert message to stderr then exit */
+        if (body->slot_kind[b] == SLOT_STR_REF) {
+            x64_mov_r64_mr64(x, 1, 4, body->slot_offset[b]);
+            x64_mov_r64_mr64(x, 2, 1, 0);   /* rdx = str ptr from ref */
+            x64_mov_r32_mr32(x, 3, 1, 8);   /* ecx = str len from ref */
+        } else {
+            x64_mov_r64_mr64(x, 2, 4, body->slot_offset[b]);    /* msg ptr */
+            x64_mov_r32_mr32(x, 3, 4, body->slot_offset[b] + 8);/* msg len */
+        }
+        x64_mov_r32_imm32(x, 0, 2);          /* fd = stderr */
+        x64_mov_r32_imm32(x, 1, 0);          /* RSI = 0 (placeholder, set below) */
+        x64_mov_r64_r64(x, 1, 2);            /* rsi = msg ptr */
+        x64_mov_r32_imm32(x, 2, 0);          /* RDX = 0 (placeholder) */
+        x64_mov_r32_r32(x, 2, 3);            /* rdx = msg len */
+        x64_mov_r32_imm32(x, 0, 0x2000004);  /* sys_write */
+        x64_syscall(x);
+        /* Write newline */
+        x64_mov_mr32_imm32(x, 4, off_dst, '\n');
+        x64_lea_r64_mr(x, 1, 4, off_dst);
+        x64_mov_r32_imm32(x, 2, 1);
+        x64_mov_r32_imm32(x, 0, 0x2000004);
+        x64_syscall(x);
+        /* Exit with code 1 */
+        x64_mov_r32_imm32(x, 0, 1);
+        x64_mov_r32_imm32(x, 0, 0x2000001);
+        x64_syscall(x);
+        int32_t assert_done = x->len;
+        x->buf[assert_ok + 1] = (uint8_t)(assert_done - (assert_ok + 2));
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
+    /* Path is absolute: check if first char is '/' */
+    } else if (kind == BODY_OP_PATH_IS_ABSOLUTE) {
+        x64_mov_r32_mr32(x, 1, 4, body->slot_offset[a] + 8);
+        x64_mov_mr32_imm32(x, 4, off_dst, 0);
+        x64_test_r32_r32(x, 1, 1);
+        int32_t pia_empty = x->len;
+        x64_jcc_rel8(x, CC_E, 0);
+        x64_mov_r64_mr64(x, 0, 4, body->slot_offset[a]);
+        x64_emit1(x, 0x0F); x64_emit1(x, 0xB6); x64_emit1(x, MODRM(0, 1, 0));
+        x64_cmp_r32_imm8(x, 1, '/');
+        int32_t pia_not = x->len;
+        x64_jcc_rel8(x, CC_NE, 0);
+        x64_mov_mr32_imm32(x, 4, off_dst, 1);
+        int32_t pia_done = x->len;
+        x->buf[pia_empty + 1] = (uint8_t)(pia_done - (pia_empty + 2));
+        x->buf[pia_not + 1] = (uint8_t)(pia_done - (pia_not + 2));
     /* Remaining target-specific ops are not implemented for x86_64. */
     } else if (kind == BODY_OP_MAKE_SEQ_I32 ||
                kind == BODY_OP_TIME_NS || kind == BODY_OP_GETRUSAGE ||
@@ -12063,7 +12153,13 @@ static void x64_codegen_op(X64Code *x, BodyIR *body, Symbols *symbols,
                kind == BODY_OP_MKDIR_ONE || kind == BODY_OP_TEXT_CONTAINS ||
                kind == BODY_OP_EXEC_SHELL || kind == BODY_OP_ARGV_STR ||
                kind == BODY_OP_SEQ_OPAQUE_INDEX_REF_DYNAMIC ||
-               kind == BODY_OP_HEAP_ALLOC || kind == BODY_OP_HEAP_FREE) {
+               kind == BODY_OP_HEAP_ALLOC || kind == BODY_OP_HEAP_FREE ||
+               /* Previously unknown ops moved to unsupported list */
+               kind == BODY_OP_BYTES_ALLOC || kind == BODY_OP_BYTES_GET ||
+               kind == BODY_OP_BYTES_SET || kind == BODY_OP_BYTES_TO_HEX ||
+               kind == BODY_OP_COPY_RAW ||
+               kind == BODY_OP_PATH_WRITE_BYTES || kind == BODY_OP_SELECT ||
+               kind == BODY_OP_SEQ_SET_LEN || kind == BODY_OP_SET_RAW) {
         fprintf(stderr, "cheng_cold: unsupported x86_64 BodyIR op kind=%d\n", kind);
         die("unsupported x86_64 BodyIR op");
     } else {
@@ -12741,6 +12837,16 @@ static void rv64_codegen_op(Code *code, BodyIR *body, Symbols *symbols,
           code_emit(code, rv_jal(RV_ZERO, (int32_t)((rv_ba_zero - code->count) * 4)));
           code->words[rv_ba_zero] = rv_beq(RV_T1, RV_ZERO, (int16_t)((code->count - rv_ba_zero) * 4)); }
         code->words[rv_ba_done] = rv_beq(RV_T0, RV_ZERO, (int16_t)((code->count - rv_ba_done) * 4));
+    /* Close: sys_close(fd) */
+    } else if (kind == BODY_OP_CLOSE) {
+        code_emit(code, rv_lw(RV_A0, RV_SP, (int16_t)body->slot_offset[a]));
+        rv_li(code->words, &code->count, RV_A7, 57); /* SYS_close */
+        code_emit(code, rv_ecall());
+        code_emit(code, rv_sw(RV_A0, RV_SP, (int16_t)off_dst));
+    /* Set seq length: store to slot+0 */
+    } else if (kind == BODY_OP_SEQ_SET_LEN) {
+        code_emit(code, rv_lw(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
+        code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)(off_dst)));
     /* Remaining complex ops are not implemented for RV64. */
     } else if (kind == BODY_OP_STR_EQ || kind == BODY_OP_STR_CONCAT ||
                kind == BODY_OP_I32_TO_STR || kind == BODY_OP_I64_TO_STR ||
@@ -12757,7 +12863,7 @@ static void rv64_codegen_op(Code *code, BodyIR *body, Symbols *symbols,
                kind == BODY_OP_COLD_SELF_EXEC || kind == BODY_OP_MKDIR_ONE ||
                kind == BODY_OP_TEXT_CONTAINS || kind == BODY_OP_EXEC_SHELL ||
                kind == BODY_OP_ARGV_STR ||
-               kind == BODY_OP_OPEN || kind == BODY_OP_READ || kind == BODY_OP_CLOSE ||
+               kind == BODY_OP_OPEN || kind == BODY_OP_READ ||
                kind == BODY_OP_TIME_NS || kind == BODY_OP_GETRUSAGE ||
                kind == BODY_OP_GETENV_STR ||
                kind == BODY_OP_SEQ_I32_ADD || kind == BODY_OP_SEQ_STR_ADD ||
@@ -12768,8 +12874,7 @@ static void rv64_codegen_op(Code *code, BodyIR *body, Symbols *symbols,
                kind == BODY_OP_SEQ_OPAQUE_REMOVE ||
                kind == BODY_OP_SEQ_OPAQUE_INDEX_REF_DYNAMIC ||
                kind == BODY_OP_BYTES_GET || kind == BODY_OP_BYTES_SET ||
-               kind == BODY_OP_BYTES_TO_HEX || kind == BODY_OP_PATH_WRITE_BYTES ||
-               kind == BODY_OP_SEQ_SET_LEN) {
+               kind == BODY_OP_BYTES_TO_HEX || kind == BODY_OP_PATH_WRITE_BYTES) {
         fprintf(stderr, "cheng_cold: unsupported RV64 BodyIR op kind=%d\n", kind);
         die("unsupported RV64 BodyIR op");
     } else {
@@ -13983,6 +14088,7 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
        verifier. Cold codegen must consume BodyIR exactly as produced. */
 
     bool use_rv64 = target && strstr(target, "riscv64") != 0;
+    bool use_linux = target && strstr(target, "linux") != 0;
 
     /* Entry trampoline: architecture-specific */
     int32_t entry_call_pos = 0;
@@ -13991,7 +14097,12 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
         code_emit(code, rv_addi(RV_S1, RV_A1, 0));
         entry_call_pos = code->count;
         code_emit(code, rv_jal(RV_RA, 0));
-        code_emit(code, rv_jalr(RV_ZERO, RV_RA, 0));
+        if (use_linux) {
+            rv_li(code->words, &code->count, RV_A7, 93); /* sys_exit */
+            code_emit(code, rv_ecall());
+        } else {
+            code_emit(code, rv_jalr(RV_ZERO, RV_RA, 0));
+        }
     } else {
         code_emit(code, a64_add_imm(19, R0, 0, true));
         code_emit(code, a64_add_imm(20, R1, 0, true));
@@ -13999,8 +14110,13 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
         code_emit(code, a64_add_imm(22, R2, 0, true));
         entry_call_pos = code->count;
         code_emit(code, a64_bl(0));
-        code_emit(code, a64_add_imm(LR, 21, 0, true));
-        code_emit(code, a64_ret());
+        if (use_linux) {
+            code_emit(code, a64_movz_x(8, 93, 0)); /* sys_exit */
+            code_emit(code, a64_svc(0));
+        } else {
+            code_emit(code, a64_add_imm(LR, 21, 0, true));
+            code_emit(code, a64_ret());
+        }
     }
 
     /* Real entry function body starts here */
@@ -20309,9 +20425,9 @@ static void cold_emit_linux_aarch64_get_nprocs_provider(Code *code) {
     code_emit(code, a64_movz_x(R8, 123, 0));
     code_emit(code, a64_svc(0));
     code_emit(code, a64_cmp_reg_x(R0, 31));
-    int32_t fail_le = code->count;
-    code_emit(code, a64_bcond(0, COND_LE));
-    code_emit(code, a64_add_imm(R1, R0, 0, true));
+    int32_t fail_lt = code->count;
+    code_emit(code, a64_bcond(0, COND_LT));
+    code_emit(code, a64_movz_x(R1, 128, 0));
     code_emit(code, a64_movz_x(R2, 0, 0));
     code_emit(code, a64_movz(R4, 0, 0));
     code_emit(code, a64_movz(R7, 1, 0));
@@ -20345,7 +20461,7 @@ static void cold_emit_linux_aarch64_get_nprocs_provider(Code *code) {
     code_emit(code, a64_b(0));
 
     int32_t ret_zero = code->count;
-    a64_patch_bcond(code, fail_le, ret_zero);
+    a64_patch_bcond(code, fail_lt, ret_zero);
     a64_patch_bcond(code, ret_zero_le, ret_zero);
     code_emit(code, a64_movz(R0, 0, 0));
 
@@ -20870,6 +20986,17 @@ bool cold_compile_source_to_object(const char *out_path,
         x64_mov_r64_r64(&x64_buf, 4, 5); /* mov %rbp,%rsp */
         x64_pop_r64(&x64_buf, 5); /* pop %rbp */
         x64_ret(&x64_buf);
+    } else if (use_entry_trampoline && use_rv64) {
+        code_emit(shared, rv_addi(RV_S0, RV_A0, 0));
+        code_emit(shared, rv_addi(RV_S1, RV_A1, 0));
+        trampoline_bl_pos = shared->count;
+        code_emit(shared, rv_jal(RV_RA, 0));
+        if (is_elf) {
+            rv_li(shared->words, &shared->count, RV_A7, 93); /* sys_exit */
+            code_emit(shared, rv_ecall());
+        } else {
+            code_emit(shared, rv_jalr(RV_ZERO, RV_RA, 0));
+        }
     } else if (use_entry_trampoline) {
         trampoline_bl_pos = shared->count + 4;
         code_emit(shared, a64_add_imm(19, R0, 0, true));
@@ -20877,8 +21004,13 @@ bool cold_compile_source_to_object(const char *out_path,
         code_emit(shared, a64_add_imm(21, LR, 0, true));
         code_emit(shared, a64_add_imm(22, R2, 0, true));
         code_emit(shared, a64_bl(0));
-        code_emit(shared, a64_add_imm(LR, 21, 0, true));
-        code_emit(shared, a64_ret());
+        if (is_elf) {
+            code_emit(shared, a64_movz_x(8, 93, 0)); /* sys_exit */
+            code_emit(shared, a64_svc(0));
+        } else {
+            code_emit(shared, a64_add_imm(LR, 21, 0, true));
+            code_emit(shared, a64_ret());
+        }
     }
 
     /* First pass: compile each function body into the shared buffer */
@@ -20989,7 +21121,10 @@ bool cold_compile_source_to_object(const char *out_path,
             x64_patch_call_rel32(&x64_buf, trampoline_bl_pos, target * 4);
             shared->count = x64_pack_words(&x64_buf, shared->words, shared->cap);
         } else {
-            shared->words[trampoline_bl_pos] = a64_bl(target - trampoline_bl_pos);
+            if (use_rv64)
+                shared->words[trampoline_bl_pos] = rv_jal(RV_RA, target - trampoline_bl_pos);
+            else
+                shared->words[trampoline_bl_pos] = a64_bl(target - trampoline_bl_pos);
         }
     }
 
