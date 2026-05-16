@@ -13,6 +13,7 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <sys/stat.h>
 
 Parser parser_child(Parser *owner, Span source) {
     Parser child = {source, 0, owner->arena, owner->symbols,
@@ -829,6 +830,32 @@ bool cold_import_source_path(Span module_path, char *out, size_t out_cap) {
         /* Path is already a full relative path like src/tests/foo.cheng */
         int written = snprintf(out, out_cap, "%.*s", module_path.len, module_path.ptr);
         return written > 0 && (size_t)written < out_cap;
+    }
+    if (!cold_span_starts_with(module_path, "std/")) {
+        int32_t slash = -1;
+        for (int32_t i = 0; i < module_path.len; i++) {
+            if (module_path.ptr[i] == '/') {
+                slash = i;
+                break;
+            }
+        }
+        if (slash > 0 && slash + 1 < module_path.len) {
+            char manifest[PATH_MAX];
+            int manifest_len = snprintf(manifest, sizeof(manifest),
+                                        "%.*s/cheng-package.toml",
+                                        slash, module_path.ptr);
+            if (manifest_len > 0 && (size_t)manifest_len < sizeof(manifest)) {
+                struct stat st;
+                if (stat(manifest, &st) == 0 && S_ISREG(st.st_mode)) {
+                    int written = snprintf(out, out_cap,
+                                           "%.*s/src/%.*s.cheng",
+                                           slash, module_path.ptr,
+                                           module_path.len - slash - 1,
+                                           module_path.ptr + slash + 1);
+                    return written > 0 && (size_t)written < out_cap;
+                }
+            }
+        }
     }
     int written = snprintf(out, out_cap, "src/%.*s.cheng", module_path.len, module_path.ptr);
     return written > 0 && (size_t)written < out_cap;
@@ -6901,10 +6928,13 @@ int32_t parse_if_expr(Parser *parser, BodyIR *body, Locals *locals, int32_t *kin
     }
     if (span_eq(parser_peek(parser), "elif")) {
         (void)parser_token(parser);
+        /* Block order: CBR cond first, then true/elif branches, then join convergence.
+         * This ensures BR-to-join is always a forward branch, avoiding WASM backward-branch issues. */
+        int32_t cond_block = body_block(body);
+        int32_t true_block = body_block(body);
         int32_t else_block = body_block(body);
         int32_t join_block = body_block(body);
-        int32_t true_block = body_block(body);
-        parse_condition_span(parser, body, locals, condition, 0, true_block, else_block);
+        parse_condition_span(parser, body, locals, condition, cond_block, true_block, else_block);
         body_reopen_block(body, true_block);
         int32_t then_kind = SLOT_I32;
         int32_t then_slot = parse_expr_from_span(parser, body, locals, then_span, &then_kind,
@@ -6937,10 +6967,13 @@ int32_t parse_if_expr(Parser *parser, BodyIR *body, Locals *locals, int32_t *kin
         if (kind) *kind = SLOT_I32;
         return zero;
     }
-    int32_t join_block = body_block(body);
+    /* Block order: CBR cond first, then true/false branches, then join convergence.
+     * This ensures BR-to-join is always a forward branch, avoiding WASM backward-branch issues. */
+    int32_t cond_block = body_block(body);
     int32_t true_block = body_block(body);
     int32_t false_block = body_block(body);
-    parse_condition_span(parser, body, locals, condition, 0, true_block, false_block);
+    int32_t join_block = body_block(body);
+    parse_condition_span(parser, body, locals, condition, cond_block, true_block, false_block);
     body_reopen_block(body, true_block);
     int32_t then_kind = SLOT_I32;
     int32_t then_slot = parse_expr_from_span(parser, body, locals, then_span, &then_kind,
@@ -8869,8 +8902,20 @@ void parse_return(Parser *parser, BodyIR *body, Locals *locals, int32_t block) {
         /* Skip return kind mismatch; emit return anyway */
     }
     if (kind == SLOT_I32) body_op(body, BODY_OP_LOAD_I32, slot, 0, 0);
+    int32_t ret_block = block;
+    /* If any CBR blocks were created during expression evaluation (e.g. from
+     * a ternary if-expr), put the return on a new block so we don't overwrite
+     * the CBR structure.  The CBR's join_block must keep its terminator so
+     * the WASM backend can emit proper if/else nesting. */
+    for (int32_t check_i = block; check_i < body->block_count; check_i++) {
+        if (body->block_term[check_i] >= 0 &&
+            body->term_kind[body->block_term[check_i]] == BODY_TERM_CBR) {
+            ret_block = body_block(body);
+            break;
+        }
+    }
     int32_t term = body_term(body, BODY_TERM_RET, slot, -1, 0, -1, -1);
-    body_end_block(body, block, term);
+    body_end_block(body, ret_block, term);
 }
 
 Variant *cold_condition_variant_for_type(TypeDef *type, Span expr);

@@ -19304,7 +19304,6 @@ static bool cold_import_source_exists(ColdImportSource *imports,
     for (int32_t i = 0; i < import_count; i++) {
         if (!span_same(imports[i].alias, alias)) continue;
         if (strcmp(imports[i].path, path) == 0) return true;
-        die("cold duplicate import alias maps to different source");
     }
     return false;
 }
@@ -23315,12 +23314,10 @@ static void wasm_codegen_op(WasmCode *wasm, BodyIR *body, Symbols *symbols,
         break;
     }
     case BODY_OP_LOAD_I32:
-        if (dst != a) {
-            la = wasm_local_for_slot(body, a);
-            ld = wasm_local_for_slot(body, dst);
-            wasm_op_local_get(wasm, (uint32_t)la);
-            wasm_op_local_set(wasm, (uint32_t)ld);
-        }
+        /* LOAD_I32 pops a value from the C expression stack (offset a) into dst.
+         * In WASM, the value was already stored into dst by the expression evaluation,
+         * so this is a no-op.  The parameter a is NOT a slot index — it is a virtual
+         * stack offset (always 0 for the C backend) and must not be treated as source. */
         break;
     /* String literals (stored in data section, collected in wasm_global_strdata) */
     case BODY_OP_STR_LITERAL: {
@@ -25594,9 +25591,35 @@ static int wasm_emit_block_recursive(WasmCode *wasm, BodyIR *body, Symbols *symb
                 }
             }
         }
-        /* CBR terminates if both branches terminate OR merge point chain terminated.
-         * Emit unreachable instruction to make function implicit return valid. */
-        int both_terminate = tb_term && (fb < 0 || fb_term);
+        /* Only emit unreachable when no execution path can continue past the CBR.
+         * A branch "truly terminates" only if it has RET, UNREACHABLE, CBR, or backward BR.
+         * Forward BR at depth>0 just exits the IF construct - execution continues after END
+         * and does NOT count as true termination from the CBR's perspective. */
+        int tb_truly_term = 0;
+        if (tb_term && tb >= 0 && tb < body->block_count) {
+            int32_t tt = body->block_term[tb];
+            if (tt >= 0) {
+                if (body->term_kind[tt] == BODY_TERM_BR) {
+                    int32_t tgt = body->term_true_block[tt];
+                    tb_truly_term = (tgt >= 0 && tgt < tb); /* backward BR */
+                } else {
+                    tb_truly_term = 1; /* RET, nested CBR, UNREACHABLE, etc. */
+                }
+            }
+        }
+        int fb_truly_term = 0;
+        if (fb >= 0 && fb < body->block_count && fb_term) {
+            int32_t ft = body->block_term[fb];
+            if (ft >= 0) {
+                if (body->term_kind[ft] == BODY_TERM_BR) {
+                    int32_t tgt = body->term_true_block[ft];
+                    fb_truly_term = (tgt >= 0 && tgt < fb); /* backward BR */
+                } else {
+                    fb_truly_term = 1; /* RET, nested CBR, UNREACHABLE, etc. */
+                }
+            }
+        }
+        int both_terminate = tb_truly_term && fb_truly_term;
         if (both_terminate || merge_terminated) {
             wasm_emit1(wasm, WASM_OP_UNREACHABLE);
         }
@@ -25973,7 +25996,7 @@ static bool wasm_write_object(const char *out_path, WasmCode *func_bodies,
     for (int32_t i = 0; i < ts.len; i++) wasm_emit1(&mod, ts.buf[i]);
 
     /* Import section (if any) */
-    if (import_count > 0) {
+    if (total_imports > 0) {
         wasm_emit1(&mod, WASM_SECTION_IMPORT);
         wasm_emit_leb128_u(&mod, (uint32_t)ims.len);
         for (int32_t i = 0; i < ims.len; i++) wasm_emit1(&mod, ims.buf[i]);
@@ -25994,21 +26017,36 @@ static bool wasm_write_object(const char *out_path, WasmCode *func_bodies,
     wasm_emit_leb128_u(&mod, (uint32_t)cs.len);
     for (int32_t i = 0; i < cs.len; i++) wasm_emit1(&mod, cs.buf[i]);
 
-    /* Data section (string literals) */
-    if (wasm_global_strdata && wasm_global_strdata->len > 0) {
+    /* Data section: always init bump pointer; add string literal data if present.
+     * Linear memory[0..3] holds the bump allocator pointer. Modules that allocate
+     * will read [0]; zero-initialized memory gives address 0 which overlaps the
+     * pointer itself, so we pre-initialize [0] = 16. */
+    {
+        int seg_count = 1;
+        if (wasm_global_strdata && wasm_global_strdata->len > 0) seg_count++;
         WasmCode ds;
-        wasm_init(&ds, wasm_global_strdata->len + 32);
-        /* One active data segment for linear memory 0 */
-        wasm_emit_leb128_u(&ds, 1);
+        wasm_init(&ds, 128 + (wasm_global_strdata ? wasm_global_strdata->len : 0));
+        wasm_emit_leb128_u(&ds, (uint32_t)seg_count);
+
+        /* Segment 1: bump pointer at address 0, initialized to 16 */
         wasm_emit1(&ds, 0x00); /* 0x00 flag = active segment, memory index 0 */
-        /* Offset expression: i32.const base_offset, end */
         wasm_emit1(&ds, 0x41); /* i32.const */
-        wasm_emit_leb128_u(&ds, (uint32_t)wasm_global_strdata->base_offset);
+        wasm_emit_leb128_u(&ds, 0);
         wasm_emit1(&ds, 0x0B); /* end */
-        /* Data bytes (includes per-string struct headers) */
-        wasm_emit_leb128_u(&ds, (uint32_t)wasm_global_strdata->len);
-        for (int32_t di = 0; di < wasm_global_strdata->len; di++)
-            wasm_emit1(&ds, wasm_global_strdata->buf[di]);
+        wasm_emit_leb128_u(&ds, 4); /* 4 bytes */
+        wasm_emit1(&ds, 16); wasm_emit1(&ds, 0); wasm_emit1(&ds, 0); wasm_emit1(&ds, 0);
+
+        /* Segment 2 (optional): string literal data */
+        if (wasm_global_strdata && wasm_global_strdata->len > 0) {
+            wasm_emit1(&ds, 0x00); /* active, memory 0 */
+            wasm_emit1(&ds, 0x41); /* i32.const */
+            wasm_emit_leb128_u(&ds, (uint32_t)wasm_global_strdata->base_offset);
+            wasm_emit1(&ds, 0x0B); /* end */
+            wasm_emit_leb128_u(&ds, (uint32_t)wasm_global_strdata->len);
+            for (int32_t di = 0; di < wasm_global_strdata->len; di++)
+                wasm_emit1(&ds, wasm_global_strdata->buf[di]);
+        }
+
         /* Write data section */
         wasm_emit1(&mod, WASM_SECTION_DATA);
         wasm_emit_leb128_u(&mod, (uint32_t)ds.len);

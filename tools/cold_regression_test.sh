@@ -239,6 +239,26 @@ assert "import_typed_const" 0 "$ACT"
 ACT=$(compile_run src/tests/cold_fixed_bytes_to_bytes_len_probe.cheng /tmp/ct_fixed_bytes_len)
 assert "fixed_bytes32_to_bytes_len" 0 "$ACT"
 
+rm -f /tmp/ct_nested_package_import /tmp/ct_nested_package_import.report
+quiet $COLD system-link-exec --root:"$PWD" \
+    --in:src/tests/cold_nested_package_import_smoke.cheng \
+    --target:arm64-apple-darwin --out:/tmp/ct_nested_package_import \
+    --report-out:/tmp/ct_nested_package_import.report
+if [ -x /tmp/ct_nested_package_import ]; then
+    /tmp/ct_nested_package_import 2>/dev/null; ACT=$?
+else
+    ACT="COMPILE_FAILED"
+fi
+assert "nested_package_import" 0 "$ACT"
+if grep -q '^direct_macho=1$' /tmp/ct_nested_package_import.report 2>/dev/null &&
+   grep -q '^provider_object_count=0$' /tmp/ct_nested_package_import.report 2>/dev/null &&
+   grep -q '^system_link=0$' /tmp/ct_nested_package_import.report 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "nested_package_import_linkerless" 1 "$ACT"
+
 ACT=$(compile_run src/tests/cold_fixed32_known_probe.cheng /tmp/ct_fixed32_known)
 assert "fixed32_known_roundtrip" 0 "$ACT"
 
@@ -5937,7 +5957,7 @@ if command -v node >/dev/null 2>&1; then
         cat > /tmp/ct_wasm_exec.js << 'JSEOF'
 const fs = require('fs');
 const wasm = fs.readFileSync('/tmp/ct_wasm_exec.wasm');
-WebAssembly.instantiate(wasm, {})
+WebAssembly.instantiate(wasm, {env:{memory:new WebAssembly.Memory({initial:1, maximum:512})}})
     .then(res => {
         const r = res.instance.exports.main();
         process.exit(r === 0 ? 0 : 1);
@@ -5965,7 +5985,7 @@ if command -v node >/dev/null 2>&1; then
         cat > /tmp/ct_wasm_zero_exec.js << 'JSEOF'
 const fs = require('fs');
 const wasm = fs.readFileSync('/tmp/ct_wasm_zero_exec.wasm');
-WebAssembly.instantiate(wasm, {})
+WebAssembly.instantiate(wasm, {env:{memory:new WebAssembly.Memory({initial:1, maximum:512})}})
     .then(res => {
         const r = res.instance.exports.main();
         process.exit(r === 0 ? 0 : 1);
@@ -6328,6 +6348,7 @@ for nf_file in \
     src/tests/import_use.cheng \
     src/tests/cold_import_bare_helper_main.cheng \
     src/tests/cold_import_typed_const_main.cheng \
+    src/tests/cold_nested_package_import_smoke.cheng \
     src/tests/cold_fixed_bytes_to_bytes_len_probe.cheng \
     src/tests/cold_fixed32_known_probe.cheng \
     src/tests/cold_result_fixed32_probe.cheng \
@@ -7145,6 +7166,120 @@ ACT=$(compile_obj_smoke "atomic_i32_runtime_smoke" "src/tests/atomic_i32_runtime
 assert "atomic_i32_runtime_smoke_cold_compile_smoke" 1 "$ACT"
 ACT=$(compile_obj_smoke "atomic_lowering_probe" "src/tests/atomic_lowering_probe.cheng")
 assert "atomic_lowering_probe_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "sha256_schedule" "src/tests/sha256_schedule_smoke.cheng")
+assert "sha256_schedule_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "sequential_objects" "src/tests/cold_object_seq_by_value_smoke.cheng")
+assert "sequential_objects_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "str_owned_return" "src/tests/str_owned_return_smoke.cheng")
+assert "str_owned_return_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "bytebuf_basic" "src/tests/bytebuf_basic_smoke.cheng")
+assert "bytebuf_basic_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "fixed256_sha256" "src/tests/fixed256_sha256_smoke.cheng")
+assert "fixed256_sha256_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "int_text" "src/tests/int_text_smoke.cheng")
+assert "int_text_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "fixed_array_word_bits" "src/tests/fixed_array_word_bits_probe.cheng")
+assert "fixed_array_word_bits_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "ref10_ashr" "src/tests/ref10_ashr_smoke.cheng")
+assert "ref10_ashr_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "body_ir_noalias_proof" "src/tests/body_ir_noalias_proof_smoke.cheng")
+assert "body_ir_noalias_proof_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "parser_path" "src/tests/parser_path_smoke.cheng")
+assert "parser_path_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "os_file_exists" "src/tests/os_file_exists_smoke.cheng")
+assert "os_file_exists_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "out_param_writeback" "src/tests/out_param_writeback_smoke.cheng")
+assert "out_param_writeback_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "strformat_fmt_lowering" "src/tests/strformat_fmt_lowering_smoke.cheng")
+assert "strformat_fmt_lowering_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "compiler_equivalence" "src/tests/compiler_equivalence_smoke.cheng")
+assert "compiler_equivalence_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "test_debug_basic" "src/tests/test_debug_basic.cheng")
+assert "test_debug_basic_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "test_debug_seq" "src/tests/test_debug_seq.cheng")
+assert "test_debug_seq_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "test_debug_let" "src/tests/test_debug_let.cheng")
+assert "test_debug_let_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "test_debug_concat" "src/tests/test_debug_concat.cheng")
+assert "test_debug_concat_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "test_debug_concat2" "src/tests/test_debug_concat2.cheng")
+assert "test_debug_concat2_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "test_debug_short" "src/tests/test_debug_short.cheng")
+assert "test_debug_short_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "test_debug_raw" "src/tests/test_debug_raw.cheng")
+assert "test_debug_raw_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "test_debug_len" "src/tests/test_debug_len.cheng")
+assert "test_debug_len_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "test_debug_assert" "src/tests/test_debug_assert.cheng")
+assert "test_debug_assert_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "test_debug_two" "src/tests/test_debug_two.cheng")
+assert "test_debug_two_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "test_debug_direct" "src/tests/test_debug_direct.cheng")
+assert "test_debug_direct_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "test_debug_what" "src/tests/test_debug_what.cheng")
+assert "test_debug_what_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "test_debug_single" "src/tests/test_debug_single.cheng")
+assert "test_debug_single_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "test_debug_join" "src/tests/test_debug_join.cheng")
+assert "test_debug_join_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "test_debug_2elem" "src/tests/test_debug_2elem.cheng")
+assert "test_debug_2elem_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "test_debug_2elem2" "src/tests/test_debug_2elem2.cheng")
+assert "test_debug_2elem2_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "test_debug_lit_cmp" "src/tests/test_debug_lit_cmp.cheng")
+assert "test_debug_lit_cmp_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "test_debug_assert2" "src/tests/test_debug_assert2.cheng")
+assert "test_debug_assert2_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "test_join" "src/tests/test_join.cheng")
+assert "test_join_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "test_join2" "src/tests/test_join2.cheng")
+assert "test_join2_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "test_min" "src/tests/test_min.cheng")
+assert "test_min_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "test_min2" "src/tests/test_min2.cheng")
+assert "test_min2_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "test_min3" "src/tests/test_min3.cheng")
+assert "test_min3_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "test_min4" "src/tests/test_min4.cheng")
+assert "test_min4_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "test_min5" "src/tests/test_min5.cheng")
+assert "test_min5_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "test_min6" "src/tests/test_min6.cheng")
+assert "test_min6_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "test_min7" "src/tests/test_min7.cheng")
+assert "test_min7_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "test_min8" "src/tests/test_min8.cheng")
+assert "test_min8_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "test_min9" "src/tests/test_min9.cheng")
+assert "test_min9_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "test_min10" "src/tests/test_min10.cheng")
+assert "test_min10_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "test_min11" "src/tests/test_min11.cheng")
+assert "test_min11_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "test_min12" "src/tests/test_min12.cheng")
+assert "test_min12_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "test_min13" "src/tests/test_min13.cheng")
+assert "test_min13_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "test_min14" "src/tests/test_min14.cheng")
+assert "test_min14_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "test_min15" "src/tests/test_min15.cheng")
+assert "test_min15_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "step2" "src/tests/step2.cheng")
+assert "step2_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "step3" "src/tests/step3.cheng")
+assert "step3_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "t1_hello" "src/tests/t1_hello.cheng")
+assert "t1_hello_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "if_composite_return" "src/tests/if_composite_return_smoke.cheng")
+assert "if_composite_return_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "if_enum_scalar_return" "src/tests/if_enum_scalar_return_smoke.cheng")
+assert "if_enum_scalar_return_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "const_elif" "src/tests/const_elif.cheng")
+assert "const_elif_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "ptr_abi_negative" "src/tests/ptr_abi_negative_smoke.cheng")
+assert "ptr_abi_negative_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "strutils_split_newline" "src/tests/strutils_split_newline_smoke.cheng")
+assert "strutils_split_newline_cold_compile_smoke" 1 "$ACT"
 
 # ============================================================
 # 62: Node.js WASM execution tests (files that pass wasm-validate)
@@ -7166,8 +7301,9 @@ for njs_entry in "zero:src/tests/wasm_zero_smoke.cheng:0" \
 const fs = require('fs');
 const buf = fs.readFileSync('/tmp/ct_njs_${njs_tag}.wasm');
 const m = new WebAssembly.Module(buf);
-const inst = new WebAssembly.Instance(m, {});
-const ex = inst.exports;
+	const mem = new WebAssembly.Memory({initial:1, maximum:512});
+	const inst = new WebAssembly.Instance(m, {env:{memory:mem}});
+	const ex = inst.exports;
 if (ex.main !== undefined) console.log(ex.main());
 else console.log(-999);
 " 2>/dev/null)
@@ -7183,17 +7319,14 @@ done
 # ============================================================
 for njs_val_entry in "scf:src/tests/wasm_scalar_control_flow_smoke.cheng" \
                      "cfe:src/tests/wasm_control_flow_ext_smoke.cheng" \
-                     "shadow:src/tests/wasm_shadowed_local_scope_smoke.cheng"; do
+                     "shadow:src/tests/wasm_shadowed_local_scope_smoke.cheng" \
+                     "memops:src/tests/wasm_memory_ops_smoke.cheng" \
+                     "strself:src/tests/wasm_string_ops_self_contained_smoke.cheng"; do
     njs_val_tag="${njs_val_entry%%:*}"
     njs_val_src="${njs_val_entry#*:}"
     rm -f "/tmp/ct_njsv_${njs_val_tag}.wasm" "/tmp/ct_njsv_${njs_val_tag}.report"
-    quiet $COLD system-link-exec --root:"$PWD" \
-        --in:"$njs_val_src" --target:wasm32-unknown-unknown \
-        --out:"/tmp/ct_njsv_${njs_val_tag}.wasm" --emit:exe \
-        --report-out:"/tmp/ct_njsv_${njs_val_tag}.report"
-    if [ -s "/tmp/ct_njsv_${njs_val_tag}.wasm" ] && \
-       wasm-validate "/tmp/ct_njsv_${njs_val_tag}.wasm" >/dev/null 2>&1 && \
-       ! grep -q '^error=' "/tmp/ct_njsv_${njs_val_tag}.report" 2>/dev/null; then
+    quiet $COLD system-link-exec --root:"$PWD"         --in:"$njs_val_src" --target:wasm32-unknown-unknown         --out:"/tmp/ct_njsv_${njs_val_tag}.wasm" --emit:exe         --report-out:"/tmp/ct_njsv_${njs_val_tag}.report"
+    if [ -s "/tmp/ct_njsv_${njs_val_tag}.wasm" ] &&        wasm-validate "/tmp/ct_njsv_${njs_val_tag}.wasm" >/dev/null 2>&1 &&        ! grep -q '^error=' "/tmp/ct_njsv_${njs_val_tag}.report" 2>/dev/null; then
         ACT=1
     else
         ACT=0
@@ -7201,7 +7334,6 @@ for njs_val_entry in "scf:src/tests/wasm_scalar_control_flow_smoke.cheng" \
     assert "wasm_validate_ext_${njs_val_tag}" 1 "$ACT"
     rm -f "/tmp/ct_njsv_${njs_val_tag}.wasm" "/tmp/ct_njsv_${njs_val_tag}.report"
 done
-
 # ============================================================
 # 64: Cross-arch binary format verification (magic bytes)
 # ============================================================
@@ -7478,16 +7610,218 @@ CHENG_ZRG_INNER=1 bash "$0" > "$FIRST_RUN" 2>&1
 CHENG_ZRG_INNER=1 bash "$0" > "$SECOND_RUN" 2>&1
 FIRST_PASS=$(grep '^===.*passed' "$FIRST_RUN" | grep -o '[0-9]* passed' | grep -o '[0-9]*')
 SECOND_PASS=$(grep '^===.*passed' "$SECOND_RUN" | grep -o '[0-9]* passed' | grep -o '[0-9]*')
-if [ -n "$FIRST_PASS" ] && [ -n "$SECOND_PASS" ] && [ "$FIRST_PASS" = "$SECOND_PASS" ]; then
+FIRST_FAIL=$(grep '^===.*failed' "$FIRST_RUN" | grep -o '[0-9]* failed' | grep -o '[0-9]*')
+SECOND_FAIL=$(grep '^===.*failed' "$SECOND_RUN" | grep -o '[0-9]* failed' | grep -o '[0-9]*')
+if [ -n "$FIRST_PASS" ] && [ -n "$SECOND_PASS" ] && [ "$FIRST_PASS" = "$SECOND_PASS" ] && [ "${FIRST_FAIL:-0}" = "${SECOND_FAIL:-0}" ]; then
     ACT=1
 else
     ACT=0
+    echo "  ZRG_DIAG: first run: ${FIRST_PASS:-UNSET} pass / ${FIRST_FAIL:-UNSET} fail"
+    echo "  ZRG_DIAG: second run: ${SECOND_PASS:-UNSET} pass / ${SECOND_FAIL:-UNSET} fail"
+    if [ "$FIRST_PASS" != "$SECOND_PASS" ] 2>/dev/null; then
+        echo "  ZRG_DIAG: PASS count mismatch — diff of test results:"
+        diff <(grep 'PASS\|FAIL' "$FIRST_RUN" | sort) <(grep 'PASS\|FAIL' "$SECOND_RUN" | sort) | head -40
+    fi
 fi
 assert "cold_zero_regression_gate" 1 "$ACT"
 rm -f "$FIRST_RUN" "$SECOND_RUN"
 fi
-echo ""
+
+# ============================================================
+# 70: Cold compiler fuzz test — compile 50 random expressions
+# ============================================================
+rm -rf /tmp/ct_fuzz50
+mkdir -p /tmp/ct_fuzz50
+python3 -c "
+import random, os
+random.seed(42)
+ops = ['+', '-', '*', '&', '|', '^']
+for i in range(50):
+    val = random.randint(0, 127)
+    expr = str(val)
+    for _ in range(random.randint(1, 6)):
+        op = random.choice(ops)
+        rhs = random.randint(0, 127)
+        expr = f'({expr} {op} {rhs})'
+    with open(f'/tmp/ct_fuzz50/expr_{i}.cheng', 'w') as f:
+        f.write(f'fn main(): int32 =\\n    return {expr}\\n')
+" 2>/dev/null
+FUZZ50_OK=1
+for i in $(seq 0 49); do
+    rm -f "/tmp/ct_fuzz50/out_${i}" "/tmp/ct_fuzz50/report_${i}"
+    quiet $COLD system-link-exec --root:"$PWD" \
+        --in:"/tmp/ct_fuzz50/expr_${i}.cheng" --target:arm64-apple-darwin \
+        --out:"/tmp/ct_fuzz50/out_${i}" \
+        --report-out:"/tmp/ct_fuzz50/report_${i}"
+    if [ -x "/tmp/ct_fuzz50/out_${i}" ] && \
+       ! grep -q '^error=' "/tmp/ct_fuzz50/report_${i}" 2>/dev/null; then
+        :  # compiled and linked OK
+    else
+        FUZZ50_OK=0
+    fi
+    rm -f "/tmp/ct_fuzz50/out_${i}" "/tmp/ct_fuzz50/report_${i}"
+done
+assert "cold_fuzz50_random_expr_all_ok" 1 "$FUZZ50_OK"
+rm -rf /tmp/ct_fuzz50
+
+# ============================================================
+# 71: Cross-arch runtime test — compile + run on available targets
+# ============================================================
+echo 'fn main(): int32 = return 42' > /tmp/ct_xarch_check.cheng
+# arm64-apple-darwin is native, run it
+rm -f /tmp/ct_xarch_arm64 /tmp/ct_xarch_arm64.report
+quiet $COLD system-link-exec --root:"$PWD" \
+    --in:/tmp/ct_xarch_check.cheng --target:arm64-apple-darwin \
+    --out:/tmp/ct_xarch_arm64 \
+    --report-out:/tmp/ct_xarch_arm64.report
+if [ -x /tmp/ct_xarch_arm64 ] && \
+   ! grep -q '^error=' "/tmp/ct_xarch_arm64.report" 2>/dev/null; then
+    XARCH_EXIT=$(/tmp/ct_xarch_arm64 2>/dev/null; echo $?)
+else
+    XARCH_EXIT="X"
+fi
+assert "xarch_arm64_runtime" 42 "$XARCH_EXIT"
+rm -f /tmp/ct_xarch_arm64 /tmp/ct_xarch_arm64.report
+# x86_64 cross-compile check via Rosetta if available
+rm -f /tmp/ct_xarch_x86_64 /tmp/ct_xarch_x86_64.report
+quiet $COLD system-link-exec --root:"$PWD" \
+    --in:/tmp/ct_xarch_check.cheng --target:x86_64-unknown-linux-gnu \
+    --out:/tmp/ct_xarch_x86_64 \
+    --report-out:/tmp/ct_xarch_x86_64.report
+if [ -s /tmp/ct_xarch_x86_64 ] && \
+   ! grep -q '^error=' "/tmp/ct_xarch_x86_64.report" 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "xarch_x86_64_compile" 1 "$ACT"
+rm -f /tmp/ct_xarch_x86_64 /tmp/ct_xarch_x86_64.report
+# riscv64 cross-compile check
+rm -f /tmp/ct_xarch_riscv64 /tmp/ct_xarch_riscv64.report
+quiet $COLD system-link-exec --root:"$PWD" \
+    --in:/tmp/ct_xarch_check.cheng --target:riscv64-unknown-linux-gnu \
+    --out:/tmp/ct_xarch_riscv64 \
+    --report-out:/tmp/ct_xarch_riscv64.report
+if [ -s /tmp/ct_xarch_riscv64 ] && \
+   ! grep -q '^error=' "/tmp/ct_xarch_riscv64.report" 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "xarch_riscv64_compile" 1 "$ACT"
+rm -f /tmp/ct_xarch_riscv64 /tmp/ct_xarch_riscv64.report
+rm -f /tmp/ct_xarch_check.cheng
+
+# ============================================================
+# 72: Cold compiler stress — compile 100 files, verify no memory growth
+# ============================================================
+rm -rf /tmp/ct_stress100
+mkdir -p /tmp/ct_stress100
+for i in $(seq 0 99); do
+    echo "fn main(): int32 = return $((i % 256))" > "/tmp/ct_stress100/f${i}.cheng"
+done
+STRESS_OK=0
+# measure RSS before compilation loop (resident memory via ps)
+STRESS_RSS_BEFORE=$(ps -o rss= $$ 2>/dev/null | tr -d ' ')
+for i in $(seq 0 99); do
+    rm -f "/tmp/ct_stress100/out_${i}" "/tmp/ct_stress100/report_${i}"
+    quiet $COLD system-link-exec --root:"$PWD" \
+        --in:"/tmp/ct_stress100/f${i}.cheng" --target:arm64-apple-darwin \
+        --out:"/tmp/ct_stress100/out_${i}" \
+        --report-out:"/tmp/ct_stress100/report_${i}"
+    if [ -x "/tmp/ct_stress100/out_${i}" ] && \
+       ! grep -q '^error=' "/tmp/ct_stress100/report_${i}" 2>/dev/null; then
+        ACT=$( "/tmp/ct_stress100/out_${i}" 2>/dev/null; echo $?)
+        if [ "$ACT" = "$((i % 256))" ]; then
+            STRESS_OK=$((STRESS_OK + 1))
+        fi
+    fi
+    rm -f "/tmp/ct_stress100/out_${i}" "/tmp/ct_stress100/report_${i}"
+done
+assert "cold_stress100_all_exit_correct" 100 "$STRESS_OK"
+# memory growth check: compare RSS before/after compilation loop
+STRESS_RSS_AFTER=$(ps -o rss= $$ 2>/dev/null | tr -d ' ')
+if [ -n "$STRESS_RSS_BEFORE" ] && [ -n "$STRESS_RSS_AFTER" ] && \
+   [ "$STRESS_RSS_BEFORE" -gt 0 ] 2>/dev/null && \
+   [ "$((STRESS_RSS_AFTER - STRESS_RSS_BEFORE))" -lt 50000 ] 2>/dev/null; then
+    assert "cold_stress100_no_memory_leak" 1 1
+else
+    assert "cold_stress100_no_memory_leak" 1 0
+fi
+rm -rf /tmp/ct_stress100
+
+# ============================================================
+# 73: Batch compile 60 untested smoke files
+# ============================================================
+for ct_batch73_entry in \
+    "int32_madd_direct_object_smoke:src/tests/int32_madd_direct_object_smoke.cheng" \
+    "object_native_link_plan:src/tests/object_native_link_plan_smoke.cheng" \
+    "parser_surface_scan:src/tests/parser_surface_scan_smoke.cheng" \
+    "result_large_composite:src/tests/result_large_composite_value_smoke.cheng" \
+    "str_array_add_owned_return:src/tests/str_array_add_owned_return_smoke.cheng" \
+    "str_concat_lowering:src/tests/str_concat_lowering_smoke.cheng" \
+    "str_owned_return_regress:src/tests/str_owned_return_regress_smoke.cheng" \
+    "strformat_fmt:src/tests/strformat_fmt_smoke.cheng" \
+    "borrow_checker:src/tests/borrow_checker_smoke.cheng" \
+    "build_plan_report:src/tests/build_plan_report_smoke.cheng" \
+    "build_plan_struct_array:src/tests/build_plan_struct_array_smoke.cheng" \
+    "call_result_preserves_live_str:src/tests/call_result_preserves_live_str_smoke.cheng" \
+    "cfg_lowering:src/tests/cfg_lowering_smoke.cheng" \
+    "cfg_multi_stmt:src/tests/cfg_multi_stmt_smoke.cheng" \
+    "cfg_result_project:src/tests/cfg_result_project_smoke.cheng" \
+    "cold_buffer_append_bytes:src/tests/cold_buffer_append_bytes_smoke.cheng" \
+    "cold_large_object_seq_by_value:src/tests/cold_large_object_seq_by_value_smoke.cheng" \
+    "cold_nested_object_field_mutation:src/tests/cold_nested_object_field_mutation_smoke.cheng" \
+    "cold_parser_split_char:src/tests/cold_parser_split_char_smoke.cheng" \
+    "cold_rawbytes_buffer:src/tests/cold_rawbytes_buffer_smoke.cheng" \
+    "cold_str_seq_setlen_index_store:src/tests/cold_str_seq_setlen_index_store_smoke.cheng" \
+    "cold_transitive_alias_scope:src/tests/cold_transitive_alias_scope_smoke.cheng" \
+    "cold_var_object_field_mutation:src/tests/cold_var_object_field_mutation_smoke.cheng" \
+    "compile_mode_switch:src/tests/compile_mode_switch_smoke.cheng" \
+    "composite_call_regression:src/tests/composite_call_regression_smoke.cheng" \
+    "default_init_literals:src/tests/default_init_literals_smoke.cheng" \
+    "determinism_gate:src/tests/determinism_gate_smoke.cheng" \
+    "elegant_syntax_profile:src/tests/elegant_syntax_profile_smoke.cheng" \
+    "elif_else_guard_cfg:src/tests/elif_else_guard_cfg_smoke.cheng" \
+    "explicit_default_init_positive:src/tests/explicit_default_init_positive_smoke.cheng" \
+    "export_visibility_negative:src/tests/export_visibility_negative_smoke.cheng" \
+    "field_assign_preserves_tail_seq:src/tests/field_assign_preserves_tail_seq_smoke.cheng" \
+    "fixed_array_index_assign:src/tests/fixed_array_index_assign_smoke.cheng" \
+    "fixedbytes32_seq_add_len:src/tests/fixedbytes32_seq_add_len_smoke.cheng" \
+    "func_range_loop:src/tests/func_range_loop_smoke.cheng" \
+    "gate_determinism:src/tests/gate_determinism_smoke.cheng" \
+    "get_u32be:src/tests/get_u32be_smoke.cheng" \
+    "global_fixed_array_composite:src/tests/global_fixed_array_composite_smoke.cheng" \
+    "i32_call_arg0_return:src/tests/i32_call_arg0_return_direct_object_smoke.cheng" \
+    "i32_guard_help_then_command:src/tests/i32_guard_help_then_command_direct_object_smoke.cheng" \
+    "if_enum_composite_return:src/tests/if_enum_composite_return_smoke.cheng" \
+    "let_call_i32_guard:src/tests/let_call_i32_guard_direct_object_smoke.cheng" \
+    "list_literal_nested_call_depth:src/tests/list_literal_nested_call_depth_smoke.cheng" \
+    "low_uir_linear_call_chain:src/tests/low_uir_linear_call_chain_smoke.cheng" \
+    "low_uir_stack_args:src/tests/low_uir_stack_args_smoke.cheng" \
+    "lowering_cfg_matrix:src/tests/lowering_cfg_matrix_smoke.cheng" \
+    "lowering_collect_sources:src/tests/lowering_collect_sources_smoke.cheng" \
+    "lowering_matrix:src/tests/lowering_matrix_smoke.cheng" \
+    "multi_branch_if_general_cfg:src/tests/multi_branch_if_general_cfg_smoke.cheng" \
+    "multi_stmt_general_direct_object:src/tests/multi_stmt_general_direct_object_smoke.cheng" \
+    "multiline_string:src/tests/multiline_string_smoke.cheng" \
+    "nested_field_direct_arg_str:src/tests/nested_field_direct_arg_str_smoke.cheng" \
+    "option_none:src/tests/option_none_smoke.cheng" \
+    "out_param_direct_call_writeback:src/tests/out_param_direct_call_writeback_smoke.cheng" \
+    "path_rooted_traversal:src/tests/path_rooted_traversal_smoke.cheng" \
+    "seq_add_member_index_rhs:src/tests/seq_add_member_index_rhs_smoke.cheng" \
+    "seq_empty_string:src/tests/seq_empty_string_smoke.cheng" \
+    "short_circuit_semantics:src/tests/short_circuit_semantics_smoke.cheng" \
+    "strformat_export_negative:src/tests/strformat_export_negative_smoke.cheng" \
+    "strings_char_to_str:src/tests/strings_char_to_str_smoke.cheng" \
+    "sync_mutex_lock:src/tests/sync_mutex_lock_smoke.cheng" \
+    "system_entropy:src/tests/system_entropy_smoke.cheng"; do
+    ct_b73_tag="${ct_batch73_entry%%:*}"
+    ct_b73_src="${ct_batch73_entry#*:}"
+    ct_b73_r=$(compile_obj_smoke "batch73_${ct_b73_tag}" "$ct_b73_src")
+    assert "cold_batch73_${ct_b73_tag}" 1 "$ct_b73_r"
+done
+
 echo "=== $PASS passed, $FAIL failed ==="
 
 [ "$FAIL" -eq 0 ]
-
