@@ -107,13 +107,14 @@ let d = RunResult { outputText: "ok" }
   - `artifacts/backend_driver/cheng run-host-smokes cheng_skill_consistency_smoke`
   - `tools/cold_regression_test.sh`
   - `tools/cold_csg_v2_roundtrip_test.sh`
+  - `tools/linux_aarch64_provider_runtime_smoke.sh`
   - `artifacts/backend_driver/cheng emit-cold-csg-v2 --root:/abs/root --in:/abs/path/file.cheng --out:/tmp/file.csgv2 --target:arm64-apple-darwin --report-out:/tmp/file.csgv2.writer.report.txt`
   - `cc -std=c11 -O2 -o /tmp/cheng_cold bootstrap/cheng_cold.c && /tmp/cheng_cold system-link-exec --csg-in:/tmp/file.csgv2 --emit:obj --out:/tmp/file.o --target:arm64-apple-darwin --report-out:/tmp/file.reader.report.txt`
   - `artifacts/bootstrap/cheng.stage3 run-stage23-libp2p-smokes`
   - `artifacts/bootstrap/cheng.stage3 run-cross-target-smokes`
   - `artifacts/backend_driver/cheng system-link-exec --root:/abs/root --in:/abs/path/file.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/app`
 - `cheng` 固定 dev-only；release 仅允许 `release-compile`。`cheng`/`release-compile` 不接受 `--linker` 或 `BACKEND_LINKER` 覆盖，链接器由命令轨道固定。
-- CSG v2 口径：当前 `tools/cold_csg_v2_roundtrip_test.sh` 通过 859/859，`tools/cold_regression_test.sh` 通过 184/184；public `emit-cold-csg-v2` 输出 canonical `CHENG_CSG_V2` facts，internal `CHENGCSG` 只保留给显式 cold self-test。完整 Cheng `PrimaryObjectPlan` 管线仍未闭合；cold_parser 的 Lowering/Primary materializer 必须写 missing reason，不能空 plan 成功。
+- CSG v2 口径：当前 `tools/cold_csg_v2_roundtrip_test.sh` 通过 859/859，`tools/cold_regression_test.sh` 通过 215/215；public `emit-cold-csg-v2` 输出 canonical `CHENG_CSG_V2` facts，internal `CHENGCSG` 只保留给显式 cold self-test。Linux AArch64 `write/get_nprocs` 已由 cold 生成真实 syscall provider object 并通过 provider archive 链接报告门禁；`tools/linux_aarch64_provider_runtime_smoke.sh` 是目标运行硬门禁，缺 native Linux AArch64、`qemu-aarch64`/`qemu-aarch64-static` 或显式 runner 直接失败；完整 Cheng `PrimaryObjectPlan` 管线仍未闭合；cold_parser 的 Lowering/Primary materializer 必须写 missing reason，不能空 plan 成功。
 - Dev 默认 self-link/direct-exe/host runner hotpatch；Release 默认 system linker/substrate runtime。`100ms` 编译和二进制原地更新只属于 dev host-only dedicated witness。
 - `BACKEND_JOBS` 是唯一公开 worker 数控制面；`BACKEND_FN_SCHED=serial` 只保留给内部诊断、perf 对照和低内存 bring-up。
 - `run-production-regression` 是当前聚合回归入口；它会串起 driver 自举、stage0/stage3/backend_driver 命令面 smoke、driver build report 合同、function task 合同、BodyIR DoD/SoA/noalias/CFG 合同、perf gate 合同、线程/原子/ORC runtime provider 合同、文档/skill 一致性、显式默认值正反例与防回潮门禁、跨目标 smoke 和 stage2/stage3 libp2p smoke。
