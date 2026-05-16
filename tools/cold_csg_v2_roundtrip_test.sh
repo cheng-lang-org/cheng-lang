@@ -438,14 +438,18 @@ canonical_writer_aarch64_provider_archive_smoke() {
     local primary_source="$WORK/canonical_provider_aarch64_primary.cheng"
     local provider_one_obj="$WORK/canonical_provider_aarch64_one.o"
     local provider_two_obj="$WORK/canonical_provider_aarch64_two.o"
+    local provider_one_report="$WORK/canonical_provider_aarch64_one.report.txt"
+    local provider_two_report="$WORK/canonical_provider_aarch64_two.report.txt"
     local archive="$WORK/canonical_provider_aarch64.chenga"
     local facts="$WORK/canonical_provider_aarch64_primary.facts"
     local primary_obj="$WORK/canonical_provider_aarch64_primary.o"
     local exe="$WORK/canonical_provider_aarch64.exe"
+    local direct_exe="$WORK/canonical_provider_aarch64_direct.exe"
     local writer_report="$WORK/canonical_provider_aarch64_primary.writer.report.txt"
     local obj_report="$WORK/canonical_provider_aarch64.obj.report.txt"
     local pack_report="$WORK/canonical_provider_aarch64.pack.report.txt"
     local link_report="$WORK/canonical_provider_aarch64.link.report.txt"
+    local direct_link_report="$WORK/canonical_provider_aarch64.direct.link.report.txt"
 
     cat > "$provider_one_source" <<'CHENG'
 @exportc("canonical_provider_aarch64_one")
@@ -490,11 +494,13 @@ CHENG
     if "$COLD" system-link-exec \
         --in:"$provider_one_source" \
         --emit:obj --target:"$target" \
-        --out:"$provider_one_obj" >/dev/null &&
+        --out:"$provider_one_obj" \
+        --report-out:"$provider_one_report" >/dev/null &&
        "$COLD" system-link-exec \
         --in:"$provider_two_source" \
         --emit:obj --target:"$target" \
-        --out:"$provider_two_obj" >/dev/null &&
+        --out:"$provider_two_obj" \
+        --report-out:"$provider_two_report" >/dev/null &&
        "$COLD" provider-archive-pack \
         --target:"$target" \
         --object:"$provider_one_obj" \
@@ -509,8 +515,26 @@ CHENG
     else
         bad "canonical_provider_aarch64_archive"
     fi
+    require_grep "canonical_provider_aarch64_provider_one_emit" '^emit=obj$' "$provider_one_report"
+    require_grep "canonical_provider_aarch64_provider_one_target" '^target=aarch64-unknown-linux-gnu$' "$provider_one_report"
+    require_grep "canonical_provider_aarch64_provider_one_link_object" '^link_object=0$' "$provider_one_report"
+    require_grep "canonical_provider_aarch64_provider_one_system_link" '^system_link=0$' "$provider_one_report"
+    require_grep "canonical_provider_aarch64_provider_one_provider_archive" '^provider_archive=0$' "$provider_one_report"
+    require_grep "canonical_provider_aarch64_provider_two_emit" '^emit=obj$' "$provider_two_report"
+    require_grep "canonical_provider_aarch64_provider_two_target" '^target=aarch64-unknown-linux-gnu$' "$provider_two_report"
+    require_grep "canonical_provider_aarch64_provider_two_link_object" '^link_object=0$' "$provider_two_report"
+    require_grep "canonical_provider_aarch64_provider_two_system_link" '^system_link=0$' "$provider_two_report"
+    require_grep "canonical_provider_aarch64_provider_two_provider_archive" '^provider_archive=0$' "$provider_two_report"
+    if [ -s "$provider_one_obj" ] && [ ! -e "$provider_one_obj.linked" ] &&
+       [ -s "$provider_two_obj" ] && [ ! -e "$provider_two_obj.linked" ]; then
+        ok "canonical_provider_aarch64_provider_objects_only"
+    else
+        bad "canonical_provider_aarch64_provider_objects_only"
+    fi
+    require_grep "canonical_provider_aarch64_pack_target" '^target=aarch64-unknown-linux-gnu$' "$pack_report"
     require_grep "canonical_provider_aarch64_pack_ok" '^provider_archive_pack=1$' "$pack_report"
     require_grep "canonical_provider_aarch64_pack_members" '^provider_object_count=2$' "$pack_report"
+    require_grep "canonical_provider_aarch64_pack_archive_members" '^provider_archive_member_count=2$' "$pack_report"
     require_grep "canonical_provider_aarch64_pack_exports" '^provider_export_count=2$' "$pack_report"
     require_grep "canonical_provider_aarch64_pack_system_link" '^system_link=0$' "$pack_report"
     require_grep "canonical_provider_aarch64_pack_linkerless" '^linkerless_image=1$' "$pack_report"
@@ -532,6 +556,9 @@ CHENG
     require_grep "canonical_provider_aarch64_obj_target" '^target=aarch64-unknown-linux-gnu$' "$obj_report"
     require_grep "canonical_provider_aarch64_obj_link_object" '^link_object=0$' "$obj_report"
     require_grep "canonical_provider_aarch64_obj_system_link" '^system_link=0$' "$obj_report"
+    require_grep "canonical_provider_aarch64_obj_provider_archive" '^provider_archive=0$' "$obj_report"
+    require_grep "canonical_provider_aarch64_obj_unresolved" '^unresolved_symbol_count=0$' "$obj_report"
+    require_grep "canonical_provider_aarch64_obj_csg_lowering" '^cold_csg_lowering=1$' "$obj_report"
     require_grep "canonical_provider_aarch64_obj_reloc_count" '^facts_reloc_count=2$' "$obj_report"
     if "$COLD" system-link-exec \
         --link-object:"$primary_obj" \
@@ -549,12 +576,39 @@ CHENG
         bad "canonical_provider_aarch64_exe_format"
     fi
     require_grep "canonical_provider_aarch64_link_object" '^link_object=1$' "$link_report"
+    require_grep "canonical_provider_aarch64_link_target" '^target=aarch64-unknown-linux-gnu$' "$link_report"
+    require_grep "canonical_provider_aarch64_link_provider_archive" '^provider_archive=1$' "$link_report"
+    require_grep "canonical_provider_aarch64_link_provider_objects" '^provider_object_count=2$' "$link_report"
     require_grep "canonical_provider_aarch64_link_members" '^provider_archive_member_count=2$' "$link_report"
     require_grep "canonical_provider_aarch64_link_exports" '^provider_export_count=2$' "$link_report"
     require_grep "canonical_provider_aarch64_link_resolved" '^provider_resolved_symbol_count=2$' "$link_report"
     require_grep "canonical_provider_aarch64_link_unresolved" '^unresolved_symbol_count=0$' "$link_report"
     require_grep "canonical_provider_aarch64_link_system_link" '^system_link=0$' "$link_report"
     require_grep "canonical_provider_aarch64_link_linkerless" '^linkerless_image=1$' "$link_report"
+    if "$COLD" system-link-exec \
+        --csg-in:"$facts" \
+        --provider-archive:"$archive" \
+        --emit:exe --target:"$target" \
+        --out:"$direct_exe" \
+        --report-out:"$direct_link_report" >/dev/null; then
+        ok "canonical_provider_aarch64_csg_in_provider_archive"
+    else
+        bad "canonical_provider_aarch64_csg_in_provider_archive"
+    fi
+    if [ -s "$direct_exe" ] && file "$direct_exe" | grep -q "ELF.*executable"; then
+        ok "canonical_provider_aarch64_direct_exe_format"
+    else
+        bad "canonical_provider_aarch64_direct_exe_format"
+    fi
+    require_grep "canonical_provider_aarch64_direct_target" '^target=aarch64-unknown-linux-gnu$' "$direct_link_report"
+    require_grep "canonical_provider_aarch64_direct_provider_archive" '^provider_archive=1$' "$direct_link_report"
+    require_grep "canonical_provider_aarch64_direct_provider_objects" '^provider_object_count=2$' "$direct_link_report"
+    require_grep "canonical_provider_aarch64_direct_members" '^provider_archive_member_count=2$' "$direct_link_report"
+    require_grep "canonical_provider_aarch64_direct_exports" '^provider_export_count=2$' "$direct_link_report"
+    require_grep "canonical_provider_aarch64_direct_resolved" '^provider_resolved_symbol_count=2$' "$direct_link_report"
+    require_grep "canonical_provider_aarch64_direct_unresolved" '^unresolved_symbol_count=0$' "$direct_link_report"
+    require_grep "canonical_provider_aarch64_direct_system_link" '^system_link=0$' "$direct_link_report"
+    require_grep "canonical_provider_aarch64_direct_linkerless" '^linkerless_image=1$' "$direct_link_report"
 }
 
 roundtrip_fixture() {

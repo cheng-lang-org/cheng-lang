@@ -157,9 +157,9 @@ reloc -> cold linkerless/object linker applies reloc
 ## 当前实测
 
 - `bootstrap/cheng_cold.c` 已实现 CSG v2 双 reader/writer：public `emit-cold-csg-v2` 写 canonical `CHENG_CSG_V2` facts；显式 `system-link-exec --emit:csg-v2` 写 internal `CHENGCSG` self-test facts；`--csg-in` 同时消费 BodyIR 快照和 canonical 指令字 facts。
-- 当前自动卡口是 `tools/cold_csg_v2_roundtrip_test.sh`：public canonical writer 覆盖 ordinary writer/read/link/run，并锁 writer report 的 `facts_bytes/facts_function_count/facts_word_count`；internal writer/reader 连续两次产 `.o` 并 `cmp` 确定性通过；同时验证 reader report、facts 预算、unknown/truncated hard-fail、provider archive 多 member/export、`--csg-in --provider-archive`。本地实跑结果为 735/735 PASS。
+- 当前自动卡口是 `tools/cold_csg_v2_roundtrip_test.sh`：public canonical writer 覆盖 ordinary writer/read/link/run，并锁 writer report 的 `facts_bytes/facts_function_count/facts_word_count`；internal writer/reader 连续两次产 `.o` 并 `cmp` 确定性通过；同时验证 reader report、facts 预算、unknown/truncated hard-fail、provider archive 多 member/export、`--csg-in --provider-archive`、真实 backend driver canonical facts → AArch64 provider archive 直接入口。当前本地实跑结果为 839/839 PASS。
 - `CHENG_CSG_V2` text object facts reader 已有最小 object smoke：`_main` 两条 ARM64 instruction word 连续两次读入生成 `.o` bit-identical，`cc` 链接后运行 exit 0。新增 public writer smoke 从 `ordinary_zero_exit_fixture` 写 canonical facts，再由 cold reader 生成 object 并链接运行 exit 0。
-- **internal fixed-point 验证通过**：`CHENGCSG` section-binary facts 只保留为显式 cold self-test，锁 writer/reader 确定性；canonical `CHENG_CSG_V2` public writer 已有最小链路 smoke。完整 Cheng `PrimaryObjectPlan` 管线仍未闭合；cold_parser 的 Lowering/Primary materializer 现在必须写出明确 missing reason，不能把 735/735 结论外推为全量 PrimaryObjectPlan 管线闭合。
+- **internal fixed-point 验证通过**：`CHENGCSG` section-binary facts 只保留为显式 cold self-test，锁 writer/reader 确定性；canonical `CHENG_CSG_V2` public writer 已有最小链路 smoke。完整 Cheng `PrimaryObjectPlan` 管线仍未闭合；cold_parser 的 Lowering/Primary materializer 现在必须写出明确 missing reason，不能把 839/839 结论外推为全量 PrimaryObjectPlan 管线闭合。
 - `ordinary_zero_exit_fixture`: facts 280 bytes, exe 0.13-0.19ms, exit 0（codesign 后）。
 - `cold_subset_coverage`: facts 19,666 bytes (23 函数/411+ ops), exe 0.15-0.22ms, MD5 一致。
 - `--csg-in --emit:obj`: 两次产出 bit-identical, `_main` 全局符号, cc 链接后运行 exit 0。
@@ -167,7 +167,7 @@ reloc -> cold linkerless/object linker applies reloc
 - report 字段：`facts_bytes`, `facts_mmap_ms`, `facts_verify_ms`, `facts_decode_ms`, `facts_total_ms`, `facts_function_count` 全部输出。
 - 三架构 codegen 100% op 覆盖（ARM64/x86_64/RISC-V），全部通过自检。
 - `build-backend-driver` 当前产物是 cold bootstrap patched-self candidate，contract hash `41cf6b574eae643f`；它不是纯 Cheng backend driver 闭合证明。纯 Cheng direct 编译 `backend_driver_dispatch_min.cheng` 已越过 `invalid string literal index`，当前由 `pure_backend_driver_direct_hard_fail` 锁住 `os.cheng_fopen/os.cheng_fflush/os.c_iometer_call` 未解析 patch 阻断点。
-- `tools/cold_csg_v2_roundtrip_test.sh` 本地实跑 735/735 PASS，public `emit-cold-csg-v2` 已锁 canonical `CHENG_CSG_V2` writer/read/link/run smoke；internal `CHENGCSG` 仅作为显式 cold self-test 子门禁保留。
+- `tools/cold_csg_v2_roundtrip_test.sh` 本地实跑 839/839 PASS，public `emit-cold-csg-v2` 已锁 canonical `CHENG_CSG_V2` writer/read/link/run smoke；internal `CHENGCSG` 仅作为显式 cold self-test 子门禁保留。
 
 ## 验收命令
 

@@ -66,6 +66,29 @@ compile_run_timed() {
     fi
 }
 
+# Test helper: compile source to .o and verify direct object report contract.
+compile_obj_smoke() {
+    local tag="$1" src="$2"
+    local o="/tmp/ct_${tag}.o" r="/tmp/ct_${tag}.report"
+    rm -f "$o" "$r"
+    if $COLD system-link-exec --root:"$PWD" \
+        --in:"$src" --target:arm64-apple-darwin \
+        --out:"$o" --emit:obj \
+        --report-out:"$r" >/dev/null 2>&1 &&
+       [ -s "$o" ] &&
+       grep -q '^system_link_exec=1$' "$r" 2>/dev/null &&
+       grep -q '^emit=obj$' "$r" 2>/dev/null &&
+       grep -q '^direct_macho=1$' "$r" 2>/dev/null &&
+       grep -q '^system_link=0$' "$r" 2>/dev/null &&
+       grep -q '^linkerless_image=1$' "$r" 2>/dev/null &&
+       ! grep -q '^error=' "$r" 2>/dev/null; then
+        echo 1
+    else
+        echo 0
+    fi
+    rm -f "$o" "$r"
+}
+
 # 1-3: Core tests
 ACT=$(compile_run src/tests/ordinary_zero_exit_fixture.cheng /tmp/ct_oz)
 assert "ordinary_zero" 0 "$ACT"
@@ -1240,6 +1263,14 @@ else
     ACT=0
 fi
 assert "parser_cold_compile_smoke" 1 "$ACT"
+
+# Verify .o has valid symbol entries via nm
+if [ -s /tmp/ct_parser_smoke.o ] && nm /tmp/ct_parser_smoke.o >/dev/null 2>&1; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "parser_cold_compile_smoke_nm_valid" 1 "$ACT"
 rm -f /tmp/ct_parser_smoke.o /tmp/ct_parser_smoke.report
 
 # --- primary_object_plan.cheng cold compile smoke ---
@@ -1256,6 +1287,14 @@ else
     ACT=0
 fi
 assert "pop_cold_compile_smoke" 1 "$ACT"
+
+# Verify .o has __TEXT/__text section via otool
+if [ -s /tmp/ct_pop_smoke.o ] && otool -l /tmp/ct_pop_smoke.o 2>/dev/null | grep -q '__text'; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "pop_cold_compile_smoke_otool_sections" 1 "$ACT"
 rm -f /tmp/ct_pop_smoke.o /tmp/ct_pop_smoke.report
 
 # --- gate_main.cheng cold compile smoke ---
@@ -1920,6 +1959,79 @@ else
 fi
 assert "build_plan_cold_compile_smoke" 1 "$ACT"
 rm -f /tmp/ct_build_plan.o /tmp/ct_build_plan.report
+
+# --- core_types.cheng cold compile smoke ---
+ACT=$(compile_obj_smoke "core_types" "src/core/ir/core_types.cheng")
+assert "core_types_cold_compile_smoke" 1 "$ACT"
+
+# --- ownership.cheng cold compile smoke ---
+ACT=$(compile_obj_smoke "ownership" "src/core/analysis/ownership.cheng")
+assert "ownership_cold_compile_smoke" 1 "$ACT"
+
+# --- object_relocs.cheng cold compile smoke ---
+ACT=$(compile_obj_smoke "object_relocs" "src/core/backend/object_relocs.cheng")
+assert "object_relocs_cold_compile_smoke" 1 "$ACT"
+
+# --- object_symbols.cheng cold compile smoke ---
+ACT=$(compile_obj_smoke "object_symbols" "src/core/backend/object_symbols.cheng")
+assert "object_symbols_cold_compile_smoke" 1 "$ACT"
+
+# --- compile_mode_switch.cheng cold compile smoke ---
+ACT=$(compile_obj_smoke "compile_mode_switch" "src/core/backend/compile_mode_switch.cheng")
+assert "compile_mode_switch_cold_compile_smoke" 1 "$ACT"
+
+# --- arena.cheng cold compile smoke ---
+ACT=$(compile_obj_smoke "arena" "src/core/runtime/arena.cheng")
+assert "arena_cold_compile_smoke" 1 "$ACT"
+
+# --- handle_table.cheng cold compile smoke ---
+ACT=$(compile_obj_smoke "handle_table" "src/core/runtime/handle_table.cheng")
+assert "handle_table_cold_compile_smoke" 1 "$ACT"
+
+# --- path.cheng cold compile smoke ---
+ACT=$(compile_obj_smoke "path" "src/core/tooling/path.cheng")
+assert "path_cold_compile_smoke" 1 "$ACT"
+
+# --- line_map.cheng cold compile smoke ---
+ACT=$(compile_obj_smoke "line_map" "src/core/backend/line_map.cheng")
+assert "line_map_cold_compile_smoke" 1 "$ACT"
+
+# --- bytes.cheng cold compile smoke ---
+ACT=$(compile_obj_smoke "bytes" "src/std/bytes.cheng")
+assert "bytes_cold_compile_smoke" 1 "$ACT"
+
+# --- cross-compilation smoke (arm64-apple-darwin explicit target) ---
+cat > /tmp/ct_cross_target.cheng << 'EOF'
+fn main(): int32 = return 42
+EOF
+rm -f /tmp/ct_cross_target.o /tmp/ct_cross_target.report
+if $COLD system-link-exec --root:"$PWD" \
+    --in:/tmp/ct_cross_target.cheng --target:arm64-apple-darwin \
+    --out:/tmp/ct_cross_target.o --emit:obj \
+    --report-out:/tmp/ct_cross_target.report >/dev/null 2>&1 &&
+   [ -s /tmp/ct_cross_target.o ] &&
+   grep -q '^emit=obj$' /tmp/ct_cross_target.report 2>/dev/null &&
+   grep -q '^target=arm64-apple-darwin$' /tmp/ct_cross_target.report 2>/dev/null &&
+   grep -q '^direct_macho=1$' /tmp/ct_cross_target.report 2>/dev/null &&
+   grep -q '^system_link=0$' /tmp/ct_cross_target.report 2>/dev/null &&
+   grep -q '^linkerless_image=1$' /tmp/ct_cross_target.report 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "cross_compile_arm64_darwin" 1 "$ACT"
+if [ -s /tmp/ct_cross_target.o ]; then
+    magic=$(otool -h /tmp/ct_cross_target.o 2>/dev/null | awk 'NR==4{print $1}')
+else
+    magic=""
+fi
+if [ "$magic" = "0xfeedfacf" ]; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "cross_compile_macho_magic" 1 "$ACT"
+rm -f /tmp/ct_cross_target.cheng /tmp/ct_cross_target.o /tmp/ct_cross_target.report
 
 echo ""
 echo "=== $PASS passed, $FAIL failed ==="

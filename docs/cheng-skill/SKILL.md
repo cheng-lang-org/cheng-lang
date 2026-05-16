@@ -6,7 +6,7 @@ description: Cheng 语言语法与语义、所有权/ORC、并发与模块导入
 # Cheng 编程（稳定版）
 
 ## 维护元数据
-- `last_verified_date`: `2026-05-14`
+- `last_verified_date`: `2026-05-16`
 - `last_verified_commit`: `workspace-local`
 - `upstream_spec`: `docs/cheng-formal-spec.md`
 
@@ -26,7 +26,7 @@ description: Cheng 语言语法与语义、所有权/ORC、并发与模块导入
 - 大文件和大仓任务必须先用 Grep/Glob/Bash 定位，再分片读取。任何 `.cheng` 文件的 Read 调用都必须显式传 `limit`，且 `limit <= 200`；已知行号时同时传 `offset` 读取 80-200 行窗口。若 Read 报 token 上限，立刻按行号分片，不要重复同一整文件 Read。
 
 ## 稳定公开表面
-- 模块与包：支持 `module`、`import`、`import ... as ...`、前缀分组导入 `import pkg/[a,b]`、包根 `cheng-package.toml`、`<pkg>/<path>` 模块路径、仓内 `src/` 回退解析；导出规则是 Go 风格首字母大写导出。
+- 模块与包：支持 `module`、`import`、`import ... as ...`、前缀分组导入 `import pkg/[a,b]`、包根 `cheng-package.toml`、`<pkg>/<path>` 模块路径、仓内 `src/` 搜索规则；导出规则是 Go 风格首字母大写导出。
 - 包解析与锁定：支持 `package_id`、依赖 channel、`cheng.lock.toml`、内容寻址包缓存、本地包根搜索与源码直发记录；编译期导入不联网，只消费本地解析结果。
 - 顶层声明：支持 `let/var/const`、`type`、`fn`、`iterator`、`macro`、`template`、`concept`、`trait`；旧 `proc/method/converter` 已移除。
 - 例程与类型：支持普通函数、`async fn`、迭代器、匿名函数、闭包、函数指针、泛型/`where`、具名参数、默认参数；支持 `bool`、整数、浮点、`char`、`str`、`cstring`、`nil`、`enum`、代数类型/tagged union（如 `type Option[T] = Some(value: T) | None`）、`set[T]`、`tuple[...]`、`object/ref object`、`var T` 借用、`fn(...)`、点限定类型名、`new(Type)`、`T()` 复合零值物化、`T { field: value }` 对象构造。
@@ -105,6 +105,7 @@ let d = RunResult { outputText: "ok" }
   - `artifacts/bootstrap/cheng.stage3 build-backend-driver`
   - `artifacts/backend_driver/cheng run-host-smokes perf_memory_contract_smoke`
   - `artifacts/backend_driver/cheng run-host-smokes cheng_skill_consistency_smoke`
+  - `tools/cold_regression_test.sh`
   - `tools/cold_csg_v2_roundtrip_test.sh`
   - `artifacts/backend_driver/cheng emit-cold-csg-v2 --root:/abs/root --in:/abs/path/file.cheng --out:/tmp/file.csgv2 --target:arm64-apple-darwin --report-out:/tmp/file.csgv2.writer.report.txt`
   - `cc -std=c11 -O2 -o /tmp/cheng_cold bootstrap/cheng_cold.c && /tmp/cheng_cold system-link-exec --csg-in:/tmp/file.csgv2 --emit:obj --out:/tmp/file.o --target:arm64-apple-darwin --report-out:/tmp/file.reader.report.txt`
@@ -112,7 +113,7 @@ let d = RunResult { outputText: "ok" }
   - `artifacts/bootstrap/cheng.stage3 run-cross-target-smokes`
   - `artifacts/backend_driver/cheng system-link-exec --root:/abs/root --in:/abs/path/file.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/app`
 - `cheng` 固定 dev-only；release 仅允许 `release-compile`。`cheng`/`release-compile` 不接受 `--linker` 或 `BACKEND_LINKER` 覆盖，链接器由命令轨道固定。
-- CSG v2 口径：当前 `tools/cold_csg_v2_roundtrip_test.sh` 通过 735/735；public `emit-cold-csg-v2` 输出 canonical `CHENG_CSG_V2` facts，internal `CHENGCSG` 只保留给显式 cold self-test。完整 Cheng `PrimaryObjectPlan` 管线仍未闭合；cold_parser 的 Lowering/Primary materializer 必须写 missing reason，不能空 plan 成功。
+- CSG v2 口径：当前 `tools/cold_csg_v2_roundtrip_test.sh` 通过 839/839，`tools/cold_regression_test.sh` 通过 159/159；public `emit-cold-csg-v2` 输出 canonical `CHENG_CSG_V2` facts，internal `CHENGCSG` 只保留给显式 cold self-test。完整 Cheng `PrimaryObjectPlan` 管线仍未闭合；cold_parser 的 Lowering/Primary materializer 必须写 missing reason，不能空 plan 成功。
 - Dev 默认 self-link/direct-exe/host runner hotpatch；Release 默认 system linker/substrate runtime。`100ms` 编译和二进制原地更新只属于 dev host-only dedicated witness。
 - `BACKEND_JOBS` 是唯一公开 worker 数控制面；`BACKEND_FN_SCHED=serial` 只保留给内部诊断、perf 对照和低内存 bring-up。
 - `run-production-regression` 是当前聚合回归入口；它会串起 driver 自举、stage0/stage3/backend_driver 命令面 smoke、driver build report 合同、function task 合同、BodyIR DoD/SoA/noalias/CFG 合同、perf gate 合同、线程/原子/ORC runtime provider 合同、文档/skill 一致性、显式默认值正反例与防回潮门禁、跨目标 smoke 和 stage2/stage3 libp2p smoke。
@@ -165,7 +166,7 @@ let d = RunResult { outputText: "ok" }
 ## 包与导入
 - 包根包含 `cheng-package.toml`，推荐 `package_id = "pkg://cheng/<name>"`。
 - 导入建议统一 `<pkg>/<path>`（标准库仍为 `std/<path>`）；`cheng/<pkg>/<path>` 仅作兼容别名。
-- 仓库内源码模块支持从 workspace 的 `src/<module>.cheng` 回退解析。
+- 仓库内源码模块支持从 workspace 的 `src/<module>.cheng` 解析。
 - 编译期导入不联网；包拉取由工具链完成。
 
 ## 一致性检查

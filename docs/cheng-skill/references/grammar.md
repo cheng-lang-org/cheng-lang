@@ -1,6 +1,6 @@
 # Cheng 语法速查（稳定对齐版）
 
-权威来源：`docs/cheng-formal-spec.md`（版本 2026-05-13）。
+权威来源：`docs/cheng-formal-spec.md`（版本 2026-05-14）。
 本文件只做速查；如有冲突，一律以正式规范为准。
 
 ## 关键结论

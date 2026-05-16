@@ -21818,13 +21818,13 @@ static int cold_run_host_smoke_skill_docs(const char *root) {
     cold_join_path(grammar, sizeof(grammar), root, "docs/cheng-skill/references/grammar.md");
     cold_join_path(spec, sizeof(spec), root, "docs/cheng-formal-spec.md");
     cold_join_path(intro, sizeof(intro), root, "docs/cheng-language-introduction.md");
-    if (!cold_file_contains_text(skill, "`last_verified_date`: `2026-05-13`") ||
+    if (!cold_file_contains_text(skill, "`last_verified_date`: `2026-05-16`") ||
         !cold_file_contains_text(skill, "T { field: value }") ||
         !cold_file_contains_text(skill, "tools/cold_csg_v2_roundtrip_test.sh") ||
         !cold_file_contains_text(skill, "emit-cold-csg-v2") ||
-        !cold_file_contains_text(grammar, "2026-05-13") ||
+        !cold_file_contains_text(grammar, "2026-05-14") ||
         !cold_file_contains_text(grammar, "TypeName { field: value }") ||
-        !cold_file_contains_text(spec, "版本：2026-05-13") ||
+        !cold_file_contains_text(spec, "版本：2026-05-14") ||
         !cold_file_contains_text(spec, "CSG v2") ||
         !cold_file_contains_text(intro, "tools/cold_csg_v2_roundtrip_test.sh")) {
         fprintf(stderr, "[cheng_cold] run-host-smokes: cheng skill docs mismatch\n");
