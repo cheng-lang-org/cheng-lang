@@ -1,0 +1,106 @@
+import std/os
+import std/strutils as strutil
+import cheng/rust-csg/core/text
+import cheng/rust-csg/protocol/types
+
+const
+    RustCsgSourceRoot: str = "/Users/lbcheng/codex-lbcheng"
+    RustCsgCodexRsRoot: str = "/Users/lbcheng/codex-lbcheng/codex-rs"
+    RustCsgExpectedCargoMembers: int32 = 106
+    RustCsgExpectedRustFiles: int32 = 1738
+    RustCsgExpectedTypeScriptFiles: int32 = 528
+    RustCsgExpectedTuiSnapshots: int32 = 454
+    RustCsgExpectedTuiFrames: int32 = 360
+    RustCsgExpectedProductPackageJson: int32 = 5
+
+fn RustCsgPathUnder(path: str, prefix: str): bool =
+    if path == prefix:
+        return true
+    return strutil.StartsWith(path, strutil.Join([prefix, "/"], ""))
+
+fn RustCsgSkipVendoredPackageJson(path: str): bool =
+    if text.RustCsgContains(path, "/node_modules/"):
+        return true
+    if text.RustCsgContains(path, "/target/"):
+        return true
+    if text.RustCsgContains(path, "/.cargo-home/"):
+        return true
+    if text.RustCsgContains(path, "/codex-rs/.cargo/"):
+        return true
+    return false
+
+fn RustCsgCountCargoMembers(cargoTomlPath: str): int32 =
+    let body = os.ReadFile(cargoTomlPath)
+    let lines = strutil.Split(body, '\n')
+    var inside: bool
+    var count: int32
+    for i in 0..<lines.len:
+        let line = strutil.Strip(lines[i])
+        if line == "members = [":
+            inside = true
+            continue
+        if inside && line == "]":
+            break
+        if inside && strutil.StartsWith(line, "\""):
+            count = count + 1
+    return count
+
+fn RustCsgCollectSourceStats(): types.RustCsgSourceStats =
+    var out: types.RustCsgSourceStats
+    out.cargoMemberCount = RustCsgCountCargoMembers(os.JoinPath(RustCsgCodexRsRoot, "Cargo.toml"))
+    let codexRsFiles = os.WalkDirRec(RustCsgCodexRsRoot)
+    for i in 0..<codexRsFiles.len:
+        let path = codexRsFiles[i]
+        if text.RustCsgContains(path, "/target/"):
+            continue
+        if text.RustCsgContains(path, "/node_modules/"):
+            continue
+        if text.RustCsgContains(path, "/.cargo/"):
+            continue
+        if text.RustCsgEndsWith(path, ".rs"):
+            out.rustSourceFileCount = out.rustSourceFileCount + 1
+        elif text.RustCsgEndsWith(path, ".ts"):
+            out.typeScriptFileCount = out.typeScriptFileCount + 1
+        elif text.RustCsgEndsWith(path, ".snap"):
+            out.tuiSnapshotCount = out.tuiSnapshotCount + 1
+        if RustCsgPathUnder(path, os.JoinPath(RustCsgCodexRsRoot, "tui/frames")) &&
+           text.RustCsgEndsWith(path, ".txt"):
+            out.tuiFrameCount = out.tuiFrameCount + 1
+    let sourceFiles = os.WalkDirRec(RustCsgSourceRoot)
+    for i in 0..<sourceFiles.len:
+        let path = sourceFiles[i]
+        if text.RustCsgEndsWith(path, "package.json") && !RustCsgSkipVendoredPackageJson(path):
+            out.productPackageJsonCount = out.productPackageJsonCount + 1
+    return out
+
+fn RustCsgInventoryOk(stats: types.RustCsgSourceStats, outReason: var str): bool =
+    outReason = ""
+    if stats.cargoMemberCount != RustCsgExpectedCargoMembers:
+        outReason = strutil.Join(["cargo_member_count=", intToStr(stats.cargoMemberCount)], "")
+        return false
+    if stats.rustSourceFileCount != RustCsgExpectedRustFiles:
+        outReason = strutil.Join(["rust_source_file_count=", intToStr(stats.rustSourceFileCount)], "")
+        return false
+    if stats.typeScriptFileCount != RustCsgExpectedTypeScriptFiles:
+        outReason = strutil.Join(["typescript_file_count=", intToStr(stats.typeScriptFileCount)], "")
+        return false
+    if stats.tuiSnapshotCount != RustCsgExpectedTuiSnapshots:
+        outReason = strutil.Join(["tui_snapshot_count=", intToStr(stats.tuiSnapshotCount)], "")
+        return false
+    if stats.tuiFrameCount != RustCsgExpectedTuiFrames:
+        outReason = strutil.Join(["tui_frame_count=", intToStr(stats.tuiFrameCount)], "")
+        return false
+    if stats.productPackageJsonCount != RustCsgExpectedProductPackageJson:
+        outReason = strutil.Join(["product_package_json_count=", intToStr(stats.productPackageJsonCount)], "")
+        return false
+    return true
+
+fn RustCsgStatsText(stats: types.RustCsgSourceStats): str =
+    return Lines([
+        strutil.Join(["cargo_members=", intToStr(stats.cargoMemberCount)], ""),
+        strutil.Join(["rust_files=", intToStr(stats.rustSourceFileCount)], ""),
+        strutil.Join(["typescript_files=", intToStr(stats.typeScriptFileCount)], ""),
+        strutil.Join(["tui_snapshots=", intToStr(stats.tuiSnapshotCount)], ""),
+        strutil.Join(["tui_frames=", intToStr(stats.tuiFrameCount)], ""),
+        strutil.Join(["product_package_json=", intToStr(stats.productPackageJsonCount)], "")
+    ])
