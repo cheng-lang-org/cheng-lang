@@ -3247,6 +3247,9 @@ assert "wasm_zero_cold_compile_smoke" 1 "$ACT"
 ACT=$(compile_obj_smoke "wasm_ops" "src/tests/wasm_ops_smoke.cheng")
 assert "wasm_ops_cold_compile_smoke" 1 "$ACT"
 
+ACT=$(compile_obj_smoke "wasm_str_join" "src/tests/wasm_str_join_smoke.cheng")
+assert "wasm_str_join_cold_compile_smoke" 1 "$ACT"
+
 # --- udp smoke tests compile_obj_smoke ---
 ACT=$(compile_obj_smoke "udp_bind_bindtext" "src/tests/udp_bind_bindtext_smoke.cheng")
 assert "udp_bind_bindtext_cold_compile_smoke" 1 "$ACT"
@@ -4943,6 +4946,149 @@ assert "json_ast_cold_compile_smoke" 1 "$ACT"
 
 ACT=$(compile_obj_smoke "option" "src/runtime/option.cheng")
 assert "option_cold_compile_smoke" 1 "$ACT"
+
+# ============================================================
+# 27: Multi-file import chain test (A imports B imports C imports D)
+# ============================================================
+# Compile each link in the chain separately
+ACT=$(compile_obj_smoke "import_chain_d" "src/tests/import_chain_d.cheng")
+assert "import_chain_d_cold_compile_smoke" 1 "$ACT"
+
+ACT=$(compile_obj_smoke "import_chain_c" "src/tests/import_chain_c.cheng")
+assert "import_chain_c_cold_compile_smoke" 1 "$ACT"
+
+ACT=$(compile_obj_smoke "import_chain_b" "src/tests/import_chain_b.cheng")
+assert "import_chain_b_cold_compile_smoke" 1 "$ACT"
+
+ACT=$(compile_obj_smoke "import_chain_a" "src/tests/import_chain_a.cheng")
+assert "import_chain_a_cold_compile_smoke" 1 "$ACT"
+
+# Full chain: compile A with all transitive deps, link, and run
+ACT=$(compile_run src/tests/import_chain_a.cheng /tmp/ct_import_chain_run)
+assert "import_chain_a_full_run" 0 "$ACT"
+
+# NM verification for import chain files
+for ich_tag in "import_chain_a" "import_chain_b" "import_chain_c" "import_chain_d"; do
+    case "$ich_tag" in
+        import_chain_a) ich_src="src/tests/import_chain_a.cheng" ;;
+        import_chain_b) ich_src="src/tests/import_chain_b.cheng" ;;
+        import_chain_c) ich_src="src/tests/import_chain_c.cheng" ;;
+        import_chain_d) ich_src="src/tests/import_chain_d.cheng" ;;
+    esac
+    rm -f "/tmp/ct_nm_${ich_tag}.o" "/tmp/ct_nm_${ich_tag}.report"
+    quiet $COLD system-link-exec --root:"$PWD" \
+        --in:"$ich_src" --target:arm64-apple-darwin \
+        --out:"/tmp/ct_nm_${ich_tag}.o" --emit:obj \
+        --report-out:"/tmp/ct_nm_${ich_tag}.report"
+    if [ -s "/tmp/ct_nm_${ich_tag}.o" ] && \
+       nm "/tmp/ct_nm_${ich_tag}.o" >/dev/null 2>&1; then
+        ACT=1
+    else
+        ACT=0
+    fi
+    assert "cold_nm_${ich_tag}" 1 "$ACT"
+    rm -f "/tmp/ct_nm_${ich_tag}.o" "/tmp/ct_nm_${ich_tag}.report"
+done
+
+# OTool verification for import_chain_a
+rm -f /tmp/ct_oto_import_chain_a.o /tmp/ct_oto_import_chain_a.report
+quiet $COLD system-link-exec --root:"$PWD" \
+    --in:src/tests/import_chain_a.cheng --target:arm64-apple-darwin \
+    --out:/tmp/ct_oto_import_chain_a.o --emit:obj \
+    --report-out:/tmp/ct_oto_import_chain_a.report
+if [ -s /tmp/ct_oto_import_chain_a.o ] && \
+   nm /tmp/ct_oto_import_chain_a.o >/dev/null 2>&1 && \
+   otool -h /tmp/ct_oto_import_chain_a.o 2>/dev/null | grep -q '0xfeedfacf'; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "cold_otool_nm_import_chain_a" 1 "$ACT"
+rm -f /tmp/ct_oto_import_chain_a.o /tmp/ct_oto_import_chain_a.report
+
+# ============================================================
+# 28: Error recovery stress test (compiler must not crash on malformed input)
+# ============================================================
+rm -f /tmp/ct_error_recover.o /tmp/ct_error_recover.report
+if $COLD system-link-exec --root:"$PWD" \
+    --in:src/tests/error_recovery_stress.cheng --target:arm64-apple-darwin \
+    --out:/tmp/ct_error_recover.o --emit:obj \
+    --report-out:/tmp/ct_error_recover.report >/dev/null 2>&1; then
+    # Compiler exited 0 - unexpected, count as failure
+    ACT=0
+elif [ -s /tmp/ct_error_recover.report ] && \
+     grep -q '^error=' /tmp/ct_error_recover.report 2>/dev/null && \
+     grep -q '^system_link_exec=0$' /tmp/ct_error_recover.report 2>/dev/null; then
+    # Expected: compiler caught errors, no crash, clean error report
+    ACT=1
+else
+    ACT=0
+fi
+assert "cold_error_recovery_graceful" 1 "$ACT"
+rm -f /tmp/ct_error_recover.o /tmp/ct_error_recover.report
+
+# ============================================================
+# 29: Cold compiler self-test — compile bootstrap and core compiler sources
+# ============================================================
+ACT=$(compile_obj_smoke "bootstrap_min_driver" "bootstrap/min_driver_bootstrap.cheng")
+assert "bootstrap_min_driver_cold_compile_smoke" 1 "$ACT"
+
+ACT=$(compile_obj_smoke "bootstrap_stage0_compiler" "bootstrap/stage0_compiler.cheng")
+assert "bootstrap_stage0_compiler_cold_compile_smoke" 1 "$ACT"
+
+# NM verification for bootstrap files
+for bs_tag in "bootstrap_min_driver" "bootstrap_stage0_compiler"; do
+    case "$bs_tag" in
+        bootstrap_min_driver) bs_src="bootstrap/min_driver_bootstrap.cheng" ;;
+        bootstrap_stage0_compiler) bs_src="bootstrap/stage0_compiler.cheng" ;;
+    esac
+    rm -f "/tmp/ct_nm_${bs_tag}.o" "/tmp/ct_nm_${bs_tag}.report"
+    quiet $COLD system-link-exec --root:"$PWD" \
+        --in:"$bs_src" --target:arm64-apple-darwin \
+        --out:"/tmp/ct_nm_${bs_tag}.o" --emit:obj \
+        --report-out:"/tmp/ct_nm_${bs_tag}.report"
+    if [ -s "/tmp/ct_nm_${bs_tag}.o" ] && \
+       nm "/tmp/ct_nm_${bs_tag}.o" >/dev/null 2>&1; then
+        ACT=1
+    else
+        ACT=0
+    fi
+    assert "cold_nm_${bs_tag}" 1 "$ACT"
+    rm -f "/tmp/ct_nm_${bs_tag}.o" "/tmp/ct_nm_${bs_tag}.report"
+done
+
+# ============================================================
+# 30: Compile everything — iterate all src/ .cheng files, verify no crash
+# ============================================================
+# This test compiles every .cheng file and verifies the compiler
+# handles it gracefully (no crash, produces clean exit). Files that
+# don't compile standalone (e.g. import-dependent modules) are
+# expected to fail with a proper error report, not a crash.
+# Files are sorted for deterministic ordering across runs.
+EVERYTHING_PASS=0; EVERYTHING_TOTAL=0; EVERYTHING_CRASH=0
+for ev_dir in src/core src/std bootstrap src/apps src/r2c src/oracle src/evomap src/chain; do
+    while IFS= read -r -d '' ev_f; do
+        EVERYTHING_TOTAL=$((EVERYTHING_TOTAL + 1))
+        ev_tag="ev_$(echo "$ev_f" | sed 's|[/.]|_|g')"
+        rm -f "/tmp/ct_${ev_tag}.o" "/tmp/ct_${ev_tag}.report"
+        if $COLD system-link-exec --root:"$PWD" \
+            --in:"$ev_f" --target:arm64-apple-darwin \
+            --out:"/tmp/ct_${ev_tag}.o" --emit:obj \
+            --report-out:"/tmp/ct_${ev_tag}.report" >/dev/null 2>&1; then
+            EVERYTHING_PASS=$((EVERYTHING_PASS + 1))
+            assert "cold_compile_graceful_${ev_tag}" 1 1
+        elif [ -s "/tmp/ct_${ev_tag}.report" ] && \
+             grep -q '^error=' "/tmp/ct_${ev_tag}.report" 2>/dev/null; then
+            EVERYTHING_PASS=$((EVERYTHING_PASS + 1))
+            assert "cold_compile_graceful_${ev_tag}" 1 1
+        else
+            EVERYTHING_CRASH=$((EVERYTHING_CRASH + 1))
+            assert "cold_compile_graceful_${ev_tag}" 1 0
+        fi
+        rm -f "/tmp/ct_${ev_tag}.o" "/tmp/ct_${ev_tag}.report"
+    done < <(find "$ev_dir" -name "*.cheng" -type f -print0 | sort -z)
+done
+assert "cold_compile_everything_no_crash" 0 "$EVERYTHING_CRASH"
 
 # --- zero regression gate ---
 if [ "${CHENG_ZRG_INNER:-0}" != "1" ]; then

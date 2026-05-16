@@ -18870,8 +18870,10 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
                     else em = EM_X86_64;
                     if (!elf_write_exec(out_path, code->words, code->count, em)) return false;
                 } else if (is_coff) {
-                    fprintf(stderr, "[cheng_cold] COFF exe not yet supported, use --emit:obj\n");
-                    return false;
+                    uint16_t cm = 0;
+                    if (strstr(target, "aarch64")) cm = IMAGE_FILE_MACHINE_ARM64;
+                    else cm = IMAGE_FILE_MACHINE_AMD64;
+                    if (!coff_write_exe(out_path, code->words, code->count, cm)) return false;
                 } else {
                     if (output_direct_macho(out_path, code) != 0) return false;
                 }
@@ -24791,7 +24793,246 @@ static void wasm_codegen_op(WasmCode *wasm, BodyIR *body, Symbols *symbols,
         wasm_op_local_set(wasm, (uint32_t)ld);
         break;
     }
-    case BODY_OP_STR_JOIN:
+    case BODY_OP_STR_JOIN: {
+        /* Join sequence of strings with separator.
+         * a = seq of str pointers (heap pointer to [count:4][capacity:4][elem0_ptr:4]...)
+         * b = separator string (heap pointer to [data_ptr:4][len:4][data...])
+         * dst = result string */
+        la = wasm_local_for_slot(body, a);
+        lb = wasm_local_for_slot(body, b);
+        ld = wasm_local_for_slot(body, dst);
+        int32_t sc_j = wasm_count_declared_locals(body, WASM_TYPE_I32);
+        int32_t scr_base_j = body->param_count + sc_j;
+        int32_t SCR_SQ = scr_base_j;
+        int32_t SCR_SP = scr_base_j + 1;
+        int32_t SCR_CNT = scr_base_j + 2;
+        int32_t SCR_SLEN = scr_base_j + 3;
+        int32_t SCR_TOT = scr_base_j + 4;
+        int32_t SCR_I = scr_base_j + 5;
+        int32_t SCR_TMP = scr_base_j + 6;
+        int32_t SCR_SAVE = scr_base_j + 7;
+
+        /* Save seq and sep pointers */
+        wasm_op_local_get(wasm, (uint32_t)la);
+        wasm_op_local_set(wasm, (uint32_t)SCR_SQ);
+        wasm_op_local_get(wasm, (uint32_t)lb);
+        wasm_op_local_set(wasm, (uint32_t)SCR_SP);
+
+        /* Load element count from [seq + 0] */
+        wasm_op_local_get(wasm, (uint32_t)SCR_SQ);
+        wasm_emit1(wasm, WASM_OP_I32_LOAD);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        wasm_op_local_set(wasm, (uint32_t)SCR_CNT);
+
+        /* Load separator length from [sep + 4] */
+        wasm_op_local_get(wasm, (uint32_t)SCR_SP);
+        wasm_op_i32_const(wasm, 4);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_emit1(wasm, WASM_OP_I32_LOAD);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        wasm_op_local_set(wasm, (uint32_t)SCR_SLEN);
+
+        /* total = 0, i = 0 */
+        wasm_op_i32_const(wasm, 0);
+        wasm_op_local_set(wasm, (uint32_t)SCR_TOT);
+        wasm_op_i32_const(wasm, 0);
+        wasm_op_local_set(wasm, (uint32_t)SCR_I);
+
+        /* Phase 1: accumulate total length = sum(elem_len) + sep_len * max(0, count-1) */
+        wasm_emit1(wasm, WASM_OP_BLOCK);
+        wasm_emit1(wasm, WASM_BLOCK_TYPE_EMPTY);
+        wasm_emit1(wasm, WASM_OP_LOOP);
+        wasm_emit1(wasm, WASM_BLOCK_TYPE_EMPTY);
+        /* if i >= count: break */
+        wasm_op_local_get(wasm, (uint32_t)SCR_I);
+        wasm_op_local_get(wasm, (uint32_t)SCR_CNT);
+        wasm_emit1(wasm, WASM_OP_I32_GE_S);
+        wasm_emit1(wasm, WASM_OP_BR_IF);
+        wasm_emit_leb128_u(wasm, 1);
+        /* Load elem ptr from [seq + 8 + i*4] */
+        wasm_op_local_get(wasm, (uint32_t)SCR_SQ);
+        wasm_op_i32_const(wasm, 8);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_get(wasm, (uint32_t)SCR_I);
+        wasm_op_i32_const(wasm, 4);
+        wasm_emit1(wasm, WASM_OP_I32_MUL);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_emit1(wasm, WASM_OP_I32_LOAD);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        /* Load elem len from [ptr + 4] */
+        wasm_op_i32_const(wasm, 4);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_emit1(wasm, WASM_OP_I32_LOAD);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        /* total += elem_len */
+        wasm_op_local_get(wasm, (uint32_t)SCR_TOT);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_set(wasm, (uint32_t)SCR_TOT);
+        /* If i > 0: total += sep_len */
+        wasm_op_local_get(wasm, (uint32_t)SCR_I);
+        wasm_op_i32_const(wasm, 0);
+        wasm_emit1(wasm, WASM_OP_I32_GT_S);
+        wasm_emit1(wasm, WASM_OP_IF);
+        wasm_emit1(wasm, WASM_BLOCK_TYPE_EMPTY);
+        wasm_op_local_get(wasm, (uint32_t)SCR_TOT);
+        wasm_op_local_get(wasm, (uint32_t)SCR_SLEN);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_set(wasm, (uint32_t)SCR_TOT);
+        wasm_emit1(wasm, WASM_OP_END);
+        /* i++ */
+        wasm_op_local_get(wasm, (uint32_t)SCR_I);
+        wasm_op_i32_const(wasm, 1);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_set(wasm, (uint32_t)SCR_I);
+        wasm_emit1(wasm, WASM_OP_BR);
+        wasm_emit_leb128_u(wasm, 0);
+        wasm_emit1(wasm, WASM_OP_END); /* end loop */
+        wasm_emit1(wasm, WASM_OP_END); /* end block */
+
+        /* Phase 2: allocate (total + 8) bytes via memory.grow */
+        wasm_op_local_get(wasm, (uint32_t)SCR_TOT);
+        wasm_op_i32_const(wasm, 8 + 65535);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_i32_const(wasm, 16);
+        wasm_emit1(wasm, WASM_OP_I32_SHR_U);
+        wasm_op_memory_grow(wasm);
+        wasm_op_i32_const(wasm, 16);
+        wasm_emit1(wasm, WASM_OP_I32_SHL);
+        wasm_op_local_tee(wasm, (uint32_t)tmp_local);
+        /* Write header: data_ptr = ptr + 8 at [ptr + 0] */
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_op_i32_const(wasm, 8);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_emit1(wasm, WASM_OP_I32_STORE);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        /* Write header: len = total at [ptr + 4] */
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_op_i32_const(wasm, 4);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_get(wasm, (uint32_t)SCR_TOT);
+        wasm_emit1(wasm, WASM_OP_I32_STORE);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+
+        /* Phase 3: copy elements with separators */
+        /* Reset i = 0, re-load count, set dst_ptr = ptr + 8 */
+        wasm_op_i32_const(wasm, 0);
+        wasm_op_local_set(wasm, (uint32_t)SCR_I);
+        wasm_op_local_get(wasm, (uint32_t)SCR_SQ);
+        wasm_emit1(wasm, WASM_OP_I32_LOAD);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        wasm_op_local_set(wasm, (uint32_t)SCR_CNT); /* reload count */
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_op_i32_const(wasm, 8);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_set(wasm, (uint32_t)SCR_TOT); /* SCR_TOT = dst_ptr */
+
+        /* Copy loop */
+        wasm_emit1(wasm, WASM_OP_BLOCK);
+        wasm_emit1(wasm, WASM_BLOCK_TYPE_EMPTY);
+        wasm_emit1(wasm, WASM_OP_LOOP);
+        wasm_emit1(wasm, WASM_BLOCK_TYPE_EMPTY);
+        /* if i >= count: break */
+        wasm_op_local_get(wasm, (uint32_t)SCR_I);
+        wasm_op_local_get(wasm, (uint32_t)SCR_CNT);
+        wasm_emit1(wasm, WASM_OP_I32_GE_S);
+        wasm_emit1(wasm, WASM_OP_BR_IF);
+        wasm_emit_leb128_u(wasm, 1);
+        /* Load elem ptr from [seq + 8 + i*4] */
+        wasm_op_local_get(wasm, (uint32_t)SCR_SQ);
+        wasm_op_i32_const(wasm, 8);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_get(wasm, (uint32_t)SCR_I);
+        wasm_op_i32_const(wasm, 4);
+        wasm_emit1(wasm, WASM_OP_I32_MUL);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_emit1(wasm, WASM_OP_I32_LOAD);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        wasm_op_local_set(wasm, (uint32_t)SCR_TMP); /* SCR_TMP = elem ptr */
+        /* Load elem len from [elem + 4] */
+        wasm_op_local_get(wasm, (uint32_t)SCR_TMP);
+        wasm_op_i32_const(wasm, 4);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_emit1(wasm, WASM_OP_I32_LOAD);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        wasm_op_local_set(wasm, (uint32_t)SCR_SLEN); /* SCR_SLEN = elem_len (reuse sep_len) */
+        /* Memcpy: copy from [elem + 8] to [dst_ptr], count = elem_len */
+        /* Save outer loop index */
+        wasm_op_local_get(wasm, (uint32_t)SCR_I);
+        wasm_op_local_set(wasm, (uint32_t)SCR_SAVE);
+        /* Setup src = elem + 8 */
+        wasm_op_local_get(wasm, (uint32_t)SCR_TMP);
+        wasm_op_i32_const(wasm, 8);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_set(wasm, (uint32_t)SCR_TMP); /* SCR_TMP = src addr */
+        /* Setup dst = current dst_ptr */
+        /* SCR_TOT already holds dst_ptr */
+        wasm_emit_memcpy_loop(wasm, SCR_SLEN, SCR_TMP, SCR_TOT, SCR_I);
+        /* Update dst_ptr += elem_len */
+        wasm_op_local_get(wasm, (uint32_t)SCR_TOT);
+        wasm_op_local_get(wasm, (uint32_t)SCR_SLEN);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_set(wasm, (uint32_t)SCR_TOT);
+        /* Restore outer loop index */
+        wasm_op_local_get(wasm, (uint32_t)SCR_SAVE);
+        wasm_op_local_set(wasm, (uint32_t)SCR_I);
+
+        /* If not last element (i < count - 1): copy separator */
+        wasm_op_local_get(wasm, (uint32_t)SCR_I);
+        wasm_op_local_get(wasm, (uint32_t)SCR_CNT);
+        wasm_op_i32_const(wasm, 1);
+        wasm_emit1(wasm, WASM_OP_I32_SUB);
+        wasm_emit1(wasm, WASM_OP_I32_LT_S);
+        wasm_emit1(wasm, WASM_OP_IF);
+        wasm_emit1(wasm, WASM_BLOCK_TYPE_EMPTY);
+        /* Save outer i */
+        wasm_op_local_get(wasm, (uint32_t)SCR_I);
+        wasm_op_local_set(wasm, (uint32_t)SCR_SAVE);
+        /* Reload sep len from [sep + 4] */
+        wasm_op_local_get(wasm, (uint32_t)SCR_SP);
+        wasm_op_i32_const(wasm, 4);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_emit1(wasm, WASM_OP_I32_LOAD);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        wasm_op_local_set(wasm, (uint32_t)SCR_SLEN);
+        /* If sep_len > 0: copy separator */
+        wasm_op_local_get(wasm, (uint32_t)SCR_SLEN);
+        wasm_op_i32_const(wasm, 0);
+        wasm_emit1(wasm, WASM_OP_I32_GT_S);
+        wasm_emit1(wasm, WASM_OP_IF);
+        wasm_emit1(wasm, WASM_BLOCK_TYPE_EMPTY);
+        /* Setup src = [sep + 8] */
+        wasm_op_local_get(wasm, (uint32_t)SCR_SP);
+        wasm_op_i32_const(wasm, 8);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_set(wasm, (uint32_t)SCR_TMP);
+        wasm_emit_memcpy_loop(wasm, SCR_SLEN, SCR_TMP, SCR_TOT, SCR_I);
+        /* dst_ptr += sep_len */
+        wasm_op_local_get(wasm, (uint32_t)SCR_TOT);
+        wasm_op_local_get(wasm, (uint32_t)SCR_SLEN);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_set(wasm, (uint32_t)SCR_TOT);
+        wasm_emit1(wasm, WASM_OP_END); /* end if sep_len > 0 */
+        wasm_emit1(wasm, WASM_OP_END); /* end if i < count-1 */
+        /* Restore outer i */
+        wasm_op_local_get(wasm, (uint32_t)SCR_SAVE);
+        wasm_op_local_set(wasm, (uint32_t)SCR_I);
+
+        /* i++ */
+        wasm_op_local_get(wasm, (uint32_t)SCR_I);
+        wasm_op_i32_const(wasm, 1);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_set(wasm, (uint32_t)SCR_I);
+        wasm_emit1(wasm, WASM_OP_BR);
+        wasm_emit_leb128_u(wasm, 0);
+        wasm_emit1(wasm, WASM_OP_END); /* end loop */
+        wasm_emit1(wasm, WASM_OP_END); /* end block */
+
+        /* Store result ptr to dst */
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_op_local_set(wasm, (uint32_t)ld);
+        break;
+    }
     case BODY_OP_STR_SPLIT_CHAR:
         /* Stub - return empty string for now */
         goto wasm_stub_zero_composite;
@@ -25203,12 +25444,17 @@ static void wasm_codegen_op(WasmCode *wasm, BodyIR *body, Symbols *symbols,
 
 /* Recursively emit WASM code for block bi, following control flow edges.
  * absorbed[] marks blocks already emitted via recursion (CBR true/false blocks).
+ * nesting_depth: number of IF/ELSE/END levels we are inside from enclosing CBR/SWITCH.
+ *   Used to compute correct branch depths for br/br_if so that a br 0 from inside
+ *   a CBR true/false block targets the IF label, and a backward branch (br to loop)
+ *   accounts for the IF nesting: e.g. depth 1 from inside one CBR = br 1 to skip IF,
+ *   landing on the enclosing LOOP label.
  * Returns 1 if block emitted a terminating op (ret/br/unreachable), 0 if fall-through.
  */
 static int wasm_emit_block_recursive(WasmCode *wasm, BodyIR *body, Symbols *symbols,
                                       FunctionPatchList *patches, int32_t bi,
                                       int32_t *func_to_wasm_idx, bool *absorbed,
-                                      int32_t func_idx) {
+                                      int32_t func_idx, int32_t nesting_depth) {
     if (bi < 0 || bi >= body->block_count || absorbed[bi]) return 0;
     absorbed[bi] = true;
 
@@ -25239,11 +25485,18 @@ static int wasm_emit_block_recursive(WasmCode *wasm, BodyIR *body, Symbols *symb
     } else if (tkind == BODY_TERM_BR) {
         int32_t target = body->term_true_block[term];
         if (target >= 0 && target < bi) {
-            /* Backward branch = loop continue: br 0 goes to innermost loop start */
+            /* Backward branch = loop continue.
+             * br must skip (nesting_depth) IF labels to reach the LOOP label. */
+            wasm_op_br(wasm, (uint32_t)nesting_depth);
+            return 1;
+        }
+        /* Forward branch: if inside a CBR/SWITCH IF, emit br 0 to skip ELSE
+         * and land after the IF/ELSE/END. Otherwise, fall through is correct. */
+        if (nesting_depth > 0) {
             wasm_op_br(wasm, 0);
             return 1;
         }
-        /* Forward branch: fall through (next block in linear order) */
+        /* Fall through (next block in linear order) */
         return 0;
     } else if (tkind == BODY_TERM_CBR) {
         int32_t cond_slot = body->term_value[term];
@@ -25257,19 +25510,26 @@ static int wasm_emit_block_recursive(WasmCode *wasm, BodyIR *body, Symbols *symb
         wasm_emit1(wasm, WASM_OP_IF);
         wasm_emit1(wasm, WASM_BLOCK_TYPE_EMPTY);
 
-        /* Emit true branch block recursively */
-        wasm_emit_block_recursive(wasm, body, symbols, patches, tb,
-                                  func_to_wasm_idx, absorbed, func_idx);
+        /* Emit true branch block recursively (inside IF, depth+1) */
+        int tb_term = wasm_emit_block_recursive(wasm, body, symbols, patches, tb,
+                                                  func_to_wasm_idx, absorbed, func_idx,
+                                                  nesting_depth + 1);
+        /* If true block didn't terminate, add br 0 to skip the ELSE */
+        if (!tb_term) {
+            wasm_op_br(wasm, 0);
+        }
 
         /* Emit false branch if present and not already absorbed */
         if (fb >= 0 && fb < body->block_count && !absorbed[fb]) {
             wasm_emit1(wasm, WASM_OP_ELSE);
             wasm_emit_block_recursive(wasm, body, symbols, patches, fb,
-                                      func_to_wasm_idx, absorbed, func_idx);
+                                      func_to_wasm_idx, absorbed, func_idx,
+                                      nesting_depth + 1);
         }
 
         wasm_emit1(wasm, WASM_OP_END);
-        return 1;
+        /* CBR does NOT terminate: execution continues after IF/ELSE/END */
+        return 0;
     } else if (tkind == BODY_TERM_SWITCH) {
         /* SWITCH: emit as nested if-else chain over tag values.
          * Reload tag from local for each comparison (WASM stack machine). */
@@ -25295,8 +25555,14 @@ static int wasm_emit_block_recursive(WasmCode *wasm, BodyIR *body, Symbols *symb
             wasm_emit1(wasm, WASM_OP_I32_EQ);
             wasm_emit1(wasm, WASM_OP_IF);
             wasm_emit1(wasm, WASM_BLOCK_TYPE_EMPTY);
-            wasm_emit_block_recursive(wasm, body, symbols, patches, target_block,
-                                      func_to_wasm_idx, absorbed, func_idx);
+            int case_term = wasm_emit_block_recursive(wasm, body, symbols, patches,
+                                                       target_block,
+                                                       func_to_wasm_idx, absorbed,
+                                                       func_idx, nesting_depth + 1);
+            /* If case block didn't terminate, br 0 to skip remaining ELSE chain */
+            if (!case_term) {
+                wasm_op_br(wasm, 0);
+            }
             wasm_emit1(wasm, WASM_OP_ELSE);
         }
 
@@ -25306,7 +25572,8 @@ static int wasm_emit_block_recursive(WasmCode *wasm, BodyIR *body, Symbols *symb
             int32_t default_block = body->switch_block[last_ci];
             if (default_block >= 0 && !absorbed[default_block]) {
                 wasm_emit_block_recursive(wasm, body, symbols, patches, default_block,
-                                          func_to_wasm_idx, absorbed, func_idx);
+                                          func_to_wasm_idx, absorbed, func_idx,
+                                          nesting_depth + 1);
             }
         }
 
@@ -25314,7 +25581,8 @@ static int wasm_emit_block_recursive(WasmCode *wasm, BodyIR *body, Symbols *symb
         for (int32_t ci = 0; ci < count; ci++) {
             wasm_emit1(wasm, WASM_OP_END);
         }
-        return 1;
+        /* SWITCH does NOT terminate: execution continues after the if-else chain */
+        return 0;
     }
     return 0;
 }
@@ -25327,8 +25595,8 @@ static void wasm_codegen_func(WasmCode *wasm, BodyIR *body, Symbols *symbols,
     /* 1. Local declarations */
     int32_t i32_cnt = wasm_count_declared_locals(body, WASM_TYPE_I32);
     int32_t i64_cnt = wasm_count_declared_locals(body, WASM_TYPE_I64);
-    /* Add scratch i32 locals for ops that need temp storage (STR_EQ loop, etc.) */
-    int32_t wasm_scratch_count = 4;
+    /* Add scratch i32 locals for ops that need temp storage (STR_EQ, STR_CONCAT, STR_JOIN, etc.) */
+    int32_t wasm_scratch_count = 8;
     i32_cnt += wasm_scratch_count;
     int32_t local_decl_count = 0;
     if (i32_cnt > 0) local_decl_count++;
@@ -25375,13 +25643,13 @@ static void wasm_codegen_func(WasmCode *wasm, BodyIR *body, Symbols *symbols,
 
             /* Emit loop body recursively from loop header */
             wasm_emit_block_recursive(wasm, body, symbols, patches, bi,
-                                      func_to_wasm_idx, absorbed, func_idx);
+                                      func_to_wasm_idx, absorbed, func_idx, 0);
 
             wasm_emit1(wasm, WASM_OP_END); /* end loop */
             wasm_emit1(wasm, WASM_OP_END); /* end block */
         } else {
             wasm_emit_block_recursive(wasm, body, symbols, patches, bi,
-                                      func_to_wasm_idx, absorbed, func_idx);
+                                      func_to_wasm_idx, absorbed, func_idx, 0);
         }
     }
 
