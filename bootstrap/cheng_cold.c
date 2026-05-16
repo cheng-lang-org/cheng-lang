@@ -14263,6 +14263,7 @@ typedef struct ColdCompileStats {
     int32_t unresolved_symbol_count;
     int32_t provider_object_count;
     char first_unresolved_symbol[COLD_NAME_CAP];
+    char provider_error[COLD_NAME_CAP];
     int32_t lowering_parallel_job_count;
     int32_t lowering_parallel_active_workers;
     int32_t lowering_parallel_schedule;
@@ -18195,6 +18196,51 @@ static bool cold_write_all_fd(int fd, const uint8_t *buf, size_t len) {
     return true;
 }
 
+static void cold_provider_error_set(char *buf, size_t cap, const char *text) {
+    if (!buf || cap == 0) return;
+    snprintf(buf, cap, "%s", text ? text : "");
+}
+
+static void cold_stats_provider_error(ColdCompileStats *stats, const char *text) {
+    if (!stats || stats->provider_error[0] != '\0') return;
+    cold_provider_error_set(stats->provider_error, sizeof(stats->provider_error), text);
+}
+
+static const char *cold_stats_provider_error_or_default(ColdCompileStats *stats,
+                                                        const char *default_error) {
+    if (stats && stats->provider_error[0] != '\0') return stats->provider_error;
+    return default_error;
+}
+
+static const char *cold_provider_object_read_error(Span object_span,
+                                                   const char *target) {
+    const char *format = cold_object_format_for_target_cstr(target);
+    if (object_span.len <= 0) return "object open failed";
+    if (!format || format[0] == '\0') return "unsupported provider archive target";
+    const uint8_t *data = object_span.ptr;
+    if (strcmp(format, "elf") == 0) {
+        uint16_t expected_machine = cold_elf_machine_for_target(target);
+        if (object_span.len < 64 || memcmp(data, "\x7F""ELF", 4) != 0)
+            return "provider object format mismatch";
+        if (data[4] != ELFCLASS64 || data[5] != ELFDATA2LSB || data[6] != EV_CURRENT)
+            return "invalid provider object";
+        if (cold_u16le(data + 0x10) != ET_REL) return "invalid provider object";
+        if (expected_machine == 0 || cold_u16le(data + 0x12) != expected_machine)
+            return "provider object machine mismatch";
+        return "invalid provider object";
+    }
+    if (strcmp(format, "macho") == 0) {
+        if (object_span.len < 32 || cold_u32le(data) != 0xfeedfacf)
+            return "provider object format mismatch";
+        if (strcmp(target, "arm64-apple-darwin") != 0 ||
+            cold_u32le(data + 4) != 0x0100000c)
+            return "provider object machine mismatch";
+        if (cold_u32le(data + 12) != 1) return "invalid provider object";
+        return "invalid provider object";
+    }
+    return "unsupported provider archive target";
+}
+
 static bool cold_write_provider_archive(const char *out_path,
                                         const char *target,
                                         const char **member_objects,
@@ -18270,7 +18316,7 @@ static bool cold_write_provider_archive(const char *out_path,
         for (int32_t oi = 0; oi < member_object_count; oi++) {
             if (objects[oi].len > 0) munmap((void *)objects[oi].ptr, (size_t)objects[oi].len);
         }
-        free(objects); free(views); free(member_export_counts); free(export_owner);
+        free(objects); free(views); free(macho_views); free(member_export_counts); free(export_owner);
         return false;
     }
     uint32_t target_len = (uint32_t)strlen(target);
@@ -18295,7 +18341,7 @@ static bool cold_write_provider_archive(const char *out_path,
         for (int32_t oi = 0; oi < member_object_count; oi++) {
             if (objects[oi].len > 0) munmap((void *)objects[oi].ptr, (size_t)objects[oi].len);
         }
-        free(objects); free(views); free(member_export_counts); free(export_owner);
+        free(objects); free(views); free(macho_views); free(member_export_counts); free(export_owner);
         return false;
     }
     uint8_t *buf = (uint8_t *)calloc(1, total);
@@ -18303,7 +18349,7 @@ static bool cold_write_provider_archive(const char *out_path,
         for (int32_t oi = 0; oi < member_object_count; oi++) {
             if (objects[oi].len > 0) munmap((void *)objects[oi].ptr, (size_t)objects[oi].len);
         }
-        free(objects); free(views); free(member_export_counts); free(export_owner);
+        free(objects); free(views); free(macho_views); free(member_export_counts); free(export_owner);
         return false;
     }
     size_t pos = 0;
@@ -18350,7 +18396,7 @@ static bool cold_write_provider_archive(const char *out_path,
         for (int32_t oi = 0; oi < member_object_count; oi++) {
             if (objects[oi].len > 0) munmap((void *)objects[oi].ptr, (size_t)objects[oi].len);
         }
-        free(objects); free(views); free(member_export_counts); free(export_owner);
+        free(objects); free(views); free(macho_views); free(member_export_counts); free(export_owner);
         return false;
     }
     uint64_t archive_hash = cold_provider_archive_hash_bytes(buf, total);
@@ -18361,7 +18407,7 @@ static bool cold_write_provider_archive(const char *out_path,
         for (int32_t oi = 0; oi < member_object_count; oi++) {
             if (objects[oi].len > 0) munmap((void *)objects[oi].ptr, (size_t)objects[oi].len);
         }
-        free(objects); free(views); free(member_export_counts); free(export_owner);
+        free(objects); free(views); free(macho_views); free(member_export_counts); free(export_owner);
         return false;
     }
     int fd = open(out_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -18370,7 +18416,7 @@ static bool cold_write_provider_archive(const char *out_path,
         for (int32_t oi = 0; oi < member_object_count; oi++) {
             if (objects[oi].len > 0) munmap((void *)objects[oi].ptr, (size_t)objects[oi].len);
         }
-        free(objects); free(views); free(member_export_counts); free(export_owner);
+        free(objects); free(views); free(macho_views); free(member_export_counts); free(export_owner);
         return false;
     }
     bool ok = cold_write_all_fd(fd, buf, total);
@@ -18379,7 +18425,7 @@ static bool cold_write_provider_archive(const char *out_path,
     for (int32_t oi = 0; oi < member_object_count; oi++) {
         if (objects[oi].len > 0) munmap((void *)objects[oi].ptr, (size_t)objects[oi].len);
     }
-    free(objects); free(views); free(member_export_counts); free(export_owner);
+    free(objects); free(views); free(macho_views); free(member_export_counts); free(export_owner);
     if (!ok) return false;
     if (member_count_out) *member_count_out = (int32_t)member_count;
     if (hash_out) *hash_out = archive_hash;
@@ -18389,45 +18435,64 @@ static bool cold_write_provider_archive(const char *out_path,
 static bool cold_verify_provider_archive(const char *path,
                                          const char *target,
                                          int32_t *member_count_out,
-                                         uint64_t *hash_out) {
+                                         uint64_t *hash_out,
+                                         char *error,
+                                         size_t error_cap) {
     Span archive = source_open(path);
-    if (archive.len < (int32_t)COLD_PROVIDER_ARCHIVE_HEADER_SIZE) return false;
-    const uint8_t *p = archive.ptr;
+    const char *reason = "provider archive verify failed";
     bool ok = false;
-    if (memcmp(p, COLD_PROVIDER_ARCHIVE_MAGIC, 8) != 0) goto done;
+    if (archive.len < (int32_t)COLD_PROVIDER_ARCHIVE_HEADER_SIZE) {
+        reason = "provider archive open/header failed";
+        goto done;
+    }
+    const uint8_t *p = archive.ptr;
+#define COLD_ARCHIVE_VERIFY_FAIL(msg) do { reason = (msg); goto done; } while (0)
+    if (memcmp(p, COLD_PROVIDER_ARCHIVE_MAGIC, 8) != 0)
+        COLD_ARCHIVE_VERIFY_FAIL("provider archive magic mismatch");
     uint32_t version = cold_u32le(p + 8);
     uint32_t target_len = cold_u32le(p + 12);
     uint32_t format_len = cold_u32le(p + 16);
     uint32_t member_count = cold_u32le(p + 20);
     uint32_t export_count = cold_u32le(p + 24);
     uint64_t stored_hash = cold_u64le(p + COLD_PROVIDER_ARCHIVE_HASH_OFFSET);
-    if (version != COLD_PROVIDER_ARCHIVE_VERSION) goto done;
-    if (target_len == 0 || format_len == 0) goto done;
+    if (version != COLD_PROVIDER_ARCHIVE_VERSION)
+        COLD_ARCHIVE_VERIFY_FAIL("provider archive version mismatch");
+    if (target_len == 0 || format_len == 0)
+        COLD_ARCHIVE_VERIFY_FAIL("provider archive header invalid");
     if (member_count == 0 || member_count > 128 ||
-        export_count == 0 || export_count > 512) goto done;
+        export_count == 0 || export_count > 512)
+        COLD_ARCHIVE_VERIFY_FAIL("provider archive counts invalid");
     uint64_t pos = COLD_PROVIDER_ARCHIVE_HEADER_SIZE;
-    if (!cold_file_range_ok(archive.len, pos, target_len)) goto done;
+    if (!cold_file_range_ok(archive.len, pos, target_len))
+        COLD_ARCHIVE_VERIFY_FAIL("provider archive target range invalid");
     Span target_span = {p + pos, (int32_t)target_len};
     pos += target_len;
-    if (!cold_file_range_ok(archive.len, pos, format_len)) goto done;
+    if (!cold_file_range_ok(archive.len, pos, format_len))
+        COLD_ARCHIVE_VERIFY_FAIL("provider archive format range invalid");
     Span format_span = {p + pos, (int32_t)format_len};
     pos += format_len;
-    if (target && target[0] != '\0' && !span_eq(target_span, target)) goto done;
+    if (target && target[0] != '\0' && !span_eq(target_span, target))
+        COLD_ARCHIVE_VERIFY_FAIL("provider archive target mismatch");
     const char *expected_format = cold_object_format_for_target_cstr(target);
-    if (expected_format[0] == '\0' || !span_eq(format_span, expected_format)) goto done;
+    if (expected_format[0] == '\0')
+        COLD_ARCHIVE_VERIFY_FAIL("unsupported provider archive target");
+    if (!span_eq(format_span, expected_format))
+        COLD_ARCHIVE_VERIFY_FAIL("provider archive format mismatch");
     uint32_t seen_exports = 0;
     for (uint32_t mi = 0; mi < member_count; mi++) {
-        if (!cold_file_range_ok(archive.len, pos, 28)) goto done;
+        if (!cold_file_range_ok(archive.len, pos, 28))
+            COLD_ARCHIVE_VERIFY_FAIL("provider archive member header invalid");
         uint32_t module_len = cold_u32le(p + pos); pos += 4;
         uint32_t source_len = cold_u32le(p + pos); pos += 4;
         uint32_t object_size = cold_u32le(p + pos); pos += 4;
         uint32_t member_exports = cold_u32le(p + pos); pos += 4;
         uint64_t object_hash = cold_u64le(p + pos); pos += 8;
         uint32_t export_blob_len = cold_u32le(p + pos); pos += 4;
-        if (member_exports == 0 || export_blob_len == 0) goto done;
+        if (member_exports == 0 || export_blob_len == 0)
+            COLD_ARCHIVE_VERIFY_FAIL("provider archive member export table empty");
         if (!cold_file_range_ok(archive.len, pos,
                                 (uint64_t)module_len + source_len + export_blob_len + object_size)) {
-            goto done;
+            COLD_ARCHIVE_VERIFY_FAIL("provider archive member range invalid");
         }
         pos += module_len + source_len;
         if (member_exports == 1) {
@@ -18435,35 +18500,44 @@ static bool cold_verify_provider_archive(const char *path,
         } else {
             uint64_t export_end = pos + export_blob_len;
             for (uint32_t ei = 0; ei < member_exports; ei++) {
-                if (!cold_file_range_ok(archive.len, pos, 4)) goto done;
+                if (!cold_file_range_ok(archive.len, pos, 4))
+                    COLD_ARCHIVE_VERIFY_FAIL("provider archive export length invalid");
                 uint32_t name_len = cold_u32le(p + pos); pos += 4;
-                if (name_len == 0 || !cold_file_range_ok(archive.len, pos, name_len)) goto done;
+                if (name_len == 0 || !cold_file_range_ok(archive.len, pos, name_len))
+                    COLD_ARCHIVE_VERIFY_FAIL("provider archive export name invalid");
                 pos += name_len;
             }
-            if (pos != export_end) goto done;
+            if (pos != export_end)
+                COLD_ARCHIVE_VERIFY_FAIL("provider archive export table invalid");
         }
         uint64_t computed_object_hash =
             cold_fnv1a64_update_bytes(1469598103934665603ULL, p + pos, object_size);
-        if (computed_object_hash != object_hash) goto done;
+        if (computed_object_hash != object_hash)
+            COLD_ARCHIVE_VERIFY_FAIL("provider archive member hash mismatch");
         pos += object_size;
         seen_exports += member_exports;
     }
-    if (seen_exports != export_count) goto done;
-    if (pos != (uint64_t)archive.len) goto done;
+    if (seen_exports != export_count)
+        COLD_ARCHIVE_VERIFY_FAIL("provider archive export count mismatch");
+    if (pos != (uint64_t)archive.len)
+        COLD_ARCHIVE_VERIFY_FAIL("provider archive trailing data");
     {
         uint8_t *copy = (uint8_t *)malloc((size_t)archive.len);
-        if (!copy) goto done;
+        if (!copy) COLD_ARCHIVE_VERIFY_FAIL("provider archive verify allocation failed");
         memcpy(copy, archive.ptr, (size_t)archive.len);
         uint64_t computed = cold_provider_archive_hash_bytes(copy, (size_t)archive.len);
         free(copy);
-        if (computed != stored_hash) goto done;
+        if (computed != stored_hash)
+            COLD_ARCHIVE_VERIFY_FAIL("provider archive hash mismatch");
     }
     if (member_count_out) *member_count_out = (int32_t)member_count;
     if (hash_out) *hash_out = stored_hash;
     ok = true;
 
 done:
+    if (!ok) cold_provider_error_set(error, error_cap, reason);
     if (archive.len > 0) munmap((void *)archive.ptr, (size_t)archive.len);
+#undef COLD_ARCHIVE_VERIFY_FAIL
     return ok;
 }
 
