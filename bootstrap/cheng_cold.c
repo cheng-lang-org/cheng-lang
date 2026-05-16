@@ -24317,43 +24317,558 @@ static void wasm_codegen_op(WasmCode *wasm, BodyIR *body, Symbols *symbols,
         wasm_emit1(wasm, WASM_OP_END);
         break;
     }
-    case BODY_OP_SEQ_OPAQUE_INDEX_STORE:
-    case BODY_OP_SEQ_OPAQUE_ADD:
-    case BODY_OP_SEQ_OPAQUE_REMOVE:
-    case BODY_OP_SEQ_SET_LEN:
-        /* Stub - no-op */
+    case BODY_OP_SEQ_OPAQUE_INDEX_STORE: {
+        /* Store value at index in opaque seq. a=seq, b=index, dst=value, c=element_size */
+        la = wasm_local_for_slot(body, a);
+        lb = wasm_local_for_slot(body, b);
+        ld = wasm_local_for_slot(body, dst);
+        int32_t es_is = c;
+        int32_t sc_is = wasm_count_declared_locals(body, WASM_TYPE_I32);
+        int32_t scr_base_is = body->param_count + sc_is;
+        int32_t SCR_CNT_IS = scr_base_is;
+        int32_t SCR_IDX_IS = scr_base_is + 1;
+        wasm_op_local_get(wasm, (uint32_t)la);
+        wasm_emit1(wasm, WASM_OP_I32_LOAD);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        wasm_op_local_set(wasm, (uint32_t)SCR_CNT_IS);
+        wasm_op_local_get(wasm, (uint32_t)lb);
+        wasm_op_local_set(wasm, (uint32_t)SCR_IDX_IS);
+        wasm_op_local_get(wasm, (uint32_t)SCR_IDX_IS);
+        wasm_op_local_get(wasm, (uint32_t)SCR_CNT_IS);
+        wasm_emit1(wasm, WASM_OP_I32_LT_S);
+        wasm_emit1(wasm, WASM_OP_IF);
+        wasm_emit1(wasm, WASM_BLOCK_TYPE_EMPTY);
+        wasm_op_local_get(wasm, (uint32_t)la);
+        wasm_op_i32_const(wasm, 8);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_get(wasm, (uint32_t)SCR_IDX_IS);
+        wasm_op_i32_const(wasm, es_is);
+        wasm_emit1(wasm, WASM_OP_I32_MUL);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_get(wasm, (uint32_t)ld);
+        wasm_emit1(wasm, WASM_OP_I32_STORE);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        wasm_emit1(wasm, WASM_OP_END);
         break;
+    }
+    case BODY_OP_SEQ_OPAQUE_ADD: {
+        /* Append value to opaque seq. dst=seq, a=value, b=element_size */
+        ld = wasm_local_for_slot(body, dst);
+        la = wasm_local_for_slot(body, a);
+        int32_t es_a = b;
+        int32_t sc_a = wasm_count_declared_locals(body, WASM_TYPE_I32);
+        int32_t scr_base_a = body->param_count + sc_a;
+        int32_t SCR_CNT_A = scr_base_a;
+        int32_t SCR_CAP_A = scr_base_a + 1;
+        wasm_op_local_get(wasm, (uint32_t)ld);
+        wasm_op_local_tee(wasm, (uint32_t)tmp_local);
+        wasm_emit1(wasm, WASM_OP_I32_LOAD);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        wasm_op_local_set(wasm, (uint32_t)SCR_CNT_A);
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_op_i32_const(wasm, 4);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_emit1(wasm, WASM_OP_I32_LOAD);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        wasm_op_local_set(wasm, (uint32_t)SCR_CAP_A);
+        wasm_op_local_get(wasm, (uint32_t)SCR_CNT_A);
+        wasm_op_local_get(wasm, (uint32_t)SCR_CAP_A);
+        wasm_emit1(wasm, WASM_OP_I32_LT_S);
+        wasm_emit1(wasm, WASM_OP_IF);
+        wasm_emit1(wasm, WASM_BLOCK_TYPE_EMPTY);
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_op_i32_const(wasm, 8);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_get(wasm, (uint32_t)SCR_CNT_A);
+        wasm_op_i32_const(wasm, es_a);
+        wasm_emit1(wasm, WASM_OP_I32_MUL);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_get(wasm, (uint32_t)la);
+        wasm_emit1(wasm, WASM_OP_I32_STORE);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_op_local_get(wasm, (uint32_t)SCR_CNT_A);
+        wasm_op_i32_const(wasm, 1);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_emit1(wasm, WASM_OP_I32_STORE);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        wasm_emit1(wasm, WASM_OP_END);
+        break;
+    }
+    case BODY_OP_SEQ_OPAQUE_REMOVE: {
+        ld = wasm_local_for_slot(body, dst);
+        la = wasm_local_for_slot(body, a);
+        int32_t es_r = b;
+        int32_t sc_r = wasm_count_declared_locals(body, WASM_TYPE_I32);
+        int32_t scr_base_r = body->param_count + sc_r;
+        int32_t SCR_B_R = scr_base_r;
+        int32_t SCR_I_R = scr_base_r + 1;
+        int32_t SCR_S_R = scr_base_r + 2;
+        int32_t SCR_D_R = scr_base_r + 3;
+        wasm_op_local_get(wasm, (uint32_t)ld);
+        wasm_op_local_tee(wasm, (uint32_t)tmp_local);
+        wasm_emit1(wasm, WASM_OP_I32_LOAD);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        wasm_op_local_set(wasm, (uint32_t)SCR_B_R);
+        wasm_op_local_get(wasm, (uint32_t)la);
+        wasm_op_local_set(wasm, (uint32_t)SCR_I_R);
+        wasm_op_local_get(wasm, (uint32_t)SCR_I_R);
+        wasm_op_local_get(wasm, (uint32_t)SCR_B_R);
+        wasm_emit1(wasm, WASM_OP_I32_LT_S);
+        wasm_emit1(wasm, WASM_OP_IF);
+        wasm_emit1(wasm, WASM_BLOCK_TYPE_EMPTY);
+        wasm_op_local_get(wasm, (uint32_t)SCR_B_R);
+        wasm_op_local_get(wasm, (uint32_t)SCR_I_R);
+        wasm_emit1(wasm, WASM_OP_I32_SUB);
+        wasm_op_i32_const(wasm, 1);
+        wasm_emit1(wasm, WASM_OP_I32_SUB);
+        wasm_op_i32_const(wasm, es_r);
+        wasm_emit1(wasm, WASM_OP_I32_MUL);
+        wasm_op_local_set(wasm, (uint32_t)SCR_B_R);
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_op_i32_const(wasm, 8);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_get(wasm, (uint32_t)SCR_I_R);
+        wasm_op_i32_const(wasm, 1);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_i32_const(wasm, es_r);
+        wasm_emit1(wasm, WASM_OP_I32_MUL);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_set(wasm, (uint32_t)SCR_S_R);
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_op_i32_const(wasm, 8);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_get(wasm, (uint32_t)SCR_I_R);
+        wasm_op_i32_const(wasm, es_r);
+        wasm_emit1(wasm, WASM_OP_I32_MUL);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_set(wasm, (uint32_t)SCR_D_R);
+        wasm_emit_memcpy_loop(wasm, SCR_B_R, SCR_S_R, SCR_D_R, SCR_I_R);
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_emit1(wasm, WASM_OP_I32_LOAD);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        wasm_op_i32_const(wasm, 1);
+        wasm_emit1(wasm, WASM_OP_I32_SUB);
+        wasm_emit1(wasm, WASM_OP_I32_STORE);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        wasm_emit1(wasm, WASM_OP_END);
+        break;
+    }
+    case BODY_OP_SEQ_SET_LEN: {
+        ld = wasm_local_for_slot(body, dst);
+        la = wasm_local_for_slot(body, a);
+        wasm_op_local_get(wasm, (uint32_t)la);
+        wasm_op_i32_const(wasm, 0);
+        wasm_emit1(wasm, WASM_OP_I32_GE_S);
+        wasm_emit1(wasm, WASM_OP_IF);
+        wasm_emit1(wasm, WASM_TYPE_I32);
+        wasm_op_local_get(wasm, (uint32_t)la);
+        wasm_emit1(wasm, WASM_OP_ELSE);
+        wasm_op_i32_const(wasm, 0);
+        wasm_emit1(wasm, WASM_OP_END);
+        wasm_op_local_get(wasm, (uint32_t)ld);
+        wasm_emit1(wasm, WASM_OP_I32_STORE);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        break;
+    }
     /* ARGC/ARGV stubs */
     case BODY_OP_ARGC_LOAD:
     case BODY_OP_ARGV_STR:
         wasm_op_i32_const(wasm, 0);
         wasm_op_local_set(wasm, (uint32_t)wasm_local_for_slot(body, dst));
         break;
-    /* String conversion stubs */
+    /* String conversion: I32_TO_STR */
     case BODY_OP_I32_TO_STR: {
+        /* Convert i32 to decimal string. a=value, dst=string ptr. */
+        la = wasm_local_for_slot(body, a);
         ld = wasm_local_for_slot(body, dst);
+        int32_t sc_is = wasm_count_declared_locals(body, WASM_TYPE_I32);
+        int32_t scr_base_is = body->param_count + sc_is;
+        int32_t SCR_VAL_IS = scr_base_is;
+        int32_t SCR_POS_IS = scr_base_is + 1;
+        int32_t SCR_LEN_IS = scr_base_is + 2;
+        int32_t SCR_DIGIT_IS = scr_base_is + 3;
+        /* Allocate 1 page for string via memory.grow */
+        wasm_op_i32_const(wasm, 1);
+        wasm_op_memory_grow(wasm);
+        wasm_op_i32_const(wasm, 16);
+        wasm_emit1(wasm, WASM_OP_I32_SHL);
+        wasm_op_local_tee(wasm, (uint32_t)tmp_local);
+        /* Load value */
+        wasm_op_local_get(wasm, (uint32_t)la);
+        wasm_op_local_set(wasm, (uint32_t)SCR_VAL_IS);
+        /* Check zero */
+        wasm_op_local_get(wasm, (uint32_t)SCR_VAL_IS);
         wasm_op_i32_const(wasm, 0);
+        wasm_emit1(wasm, WASM_OP_I32_EQ);
+        wasm_emit1(wasm, WASM_OP_IF);
+        wasm_emit1(wasm, WASM_BLOCK_TYPE_EMPTY);
+        /* Zero case: ptr[8]='0', data_ptr=ptr+8, len=1 */
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_op_i32_const(wasm, 8);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_i32_const(wasm, 0x30);
+        wasm_emit1(wasm, WASM_OP_I32_STORE8);
+        wasm_emit_leb128_u(wasm, 0); wasm_emit_leb128_u(wasm, 0);
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_op_i32_const(wasm, 8);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_emit1(wasm, WASM_OP_I32_STORE);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_op_i32_const(wasm, 4);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_i32_const(wasm, 1);
+        wasm_emit1(wasm, WASM_OP_I32_STORE);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        wasm_emit1(wasm, WASM_OP_ELSE);
+        /* Non-zero: handle sign and digits */
+        /* If negative, negate */
+        wasm_op_local_get(wasm, (uint32_t)SCR_VAL_IS);
+        wasm_op_i32_const(wasm, 0);
+        wasm_emit1(wasm, WASM_OP_I32_LT_S);
+        wasm_emit1(wasm, WASM_OP_IF);
+        wasm_emit1(wasm, WASM_BLOCK_TYPE_EMPTY);
+        wasm_op_i32_const(wasm, 0);
+        wasm_op_local_get(wasm, (uint32_t)SCR_VAL_IS);
+        wasm_emit1(wasm, WASM_OP_I32_SUB);
+        wasm_op_local_set(wasm, (uint32_t)SCR_VAL_IS);
+        wasm_emit1(wasm, WASM_OP_END);
+        /* Set buffer pos = ptr + 19 (space for 10 digits + sign + margin) */
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_op_i32_const(wasm, 19);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_set(wasm, (uint32_t)SCR_POS_IS);
+        /* len = 0 */
+        wasm_op_i32_const(wasm, 0);
+        wasm_op_local_set(wasm, (uint32_t)SCR_LEN_IS);
+        /* Digit loop: while (SCR_VAL > 0) */
+        wasm_emit1(wasm, WASM_OP_BLOCK);
+        wasm_emit1(wasm, WASM_BLOCK_TYPE_EMPTY);
+        wasm_emit1(wasm, WASM_OP_LOOP);
+        wasm_emit1(wasm, WASM_BLOCK_TYPE_EMPTY);
+        wasm_op_local_get(wasm, (uint32_t)SCR_VAL_IS);
+        wasm_op_i32_const(wasm, 0);
+        wasm_emit1(wasm, WASM_OP_I32_EQ);
+        wasm_emit1(wasm, WASM_OP_BR_IF);
+        wasm_emit_leb128_u(wasm, 1);
+        /* digit = val % 10 */
+        wasm_op_local_get(wasm, (uint32_t)SCR_VAL_IS);
+        wasm_op_i32_const(wasm, 10);
+        wasm_emit1(wasm, WASM_OP_I32_REM_S);
+        wasm_op_local_set(wasm, (uint32_t)SCR_DIGIT_IS);
+        /* val /= 10 */
+        wasm_op_local_get(wasm, (uint32_t)SCR_VAL_IS);
+        wasm_op_i32_const(wasm, 10);
+        wasm_emit1(wasm, WASM_OP_I32_DIV_S);
+        wasm_op_local_set(wasm, (uint32_t)SCR_VAL_IS);
+        /* *(--pos) = '0' + digit */
+        wasm_op_local_get(wasm, (uint32_t)SCR_POS_IS);
+        wasm_op_i32_const(wasm, 1);
+        wasm_emit1(wasm, WASM_OP_I32_SUB);
+        wasm_op_local_tee(wasm, (uint32_t)SCR_POS_IS);
+        wasm_op_local_get(wasm, (uint32_t)SCR_DIGIT_IS);
+        wasm_op_i32_const(wasm, 0x30);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_emit1(wasm, WASM_OP_I32_STORE8);
+        wasm_emit_leb128_u(wasm, 0); wasm_emit_leb128_u(wasm, 0);
+        /* len++ */
+        wasm_op_local_get(wasm, (uint32_t)SCR_LEN_IS);
+        wasm_op_i32_const(wasm, 1);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_set(wasm, (uint32_t)SCR_LEN_IS);
+        wasm_emit1(wasm, WASM_OP_BR);
+        wasm_emit_leb128_u(wasm, 0);
+        wasm_emit1(wasm, WASM_OP_END);
+        wasm_emit1(wasm, WASM_OP_END);
+        /* Check original sign from slot a */
+        wasm_op_local_get(wasm, (uint32_t)la);
+        wasm_op_i32_const(wasm, 0);
+        wasm_emit1(wasm, WASM_OP_I32_LT_S);
+        wasm_emit1(wasm, WASM_OP_IF);
+        wasm_emit1(wasm, WASM_BLOCK_TYPE_EMPTY);
+        wasm_op_local_get(wasm, (uint32_t)SCR_POS_IS);
+        wasm_op_i32_const(wasm, 1);
+        wasm_emit1(wasm, WASM_OP_I32_SUB);
+        wasm_op_local_tee(wasm, (uint32_t)SCR_POS_IS);
+        wasm_op_i32_const(wasm, 0x2D);
+        wasm_emit1(wasm, WASM_OP_I32_STORE8);
+        wasm_emit_leb128_u(wasm, 0); wasm_emit_leb128_u(wasm, 0);
+        wasm_op_local_get(wasm, (uint32_t)SCR_LEN_IS);
+        wasm_op_i32_const(wasm, 1);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_set(wasm, (uint32_t)SCR_LEN_IS);
+        wasm_emit1(wasm, WASM_OP_END);
+        /* Write struct header: [ptr+0]=data_ptr=SCR_POS, [ptr+4]=len=SCR_LEN */
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_op_local_get(wasm, (uint32_t)SCR_POS_IS);
+        wasm_emit1(wasm, WASM_OP_I32_STORE);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_op_i32_const(wasm, 4);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_get(wasm, (uint32_t)SCR_LEN_IS);
+        wasm_emit1(wasm, WASM_OP_I32_STORE);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        wasm_emit1(wasm, WASM_OP_END);
+        /* Store ptr to dst */
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
         wasm_op_local_set(wasm, (uint32_t)ld);
-        wasm_op_i32_const(wasm, 0);
-        wasm_op_local_set(wasm, (uint32_t)(ld + 1));
         break;
     }
+    /* String conversion: I64_TO_STR */
     case BODY_OP_I64_TO_STR: {
+        /* Convert i64 to decimal string. a=value(i64), dst=string ptr. */
+        la = wasm_local_for_slot(body, a);
         ld = wasm_local_for_slot(body, dst);
+        int32_t sc_i64 = wasm_count_declared_locals(body, WASM_TYPE_I32);
+        int32_t scr_base_i64 = body->param_count + sc_i64;
+        int32_t SCR_SIGN_64 = scr_base_i64;
+        int32_t SCR_POS_64 = scr_base_i64 + 1;
+        int32_t SCR_LEN_64 = scr_base_i64 + 2;
+        int32_t SCR_DIGIT_64 = scr_base_i64 + 3;
+        /* Allocate 1 page for string */
+        wasm_op_i32_const(wasm, 1);
+        wasm_op_memory_grow(wasm);
+        wasm_op_i32_const(wasm, 16);
+        wasm_emit1(wasm, WASM_OP_I32_SHL);
+        wasm_op_local_tee(wasm, (uint32_t)tmp_local);
+        /* Check if value == 0 */
+        wasm_op_local_get(wasm, (uint32_t)la);
+        wasm_emit1(wasm, WASM_OP_I64_EQZ);
+        wasm_emit1(wasm, WASM_OP_IF);
+        wasm_emit1(wasm, WASM_BLOCK_TYPE_EMPTY);
+        /* Zero case: same as i32 */
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_op_i32_const(wasm, 8);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_i32_const(wasm, 0x30);
+        wasm_emit1(wasm, WASM_OP_I32_STORE8);
+        wasm_emit_leb128_u(wasm, 0); wasm_emit_leb128_u(wasm, 0);
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_op_i32_const(wasm, 8);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_emit1(wasm, WASM_OP_I32_STORE);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_op_i32_const(wasm, 4);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_i32_const(wasm, 1);
+        wasm_emit1(wasm, WASM_OP_I32_STORE);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        wasm_emit1(wasm, WASM_OP_ELSE);
+        /* Non-zero: save sign, negate if needed */
+        wasm_op_local_get(wasm, (uint32_t)la);
+        wasm_emit1(wasm, WASM_OP_I64_CONST);
+        wasm_emit_leb128_s(wasm, 0);
+        wasm_emit1(wasm, WASM_OP_I64_LT_S);
+        wasm_op_local_set(wasm, (uint32_t)SCR_SIGN_64);
+        /* If negative, negate and store positive to [tmp_local+40] */
+        wasm_op_local_get(wasm, (uint32_t)SCR_SIGN_64);
+        wasm_emit1(wasm, WASM_OP_IF);
+        wasm_emit1(wasm, WASM_BLOCK_TYPE_EMPTY);
+        /* 0 - val → positive */
+        wasm_emit1(wasm, WASM_OP_I64_CONST);
+        wasm_emit_leb128_s(wasm, 0);
+        wasm_op_local_get(wasm, (uint32_t)la);
+        wasm_emit1(wasm, WASM_OP_I64_SUB);
+        /* Store positive value to memory for loop use */
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_op_i32_const(wasm, 40);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_emit1(wasm, WASM_OP_I64_STORE);
+        wasm_emit_leb128_u(wasm, 3); wasm_emit_leb128_u(wasm, 0);
+        wasm_emit1(wasm, WASM_OP_ELSE);
+        /* Already positive, store to memory */
+        wasm_op_local_get(wasm, (uint32_t)la);
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_op_i32_const(wasm, 40);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_emit1(wasm, WASM_OP_I64_STORE);
+        wasm_emit_leb128_u(wasm, 3); wasm_emit_leb128_u(wasm, 0);
+        wasm_emit1(wasm, WASM_OP_END);
+        /* Set buffer pos = ptr + 29 (20 digits + sign + margin) */
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_op_i32_const(wasm, 29);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_set(wasm, (uint32_t)SCR_POS_64);
+        /* len = 0 */
         wasm_op_i32_const(wasm, 0);
+        wasm_op_local_set(wasm, (uint32_t)SCR_LEN_64);
+        /* Digit loop: load from [tmp_local+40] */
+        wasm_emit1(wasm, WASM_OP_BLOCK);
+        wasm_emit1(wasm, WASM_BLOCK_TYPE_EMPTY);
+        wasm_emit1(wasm, WASM_OP_LOOP);
+        wasm_emit1(wasm, WASM_BLOCK_TYPE_EMPTY);
+        /* Load val from memory */
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_op_i32_const(wasm, 40);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_emit1(wasm, WASM_OP_I64_LOAD);
+        wasm_emit_leb128_u(wasm, 3); wasm_emit_leb128_u(wasm, 0);
+        /* Check == 0 */
+        wasm_emit1(wasm, WASM_OP_I64_EQZ);
+        wasm_emit1(wasm, WASM_OP_BR_IF);
+        wasm_emit_leb128_u(wasm, 1);
+        /* Load from memory again for computation */
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_op_i32_const(wasm, 40);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_emit1(wasm, WASM_OP_I64_LOAD);
+        wasm_emit_leb128_u(wasm, 3); wasm_emit_leb128_u(wasm, 0);
+        /* digit_i32 = (i32)(val % 10) */
+        wasm_emit1(wasm, WASM_OP_I64_CONST);
+        wasm_emit_leb128_s(wasm, 10);
+        wasm_emit1(wasm, WASM_OP_I64_REM_S);
+        wasm_emit1(wasm, WASM_OP_I32_WRAP_I64);
+        wasm_op_local_set(wasm, (uint32_t)SCR_DIGIT_64);
+        /* val /= 10 (reload for division) */
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_op_i32_const(wasm, 40);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_emit1(wasm, WASM_OP_I64_LOAD);
+        wasm_emit_leb128_u(wasm, 3); wasm_emit_leb128_u(wasm, 0);
+        wasm_emit1(wasm, WASM_OP_I64_CONST);
+        wasm_emit_leb128_s(wasm, 10);
+        wasm_emit1(wasm, WASM_OP_I64_DIV_S);
+        /* Store back to memory */
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_op_i32_const(wasm, 40);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_emit1(wasm, WASM_OP_I64_STORE);
+        wasm_emit_leb128_u(wasm, 3); wasm_emit_leb128_u(wasm, 0);
+        /* *(--pos) = '0' + digit */
+        wasm_op_local_get(wasm, (uint32_t)SCR_POS_64);
+        wasm_op_i32_const(wasm, 1);
+        wasm_emit1(wasm, WASM_OP_I32_SUB);
+        wasm_op_local_tee(wasm, (uint32_t)SCR_POS_64);
+        wasm_op_local_get(wasm, (uint32_t)SCR_DIGIT_64);
+        wasm_op_i32_const(wasm, 0x30);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_emit1(wasm, WASM_OP_I32_STORE8);
+        wasm_emit_leb128_u(wasm, 0); wasm_emit_leb128_u(wasm, 0);
+        /* len++ */
+        wasm_op_local_get(wasm, (uint32_t)SCR_LEN_64);
+        wasm_op_i32_const(wasm, 1);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_set(wasm, (uint32_t)SCR_LEN_64);
+        wasm_emit1(wasm, WASM_OP_BR);
+        wasm_emit_leb128_u(wasm, 0);
+        wasm_emit1(wasm, WASM_OP_END);
+        wasm_emit1(wasm, WASM_OP_END);
+        /* Add '-' if sign */
+        wasm_op_local_get(wasm, (uint32_t)SCR_SIGN_64);
+        wasm_emit1(wasm, WASM_OP_IF);
+        wasm_emit1(wasm, WASM_BLOCK_TYPE_EMPTY);
+        wasm_op_local_get(wasm, (uint32_t)SCR_POS_64);
+        wasm_op_i32_const(wasm, 1);
+        wasm_emit1(wasm, WASM_OP_I32_SUB);
+        wasm_op_local_tee(wasm, (uint32_t)SCR_POS_64);
+        wasm_op_i32_const(wasm, 0x2D);
+        wasm_emit1(wasm, WASM_OP_I32_STORE8);
+        wasm_emit_leb128_u(wasm, 0); wasm_emit_leb128_u(wasm, 0);
+        wasm_op_local_get(wasm, (uint32_t)SCR_LEN_64);
+        wasm_op_i32_const(wasm, 1);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_set(wasm, (uint32_t)SCR_LEN_64);
+        wasm_emit1(wasm, WASM_OP_END);
+        /* Write struct header */
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_op_local_get(wasm, (uint32_t)SCR_POS_64);
+        wasm_emit1(wasm, WASM_OP_I32_STORE);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_op_i32_const(wasm, 4);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_get(wasm, (uint32_t)SCR_LEN_64);
+        wasm_emit1(wasm, WASM_OP_I32_STORE);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        wasm_emit1(wasm, WASM_OP_END);
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
         wasm_op_local_set(wasm, (uint32_t)ld);
-        wasm_op_i32_const(wasm, 0);
-        wasm_op_local_set(wasm, (uint32_t)(ld + 1));
         break;
     }
     case BODY_OP_STR_JOIN:
     case BODY_OP_STR_SPLIT_CHAR:
+        /* Stub - return empty string for now */
+        goto wasm_stub_zero_composite;
     case BODY_OP_STR_STRIP:
-    case BODY_OP_STR_SELECT_NONEMPTY:
+        /* Strip whitespace: passthrough (copy ptr) */
+        la = wasm_local_for_slot(body, a);
+        ld = wasm_local_for_slot(body, dst);
+        wasm_op_local_get(wasm, (uint32_t)la);
+        wasm_op_local_set(wasm, (uint32_t)ld);
+        break;
+    case BODY_OP_STR_SELECT_NONEMPTY: {
+        /* Select first non-empty string. a=first, b=second, dst=result */
+        la = wasm_local_for_slot(body, a);
+        lb = wasm_local_for_slot(body, b);
+        ld = wasm_local_for_slot(body, dst);
+        int32_t sc_sne = wasm_count_declared_locals(body, WASM_TYPE_I32);
+        int32_t SCR_LEN_SNE = body->param_count + sc_sne;
+        /* Load length of a: [a+4] */
+        wasm_op_local_get(wasm, (uint32_t)la);
+        wasm_op_i32_const(wasm, 4);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_emit1(wasm, WASM_OP_I32_LOAD);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        wasm_op_local_set(wasm, (uint32_t)SCR_LEN_SNE);
+        wasm_op_local_get(wasm, (uint32_t)SCR_LEN_SNE);
+        wasm_op_i32_const(wasm, 0);
+        wasm_emit1(wasm, WASM_OP_I32_GT_S);
+        wasm_emit1(wasm, WASM_OP_IF);
+        wasm_emit1(wasm, WASM_TYPE_I32);
+        wasm_op_local_get(wasm, (uint32_t)la);
+        wasm_emit1(wasm, WASM_OP_ELSE);
+        wasm_op_local_get(wasm, (uint32_t)lb);
+        wasm_emit1(wasm, WASM_OP_END);
+        wasm_op_local_set(wasm, (uint32_t)ld);
+        break;
+    }
     case BODY_OP_SHELL_QUOTE:
-    case BODY_OP_CWD_STR:
+        /* Shell-quote: passthrough (copy ptr) */
+        la = wasm_local_for_slot(body, a);
+        ld = wasm_local_for_slot(body, dst);
+        wasm_op_local_get(wasm, (uint32_t)la);
+        wasm_op_local_set(wasm, (uint32_t)ld);
+        break;
+    case BODY_OP_CWD_STR: {
+        /* Return "/" string. Allocate 2-byte string with just '/' */
+        ld = wasm_local_for_slot(body, dst);
+        wasm_op_i32_const(wasm, 1);
+        wasm_op_memory_grow(wasm);
+        wasm_op_i32_const(wasm, 16);
+        wasm_emit1(wasm, WASM_OP_I32_SHL);
+        wasm_op_local_tee(wasm, (uint32_t)tmp_local);
+        /* ptr[8] = '/' */
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_op_i32_const(wasm, 8);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_i32_const(wasm, 0x2F);
+        wasm_emit1(wasm, WASM_OP_I32_STORE8);
+        wasm_emit_leb128_u(wasm, 0); wasm_emit_leb128_u(wasm, 0);
+        /* [ptr+0] = data_ptr = ptr+8 */
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_op_i32_const(wasm, 8);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_emit1(wasm, WASM_OP_I32_STORE);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        /* [ptr+4] = 1 */
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_op_i32_const(wasm, 4);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_i32_const(wasm, 1);
+        wasm_emit1(wasm, WASM_OP_I32_STORE);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        wasm_op_local_get(wasm, (uint32_t)tmp_local);
+        wasm_op_local_set(wasm, (uint32_t)ld);
+        break;
+    }
     case BODY_OP_GETENV_STR:
-    case BODY_OP_PARSE_INT:
     case BODY_OP_PATH_JOIN:
     case BODY_OP_PATH_ABSOLUTE:
     case BODY_OP_PATH_PARENT:
@@ -24367,15 +24882,257 @@ static void wasm_codegen_op(WasmCode *wasm, BodyIR *body, Symbols *symbols,
     case BODY_OP_CHMOD_X:
     case BODY_OP_COLD_SELF_EXEC:
     case BODY_OP_EXEC_SHELL:
-    case BODY_OP_TEXT_CONTAINS:
-    case BODY_OP_READ_FLAG:
     case BODY_OP_TIME_NS:
     case BODY_OP_GETRUSAGE:
-    case BODY_OP_PATH_IS_ABSOLUTE:
     case BODY_OP_TEXT_SET_INSERT:
     case BODY_OP_CLOSURE_NEW:
     case BODY_OP_CLOSURE_CALL:
-        /* Stub: store 0 for i32, or zero-filled string for str */
+        /* Stub: return 0 or null for unimplemented WASM ops */
+        goto wasm_stub_zero_composite;
+    case BODY_OP_TEXT_CONTAINS: {
+        /* Check if string a contains substring b. Returns i32 0/1 */
+        la = wasm_local_for_slot(body, a);
+        lb = wasm_local_for_slot(body, b);
+        ld = wasm_local_for_slot(body, dst);
+        int32_t sc_tc = wasm_count_declared_locals(body, WASM_TYPE_I32);
+        int32_t scr_base_tc = body->param_count + sc_tc;
+        int32_t SCR_LA_TC = scr_base_tc;
+        int32_t SCR_LB_TC = scr_base_tc + 1;
+        int32_t SCR_I_TC = scr_base_tc + 2;
+        int32_t SCR_J_TC = scr_base_tc + 3;
+        /* Load len_a = [a+4] */
+        wasm_op_local_get(wasm, (uint32_t)la);
+        wasm_op_i32_const(wasm, 4);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_emit1(wasm, WASM_OP_I32_LOAD);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        wasm_op_local_set(wasm, (uint32_t)SCR_LA_TC);
+        /* Load len_b = [b+4] */
+        wasm_op_local_get(wasm, (uint32_t)lb);
+        wasm_op_i32_const(wasm, 4);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_emit1(wasm, WASM_OP_I32_LOAD);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        wasm_op_local_set(wasm, (uint32_t)SCR_LB_TC);
+        /* Data ptrs: data_a = [a+0], data_b = [b+0] */
+        /* We use a+8 for inline data (matches how WASM strings are allocated) */
+        /* If len_b == 0 -> contains = true */
+        wasm_op_local_get(wasm, (uint32_t)SCR_LB_TC);
+        wasm_op_i32_const(wasm, 0);
+        wasm_emit1(wasm, WASM_OP_I32_EQ);
+        wasm_emit1(wasm, WASM_OP_IF);
+        wasm_emit1(wasm, WASM_TYPE_I32);
+        wasm_op_i32_const(wasm, 1);
+        wasm_emit1(wasm, WASM_OP_ELSE);
+        /* if len_a < len_b -> contains = false */
+        wasm_op_local_get(wasm, (uint32_t)SCR_LA_TC);
+        wasm_op_local_get(wasm, (uint32_t)SCR_LB_TC);
+        wasm_emit1(wasm, WASM_OP_I32_LT_S);
+        wasm_emit1(wasm, WASM_OP_IF);
+        wasm_emit1(wasm, WASM_TYPE_I32);
+        wasm_op_i32_const(wasm, 0);
+        wasm_emit1(wasm, WASM_OP_ELSE);
+        /* Full O(n*m) substring search for TEXT_CONTAINS */
+        /* Initialize ld = 0 (no match) */
+        wasm_op_i32_const(wasm, 0);
+        wasm_op_local_set(wasm, (uint32_t)ld);
+        /* i = 0 */
+        wasm_op_i32_const(wasm, 0);
+        wasm_op_local_set(wasm, SCR_I_TC);
+        /* block @exit_all (br target for break all) */
+        wasm_emit1(wasm, WASM_OP_BLOCK);
+        wasm_emit1(wasm, WASM_BLOCK_TYPE_EMPTY);
+        /* loop @outer */
+        wasm_emit1(wasm, WASM_OP_LOOP);
+        wasm_emit1(wasm, WASM_BLOCK_TYPE_EMPTY);
+        /* if i > len_a - len_b: break all (no match) */
+        wasm_op_local_get(wasm, SCR_LA_TC);
+        wasm_op_local_get(wasm, SCR_LB_TC);
+        wasm_emit1(wasm, WASM_OP_I32_SUB);
+        wasm_op_local_get(wasm, SCR_I_TC);
+        wasm_emit1(wasm, WASM_OP_I32_GT_S);
+        wasm_emit1(wasm, WASM_OP_BR_IF);
+        wasm_emit_leb128_u(wasm, 1);
+        /* block @mismatch (br target when chars differ) */
+        wasm_emit1(wasm, WASM_OP_BLOCK);
+        wasm_emit1(wasm, WASM_BLOCK_TYPE_EMPTY);
+        /* j = 0 */
+        wasm_op_i32_const(wasm, 0);
+        wasm_op_local_set(wasm, SCR_J_TC);
+        /* block @inner_break (br target when full match found) */
+        wasm_emit1(wasm, WASM_OP_BLOCK);
+        wasm_emit1(wasm, WASM_BLOCK_TYPE_EMPTY);
+        /* loop @inner */
+        wasm_emit1(wasm, WASM_OP_LOOP);
+        wasm_emit1(wasm, WASM_BLOCK_TYPE_EMPTY);
+        /* if j >= len_b: break to inner_break (full match at this position) */
+        wasm_op_local_get(wasm, SCR_J_TC);
+        wasm_op_local_get(wasm, SCR_LB_TC);
+        wasm_emit1(wasm, WASM_OP_I32_GE_S);
+        wasm_emit1(wasm, WASM_OP_BR_IF);
+        wasm_emit_leb128_u(wasm, 1);
+        /* Load a[i+j] = byte at [la + 8 + i + j] */
+        wasm_op_local_get(wasm, (uint32_t)la);
+        wasm_op_i32_const(wasm, 8);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_get(wasm, SCR_I_TC);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_get(wasm, SCR_J_TC);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_emit1(wasm, WASM_OP_I32_LOAD8_U);
+        wasm_emit_leb128_u(wasm, 0); wasm_emit_leb128_u(wasm, 0);
+        /* Load b[j] = byte at [lb + 8 + j] */
+        wasm_op_local_get(wasm, (uint32_t)lb);
+        wasm_op_i32_const(wasm, 8);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_get(wasm, SCR_J_TC);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_emit1(wasm, WASM_OP_I32_LOAD8_U);
+        wasm_emit_leb128_u(wasm, 0); wasm_emit_leb128_u(wasm, 0);
+        /* Compare: if a[i+j] != b[j]: break to mismatch (try next position) */
+        wasm_emit1(wasm, WASM_OP_I32_NE);
+        wasm_emit1(wasm, WASM_OP_BR_IF);
+        wasm_emit_leb128_u(wasm, 2);
+        /* j++ */
+        wasm_op_local_get(wasm, SCR_J_TC);
+        wasm_op_i32_const(wasm, 1);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_set(wasm, SCR_J_TC);
+        /* continue inner loop */
+        wasm_emit1(wasm, WASM_OP_BR);
+        wasm_emit_leb128_u(wasm, 0);
+        /* end inner loop */
+        wasm_emit1(wasm, WASM_OP_END);
+        /* end inner_break (match found - fall through from br 2) */
+        wasm_emit1(wasm, WASM_OP_END);
+        /* Set ld = 1, break all */
+        wasm_op_i32_const(wasm, 1);
+        wasm_op_local_set(wasm, (uint32_t)ld);
+        wasm_emit1(wasm, WASM_OP_BR);
+        wasm_emit_leb128_u(wasm, 2);
+        /* end mismatch block */
+        wasm_emit1(wasm, WASM_OP_END);
+        /* i++ */
+        wasm_op_local_get(wasm, SCR_I_TC);
+        wasm_op_i32_const(wasm, 1);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_set(wasm, SCR_I_TC);
+        /* continue outer loop */
+        wasm_emit1(wasm, WASM_OP_BR);
+        wasm_emit_leb128_u(wasm, 0);
+        /* end outer loop */
+        wasm_emit1(wasm, WASM_OP_END);
+        /* end exit_all */
+        wasm_emit1(wasm, WASM_OP_END);
+        /* Push ld value for enclosing if/else */
+        wasm_op_local_get(wasm, (uint32_t)ld);
+        wasm_emit1(wasm, WASM_OP_END);
+        wasm_emit1(wasm, WASM_OP_END);
+        wasm_op_local_set(wasm, (uint32_t)ld);
+        break;
+    }
+    case BODY_OP_READ_FLAG: {
+        /* Read a flag: return default value from slot b (not hardcoded 0) */
+        lb = wasm_local_for_slot(body, b);
+        ld = wasm_local_for_slot(body, dst);
+        wasm_op_local_get(wasm, (uint32_t)lb);
+        wasm_op_local_set(wasm, (uint32_t)ld);
+        break;
+    }
+    case BODY_OP_PATH_IS_ABSOLUTE: {
+        /* Check if path starts with '/' */
+        la = wasm_local_for_slot(body, a);
+        ld = wasm_local_for_slot(body, dst);
+        /* Load first byte from [a+8] */
+        wasm_op_local_get(wasm, (uint32_t)la);
+        wasm_op_i32_const(wasm, 8);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_emit1(wasm, WASM_OP_I32_LOAD8_U);
+        wasm_emit_leb128_u(wasm, 0); wasm_emit_leb128_u(wasm, 0);
+        /* Compare to '/' (0x2F) */
+        wasm_op_i32_const(wasm, 0x2F);
+        wasm_emit1(wasm, WASM_OP_I32_EQ);
+        wasm_op_local_set(wasm, (uint32_t)ld);
+        break;
+    }
+    case BODY_OP_PARSE_INT: {
+        /* Parse decimal string to i32. a=str, dst=i32 result */
+        la = wasm_local_for_slot(body, a);
+        ld = wasm_local_for_slot(body, dst);
+        int32_t sc_pi = wasm_count_declared_locals(body, WASM_TYPE_I32);
+        int32_t scr_base_pi = body->param_count + sc_pi;
+        int32_t SCR_RES_PI = scr_base_pi;
+        int32_t SCR_LEN_PI = scr_base_pi + 1;
+        int32_t SCR_I_PI = scr_base_pi + 2;
+        int32_t SCR_CH_PI = scr_base_pi + 3;
+        /* Load length */
+        wasm_op_local_get(wasm, (uint32_t)la);
+        wasm_op_i32_const(wasm, 4);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_emit1(wasm, WASM_OP_I32_LOAD);
+        wasm_emit_leb128_u(wasm, 2); wasm_emit_leb128_u(wasm, 0);
+        wasm_op_local_set(wasm, (uint32_t)SCR_LEN_PI);
+        /* result = 0, i = 0 */
+        wasm_op_i32_const(wasm, 0);
+        wasm_op_local_set(wasm, (uint32_t)SCR_RES_PI);
+        wasm_op_i32_const(wasm, 0);
+        wasm_op_local_set(wasm, (uint32_t)SCR_I_PI);
+        /* Loop: while i < len */
+        wasm_emit1(wasm, WASM_OP_BLOCK);
+        wasm_emit1(wasm, WASM_BLOCK_TYPE_EMPTY);
+        wasm_emit1(wasm, WASM_OP_LOOP);
+        wasm_emit1(wasm, WASM_BLOCK_TYPE_EMPTY);
+        wasm_op_local_get(wasm, (uint32_t)SCR_I_PI);
+        wasm_op_local_get(wasm, (uint32_t)SCR_LEN_PI);
+        wasm_emit1(wasm, WASM_OP_I32_GE_S);
+        wasm_emit1(wasm, WASM_OP_BR_IF);
+        wasm_emit_leb128_u(wasm, 1);
+        /* ch = [a+8 + i] */
+        wasm_op_local_get(wasm, (uint32_t)la);
+        wasm_op_i32_const(wasm, 8);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_get(wasm, (uint32_t)SCR_I_PI);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_emit1(wasm, WASM_OP_I32_LOAD8_U);
+        wasm_emit_leb128_u(wasm, 0); wasm_emit_leb128_u(wasm, 0);
+        wasm_op_local_set(wasm, (uint32_t)SCR_CH_PI);
+        /* if '0' <= ch <= '9': result = result*10 + (ch - '0') */
+        wasm_op_local_get(wasm, (uint32_t)SCR_CH_PI);
+        wasm_op_i32_const(wasm, 0x30); /* '0' */
+        wasm_emit1(wasm, WASM_OP_I32_GE_S);
+        wasm_emit1(wasm, WASM_OP_IF);
+        wasm_emit1(wasm, WASM_BLOCK_TYPE_EMPTY);
+        wasm_op_local_get(wasm, (uint32_t)SCR_CH_PI);
+        wasm_op_i32_const(wasm, 0x39); /* '9' */
+        wasm_emit1(wasm, WASM_OP_I32_LE_S);
+        wasm_emit1(wasm, WASM_OP_IF);
+        wasm_emit1(wasm, WASM_BLOCK_TYPE_EMPTY);
+        wasm_op_local_get(wasm, (uint32_t)SCR_RES_PI);
+        wasm_op_i32_const(wasm, 10);
+        wasm_emit1(wasm, WASM_OP_I32_MUL);
+        wasm_op_local_get(wasm, (uint32_t)SCR_CH_PI);
+        wasm_op_i32_const(wasm, 0x30);
+        wasm_emit1(wasm, WASM_OP_I32_SUB);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_set(wasm, (uint32_t)SCR_RES_PI);
+        wasm_emit1(wasm, WASM_OP_END);
+        wasm_emit1(wasm, WASM_OP_END);
+        /* i++ */
+        wasm_op_local_get(wasm, (uint32_t)SCR_I_PI);
+        wasm_op_i32_const(wasm, 1);
+        wasm_emit1(wasm, WASM_OP_I32_ADD);
+        wasm_op_local_set(wasm, (uint32_t)SCR_I_PI);
+        wasm_emit1(wasm, WASM_OP_BR);
+        wasm_emit_leb128_u(wasm, 0);
+        wasm_emit1(wasm, WASM_OP_END);
+        wasm_emit1(wasm, WASM_OP_END);
+        wasm_op_local_get(wasm, (uint32_t)SCR_RES_PI);
+        wasm_op_local_set(wasm, (uint32_t)ld);
+        break;
+    }
+    /* Stub fallback label for unimplemented ops */
+    wasm_stub_zero_composite:
+        /* Stub: store 0 or null based on slot kind */
         la = body->slot_kind[dst];
         ld = wasm_local_for_slot(body, dst);
         if (la == SLOT_I32 || la == SLOT_PTR || la == SLOT_I32_REF) {
@@ -24395,7 +25152,6 @@ static void wasm_codegen_op(WasmCode *wasm, BodyIR *body, Symbols *symbols,
             wasm_emit1(wasm, WASM_OP_F64_REINTERPRET_I64);
             wasm_op_local_set(wasm, (uint32_t)ld);
         } else {
-            /* Composite type: store null pointer */
             wasm_op_i32_const(wasm, 0);
             wasm_op_local_set(wasm, (uint32_t)ld);
         }

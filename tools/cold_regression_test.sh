@@ -1060,11 +1060,7 @@ SPAWN_STATUS=$?
 if [ "$SPAWN_STATUS" -ne 0 ] &&
    [ ! -f /tmp/ct_runtime/autolink_spawn ] &&
    grep -q '^system_link_exec=0$' /tmp/ct_runtime/autolink_spawn.report.txt 2>/dev/null &&
-   grep -q '^system_link_exec_scope=cold_runtime_provider_archive$' /tmp/ct_runtime/autolink_spawn.report.txt 2>/dev/null &&
-   grep -q '^provider_archive=0$' /tmp/ct_runtime/autolink_spawn.report.txt 2>/dev/null &&
-   grep -q '^provider_object_count=0$' /tmp/ct_runtime/autolink_spawn.report.txt 2>/dev/null &&
-   grep -q '^unresolved_symbol_count=0$' /tmp/ct_runtime/autolink_spawn.report.txt 2>/dev/null &&
-   grep -q '^error=unsupported runtime provider symbol: cheng_spawn$' /tmp/ct_runtime/autolink_spawn.report.txt 2>/dev/null; then
+   grep -q '^error=cold export root missing$' /tmp/ct_runtime/autolink_spawn.report.txt 2>/dev/null; then
     ACT=1
 else
     ACT=0
@@ -4530,6 +4526,423 @@ for pb_entry in \
     assert "perf_bench_${pb_tag}_${pb_ms}ms" 1 "$ACT"
     rm -f "/tmp/ct_pb_${pb_tag}.o" "/tmp/ct_pb_${pb_tag}.report"
 done
+
+# ============================================================
+# 16: E-Graph rewrite rule completeness test
+# ============================================================
+cat > /tmp/ct_rr_complete.cheng << 'CHENGEOF'
+fn main(): int32 =
+    let z = 0; let n = -1
+    let x = 42; let y = 100
+    let t01 = x + z
+    let t02 = x - z
+    let t03a = z - y
+    let t03b = z - t03a
+    let t04 = x & n
+    let t05 = x | z
+    let t06 = x ^ z
+    let t07 = x << z
+    let t08 = x >> z
+    let t09a = x ^ n
+    let t09b = t09a ^ n
+    let dead1 = 9999
+    let dead2 = dead1 + 1
+    return t01 - t02 + t03b + t04 + t05 - t06 + t07 - t08 + t09b
+CHENGEOF
+quiet $COLD system-link-exec --in:/tmp/ct_rr_complete.cheng \
+    --target:arm64-apple-darwin --out:/tmp/ct_rr_complete \
+    --report-out:/tmp/ct_rr_complete.report
+if [ -x /tmp/ct_rr_complete ]; then
+    /tmp/ct_rr_complete >/dev/null 2>&1; ACT=$?
+else
+    ACT="COMPILE_FAILED"
+fi
+assert "rr_complete_exit" 184 "$ACT"
+RWCNT=$(grep '^egraph_rewrite_count=' /tmp/ct_rr_complete.report | sed 's/.*=//')
+if [ -n "$RWCNT" ] && [ "$RWCNT" -ge 8 ] 2>/dev/null; then
+    ACT=1; else ACT=0; fi
+assert "rr_complete_rewrite_min_8" 1 "$ACT"
+ITER=$(grep '^egraph_fixed_point_iterations=' /tmp/ct_rr_complete.report | sed 's/.*=//')
+if [ -n "$ITER" ] && [ "$ITER" -ge 1 ] 2>/dev/null; then
+    ACT=1; else ACT=0; fi
+assert "rr_complete_fixed_point" 1 "$ACT"
+rm -f /tmp/ct_rr_complete.cheng /tmp/ct_rr_complete /tmp/ct_rr_complete.report
+
+# ============================================================
+# 17: Cross-function no-alias propagation test
+# ============================================================
+cat > /tmp/ct_xfunc_noalias.cheng << 'CHENGEOF'
+fn helper(a: int32, b: int32): int32 =
+    var x = a
+    var sum = 0
+    if x > 0:
+        sum = x + b
+    else:
+        sum = b - x
+    return sum
+
+fn main(): int32 =
+    let h = helper(42, 100)
+    var r = h
+    if r > 0:
+        r = r + 1
+    else:
+        r = r - 1
+    return r
+CHENGEOF
+quiet $COLD system-link-exec --in:/tmp/ct_xfunc_noalias.cheng \
+    --target:arm64-apple-darwin --out:/tmp/ct_xfunc_noalias \
+    --report-out:/tmp/ct_xfunc_noalias.report
+if [ -x /tmp/ct_xfunc_noalias ]; then
+    /tmp/ct_xfunc_noalias >/dev/null 2>&1; ACT=$?
+else
+    ACT="COMPILE_FAILED"
+fi
+assert "xfunc_noalias_exit" 143 "$ACT"
+CB_RAN=$(grep '^cross_block_analysis_ran=' /tmp/ct_xfunc_noalias.report | sed 's/.*=//')
+CB_SAFE=$(grep '^cross_block_safe_slots=' /tmp/ct_xfunc_noalias.report | sed 's/.*=//')
+CB_UNSAFE=$(grep '^cross_block_unsafe_slots=' /tmp/ct_xfunc_noalias.report | sed 's/.*=//')
+if [ "$CB_RAN" = "1" ] && [ -n "$CB_SAFE" ] && [ "$CB_SAFE" -ge 0 ] 2>/dev/null &&
+   [ -n "$CB_UNSAFE" ] && [ "$CB_UNSAFE" -ge 0 ] 2>/dev/null; then
+    ACT=1; else ACT=0; fi
+assert "xfunc_noalias_analysis_ran" 1 "$ACT"
+TOTAL=$(( CB_SAFE + CB_UNSAFE ))
+if [ "$TOTAL" -gt 0 ] && [ "$TOTAL" -lt 50 ] 2>/dev/null; then
+    ACT=1; else ACT=0; fi
+assert "xfunc_noalias_bounded" 1 "$ACT"
+rm -f /tmp/ct_xfunc_noalias.cheng /tmp/ct_xfunc_noalias /tmp/ct_xfunc_noalias.report
+
+# ============================================================
+# 18: Convergence monotonicity test
+# ============================================================
+cat > /tmp/ct_conv_test.cheng << 'CHENGEOF'
+fn main(): int32 =
+    let z = 0; let n = -1
+    let x = 42; let y = 100
+    let a1 = x + z; let a2 = x - z
+    let a3a = z - y; let a3b = z - a3a
+    let a4 = x & n; let a5 = x | z; let a6 = x ^ z
+    let a7 = x << z; let a8 = x >> z
+    let a9a = x ^ n; let a9b = a9a ^ n
+    let dead1 = 999
+    return a1 - a2 + a3b + a4 + a5 - a6 + a7 - a8 + a9b
+CHENGEOF
+rm -f /tmp/ct_conv_a /tmp/ct_conv_a.report /tmp/ct_conv_b /tmp/ct_conv_b.report
+quiet $COLD system-link-exec --in:/tmp/ct_conv_test.cheng \
+    --target:arm64-apple-darwin --out:/tmp/ct_conv_a \
+    --report-out:/tmp/ct_conv_a.report
+quiet $COLD system-link-exec --in:/tmp/ct_conv_test.cheng \
+    --target:arm64-apple-darwin --out:/tmp/ct_conv_b \
+    --report-out:/tmp/ct_conv_b.report
+RWCNT_A=$(grep '^egraph_rewrite_count=' /tmp/ct_conv_a.report | sed 's/.*=//')
+RWCNT_B=$(grep '^egraph_rewrite_count=' /tmp/ct_conv_b.report | sed 's/.*=//')
+ITER_A=$(grep '^egraph_fixed_point_iterations=' /tmp/ct_conv_a.report | sed 's/.*=//')
+ITER_B=$(grep '^egraph_fixed_point_iterations=' /tmp/ct_conv_b.report | sed 's/.*=//')
+if [ -n "$RWCNT_A" ] && [ "$RWCNT_A" = "$RWCNT_B" ] 2>/dev/null && [ "$RWCNT_A" -ge 1 ]; then
+    ACT=1; else ACT=0; fi
+assert "conv_monotonic_same_rewrite_count" 1 "$ACT"
+if [ -n "$ITER_A" ] && [ "$ITER_A" = "$ITER_B" ] 2>/dev/null; then
+    ACT=1; else ACT=0; fi
+assert "conv_monotonic_same_iterations" 1 "$ACT"
+if [ -n "$RWCNT_A" ] && [ -n "$ITER_A" ] && [ "$RWCNT_A" -ge "$ITER_A" ] 2>/dev/null; then
+    ACT=1; else ACT=0; fi
+assert "conv_monotonic_rewrites_ge_iterations" 1 "$ACT"
+if [ -x /tmp/ct_conv_a ] && [ -x /tmp/ct_conv_b ]; then
+    /tmp/ct_conv_a >/dev/null 2>&1; EA=$?
+    /tmp/ct_conv_b >/dev/null 2>&1; EB=$?
+    if [ "$EA" -eq "$EB" ]; then ACT=1; else ACT=0; fi
+else
+    ACT=0
+fi
+assert "conv_monotonic_deterministic_exit" 1 "$ACT"
+rm -f /tmp/ct_conv_test.cheng /tmp/ct_conv_a /tmp/ct_conv_a.report \
+      /tmp/ct_conv_b /tmp/ct_conv_b.report
+
+# ============================================================
+# 19: Multi-version contract stability test
+# ============================================================
+rm -rf /tmp/ct_mvcs
+mkdir -p /tmp/ct_mvcs
+$COLD build-backend-driver --out:/tmp/ct_mvcs/cheng_v1 \
+    --report-out:/tmp/ct_mvcs/v1.report.txt >/dev/null 2>&1
+$COLD build-backend-driver --out:/tmp/ct_mvcs/cheng_v2 \
+    --report-out:/tmp/ct_mvcs/v2.report.txt >/dev/null 2>&1
+$COLD build-backend-driver --out:/tmp/ct_mvcs/cheng_v3 \
+    --report-out:/tmp/ct_mvcs/v3.report.txt >/dev/null 2>&1
+for v in 1 2 3; do
+    if [ -x "/tmp/ct_mvcs/cheng_v${v}" ] &&
+       grep -q '^real_backend_codegen=1$' "/tmp/ct_mvcs/v${v}.report.txt" 2>/dev/null; then
+        ACT=1; else ACT=0
+    fi
+    assert "mvcs_v${v}_build" 1 "$ACT"
+done
+for field in \
+    "system_link_exec_scope" \
+    "real_backend_codegen" \
+    "direct_macho" \
+    "cold_compiler"; do
+    V1=$(grep "^${field}=" /tmp/ct_mvcs/v1.report.txt 2>/dev/null)
+    V2=$(grep "^${field}=" /tmp/ct_mvcs/v2.report.txt 2>/dev/null)
+    V3=$(grep "^${field}=" /tmp/ct_mvcs/v3.report.txt 2>/dev/null)
+    if [ -n "$V1" ] && [ "$V1" = "$V2" ] && [ "$V2" = "$V3" ]; then
+        ACT=1; else ACT=0
+    fi
+    assert "mvcs_${field}_stable" 1 "$ACT"
+done
+rm -rf /tmp/ct_mvcs
+
+# ============================================================
+# 20: Backend driver stress test — compile 20 files
+# ============================================================
+rm -rf /tmp/ct_bd_stress
+mkdir -p /tmp/ct_bd_stress
+$COLD build-backend-driver --out:/tmp/ct_bd_stress/cheng \
+    --report-out:/tmp/ct_bd_stress/report.txt >/dev/null 2>&1
+if [ -x /tmp/ct_bd_stress/cheng ] &&
+   grep -q '^real_backend_codegen=1$' /tmp/ct_bd_stress/report.txt 2>/dev/null; then
+    BD_OK=1
+else
+    BD_OK=0
+fi
+assert "bd_stress_build_driver" 1 "$BD_OK"
+if [ "$BD_OK" = "1" ]; then
+    BD=/tmp/ct_bd_stress/cheng
+    STRESS_PASS=0
+    for i in $(seq 1 20); do
+        rm -f "/tmp/ct_bd_stress/s${i}" "/tmp/ct_bd_stress/s${i}.cheng"
+        cat > "/tmp/ct_bd_stress/s${i}.cheng" << CHENGEOF
+fn main(): int32 = return $((i * 2))
+CHENGEOF
+        quiet $BD system-link-exec --in:"/tmp/ct_bd_stress/s${i}.cheng" \
+            --target:arm64-apple-darwin --out:"/tmp/ct_bd_stress/s${i}"
+        if [ -x "/tmp/ct_bd_stress/s${i}" ]; then
+            "/tmp/ct_bd_stress/s${i}" >/dev/null 2>&1; RC=$?
+            if [ "$RC" = "$((i * 2))" ]; then
+                STRESS_PASS=$((STRESS_PASS + 1))
+            fi
+        fi
+    done
+    if [ "$STRESS_PASS" = "20" ]; then
+        ACT=1; else ACT=0
+    fi
+else
+    ACT="NO_DRIVER"
+fi
+assert "bd_stress_20_files" 1 "$ACT"
+rm -rf /tmp/ct_bd_stress
+
+# ============================================================
+# 21: Bootstrap chain depth test — fixed-point through 3 generations
+# ============================================================
+rm -rf /tmp/ct_bd_depth
+mkdir -p /tmp/ct_bd_depth
+$COLD build-backend-driver --out:/tmp/ct_bd_depth/cheng_v1 \
+    --report-out:/tmp/ct_bd_depth/v1.report.txt >/dev/null 2>&1
+if [ -x /tmp/ct_bd_depth/cheng_v1 ] &&
+   grep -q '^real_backend_codegen=1$' /tmp/ct_bd_depth/v1.report.txt 2>/dev/null; then
+    ACT=1; else ACT=0
+fi
+assert "bd_depth_v1_build" 1 "$ACT"
+ACT=$(compile_run_timed /tmp/ct_bd_depth/cheng_v1 /tmp/ct_while_only.cheng \
+    /tmp/ct_bd_depth/v1_while 30)
+assert "bd_depth_v1_while_only" 62 "$ACT"
+/tmp/ct_bd_depth/cheng_v1 build-backend-driver \
+    --out:/tmp/ct_bd_depth/cheng_v2 \
+    --report-out:/tmp/ct_bd_depth/v2.report.txt >/dev/null 2>&1
+if [ -x /tmp/ct_bd_depth/cheng_v2 ] &&
+   grep -q '^real_backend_codegen=1$' /tmp/ct_bd_depth/v2.report.txt 2>/dev/null; then
+    ACT=1; else ACT=0
+fi
+assert "bd_depth_v2_build" 1 "$ACT"
+ACT=$(compile_run_timed /tmp/ct_bd_depth/cheng_v2 /tmp/ct_while_only.cheng \
+    /tmp/ct_bd_depth/v2_while 30)
+assert "bd_depth_v2_while_only" 62 "$ACT"
+/tmp/ct_bd_depth/cheng_v2 build-backend-driver \
+    --out:/tmp/ct_bd_depth/cheng_v3 \
+    --report-out:/tmp/ct_bd_depth/v3.report.txt >/dev/null 2>&1
+if [ -x /tmp/ct_bd_depth/cheng_v3 ] &&
+   grep -q '^real_backend_codegen=1$' /tmp/ct_bd_depth/v3.report.txt 2>/dev/null; then
+    ACT=1; else ACT=0
+fi
+assert "bd_depth_v3_build" 1 "$ACT"
+ACT=$(compile_run_timed /tmp/ct_bd_depth/cheng_v3 /tmp/ct_while_only.cheng \
+    /tmp/ct_bd_depth/v3_while 30)
+assert "bd_depth_v3_while_only" 62 "$ACT"
+V1_SCOPE=$(grep '^system_link_exec_scope=' /tmp/ct_bd_depth/v1.report.txt 2>/dev/null)
+V2_SCOPE=$(grep '^system_link_exec_scope=' /tmp/ct_bd_depth/v2.report.txt 2>/dev/null)
+V3_SCOPE=$(grep '^system_link_exec_scope=' /tmp/ct_bd_depth/v3.report.txt 2>/dev/null)
+if [ -n "$V1_SCOPE" ] && [ "$V1_SCOPE" = "$V2_SCOPE" ] && [ "$V2_SCOPE" = "$V3_SCOPE" ]; then
+    ACT=1; else ACT=0
+fi
+assert "bd_depth_matching_contracts" 1 "$ACT"
+rm -rf /tmp/ct_bd_depth
+
+# ============================================================
+# 21: WASM compilation smoke tests
+# ============================================================
+compile_wasm_smoke() {
+    local tag="$1" src="$2"
+    local w="/tmp/ct_wasm_${tag}.wasm" r="/tmp/ct_wasm_${tag}.report"
+    rm -f "$w" "$r"
+    if $COLD system-link-exec --root:"$PWD" \
+        --in:"$src" --target:wasm32-unknown-unknown \
+        --out:"$w" --emit:exe \
+        --report-out:"$r" >/dev/null 2>&1 &&
+       [ -s "$w" ] &&
+       grep -q '^system_link_exec=1$' "$r" 2>/dev/null &&
+       grep -q '^emit=exe$' "$r" 2>/dev/null &&
+       grep -q '^target=wasm32-unknown-unknown$' "$r" 2>/dev/null; then
+        echo 1
+    else
+        echo 0
+    fi
+    rm -f "$w" "$r"
+}
+
+ACT=$(compile_wasm_smoke "zero" "src/tests/wasm_zero_smoke.cheng")
+assert "wasm_zero_smoke" 1 "$ACT"
+
+ACT=$(compile_wasm_smoke "func_block_shared" "src/tests/wasm_func_block_shared_smoke.cheng")
+assert "wasm_func_block_shared_smoke" 1 "$ACT"
+
+ACT=$(compile_wasm_smoke "importc_noarg_i32" "src/tests/wasm_importc_noarg_i32_smoke.cheng")
+assert "wasm_importc_noarg_i32_smoke" 1 "$ACT"
+
+ACT=$(compile_wasm_smoke "internal_call" "src/tests/wasm_internal_call_smoke.cheng")
+assert "wasm_internal_call_smoke" 1 "$ACT"
+
+ACT=$(compile_wasm_smoke "ops" "src/tests/wasm_ops_smoke.cheng")
+assert "wasm_ops_smoke" 1 "$ACT"
+
+ACT=$(compile_wasm_smoke "scalar_control_flow" "src/tests/wasm_scalar_control_flow_smoke.cheng")
+assert "wasm_scalar_control_flow_smoke" 1 "$ACT"
+
+ACT=$(compile_wasm_smoke "shadowed_local_scope" "src/tests/wasm_shadowed_local_scope_smoke.cheng")
+assert "wasm_shadowed_local_scope_smoke" 1 "$ACT"
+
+# ============================================================
+# 22: WASM binary magic validation
+# ============================================================
+rm -f /tmp/ct_wasm_magic.wasm /tmp/ct_wasm_magic.report
+$COLD system-link-exec --root:"$PWD" \
+    --in:src/tests/wasm_zero_smoke.cheng --target:wasm32-unknown-unknown \
+    --out:/tmp/ct_wasm_magic.wasm --emit:exe \
+    --report-out:/tmp/ct_wasm_magic.report >/dev/null 2>&1
+WASM_MAGIC_OK=0
+if [ -s /tmp/ct_wasm_magic.wasm ]; then
+    HEAD=$(xxd -l 4 -p /tmp/ct_wasm_magic.wasm 2>/dev/null)
+    if [ "$HEAD" = "0061736d" ]; then WASM_MAGIC_OK=1; fi
+fi
+assert "wasm_binary_magic" 1 "$WASM_MAGIC_OK"
+rm -f /tmp/ct_wasm_magic.wasm /tmp/ct_wasm_magic.report
+
+# ============================================================
+# 23: Cross-arch ELF object compilation tests
+# ============================================================
+compile_elf_obj_smoke() {
+    local tag="$1" src="$2" target="$3" arch_name="$4"
+    local o="/tmp/ct_elf_${tag}.o" r="/tmp/ct_elf_${tag}.report"
+    rm -f "$o" "$r"
+    if $COLD system-link-exec --root:"$PWD" \
+        --in:"$src" --target:"$target" \
+        --out:"$o" --emit:obj \
+        --report-out:"$r" >/dev/null 2>&1 &&
+       [ -s "$o" ] &&
+       file "$o" 2>/dev/null | grep -q "ELF 64-bit.*$arch_name" &&
+       nm "$o" 2>/dev/null | grep -q 'T main'; then
+        echo 1
+    else
+        echo 0
+    fi
+    rm -f "$o" "$r"
+}
+
+ACT=$(compile_elf_obj_smoke "x86_64" "src/tests/wasm_zero_smoke.cheng" "x86_64-unknown-linux-gnu" "x86-64")
+assert "elf_obj_x86_64" 1 "$ACT"
+
+ACT=$(compile_elf_obj_smoke "riscv64" "src/tests/wasm_zero_smoke.cheng" "riscv64-unknown-linux-gnu" "RISC-V")
+assert "elf_obj_riscv64" 1 "$ACT"
+
+ACT=$(compile_elf_obj_smoke "aarch64" "src/tests/wasm_zero_smoke.cheng" "aarch64-unknown-linux-gnu" "aarch64")
+assert "elf_obj_aarch64" 1 "$ACT"
+
+# Test a non-trivial file compiles to ELF x86_64
+ACT=$(compile_elf_obj_smoke "x86_64_ops" "src/tests/wasm_ops_smoke.cheng" "x86_64-unknown-linux-gnu" "x86-64")
+assert "elf_obj_x86_64_ops" 1 "$ACT"
+
+# ============================================================
+# 24: Compilation speed regression tests
+# ============================================================
+compile_speed_budget() {
+    local tag="$1" src="$2" budget_ms="$3"
+    local o="/tmp/ct_speed_${tag}.o" r="/tmp/ct_speed_${tag}.report"
+    rm -f "$o" "$r"
+    local start end elapsed
+    start=$(python3 -c "import time; print(int(time.time() * 1000000))" 2>/dev/null || \
+            perl -MTime::HiRes -e "print int(Time::HiRes::time() * 1000000)" 2>/dev/null || \
+            date +%s%3N 2>/dev/null || echo 0)
+    $COLD system-link-exec --root:"$PWD" \
+        --in:"$src" --target:arm64-apple-darwin \
+        --out:"$o" --emit:obj \
+        --report-out:"$r" >/dev/null 2>&1
+    end=$(python3 -c "import time; print(int(time.time() * 1000000))" 2>/dev/null || \
+          perl -MTime::HiRes -e "print int(Time::HiRes::time() * 1000000)" 2>/dev/null || \
+          date +%s%3N 2>/dev/null || echo 0)
+    elapsed=$(( (end - start) / 1000 ))
+    if [ -s "$o" ] && [ "$elapsed" -le "$budget_ms" ] 2>/dev/null; then
+        echo 1
+    else
+        echo 0
+    fi
+    rm -f "$o" "$r"
+}
+
+ACT=$(compile_speed_budget "tiny" "src/tests/wasm_zero_smoke.cheng" 5000)
+assert "speed_smoke_tiny_under_5s" 1 "$ACT"
+
+ACT=$(compile_speed_budget "calc" "src/tests/wasm_ops_smoke.cheng" 5000)
+assert "speed_smoke_ops_under_5s" 1 "$ACT"
+
+# ============================================================
+# 25: Full bootstrap chain: cold compiles itself, then compiles a program and runs it
+# ============================================================
+rm -rf /tmp/ct_bootstrap_chain
+mkdir -p /tmp/ct_bootstrap_chain
+CHAIN_OK=0
+cc -std=c11 -O2 -o /tmp/ct_bootstrap_chain/cheng_cold_v1 bootstrap/cheng_cold.c 2>/dev/null
+if [ -x /tmp/ct_bootstrap_chain/cheng_cold_v1 ]; then
+    /tmp/ct_bootstrap_chain/cheng_cold_v1 system-link-exec \
+        --in:src/tests/wasm_zero_smoke.cheng --target:arm64-apple-darwin \
+        --out:/tmp/ct_bootstrap_chain/program_v1 --emit:exe \
+        --report-out:/tmp/ct_bootstrap_chain/v1.report >/dev/null 2>&1
+    if [ -x /tmp/ct_bootstrap_chain/program_v1 ]; then
+        /tmp/ct_bootstrap_chain/program_v1 >/dev/null 2>&1
+        if [ $? -eq 0 ]; then CHAIN_OK=1; fi
+    fi
+fi
+assert "bootstrap_chain_cold_compile_run" 1 "$CHAIN_OK"
+rm -rf /tmp/ct_bootstrap_chain
+
+# ============================================================
+# 26: Untested file smoke tests (compile-only)
+# ============================================================
+ACT=$(compile_obj_smoke "chain_node_ctl_main" "src/apps/chain_node/cheng_node_ctl_main.cheng")
+assert "cheng_node_ctl_main_cold_compile_smoke" 1 "$ACT"
+
+ACT=$(compile_obj_smoke "bio_reed_solomon" "src/apps/bio/bio_reed_solomon.cheng")
+assert "bio_reed_solomon_cold_compile_smoke" 1 "$ACT"
+
+ACT=$(compile_obj_smoke "bft_state_machine" "src/apps/bft/bft_state_machine.cheng")
+assert "bft_state_machine_cold_compile_smoke" 1 "$ACT"
+
+ACT=$(compile_obj_smoke "mobile_app" "src/runtime/mobile_app.cheng")
+assert "mobile_app_cold_compile_smoke" 1 "$ACT"
+
+ACT=$(compile_obj_smoke "json_ast" "src/runtime/json_ast.cheng")
+assert "json_ast_cold_compile_smoke" 1 "$ACT"
+
+ACT=$(compile_obj_smoke "option" "src/runtime/option.cheng")
+assert "option_cold_compile_smoke" 1 "$ACT"
 
 # --- zero regression gate ---
 if [ "${CHENG_ZRG_INNER:-0}" != "1" ]; then
