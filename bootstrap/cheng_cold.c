@@ -4791,6 +4791,26 @@ ObjectField *object_find_field(ObjectDef *object, Span name) {
     return 0;
 }
 
+static bool cold_simple_builtin_type_name(Span type) {
+    type = span_trim(cold_type_strip_var(type, 0));
+    return span_eq(type, "int32") || span_eq(type, "int") ||
+           span_eq(type, "bool") || span_eq(type, "uint8") ||
+           span_eq(type, "int8") || span_eq(type, "char") ||
+           span_eq(type, "uint32") || span_eq(type, "int64") ||
+           span_eq(type, "uint64") || span_eq(type, "str") ||
+           span_eq(type, "cstring") || span_eq(type, "ptr") ||
+           span_eq(type, "void");
+}
+
+static bool cold_unresolved_single_letter_generic_arg(Symbols *symbols, Span type) {
+    type = span_trim(cold_type_strip_var(type, 0));
+    if (type.len != 1 || type.ptr[0] < 'A' || type.ptr[0] > 'Z') return false;
+    if (cold_simple_builtin_type_name(type)) return false;
+    if (symbols && symbols_find_type(symbols, type)) return false;
+    if (symbols && symbols_find_object(symbols, type)) return false;
+    return true;
+}
+
 static ObjectDef *symbols_add_object(Symbols *symbols, Span name, int32_t field_count) {
     ObjectDef *existing = symbols_find_object(symbols, name);
     if (existing) return existing; /* skip duplicate (imported type already defined) */
@@ -5022,15 +5042,21 @@ static ObjectDef *symbols_resolve_object(Symbols *symbols, Span type_name) {
         ObjectField *src = &base->fields[fi];
         ObjectField *dst = &inst->fields[fi];
         Span field_type = cold_substitute_generic_object_type(base, src->type_name, args, arg_count);
-        /* fallback: if substitution produced empty span (e.g. src->type_name missing), use arg directly */
-        if (field_type.len <= 0 && span_eq(src->name, "value") && arg_count > 0) {
-            field_type = args[0];
+        bool unresolved_generic = false;
+        for (int32_t ai = 0; ai < arg_count; ai++) {
+            if (span_same(field_type, args[ai]) &&
+                cold_unresolved_single_letter_generic_arg(symbols, args[ai])) {
+                unresolved_generic = true;
+                break;
+            }
         }
-        int32_t fk = cold_slot_kind_from_type_with_symbols(symbols, field_type);
+        int32_t fk = unresolved_generic ? SLOT_I32
+                                        : cold_slot_kind_from_type_with_symbols(symbols, field_type);
         dst->name = src->name;
         dst->type_name = field_type;
         dst->kind = fk;
-        dst->size = cold_slot_size_from_type_with_symbols(symbols, field_type, fk);
+        dst->size = unresolved_generic ? 4
+                                       : cold_slot_size_from_type_with_symbols(symbols, field_type, fk);
         dst->array_len = 0;
         if (fk == SLOT_ARRAY_I32 && !cold_parse_i32_array_type(field_type, &dst->array_len) && !cold_span_starts_with(span_trim(field_type), "uint8[")) {
             dst->array_len = 4; /* default */
@@ -5795,12 +5821,18 @@ static void cold_csg_add_function(ColdCsg *csg, Span *fields, int32_t field_coun
     if (index != csg->function_count) die("cold csg functions must be dense and ordered");
     cold_csg_ensure_functions(csg);
     ColdCsgFunction *fn = &csg->functions[csg->function_count++];
+    memset(fn, 0, sizeof(*fn));
     fn->name = fields[2];
     fn->params = fields[3];
     fn->ret = fields[4];
     fn->stmt_start = -1;
     fn->stmt_count = 0;
     fn->symbol_index = -1;
+    if (field_count > 5 && fields[5].len > 0) {
+        fn->generic_count = cold_split_top_level_commas(fields[5],
+                                                        fn->generic_names,
+                                                        4);
+    }
 }
 
 /* Un-escape CSG escape sequences (\t, \n, \\\\) in-place within an arena-allocated buffer.
@@ -5864,29 +5896,27 @@ static void cold_csg_finalize(ColdCsg *csg) {
         Span names[COLD_MAX_I32_PARAMS];
         int32_t kinds[COLD_MAX_I32_PARAMS];
         int32_t sizes[COLD_MAX_I32_PARAMS];
-        int32_t arity = parse_param_specs(csg->symbols, csg->functions[i].params,
-                                          names, kinds, sizes, 0, COLD_MAX_I32_PARAMS);
-        /* refine kinds using symbols table (must match parse_fn's cold_slot_kind_from_type_with_symbols) */
         Span tnames[COLD_MAX_I32_PARAMS];
-        int32_t refined_kinds[COLD_MAX_I32_PARAMS];
-        int32_t refined_sizes[COLD_MAX_I32_PARAMS];
-        int32_t r_arity = parse_param_specs(csg->symbols, csg->functions[i].params,
-                                            names, refined_kinds, refined_sizes, tnames, COLD_MAX_I32_PARAMS);
-        if (r_arity == arity) {
-            memcpy(kinds, refined_kinds, (size_t)arity * sizeof(int32_t));
-            memcpy(sizes, refined_sizes, (size_t)arity * sizeof(int32_t));
-        }
+        int32_t arity = parse_param_specs_with_generics(csg->symbols,
+                                                        csg->functions[i].params,
+                                                        csg->functions[i].generic_names,
+                                                        csg->functions[i].generic_count,
+                                                        names, kinds, sizes,
+                                                        tnames,
+                                                        COLD_MAX_I32_PARAMS);
         csg->functions[i].symbol_index = symbols_add_fn(csg->symbols,
                                                         csg->functions[i].name,
                                                         arity,
                                                         kinds,
                                                         sizes,
                                                         csg->functions[i].ret);
-if (csg->functions[i].generic_count > 0)
-           symbols_set_fn_generics(csg->symbols, csg->functions[i].symbol_index,
-                                   csg->functions[i].generic_names,
-                                   csg->functions[i].generic_count);
-     }
+        symbols_set_fn_param_types(csg->symbols, csg->functions[i].symbol_index,
+                                   tnames, arity);
+        if (csg->functions[i].generic_count > 0)
+            symbols_set_fn_generics(csg->symbols, csg->functions[i].symbol_index,
+                                    csg->functions[i].generic_names,
+                                    csg->functions[i].generic_count);
+    }
     int32_t prev_fn = -1;
     for (int32_t i = 0; i < csg->stmt_count; i++) {
         ColdCsgStmt *stmt = &csg->stmts[i];
@@ -12191,27 +12221,160 @@ static void x64_codegen_op(X64Code *x, BodyIR *body, Symbols *symbols,
         int32_t pia_done = x->len;
         x->buf[pia_empty + 1] = (uint8_t)(pia_done - (pia_empty + 2));
         x->buf[pia_not + 1] = (uint8_t)(pia_done - (pia_not + 2));
+    /* Seq set len: load len from a, store to dst->len */
+    } else if (kind == BODY_OP_SEQ_SET_LEN) {
+        x64_mov_r32_mr32(x, 0, 4, body->slot_offset[a]);
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
+    /* Make empty seq_i32: zero-fill the entire slot */
+    } else if (kind == BODY_OP_MAKE_SEQ_I32) {
+        x64_xor_r64_r64(x, 0, 0);
+        { int32_t xz = body->slot_size[dst];
+          for (int32_t xi = 0; xi < xz; xi += 8)
+              x64_mov_mr64_r64(x, 4, off_dst + xi, 0); }
+    /* Copy raw: byte-level memcpy via rep movsb */
+    } else if (kind == BODY_OP_COPY_RAW) {
+        x64_mov_r64_mr64(x, 7, 4, body->slot_offset[a]);   /* rdi = dst ptr */
+        x64_mov_r64_mr64(x, 6, 4, body->slot_offset[b]);   /* rsi = src ptr */
+        if (body->slot_kind[c] == SLOT_I32)
+            x64_mov_r32_mr32(x, 1, 4, body->slot_offset[c]); /* rcx = count (i32) */
+        else
+            x64_mov_r64_mr64(x, 1, 4, body->slot_offset[c]); /* rcx = count (i64) */
+        x64_emit1(x, 0xF3); x64_emit1(x, 0xA4);             /* rep movsb */
+        x64_mov_mr32_imm32(x, 4, off_dst, 0);                /* result = 0 */
+    /* Set raw: byte-level memset via rep stosb */
+    } else if (kind == BODY_OP_SET_RAW) {
+        x64_mov_r64_mr64(x, 7, 4, body->slot_offset[a]);   /* rdi = dst ptr */
+        if (body->slot_kind[b] == SLOT_I32)
+            x64_mov_r32_mr32(x, 0, 4, body->slot_offset[b]); /* eax = byte val */
+        else
+            x64_mov_r64_mr64(x, 0, 4, body->slot_offset[b]); /* rax = byte val */
+        if (body->slot_kind[c] == SLOT_I32)
+            x64_mov_r32_mr32(x, 1, 4, body->slot_offset[c]); /* rcx = count (i32) */
+        else
+            x64_mov_r64_mr64(x, 1, 4, body->slot_offset[c]); /* rcx = count (i64) */
+        x64_emit1(x, 0xF3); x64_emit1(x, 0xAA);             /* rep stosb */
+        x64_mov_mr32_imm32(x, 4, off_dst, 0);                /* result = 0 */
+    /* Heap alloc: mmap(addr=0, len, prot=RW, flags=ANON|PRIVATE, fd=-1, off=0) */
+    } else if (kind == BODY_OP_HEAP_ALLOC) {
+        x64_mov_r64_imm64(x, 7, 0);                         /* rdi = addr = 0 */
+        if (body->slot_kind[a] == SLOT_I32) {
+            x64_mov_r32_mr32(x, 0, 4, body->slot_offset[a]); /* eax = len (i32) */
+            x64_mov_r64_r64(x, 6, 0);                        /* rsi = len */
+        } else {
+            x64_mov_r64_mr64(x, 6, 4, body->slot_offset[a]); /* rsi = len (i64) */
+        }
+        x64_mov_r64_imm64(x, 2, 3);                          /* rdx = PROT_READ|WRITE */
+        x64_mov_r64_imm64(x, 10, 0x1002);                    /* r10 = MAP_PRIVATE|ANON */
+        x64_mov_r64_imm64(x, 8, -1ULL);                      /* r8 = fd = -1 */
+        x64_mov_r64_imm64(x, 9, 0);                          /* r9 = offset = 0 */
+        x64_mov_r32_imm32(x, 0, 0x20000C5);                  /* rax = mmap */
+        x64_syscall(x);
+        x64_mov_mr64_r64(x, 4, off_dst, 0);                  /* store result ptr */
+    /* Heap free: munmap(ptr, len) */
+    } else if (kind == BODY_OP_HEAP_FREE) {
+        x64_mov_r64_mr64(x, 7, 4, body->slot_offset[a]);   /* rdi = ptr */
+        if (body->slot_kind[b] == SLOT_I32) {
+            x64_mov_r32_mr32(x, 0, 4, body->slot_offset[b]); /* eax = len (i32) */
+            x64_mov_r64_r64(x, 6, 0);                        /* rsi = len */
+        } else {
+            x64_mov_r64_mr64(x, 6, 4, body->slot_offset[b]); /* rsi = len (i64) */
+        }
+        x64_mov_r32_imm32(x, 0, 0x2000049);                  /* rax = munmap */
+        x64_syscall(x);
+        x64_mov_mr32_r32(x, 4, off_dst, 0);                  /* store result */
+    /* Select: conditional copy, a=cond(i32), b=true_val, c=false_val */
+    } else if (kind == BODY_OP_SELECT) {
+        x64_mov_r32_mr32(x, 0, 4, body->slot_offset[a]);    /* load condition */
+        x64_test_r32_r32(x, 0, 0);
+        int32_t sel_else = x->len;
+        x64_jcc_rel8(x, CC_E, 0);                            /* if cond == 0 goto else */
+        { int32_t ssz = body->slot_size[dst];
+          for (int32_t si = 0; si < ssz; si += 8) {
+              x64_mov_r64_mr64(x, 0, 4, body->slot_offset[b] + si);
+              x64_mov_mr64_r64(x, 4, off_dst + si, 0); } }
+        int32_t sel_end = x->len;
+        x64_jmp_rel8(x, 0);                                  /* skip else */
+        { int32_t ssz = body->slot_size[dst];
+          for (int32_t si = 0; si < ssz; si += 8) {
+              x64_mov_r64_mr64(x, 0, 4, body->slot_offset[c] + si);
+              x64_mov_mr64_r64(x, 4, off_dst + si, 0); } }
+        x->buf[sel_else + 1] = (uint8_t)(x->len - (sel_else + 2));
+        x->buf[sel_end + 1] = (uint8_t)(x->len - (sel_end + 2));
+    /* Bytes alloc: mmap byte buffer with zero-init slot */
+    } else if (kind == BODY_OP_BYTES_ALLOC) {
+        x64_xor_r64_r64(x, 0, 0);
+        { int32_t xz = body->slot_size[dst];
+          for (int32_t xi = 0; xi < xz; xi += 8)
+              x64_mov_mr64_r64(x, 4, off_dst + xi, 0); }
+        x64_mov_r32_mr32(x, 0, 4, body->slot_offset[a]);    /* load requested len */
+        x64_test_r32_r32(x, 0, 0);
+        int32_t ba_done = x->len;
+        x64_jcc_rel8(x, CC_E, 0);                            /* if len == 0, done */
+        x64_mov_mr32_r32(x, 4, off_dst + 8, 0);              /* store len at slot+8 */
+        x64_mov_r64_imm64(x, 7, 0);                          /* rdi = addr = 0 */
+        x64_mov_r64_r64(x, 6, 0);                            /* rsi = len (from eax) */
+        x64_mov_r64_imm64(x, 2, 3);                          /* rdx = prot */
+        x64_mov_r64_imm64(x, 10, 0x1002);                    /* r10 = flags */
+        x64_mov_r64_imm64(x, 8, -1ULL);                      /* r8 = fd = -1 */
+        x64_mov_r64_imm64(x, 9, 0);                          /* r9 = offset = 0 */
+        x64_mov_r32_imm32(x, 0, 0x20000C5);                  /* rax = mmap */
+        x64_syscall(x);
+        x64_mov_mr64_r64(x, 4, off_dst, 0);                  /* store data ptr */
+        x->buf[ba_done + 1] = (uint8_t)(x->len - (ba_done + 2));
+    } else if (kind == BODY_OP_REMOVE_FILE) {
+        x64_mov_r64_mr64(x, 7, 4, body->slot_offset[a]);  /* RDI = path ptr */
+        x64_mov_r32_imm32(x, 0, 0x200000A);                  /* RAX = SYS_unlink */
+        x64_syscall(x);
+        x64_test_r32_r32(x, 0, 0);
+        x64_setcc_r8(x, CC_E, 0);
+        x64_movzb_r8_r32(x, 0, 0);
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_MKDIR_ONE) {
+        x64_mov_r64_mr64(x, 7, 4, body->slot_offset[a]);  /* RDI = path ptr */
+        x64_mov_r64_imm64(x, 6, 0755);                       /* RSI = mode */
+        x64_mov_r32_imm32(x, 0, 0x2000088);                  /* RAX = SYS_mkdir (136=0x88) */
+        x64_syscall(x);
+        x64_test_r32_r32(x, 0, 0);
+        x64_setcc_r8(x, CC_E, 0);
+        x64_movzb_r8_r32(x, 0, 0);
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_CHMOD_X) {
+        x64_mov_r64_mr64(x, 7, 4, body->slot_offset[a]);  /* RDI = path ptr */
+        x64_mov_r64_imm64(x, 6, 0755);                       /* RSI = mode */
+        x64_mov_r32_imm32(x, 0, 0x200000F);                  /* RAX = SYS_chmod (15) */
+        x64_syscall(x);
+        x64_test_r32_r32(x, 0, 0);
+        x64_setcc_r8(x, CC_E, 0);
+        x64_movzb_r8_r32(x, 0, 0);
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
+    } else if (kind == BODY_OP_GETRUSAGE) {
+        if (body->slot_kind[a] != SLOT_I32) return;
+        x64_mov_r32_mr32(x, 7, 4, body->slot_offset[a]);  /* RDI = who */
+        if (body->slot_kind[b] == SLOT_OBJECT_REF || body->slot_kind[b] == SLOT_OPAQUE_REF) {
+            x64_mov_r64_mr64(x, 6, 4, body->slot_offset[b]);  /* RSI = ptr from ref */
+        } else if (body->slot_kind[b] == SLOT_OBJECT || body->slot_kind[b] == SLOT_OPAQUE) {
+            x64_lea_r64_mr(x, 6, 4, body->slot_offset[b]);     /* RSI = &object */
+        } else {
+            return;
+        }
+        x64_mov_r32_imm32(x, 0, 0x200004D);                  /* RAX = SYS_getrusage (77=0x4D) */
+        x64_syscall(x);
+        x64_mov_mr32_r32(x, 4, off_dst, 0);
     /* Remaining target-specific ops are not implemented for x86_64. */
-    } else if (kind == BODY_OP_MAKE_SEQ_I32 ||
-               kind == BODY_OP_TIME_NS || kind == BODY_OP_GETRUSAGE ||
+    } else if (kind == BODY_OP_TIME_NS ||
                kind == BODY_OP_GETENV_STR || kind == BODY_OP_READ_FLAG ||
                kind == BODY_OP_PARSE_INT ||
                kind == BODY_OP_TEXT_SET_INSERT || kind == BODY_OP_CWD_STR ||
                kind == BODY_OP_PATH_JOIN || kind == BODY_OP_PATH_ABSOLUTE ||
                kind == BODY_OP_PATH_PARENT || kind == BODY_OP_PATH_EXISTS ||
                kind == BODY_OP_PATH_FILE_SIZE || kind == BODY_OP_PATH_READ_TEXT ||
-               kind == BODY_OP_PATH_WRITE_TEXT || kind == BODY_OP_REMOVE_FILE ||
-               kind == BODY_OP_CHMOD_X || kind == BODY_OP_COLD_SELF_EXEC ||
-               kind == BODY_OP_MKDIR_ONE || kind == BODY_OP_TEXT_CONTAINS ||
+               kind == BODY_OP_PATH_WRITE_TEXT ||
+               kind == BODY_OP_COLD_SELF_EXEC || kind == BODY_OP_TEXT_CONTAINS ||
                kind == BODY_OP_EXEC_SHELL || kind == BODY_OP_ARGV_STR ||
                kind == BODY_OP_SEQ_OPAQUE_INDEX_REF_DYNAMIC ||
-               kind == BODY_OP_HEAP_ALLOC || kind == BODY_OP_HEAP_FREE ||
-               /* Previously unknown ops moved to unsupported list */
-               kind == BODY_OP_BYTES_ALLOC || kind == BODY_OP_BYTES_GET ||
-               kind == BODY_OP_BYTES_SET || kind == BODY_OP_BYTES_TO_HEX ||
-               kind == BODY_OP_COPY_RAW ||
-               kind == BODY_OP_PATH_WRITE_BYTES || kind == BODY_OP_SELECT ||
-               kind == BODY_OP_SEQ_SET_LEN || kind == BODY_OP_SET_RAW) {
+               kind == BODY_OP_BYTES_GET || kind == BODY_OP_BYTES_SET ||
+               kind == BODY_OP_BYTES_TO_HEX ||
+               kind == BODY_OP_PATH_WRITE_BYTES) {
         fprintf(stderr, "cheng_cold: unsupported x86_64 BodyIR op kind=%d\n", kind);
         die("unsupported x86_64 BodyIR op");
     } else {
@@ -12899,6 +13062,101 @@ static void rv64_codegen_op(Code *code, BodyIR *body, Symbols *symbols,
     } else if (kind == BODY_OP_SEQ_SET_LEN) {
         code_emit(code, rv_lw(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));
         code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)(off_dst)));
+    /* Open: openat(AT_FDCWD=-100, pathname, flags, mode=0644) */
+    } else if (kind == BODY_OP_OPEN) {
+        code_emit(code, rv_addi(RV_A0, RV_ZERO, -100));                /* AT_FDCWD */
+        code_emit(code, rv_ld(RV_A1, RV_SP, (int16_t)body->slot_offset[a]));  /* path ptr */
+        code_emit(code, rv_lw(RV_A2, RV_SP, (int16_t)body->slot_offset[b]));  /* flags */
+        rv_li(code->words, &code->count, RV_A3, 0644);                        /* mode */
+        rv_li(code->words, &code->count, RV_A7, 56);                          /* SYS_openat */
+        code_emit(code, rv_ecall());
+        code_emit(code, rv_sw(RV_A0, RV_SP, (int16_t)off_dst));               /* result */
+    /* Read: read(fd, buf, count) */
+    } else if (kind == BODY_OP_READ) {
+        code_emit(code, rv_lw(RV_A0, RV_SP, (int16_t)body->slot_offset[a]));  /* fd */
+        code_emit(code, rv_ld(RV_A1, RV_SP, (int16_t)body->slot_offset[b]));  /* buf ptr */
+        code_emit(code, rv_lw(RV_A2, RV_SP, (int16_t)body->slot_offset[c]));  /* count */
+        rv_li(code->words, &code->count, RV_A7, 63);                          /* SYS_read */
+        code_emit(code, rv_ecall());
+        code_emit(code, rv_sw(RV_A0, RV_SP, (int16_t)off_dst));               /* result */
+    } else if (kind == BODY_OP_REMOVE_FILE) {
+        /* unlinkat(AT_FDCWD=-100, path, flags=0) -> bool */
+        code_emit(code, rv_addi(RV_A0, RV_ZERO, -100));                /* AT_FDCWD */
+        code_emit(code, rv_ld(RV_A1, RV_SP, (int16_t)body->slot_offset[a]));  /* path ptr */
+        code_emit(code, rv_addi(RV_A2, RV_ZERO, 0));                   /* flags = 0 */
+        rv_li(code->words, &code->count, RV_A7, 263);                  /* SYS_unlinkat */
+        code_emit(code, rv_ecall());
+        code_emit(code, rv_sltiu(RV_T0, RV_A0, 1));                   /* T0 = (A0==0) ? 1:0 */
+        code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_MKDIR_ONE) {
+        /* mkdirat(AT_FDCWD=-100, path, mode=0755) -> bool */
+        code_emit(code, rv_addi(RV_A0, RV_ZERO, -100));                /* AT_FDCWD */
+        code_emit(code, rv_ld(RV_A1, RV_SP, (int16_t)body->slot_offset[a]));  /* path ptr */
+        rv_li(code->words, &code->count, RV_A2, 0755);                /* mode */
+        rv_li(code->words, &code->count, RV_A7, 264);                  /* SYS_mkdirat */
+        code_emit(code, rv_ecall());
+        code_emit(code, rv_sltiu(RV_T0, RV_A0, 1));                   /* T0 = (A0==0) ? 1:0 */
+        code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_CHMOD_X) {
+        /* fchmodat(AT_FDCWD=-100, path, mode=0755) -> bool */
+        code_emit(code, rv_addi(RV_A0, RV_ZERO, -100));                /* AT_FDCWD */
+        code_emit(code, rv_ld(RV_A1, RV_SP, (int16_t)body->slot_offset[a]));  /* path ptr */
+        rv_li(code->words, &code->count, RV_A2, 0755);                /* mode */
+        rv_li(code->words, &code->count, RV_A7, 268);                  /* SYS_fchmodat */
+        code_emit(code, rv_ecall());
+        code_emit(code, rv_sltiu(RV_T0, RV_A0, 1));                   /* T0 = (A0==0) ? 1:0 */
+        code_emit(code, rv_sw(RV_T0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_GETRUSAGE) {
+        if (body->slot_kind[a] != SLOT_I32) return;
+        code_emit(code, rv_lw(RV_A0, RV_SP, (int16_t)body->slot_offset[a]));  /* who */
+        if (body->slot_kind[b] == SLOT_OBJECT_REF || body->slot_kind[b] == SLOT_OPAQUE_REF) {
+            code_emit(code, rv_ld(RV_A1, RV_SP, (int16_t)body->slot_offset[b]));  /* ptr from ref */
+        } else if (body->slot_kind[b] == SLOT_OBJECT || body->slot_kind[b] == SLOT_OPAQUE) {
+            code_emit(code, rv_addi(RV_A1, RV_SP, (int16_t)body->slot_offset[b])); /* &object */
+        } else {
+            return;
+        }
+        rv_li(code->words, &code->count, RV_A7, 165);                  /* SYS_getrusage */
+        code_emit(code, rv_ecall());
+        code_emit(code, rv_sw(RV_A0, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_BYTES_GET) {
+        code_emit(code, rv_addi(RV_T3, RV_ZERO, 0));                   /* default result = 0 */
+        code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));  /* ptr */
+        code_emit(code, rv_beq(RV_T0, RV_ZERO, 0));                    /* null -> done */
+        int32_t bg_null = code->count - 1;
+        code_emit(code, rv_lw(RV_T1, RV_SP, (int16_t)(body->slot_offset[a] + 8)));  /* len */
+        code_emit(code, rv_lw(RV_T2, RV_SP, (int16_t)body->slot_offset[b]));        /* index */
+        code_emit(code, rv_blt(RV_T2, RV_ZERO, 0));                   /* index<0 -> done */
+        int32_t bg_neg = code->count - 1;
+        code_emit(code, rv_bge(RV_T2, RV_T1, 0));                     /* index>=len -> done */
+        int32_t bg_high = code->count - 1;
+        code_emit(code, rv_add(RV_T3, RV_T0, RV_T2));                 /* addr = ptr + index */
+        code_emit(code, rv_lbu(RV_T3, RV_T3, 0));                      /* load byte */
+        int32_t bg_done = code->count;
+        code->words[bg_null] = rv_beq(RV_T0, RV_ZERO, (int16_t)((bg_done - bg_null) * 4));
+        code->words[bg_neg] = rv_blt(RV_T2, RV_ZERO, (int16_t)((bg_done - bg_neg) * 4));
+        code->words[bg_high] = rv_bge(RV_T2, RV_T1, (int16_t)((bg_done - bg_high) * 4));
+        code_emit(code, rv_sw(RV_T3, RV_SP, (int16_t)off_dst));
+    } else if (kind == BODY_OP_BYTES_SET) {
+        code_emit(code, rv_addi(RV_T3, RV_ZERO, 0));                   /* default result = 0 */
+        code_emit(code, rv_ld(RV_T0, RV_SP, (int16_t)body->slot_offset[a]));  /* ptr */
+        code_emit(code, rv_beq(RV_T0, RV_ZERO, 0));                    /* null -> done */
+        int32_t bs_null = code->count - 1;
+        code_emit(code, rv_lw(RV_T1, RV_SP, (int16_t)(body->slot_offset[a] + 8)));  /* len */
+        code_emit(code, rv_lw(RV_T2, RV_SP, (int16_t)body->slot_offset[b]));        /* index */
+        code_emit(code, rv_blt(RV_T2, RV_ZERO, 0));                   /* index<0 -> done */
+        int32_t bs_neg = code->count - 1;
+        code_emit(code, rv_bge(RV_T2, RV_T1, 0));                     /* index>=len -> done */
+        int32_t bs_high = code->count - 1;
+        code_emit(code, rv_lw(RV_T4, RV_SP, (int16_t)body->slot_offset[c]));        /* value */
+        code_emit(code, rv_add(RV_T5, RV_T0, RV_T2));                 /* addr = ptr + index */
+        code_emit(code, rv_sb(RV_T4, RV_T5, 0));                       /* store byte */
+        code_emit(code, rv_addi(RV_T3, RV_ZERO, 1));                  /* result = 1 (success) */
+        int32_t bs_done = code->count;
+        code->words[bs_null] = rv_beq(RV_T0, RV_ZERO, (int16_t)((bs_done - bs_null) * 4));
+        code->words[bs_neg] = rv_blt(RV_T2, RV_ZERO, (int16_t)((bs_done - bs_neg) * 4));
+        code->words[bs_high] = rv_bge(RV_T2, RV_T1, (int16_t)((bs_done - bs_high) * 4));
+        code_emit(code, rv_sw(RV_T3, RV_SP, (int16_t)off_dst));
     /* Remaining complex ops are not implemented for RV64. */
     } else if (kind == BODY_OP_STR_EQ || kind == BODY_OP_STR_CONCAT ||
                kind == BODY_OP_I32_TO_STR || kind == BODY_OP_I64_TO_STR ||
@@ -12911,12 +13169,10 @@ static void rv64_codegen_op(Code *code, BodyIR *body, Symbols *symbols,
                kind == BODY_OP_PATH_ABSOLUTE || kind == BODY_OP_PATH_PARENT ||
                kind == BODY_OP_PATH_EXISTS || kind == BODY_OP_PATH_FILE_SIZE ||
                kind == BODY_OP_PATH_READ_TEXT || kind == BODY_OP_PATH_WRITE_TEXT ||
-               kind == BODY_OP_REMOVE_FILE || kind == BODY_OP_CHMOD_X ||
-               kind == BODY_OP_COLD_SELF_EXEC || kind == BODY_OP_MKDIR_ONE ||
+               kind == BODY_OP_COLD_SELF_EXEC ||
                kind == BODY_OP_TEXT_CONTAINS || kind == BODY_OP_EXEC_SHELL ||
                kind == BODY_OP_ARGV_STR ||
-               kind == BODY_OP_OPEN || kind == BODY_OP_READ ||
-               kind == BODY_OP_TIME_NS || kind == BODY_OP_GETRUSAGE ||
+               kind == BODY_OP_TIME_NS ||
                kind == BODY_OP_GETENV_STR ||
                kind == BODY_OP_SEQ_I32_ADD || kind == BODY_OP_SEQ_STR_ADD ||
                kind == BODY_OP_SEQ_STR_INDEX_DYNAMIC ||
@@ -12925,7 +13181,6 @@ static void rv64_codegen_op(Code *code, BodyIR *body, Symbols *symbols,
                kind == BODY_OP_SEQ_OPAQUE_INDEX_STORE ||
                kind == BODY_OP_SEQ_OPAQUE_REMOVE ||
                kind == BODY_OP_SEQ_OPAQUE_INDEX_REF_DYNAMIC ||
-               kind == BODY_OP_BYTES_GET || kind == BODY_OP_BYTES_SET ||
                kind == BODY_OP_BYTES_TO_HEX || kind == BODY_OP_PATH_WRITE_BYTES) {
         fprintf(stderr, "cheng_cold: unsupported RV64 BodyIR op kind=%d\n", kind);
         die("unsupported RV64 BodyIR op");
@@ -17410,17 +17665,24 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
         int32_t kinds[COLD_MAX_I32_PARAMS];
         int32_t sizes[COLD_MAX_I32_PARAMS];
         Span tnames[COLD_MAX_I32_PARAMS];
-        int32_t arity = parse_param_specs(csg.symbols, csg.functions[i].params,
-                                          names, kinds, sizes, tnames, COLD_MAX_I32_PARAMS);
+        int32_t arity = parse_param_specs_with_generics(csg.symbols,
+                                                        csg.functions[i].params,
+                                                        csg.functions[i].generic_names,
+                                                        csg.functions[i].generic_count,
+                                                        names, kinds, sizes,
+                                                        tnames,
+                                                        COLD_MAX_I32_PARAMS);
         csg.functions[i].symbol_index = symbols_add_fn(csg.symbols,
                                                         csg.functions[i].name,
                                                         arity, kinds, sizes,
                                                         csg.functions[i].ret);
-if (csg.functions[i].generic_count > 0)
-           symbols_set_fn_generics(csg.symbols, csg.functions[i].symbol_index,
-                                   csg.functions[i].generic_names,
-                                   csg.functions[i].generic_count);
-     }
+        symbols_set_fn_param_types(csg.symbols, csg.functions[i].symbol_index,
+                                   tnames, arity);
+        if (csg.functions[i].generic_count > 0)
+            symbols_set_fn_generics(csg.symbols, csg.functions[i].symbol_index,
+                                    csg.functions[i].generic_names,
+                                    csg.functions[i].generic_count);
+    }
     BodyIR **function_bodies = arena_alloc(arena, (size_t)symbols->function_cap * sizeof(BodyIR *));
     memset(function_bodies, 0, (size_t)symbols->function_cap * sizeof(BodyIR *));
     int32_t entry_function = -1;
@@ -17432,7 +17694,18 @@ if (csg.functions[i].generic_count > 0)
         if (symbol_index < 0 || symbol_index >= symbols->function_cap) die("cold csg function body table overflow");
         ColdCsgFunction *fn = &csg.functions[i];
         int32_t u = 0;
-        u += snprintf(src + u, src_cap - (size_t)u, "fn %.*s(", fn->name.len, fn->name.ptr);
+        u += snprintf(src + u, src_cap - (size_t)u, "fn %.*s", fn->name.len, fn->name.ptr);
+        if (fn->generic_count > 0) {
+            u += snprintf(src + u, src_cap - (size_t)u, "[");
+            for (int32_t gi = 0; gi < fn->generic_count; gi++) {
+                if (gi > 0) u += snprintf(src + u, src_cap - (size_t)u, ",");
+                u += snprintf(src + u, src_cap - (size_t)u, "%.*s",
+                              fn->generic_names[gi].len,
+                              fn->generic_names[gi].ptr);
+            }
+            u += snprintf(src + u, src_cap - (size_t)u, "]");
+        }
+        u += snprintf(src + u, src_cap - (size_t)u, "(");
         if (fn->params.len > 0)
             u += snprintf(src + u, src_cap - (size_t)u, "%.*s", fn->params.len, fn->params.ptr);
         u += snprintf(src + u, src_cap - (size_t)u, ")");
@@ -17458,6 +17731,8 @@ if (csg.functions[i].generic_count > 0)
                 u += snprintf(src + u, src_cap - (size_t)u, "return %.*s\n", st->a.len, st->a.ptr);
             } else if (span_eq(st->kind, "let") || span_eq(st->kind, "var")) {
                 u += snprintf(src + u, src_cap - (size_t)u, "%.*s %.*s = %.*s\n", st->kind.len, st->kind.ptr, st->a.len, st->a.ptr, st->b.len, st->b.ptr);
+            } else if (span_eq(st->kind, "let_t")) {
+                u += snprintf(src + u, src_cap - (size_t)u, "let %.*s: %.*s = %.*s\n", st->a.len, st->a.ptr, st->b.len, st->b.ptr, st->c.len, st->c.ptr);
             } else if (span_eq(st->kind, "var_t")) {
                 u += snprintf(src + u, src_cap - (size_t)u, "var %.*s: %.*s = %.*s\n", st->a.len, st->a.ptr, st->b.len, st->b.ptr, st->c.len, st->c.ptr);
             } else if (span_eq(st->kind, "assign")) {
@@ -17501,7 +17776,9 @@ if (csg.functions[i].generic_count > 0)
             function_bodies[symbol_index] = 0;
             continue;
         }
-        Parser p = {(Span){(const uint8_t *)src, u}, 0, arena, symbols};
+        char *stable_src = arena_alloc(arena, (size_t)u + 1);
+        memcpy(stable_src, src, (size_t)u + 1);
+        Parser p = {(Span){(const uint8_t *)stable_src, u}, 0, arena, symbols};
         int32_t psym = -1;
         cold_current_parsing_body = 0;
         BodyIR *body = parse_fn(&p, &psym);
@@ -18032,8 +18309,11 @@ static bool cold_source_function_symbol_matches(Symbols *symbols,
     Span names[COLD_MAX_I32_PARAMS];
     int32_t kinds[COLD_MAX_I32_PARAMS];
     int32_t sizes[COLD_MAX_I32_PARAMS];
-    int32_t arity = parse_param_specs(symbols, symbol->params, names, kinds, sizes,
-                                      0, COLD_MAX_I32_PARAMS);
+    int32_t arity = parse_param_specs_with_generics(symbols, symbol->params,
+                                                    symbol->generic_names,
+                                                    symbol->generic_count,
+                                                    names, kinds, sizes,
+                                                    0, COLD_MAX_I32_PARAMS);
     if (arity != target->arity) return false;
     int32_t resolved = symbols_find_fn(symbols, symbol->name, arity, kinds, sizes,
                                        symbol->return_type);
@@ -20923,11 +21203,19 @@ static int cold_cmd_provider_archive_pack(int argc, char **argv) {
 
 /* WASM opcodes */
 #define WASM_OP_UNREACHABLE 0x00
+#define WASM_OP_BLOCK    0x02
+#define WASM_OP_LOOP     0x03
+#define WASM_OP_IF       0x04
+#define WASM_OP_ELSE     0x05
 #define WASM_OP_END      0x0B
+#define WASM_OP_BR       0x0C
+#define WASM_OP_BR_IF    0x0D
 #define WASM_OP_RETURN   0x0F
 #define WASM_OP_CALL     0x10
 #define WASM_OP_LOCAL_GET 0x20
 #define WASM_OP_LOCAL_SET 0x21
+#define WASM_OP_I32_LOAD 0x28
+#define WASM_OP_I32_STORE 0x36
 #define WASM_OP_I32_CONST 0x41
 #define WASM_OP_I64_CONST 0x42
 #define WASM_OP_I32_EQZ  0x45
@@ -20970,8 +21258,13 @@ static int cold_cmd_provider_archive_pack(int argc, char **argv) {
 #define WASM_SECTION_TYPE     1
 #define WASM_SECTION_IMPORT   2
 #define WASM_SECTION_FUNCTION 3
+#define WASM_SECTION_MEMORY   5
 #define WASM_SECTION_EXPORT   7
 #define WASM_SECTION_CODE    10
+#define WASM_SECTION_DATA    11
+
+/* Block type for empty (void) blocks */
+#define WASM_BLOCK_TYPE_EMPTY 0x40
 
 /* Byte-level code buffer for WASM (like X64Code) */
 typedef struct WasmCode {
@@ -21031,6 +21324,16 @@ static void wasm_op_local_set(WasmCode *c, uint32_t idx) {
 static void wasm_op_call(WasmCode *c, uint32_t idx) {
     wasm_emit1(c, WASM_OP_CALL);
     wasm_emit_leb128_u(c, idx);
+}
+
+static void wasm_op_br(WasmCode *c, uint32_t depth) {
+    wasm_emit1(c, WASM_OP_BR);
+    wasm_emit_leb128_u(c, depth);
+}
+
+static void wasm_op_br_if(WasmCode *c, uint32_t depth) {
+    wasm_emit1(c, WASM_OP_BR_IF);
+    wasm_emit_leb128_u(c, depth);
 }
 
 /* Convert BodyIR slot kind to WASM value type */
@@ -21310,15 +21613,34 @@ static void wasm_codegen_op(WasmCode *wasm, BodyIR *body, Symbols *symbols,
         wasm_op_i32_const(wasm, (int32_t)b);
         wasm_emit1(wasm, WASM_OP_I32_EQ);
         /* if equal, drop and continue; else return 0 */
-        /* We use if/else/end */
-        wasm_emit1(wasm, 0x04); /* if */
-        wasm_emit1(wasm, WASM_TYPE_I32); /* empty block type */
-        wasm_emit1(wasm, 0x05); /* else */
+        wasm_emit1(wasm, WASM_OP_IF);
+        wasm_emit1(wasm, WASM_BLOCK_TYPE_EMPTY);
+        wasm_emit1(wasm, WASM_OP_ELSE);
         wasm_op_i32_const(wasm, 0);
         wasm_emit1(wasm, WASM_OP_RETURN);
         wasm_emit1(wasm, WASM_OP_END);
         break;
     }
+    case BODY_OP_PTR_LOAD_I32:
+        /* Load i32 from address in slot a */
+        la = wasm_local_for_slot(body, a);
+        ld = wasm_local_for_slot(body, dst);
+        wasm_op_local_get(wasm, (uint32_t)la);
+        wasm_emit1(wasm, WASM_OP_I32_LOAD);
+        wasm_emit_leb128_u(wasm, 2); /* align=2 (4-byte) */
+        wasm_emit_leb128_u(wasm, 0); /* offset=0 */
+        wasm_op_local_set(wasm, (uint32_t)ld);
+        break;
+    case BODY_OP_PTR_STORE_I32:
+        /* Store i32 value from slot a to address in slot dst */
+        la = wasm_local_for_slot(body, a);
+        ld = wasm_local_for_slot(body, dst);
+        wasm_op_local_get(wasm, (uint32_t)ld); /* pointer */
+        wasm_op_local_get(wasm, (uint32_t)la); /* value */
+        wasm_emit1(wasm, WASM_OP_I32_STORE);
+        wasm_emit_leb128_u(wasm, 2); /* align=2 (4-byte) */
+        wasm_emit_leb128_u(wasm, 0); /* offset=0 */
+        break;
     case BODY_OP_STR_LITERAL:
     case BODY_OP_STR_LEN:
         /* Stub: store null/0 */
@@ -21336,6 +21658,79 @@ static void wasm_codegen_op(WasmCode *wasm, BodyIR *body, Symbols *symbols,
         }
         break;
     }
+}
+
+/* Recursively emit WASM code for block bi, following control flow edges.
+ * absorbed[] marks blocks already emitted via recursion (CBR true/false blocks).
+ * Returns 1 if block emitted a terminating op (ret/br/unreachable), 0 if fall-through.
+ */
+static int wasm_emit_block_recursive(WasmCode *wasm, BodyIR *body, Symbols *symbols,
+                                      FunctionPatchList *patches, int32_t bi,
+                                      int32_t *func_to_wasm_idx, bool *absorbed,
+                                      int32_t func_idx) {
+    if (bi < 0 || bi >= body->block_count || absorbed[bi]) return 0;
+    absorbed[bi] = true;
+
+    /* Emit ops for this block */
+    int32_t bs = body->block_op_start[bi];
+    int32_t be = bs + body->block_op_count[bi];
+    for (int32_t oi = bs; oi < be; oi++)
+        wasm_codegen_op(wasm, body, symbols, patches, oi, func_to_wasm_idx);
+
+    /* Handle terminator */
+    int32_t term = body->block_term[bi];
+    if (term < 0) return 0;
+    int32_t tkind = body->term_kind[term];
+
+    if (tkind == BODY_TERM_RET) {
+        int32_t val_slot = body->term_value[term];
+        uint8_t rt = wasm_result_type_for_fn(&symbols->functions[func_idx]);
+        if (val_slot >= 0 && rt != 0) {
+            wasm_op_local_get(wasm, (uint32_t)wasm_local_for_slot(body, val_slot));
+        } else {
+            wasm_op_i32_const(wasm, 0);
+        }
+        wasm_emit1(wasm, WASM_OP_RETURN);
+        return 1;
+    } else if (tkind == BODY_TERM_UNREACHABLE) {
+        wasm_emit1(wasm, WASM_OP_UNREACHABLE);
+        return 1;
+    } else if (tkind == BODY_TERM_BR) {
+        int32_t target = body->term_true_block[term];
+        if (target >= 0 && target < bi) {
+            /* Backward branch = loop continue: br 0 goes to innermost loop start */
+            wasm_op_br(wasm, 0);
+            return 1;
+        }
+        /* Forward branch: fall through (next block in linear order) */
+        return 0;
+    } else if (tkind == BODY_TERM_CBR) {
+        int32_t cond_slot = body->term_value[term];
+        int32_t tb = body->term_true_block[term];
+        int32_t fb = body->term_false_block[term];
+
+        /* Load condition value (0 or 1, non-zero = true) */
+        wasm_op_local_get(wasm, (uint32_t)wasm_local_for_slot(body, cond_slot));
+
+        /* if cond { ... } else { ... } end */
+        wasm_emit1(wasm, WASM_OP_IF);
+        wasm_emit1(wasm, WASM_BLOCK_TYPE_EMPTY);
+
+        /* Emit true branch block recursively */
+        wasm_emit_block_recursive(wasm, body, symbols, patches, tb,
+                                  func_to_wasm_idx, absorbed, func_idx);
+
+        /* Emit false branch if present and not already absorbed */
+        if (fb >= 0 && fb < body->block_count && !absorbed[fb]) {
+            wasm_emit1(wasm, WASM_OP_ELSE);
+            wasm_emit_block_recursive(wasm, body, symbols, patches, fb,
+                                      func_to_wasm_idx, absorbed, func_idx);
+        }
+
+        wasm_emit1(wasm, WASM_OP_END);
+        return 1;
+    }
+    return 0;
 }
 
 /* Generate WASM bytecode for a single function body */
@@ -21359,38 +21754,51 @@ static void wasm_codegen_func(WasmCode *wasm, BodyIR *body, Symbols *symbols,
         wasm_emit1(wasm, WASM_TYPE_I64);
     }
 
-    /* 2. Emit ops for each block */
+    /* 2. Pre-pass: detect loop headers (blocks with backward incoming edges) */
+    bool *is_loop_header = (bool *)calloc((size_t)body->block_count, 1);
     for (int32_t bi = 0; bi < body->block_count; bi++) {
-        int32_t bs = body->block_op_start[bi];
-        int32_t be = bs + body->block_op_count[bi];
-        for (int32_t oi = bs; oi < be; oi++)
-            wasm_codegen_op(wasm, body, symbols, patches, oi, func_to_wasm_idx);
-
-        /* 3. Handle terminator */
-        int32_t term = body->block_term[bi];
-        if (term < 0) continue;
-        int32_t tkind = body->term_kind[term];
-        if (tkind == BODY_TERM_RET) {
-            int32_t val_slot = body->term_value[term];
-            int32_t val_kind = body->slot_kind[val_slot];
-            uint8_t rt = wasm_result_type_for_fn(&symbols->functions[func_idx]);
-            /* Load return value onto stack. For composite returns, just return 0. */
-            if (val_slot >= 0 && rt != 0) {
-                wasm_op_local_get(wasm, (uint32_t)wasm_local_for_slot(body, val_slot));
-            } else {
-                wasm_op_i32_const(wasm, 0);
-            }
-            /* If the function has sret, the return type should be void */
-            if (body->sret_slot >= 0) {
-                /* void return - just return */
-            }
-            wasm_emit1(wasm, WASM_OP_RETURN);
-        } else if (tkind == BODY_TERM_UNREACHABLE) {
-            wasm_emit1(wasm, WASM_OP_UNREACHABLE);
-            /* Actually just use 0x00 which is unreachable */
+        int32_t term_idx = body->block_term[bi];
+        if (term_idx < 0) continue;
+        int32_t tkind = body->term_kind[term_idx];
+        if (tkind == BODY_TERM_BR) {
+            int32_t target = body->term_true_block[term_idx];
+            if (target >= 0 && target < bi) is_loop_header[target] = true;
+        } else if (tkind == BODY_TERM_CBR) {
+            int32_t tb = body->term_true_block[term_idx];
+            int32_t fb = body->term_false_block[term_idx];
+            if (tb >= 0 && tb < bi) is_loop_header[tb] = true;
+            if (fb >= 0 && fb < bi) is_loop_header[fb] = true;
         }
     }
-    wasm_emit1(wasm, WASM_OP_END);
+
+    /* 3. Emit blocks with structured control flow */
+    bool *absorbed = (bool *)calloc((size_t)body->block_count, 1);
+
+    for (int32_t bi = 0; bi < body->block_count; bi++) {
+        if (absorbed[bi]) continue;
+
+        if (is_loop_header[bi]) {
+            /* Loop header: wrap in block (break) + loop (continue) */
+            wasm_emit1(wasm, WASM_OP_BLOCK);
+            wasm_emit1(wasm, WASM_BLOCK_TYPE_EMPTY);
+            wasm_emit1(wasm, WASM_OP_LOOP);
+            wasm_emit1(wasm, WASM_BLOCK_TYPE_EMPTY);
+
+            /* Emit loop body recursively from loop header */
+            wasm_emit_block_recursive(wasm, body, symbols, patches, bi,
+                                      func_to_wasm_idx, absorbed, func_idx);
+
+            wasm_emit1(wasm, WASM_OP_END); /* end loop */
+            wasm_emit1(wasm, WASM_OP_END); /* end block */
+        } else {
+            wasm_emit_block_recursive(wasm, body, symbols, patches, bi,
+                                      func_to_wasm_idx, absorbed, func_idx);
+        }
+    }
+
+    wasm_emit1(wasm, WASM_OP_END); /* end function body */
+    free(is_loop_header);
+    free(absorbed);
 }
 
 /* Write a complete .wasm binary module.
@@ -21448,25 +21856,34 @@ static bool wasm_write_object(const char *out_path, WasmCode *func_bodies,
     /* ---- Build IMPORT section ---- */
     WasmCode ims;
     wasm_init(&ims, 4096);
-    if (import_count > 0) {
-        wasm_emit_leb128_u(&ims, (uint32_t)import_count);
-        int32_t import_idx = 0;
+    /* Always import memory from env.memory (needed for load/store ops). */
+    int32_t memory_import = 1;
+    int32_t total_imports = import_count + memory_import;
+    if (total_imports > 0) {
+        wasm_emit_leb128_u(&ims, (uint32_t)total_imports);
+        /* Memory import: (import "env" "memory" (memory 1 512)) */
+        wasm_emit_leb128_u(&ims, 3);
+        wasm_emit1(&ims, 'e'); wasm_emit1(&ims, 'n'); wasm_emit1(&ims, 'v');
+        wasm_emit_leb128_u(&ims, 6);
+        wasm_emit1(&ims, 'm'); wasm_emit1(&ims, 'e'); wasm_emit1(&ims, 'm');
+        wasm_emit1(&ims, 'o'); wasm_emit1(&ims, 'r'); wasm_emit1(&ims, 'y');
+        wasm_emit1(&ims, 0x02); /* import kind: memory */
+        wasm_emit1(&ims, 0x01); /* limits with max */
+        wasm_emit_leb128_u(&ims, 1);   /* min pages */
+        wasm_emit_leb128_u(&ims, 512); /* max pages */
+        /* Function imports */
+        int32_t import_idx = memory_import; /* WASM function index starts after memory */
         for (int32_t i = 0; i < func_count; i++) {
             if (!symbols->functions[i].is_external) continue;
-            /* Module: "env" */
             wasm_emit_leb128_u(&ims, 3);
             wasm_emit1(&ims, 'e'); wasm_emit1(&ims, 'n'); wasm_emit1(&ims, 'v');
-            /* Field name = function name */
             Span nm = symbols->functions[i].name;
             int32_t nmlen = nm.len > 0 ? nm.len : 1;
             wasm_emit_leb128_u(&ims, (uint32_t)nmlen);
             for (int32_t ni = 0; ni < nmlen; ni++)
                 wasm_emit1(&ims, (uint8_t)nm.ptr[ni]);
-            /* Import kind: func */
-            wasm_emit1(&ims, 0x00);
-            /* Type index */
-            wasm_emit_leb128_u(&ims, (uint32_t)i);
-            /* Assignment: WASM import entry index = import_idx */
+            wasm_emit1(&ims, 0x00); /* import kind: func */
+            wasm_emit_leb128_u(&ims, (uint32_t)i); /* type index */
             func_to_wasm_idx[i] = import_idx;
             import_idx++;
         }
@@ -21481,7 +21898,7 @@ static bool wasm_write_object(const char *out_path, WasmCode *func_bodies,
         func_body_count++;
     }
     wasm_emit_leb128_u(&fns, (uint32_t)func_body_count);
-    int32_t wasm_fn_idx = import_count;
+    int32_t wasm_fn_idx = import_count + 1; /* +1 for memory import */
     for (int32_t i = 0; i < func_count; i++) {
         if (symbols->functions[i].is_external) continue;
         wasm_emit_leb128_u(&fns, (uint32_t)i); /* type index = function index in type section */
@@ -21559,7 +21976,7 @@ static bool wasm_write_object(const char *out_path, WasmCode *func_bodies,
         body_sizes[ei] = next_off - func_offsets[ei];
     }
     /* Now write code section - need to map emit indices to WASM func indices */
-    wasm_fn_idx = import_count;
+    wasm_fn_idx = import_count + 1; /* +1 for memory import */
     for (int32_t ei = 0; ei < emit_count; ei++) {
         int32_t body_off = func_offsets[ei];
         int32_t body_sz = body_sizes[ei];
@@ -22314,41 +22731,105 @@ static bool cold_emit_csg_v2_facts(const char *path, BodyIR **function_bodies,
                                     int32_t func_count, Symbols *symbols,
                                     const char *target) {
     if (!function_bodies || !symbols || func_count <= 0) return false;
-    bool *referenced = (bool *)calloc((size_t)func_count, sizeof(bool));
-    if (!referenced) return false;
-    for (int32_t i = 0; i < func_count; i++) {
-        BodyIR *b = function_bodies[i];
-        if (!b || b->has_fallback) continue;
+    bool *emit_function = (bool *)calloc((size_t)func_count, sizeof(bool));
+    bool *queued_function = (bool *)calloc((size_t)func_count, sizeof(bool));
+    bool *referenced_external = (bool *)calloc((size_t)func_count, sizeof(bool));
+    int32_t *function_index_map = (int32_t *)malloc((size_t)func_count * sizeof(int32_t));
+    int32_t *stack = (int32_t *)malloc((size_t)func_count * sizeof(int32_t));
+    if (!emit_function || !queued_function || !referenced_external ||
+        !function_index_map || !stack) {
+        free(emit_function);
+        free(queued_function);
+        free(referenced_external);
+        free(function_index_map);
+        free(stack);
+        return false;
+    }
+    for (int32_t i = 0; i < func_count; i++) function_index_map[i] = -1;
+
+    int32_t stack_count = 0;
+    int32_t root_count = 0;
+    for (int32_t i = 0; i < func_count && i < symbols->function_count; i++) {
+        if (!span_eq(symbols->functions[i].name, "main")) continue;
+        if (!queued_function[i]) {
+            queued_function[i] = true;
+            stack[stack_count++] = i;
+            root_count++;
+        }
+    }
+    if (root_count == 0) {
+        for (int32_t i = 0; i < func_count; i++) {
+            BodyIR *b = function_bodies[i];
+            if (b && !b->has_fallback && !queued_function[i]) {
+                queued_function[i] = true;
+                stack[stack_count++] = i;
+                root_count++;
+            }
+        }
+    }
+
+    while (stack_count > 0) {
+        int32_t fi = stack[--stack_count];
+        if (fi < 0 || fi >= func_count) continue;
+        if (emit_function[fi]) continue;
+        BodyIR *b = function_bodies[fi];
+        if (!b || b->has_fallback) {
+            if (fi < symbols->function_count &&
+                symbols->functions[fi].name.len > 0 &&
+                symbols->functions[fi].is_external) {
+                referenced_external[fi] = true;
+                continue;
+            }
+            free(emit_function);
+            free(queued_function);
+            free(referenced_external);
+            free(function_index_map);
+            free(stack);
+            return false;
+        }
+        emit_function[fi] = true;
         for (int32_t oi = 0; oi < b->op_count; oi++) {
             int32_t ok = b->op_kind[oi];
             if (ok != BODY_OP_CALL_I32 && ok != BODY_OP_CALL_COMPOSITE &&
                 ok != BODY_OP_FN_ADDR) continue;
             int32_t target_fn = b->op_a[oi];
-            if (target_fn >= 0 && target_fn < func_count) referenced[target_fn] = true;
+            if (target_fn < 0 || target_fn >= func_count) continue;
+            if (target_fn < symbols->function_count &&
+                symbols->functions[target_fn].is_external &&
+                (!function_bodies[target_fn] || function_bodies[target_fn]->has_fallback)) {
+                referenced_external[target_fn] = true;
+                continue;
+            }
+            if (!queued_function[target_fn]) {
+                queued_function[target_fn] = true;
+                stack[stack_count++] = target_fn;
+            }
         }
     }
 
-    /* Count functions to serialize: valid bodies plus referenced externals. */
+    /* Count root-reachable bodies plus root-reachable externals. */
     int32_t valid_count = 0;
     for (int32_t i = 0; i < func_count; i++) {
-        BodyIR *b = function_bodies[i];
-        if (b && !b->has_fallback) valid_count++;
-        else if (symbols->functions[i].name.len > 0 &&
-                 symbols->functions[i].is_external &&
-                 referenced[i]) valid_count++;
-        else if (symbols->functions[i].name.len > 0 && referenced[i]) {
-            free(referenced);
-            return false;
+        if (emit_function[i] || referenced_external[i]) {
+            function_index_map[i] = valid_count++;
         }
     }
     if (valid_count <= 0) {
-        free(referenced);
+        free(emit_function);
+        free(queued_function);
+        free(referenced_external);
+        free(function_index_map);
+        free(stack);
         return false;
     }
 
     FILE *f = fopen(path, "wb");
     if (!f) {
-        free(referenced);
+        free(emit_function);
+        free(queued_function);
+        free(referenced_external);
+        free(function_index_map);
+        free(stack);
         return false;
     }
 
@@ -22386,7 +22867,7 @@ static bool cold_emit_csg_v2_facts(const char *path, BodyIR **function_bodies,
     int32_t total_str_slots = 0;
     for (int32_t i = 0; i < func_count; i++) {
         BodyIR *b = function_bodies[i];
-        if (!b || b->has_fallback) continue;
+        if (!emit_function[i] || !b || b->has_fallback) continue;
         if (b->string_literal_count > 0 && b->string_literal_count < 65536)
             total_str_slots += b->string_literal_count;
     }
@@ -22404,7 +22885,7 @@ static bool cold_emit_csg_v2_facts(const char *path, BodyIR **function_bodies,
         int32_t map_idx = 0;
         for (int32_t fi = 0; fi < func_count; fi++) {
             BodyIR *b = function_bodies[fi];
-            if (!b || b->has_fallback) continue;
+            if (!emit_function[fi] || !b || b->has_fallback) continue;
             if (b->string_literal_count < 0 || b->string_literal_count > 65536 ||
                 !b->string_literal) continue;
             for (int32_t si = 0; si < b->string_literal_count; si++) {
@@ -22435,18 +22916,21 @@ static bool cold_emit_csg_v2_facts(const char *path, BodyIR **function_bodies,
         int32_t map_idx = 0;
         for (int32_t fi = 0; fi < func_count; fi++) {
             BodyIR *b = function_bodies[fi];
-            bool valid_body = b && !b->has_fallback;
-            bool referenced_external = !valid_body &&
+            bool valid_body = emit_function[fi] && b && !b->has_fallback;
+            bool external_decl = referenced_external[fi] &&
+                fi < symbols->function_count &&
                 symbols->functions[fi].name.len > 0 &&
-                symbols->functions[fi].is_external &&
-                referenced[fi];
-            if (!valid_body && symbols->functions[fi].name.len > 0 && referenced[fi] &&
-                !referenced_external) {
+                symbols->functions[fi].is_external;
+            if (!valid_body && referenced_external[fi] && !external_decl) {
                 fclose(f);
-                free(referenced);
+                free(emit_function);
+                free(queued_function);
+                free(referenced_external);
+                free(function_index_map);
+                free(stack);
                 return false;
             }
-            if (!valid_body && !referenced_external) continue;
+            if (!valid_body && !external_decl) continue;
 
             /* name: u32 len + utf8 bytes */
             cold_emit_csg_v2_str(f, symbols->functions[fi].name);
@@ -22491,9 +22975,28 @@ static bool cold_emit_csg_v2_facts(const char *path, BodyIR **function_bodies,
             /* op_count + ops (5 x u32 = 20 bytes per op) */
             cold_emit_csg_v2_u32(f, (uint32_t)b->op_count);
             for (int32_t oi = 0; oi < b->op_count; oi++) {
-                cold_emit_csg_v2_u32(f, (uint32_t)b->op_kind[oi]);
+                int32_t op_kind = b->op_kind[oi];
+                int32_t op_a = b->op_a[oi];
+                if ((op_kind == BODY_OP_CALL_I32 ||
+                     op_kind == BODY_OP_CALL_COMPOSITE ||
+                     op_kind == BODY_OP_FN_ADDR) &&
+                    op_a >= 0 && op_a < func_count) {
+                    op_a = function_index_map[op_a];
+                    if (op_a < 0) {
+                        fclose(f);
+                        free(emit_function);
+                        free(queued_function);
+                        free(referenced_external);
+                        free(function_index_map);
+                        free(stack);
+                        free(unique_strs);
+                        free(str_id_map);
+                        return false;
+                    }
+                }
+                cold_emit_csg_v2_u32(f, (uint32_t)op_kind);
                 cold_emit_csg_v2_u32(f, (uint32_t)b->op_dst[oi]);
-                cold_emit_csg_v2_u32(f, (uint32_t)b->op_a[oi]);
+                cold_emit_csg_v2_u32(f, (uint32_t)op_a);
                 cold_emit_csg_v2_u32(f, (uint32_t)b->op_b[oi]);
                 cold_emit_csg_v2_u32(f, (uint32_t)b->op_c[oi]);
             }
@@ -22542,6 +23045,21 @@ static bool cold_emit_csg_v2_facts(const char *path, BodyIR **function_bodies,
                     if (ok != BODY_OP_CALL_I32 && ok != BODY_OP_CALL_COMPOSITE)
                         continue;
                     int32_t target_fn = b->op_a[oi];
+                    int32_t emitted_target = target_fn;
+                    if (target_fn >= 0 && target_fn < func_count) {
+                        emitted_target = function_index_map[target_fn];
+                        if (emitted_target < 0) {
+                            fclose(f);
+                            free(emit_function);
+                            free(queued_function);
+                            free(referenced_external);
+                            free(function_index_map);
+                            free(stack);
+                            free(unique_strs);
+                            free(str_id_map);
+                            return false;
+                        }
+                    }
                     int32_t arg_start  = b->op_b[oi];
                     int32_t arg_count;
                     if (ok == BODY_OP_CALL_I32) {
@@ -22553,7 +23071,7 @@ static bool cold_emit_csg_v2_facts(const char *path, BodyIR **function_bodies,
                         arg_count = b->op_c[oi];
                     }
                     int32_t result_slot = b->op_dst[oi];
-                    cold_emit_csg_v2_u32(f, (uint32_t)target_fn);
+                    cold_emit_csg_v2_u32(f, (uint32_t)emitted_target);
                     cold_emit_csg_v2_u32(f, (uint32_t)arg_start);
                     cold_emit_csg_v2_u32(f, (uint32_t)arg_count);
                     cold_emit_csg_v2_u32(f, (uint32_t)result_slot);
@@ -22630,7 +23148,11 @@ static bool cold_emit_csg_v2_facts(const char *path, BodyIR **function_bodies,
     fclose(f);
     free(unique_strs);
     free(str_id_map);
-    free(referenced);
+    free(emit_function);
+    free(queued_function);
+    free(referenced_external);
+    free(function_index_map);
+    free(stack);
     return true;
 }
 

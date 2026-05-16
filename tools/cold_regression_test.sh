@@ -3216,8 +3216,156 @@ assert "zrpc_integration_cold_compile_smoke" 1 "$ACT"
 ACT=$(compile_obj_smoke "zrpc_slice_map_integration" "src/tests/zrpc_slice_map_integration_smoke.cheng")
 assert "zrpc_slice_map_integration_cold_compile_smoke" 1 "$ACT"
 
+# --- new compile_obj_smoke: core/lang files ---
+ACT=$(compile_obj_smoke "intern" "src/core/lang/intern.cheng")
+assert "intern_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "browser_abi_rule" "src/core/lang/browser_abi_rule.cheng")
+assert "browser_abi_rule_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "outline_parser" "src/core/lang/outline_parser.cheng")
+assert "outline_parser_cold_compile_smoke" 1 "$ACT"
+
+# --- new compile_obj_smoke: core/ir files ---
+ACT=$(compile_obj_smoke "body_ir_opt" "src/core/ir/body_ir_opt.cheng")
+assert "body_ir_opt_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "low_uir" "src/core/ir/low_uir.cheng")
+assert "low_uir_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "body_ir_noalias" "src/core/ir/body_ir_noalias.cheng")
+assert "body_ir_noalias_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "type_abi" "src/core/ir/type_abi.cheng")
+assert "type_abi_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "body_ir_loop" "src/core/ir/body_ir_loop.cheng")
+assert "body_ir_loop_cold_compile_smoke" 1 "$ACT"
+
+# --- new compile_obj_smoke: core/backend files ---
+ACT=$(compile_obj_smoke "uir_noalias_pass" "src/core/backend/uir_noalias_pass.cheng")
+assert "uir_noalias_pass_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "uir_egraph_rewrite" "src/core/backend/uir_egraph_rewrite.cheng")
+assert "uir_egraph_rewrite_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "macho_object_linker" "src/core/backend/macho_object_linker.cheng")
+assert "macho_object_linker_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "wasm_module_emit" "src/core/backend/wasm_module_emit.cheng")
+assert "wasm_module_emit_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "x86_64_encode" "src/core/backend/x86_64_encode.cheng")
+assert "x86_64_encode_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "macho_object_writer" "src/core/backend/macho_object_writer.cheng")
+assert "macho_object_writer_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "elf_object_writer" "src/core/backend/elf_object_writer.cheng")
+assert "elf_object_writer_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "elf_riscv64_writer" "src/core/backend/elf_riscv64_writer.cheng")
+assert "elf_riscv64_writer_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "coff_object_writer" "src/core/backend/coff_object_writer.cheng")
+assert "coff_object_writer_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "primary_object_emit" "src/core/backend/primary_object_emit.cheng")
+assert "primary_object_emit_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "system_link_exec_runtime" "src/core/backend/system_link_exec_runtime.cheng")
+assert "system_link_exec_runtime_cold_compile_smoke" 1 "$ACT"
+
+# --- new compile_obj_smoke: core/runtime files ---
+ACT=$(compile_obj_smoke "core_runtime_provider_darwin" "src/core/runtime/core_runtime_provider_darwin.cheng")
+assert "core_runtime_provider_darwin_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "debug_runtime_stub" "src/core/runtime/debug_runtime_stub.cheng")
+assert "debug_runtime_stub_cold_compile_smoke" 1 "$ACT"
+
+# --- new compile_obj_smoke: core/tooling files ---
+ACT=$(compile_obj_smoke "seed_orphan_guard_gate" "src/core/tooling/seed_orphan_guard_gate.cheng")
+assert "seed_orphan_guard_gate_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "seed_app_build_gate" "src/core/tooling/seed_app_build_gate.cheng")
+assert "seed_app_build_gate_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "wasm_smoke_gate" "src/core/tooling/wasm_smoke_gate.cheng")
+assert "wasm_smoke_gate_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "host_smoke_gate" "src/core/tooling/host_smoke_gate.cheng")
+assert "host_smoke_gate_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "debug_tools_gate" "src/core/tooling/debug_tools_gate.cheng")
+assert "debug_tools_gate_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "perf_memory_gate" "src/core/tooling/perf_memory_gate.cheng")
+assert "perf_memory_gate_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "seed_network_gate" "src/core/tooling/seed_network_gate.cheng")
+assert "seed_network_gate_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "seed_debug_runtime_gate" "src/core/tooling/seed_debug_runtime_gate.cheng")
+assert "seed_debug_runtime_gate_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "seed_stage23_libp2p_gate" "src/core/tooling/seed_stage23_libp2p_gate.cheng")
+assert "seed_stage23_libp2p_gate_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "compiler_world_bundle" "src/core/tooling/compiler_world_bundle.cheng")
+assert "compiler_world_bundle_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "host_ops" "src/core/tooling/host_ops.cheng")
+assert "host_ops_cold_compile_smoke" 1 "$ACT"
+
+# --- new compile_obj_smoke: tests/ files ---
+ACT=$(compile_obj_smoke "seqs_add_generic" "src/tests/seqs_add_generic_smoke.cheng")
+assert "seqs_add_generic_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "composite_default_init" "src/tests/composite_default_init_smoke.cheng")
+assert "composite_default_init_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "function_task_contract" "src/tests/function_task_contract_smoke.cheng")
+assert "function_task_contract_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "call_hir_matrix" "src/tests/call_hir_matrix_smoke.cheng")
+assert "call_hir_matrix_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "primary_object_codegen" "src/tests/primary_object_codegen_smoke.cheng")
+assert "primary_object_codegen_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "parser_normalized_expr" "src/tests/parser_normalized_expr_smoke.cheng")
+assert "parser_normalized_expr_cold_compile_smoke" 1 "$ACT"
+ACT=$(compile_obj_smoke "test_lowering_plan" "src/tests/lowering_plan_smoke.cheng")
+assert "test_lowering_plan_cold_compile_smoke" 1 "$ACT"
+
+# --- generic var T smoke test (compile object) ---
+cat > /tmp/ct_generic_var_t.cheng << 'CHENGEOF'
+type
+    Box[T] =
+        value: T
+
+fn makeBox[T](v: T): Box[T] =
+    Box[T](value: v)
+
+fn main(): int32 =
+    let b: Box[int32] = makeBox[int32](42)
+    if b.value == 42:
+        return 0
+    return 1
+CHENGEOF
+ACT=$(compile_obj_smoke "generic_var_t" "/tmp/ct_generic_var_t.cheng")
+assert "generic_var_t_cold_compile_smoke" 1 "$ACT"
+
+# --- wasm backend smoke test ---
+rm -f /tmp/ct_wasm_backend.wasm /tmp/ct_wasm_backend.report
+quiet $COLD system-link-exec --root:"$PWD" \
+    --in:src/tests/wasm_zero_smoke.cheng --target:wasm32-unknown-unknown \
+    --out:/tmp/ct_wasm_backend.wasm --emit:obj \
+    --report-out:/tmp/ct_wasm_backend.report
+if [ -s /tmp/ct_wasm_backend.wasm ] && grep -q '^target=wasm32-unknown-unknown$' /tmp/ct_wasm_backend.report 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "wasm_backend_smoke" 1 "$ACT"
+rm -f /tmp/ct_wasm_backend.wasm /tmp/ct_wasm_backend.report
+
+# --- compile chain depth test: A imports B imports C ---
+mkdir -p /tmp/ct_chain
+cat > /tmp/ct_chain/level_c.cheng << 'CHENGEOF'
+fn getValue(): int32 =
+    return 42
+CHENGEOF
+cat > /tmp/ct_chain/level_b.cheng << 'CHENGEOF'
+import "/tmp/ct_chain/level_c.cheng" as c
+
+fn getWrapped(): int32 =
+    let v = c.getValue()
+    return v + 1
+CHENGEOF
+cat > /tmp/ct_chain/level_a.cheng << 'CHENGEOF'
+import "/tmp/ct_chain/level_b.cheng" as b
+
+fn main(): int32 =
+    let v = b.getWrapped()
+    if v == 43:
+        return 0
+    return 1
+CHENGEOF
+ACT=$(compile_obj_smoke "chain_depth_a" "/tmp/ct_chain/level_a.cheng")
+assert "chain_depth_a_cold_compile_smoke" 1 "$ACT"
+rm -rf /tmp/ct_chain
+
 # --- nm verification for compile_obj_smoke files (expanded coverage) ---
-for nm_tag in "chain_binary_types" "chain_csg" "chain_lsmr" "oracle_plane" "oracle_types"               "r2c_schema" "r2c_react" "runtime_mobile" "runtime_mobile_app"               "native_link_exec" "system_link_exec_runtime_direct"               "tls_client_hello_parse" "thread_parallelism_runtime"               "wasm_scalar_control_flow" "udp_bind_bindtext"               "webrtc_browser_pubsub" "zrpc_integration"               "typed_expr_call_validate_probe" "test_probe"; do
+for nm_tag in "chain_binary_types" "chain_csg" "chain_lsmr" "oracle_plane" "oracle_types"               "r2c_schema" "r2c_react" "runtime_mobile" "runtime_mobile_app"               "native_link_exec" "system_link_exec_runtime_direct"               "tls_client_hello_parse" "thread_parallelism_runtime"               "wasm_scalar_control_flow" "udp_bind_bindtext"               "webrtc_browser_pubsub" "zrpc_integration"               "typed_expr_call_validate_probe" "test_probe"               "aarch64_encode" "borrow_checker" "bytes" "chain_content_plane"               "chain_dag_mempool" "chain_erasure_swarm" "chain_location_proof"               "compile_mode_switch" "determinism_gate" "direct_object_emit"               "handle_table" "hot_patch" "linkerless_object_writer"               "native_link_plan" "object_buffer" "object_plan" "option"               "oracle_bft_state_machine" "r2c_native_gui_runtime_generic"               "cold_csg_facts_exporter" "str_concat_prelude" "wasm_zero"; do
     case "$nm_tag" in
         chain_binary_types) nm_src="src/chain/binary_types.cheng" ;;
         chain_csg) nm_src="src/chain/csg.cheng" ;;
@@ -3238,6 +3386,28 @@ for nm_tag in "chain_binary_types" "chain_csg" "chain_lsmr" "oracle_plane" "orac
         zrpc_integration) nm_src="src/tests/zrpc_integration_smoke.cheng" ;;
         typed_expr_call_validate_probe) nm_src="src/tests/typed_expr_call_validate_probe.cheng" ;;
         test_probe) nm_src="src/tests/test_probe.cheng" ;;
+        aarch64_encode) nm_src="src/core/backend/aarch64_encode.cheng" ;;
+        borrow_checker) nm_src="src/core/analysis/borrow_checker.cheng" ;;
+        bytes) nm_src="src/std/bytes.cheng" ;;
+        chain_content_plane) nm_src="src/chain/content_plane.cheng" ;;
+        chain_dag_mempool) nm_src="src/chain/dag_mempool.cheng" ;;
+        chain_erasure_swarm) nm_src="src/chain/erasure_swarm.cheng" ;;
+        chain_location_proof) nm_src="src/chain/location_proof.cheng" ;;
+        compile_mode_switch) nm_src="src/core/backend/compile_mode_switch.cheng" ;;
+        determinism_gate) nm_src="src/core/tooling/determinism_gate.cheng" ;;
+        direct_object_emit) nm_src="src/core/backend/direct_object_emit.cheng" ;;
+        handle_table) nm_src="src/core/runtime/handle_table.cheng" ;;
+        hot_patch) nm_src="src/core/backend/hot_patch.cheng" ;;
+        linkerless_object_writer) nm_src="src/core/backend/linkerless_object_writer.cheng" ;;
+        native_link_plan) nm_src="src/core/backend/native_link_plan.cheng" ;;
+        object_buffer) nm_src="src/core/backend/object_buffer.cheng" ;;
+        object_plan) nm_src="src/core/backend/object_plan.cheng" ;;
+        option) nm_src="src/core/option.cheng" ;;
+        oracle_bft_state_machine) nm_src="src/oracle/oracle_bft_state_machine.cheng" ;;
+        r2c_native_gui_runtime_generic) nm_src="src/r2c/native_gui_runtime_generic.cheng" ;;
+        cold_csg_facts_exporter) nm_src="src/tests/cold_csg_facts_exporter_smoke.cheng" ;;
+        str_concat_prelude) nm_src="src/tests/str_concat_prelude_probe.cheng" ;;
+        wasm_zero) nm_src="src/tests/wasm_zero_smoke.cheng" ;;
     esac
     rm -f "/tmp/ct_nm_${nm_tag}.o" "/tmp/ct_nm_${nm_tag}.report"
     quiet $COLD system-link-exec --root:"$PWD"         --in:"$nm_src" --target:arm64-apple-darwin         --out:"/tmp/ct_nm_${nm_tag}.o" --emit:obj         --report-out:"/tmp/ct_nm_${nm_tag}.report"

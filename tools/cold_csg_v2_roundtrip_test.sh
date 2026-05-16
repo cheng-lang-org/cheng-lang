@@ -895,6 +895,45 @@ roundtrip_fixture return_udiv tests/cheng/backend/fixtures/return_udiv.cheng 409
 # Unsigned modulo: uint32/uint64 mod
 roundtrip_fixture return_umod tests/cheng/backend/fixtures/return_umod.cheng 4096
 
+# I64 function calls: add64(10,20) - 30 == 0
+roundtrip_fixture return_call_i64 tests/cheng/backend/fixtures/return_call_i64.cheng 4096
+
+# Multi-arg function calls: 5-arg sum
+roundtrip_fixture return_call5 tests/cheng/backend/fixtures/return_call5.cheng 4096
+
+# Multi-arg function calls: 8-arg sum
+roundtrip_fixture return_call8 tests/cheng/backend/fixtures/return_call8.cheng 4096
+
+# Multi-arg function calls: 9-arg sum
+roundtrip_fixture return_call9 tests/cheng/backend/fixtures/return_call9.cheng 4096
+
+# I64 mixed function calls: widen + cast
+roundtrip_fixture return_call_mixed tests/cheng/backend/fixtures/return_call_mixed.cheng 4096
+
+# Global variable assignment: g = 7, return g - 7 == 0
+roundtrip_fixture return_global_assign tests/cheng/backend/fixtures/return_global_assign.cheng 4096
+
+# Global i64 variable: load and compare
+roundtrip_fixture return_global_i64 tests/cheng/backend/fixtures/return_global_i64.cheng 4096
+
+# Logical OR expression: (0 < 0 || 1 < 2) - 1 == 0
+roundtrip_fixture return_or_expr tests/cheng/backend/fixtures/return_or_expr.cheng 4096
+
+# Logical OR in if condition: if cond || cond
+roundtrip_fixture return_or_if tests/cheng/backend/fixtures/return_or_if.cheng 4096
+
+# Logical OR in let: let x = a || b
+roundtrip_fixture return_or_let tests/cheng/backend/fixtures/return_or_let.cheng 4096
+
+# Inline if + ternary: clamp + ternary patterns
+roundtrip_fixture return_inline_if_and_ternary tests/cheng/backend/fixtures/return_inline_if_and_ternary.cheng 4096
+
+# Nested boolean AND: (ternary && ternary) - 1 == 0
+roundtrip_fixture return_and_nested tests/cheng/backend/fixtures/return_and_nested.cheng 4096
+
+# Simple var assignment: x = x + 1, return x - 2 == 0
+roundtrip_fixture return_assign tests/cheng/backend/fixtures/return_assign.cheng 4096
+
 # Import chain with unqualified cross-module bare call must hard-fail in cold.
 echo "  - import_chain_bare_hard_fail"
 import_chain_report="$WORK/import_chain_a.writer.report.txt"

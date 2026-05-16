@@ -366,9 +366,25 @@ int32_t cold_arg_reg_count(int32_t kind, int32_t size) {
     return 1;
 }
 
-int32_t parse_param_specs(Symbols *symbols, Span params, Span *names,
-                                 int32_t *kinds, int32_t *sizes, Span *types,
-                                 int32_t cap) {
+static bool cold_type_matches_generic_names(Span type, Span *generic_names,
+                                            int32_t generic_count,
+                                            bool *is_var_out) {
+    bool is_var = false;
+    Span stripped = span_trim(cold_type_strip_var(type, &is_var));
+    if (is_var_out) *is_var_out = is_var;
+    for (int32_t gi = 0; gi < generic_count; gi++) {
+        if (span_same(stripped, generic_names[gi])) return true;
+    }
+    return false;
+}
+
+int32_t parse_param_specs_with_generics(Symbols *symbols, Span params,
+                                               Span *generic_names,
+                                               int32_t generic_count,
+                                               Span *names,
+                                               int32_t *kinds,
+                                               int32_t *sizes, Span *types,
+                                               int32_t cap) {
     Parser parser = {params, 0, 0, 0};
     int32_t count = 0;
     while (parser.pos < parser.source.len) {
@@ -381,12 +397,21 @@ int32_t parse_param_specs(Symbols *symbols, Span params, Span *names,
         if (span_eq(parser_peek(&parser), ":")) {
             (void)parser_token(&parser);
             type = parser_take_type_span(&parser);
-            kind = cold_param_kind_from_type(type);
-            if (symbols) kind = cold_parser_slot_kind_from_type(symbols, type);
+            bool generic_is_var = false;
+            if (cold_type_matches_generic_names(type, generic_names,
+                                                generic_count, &generic_is_var)) {
+                kind = generic_is_var ? SLOT_I32_REF : SLOT_I32;
+            } else {
+                kind = cold_param_kind_from_type(type);
+                if (symbols) kind = cold_parser_slot_kind_from_type(symbols, type);
+            }
         }
         names[count] = name;
         if (kinds) kinds[count] = kind;
-        if (sizes) sizes[count] = cold_param_size_from_type(symbols, type, kind);
+        if (sizes) sizes[count] = cold_type_matches_generic_names(type, generic_names,
+                                                                  generic_count, 0)
+            ? (kind == SLOT_I32_REF ? 8 : 4)
+            : cold_param_size_from_type(symbols, type, kind);
         if (types) types[count] = span_trim(type);
         count++;
         while (parser.pos < parser.source.len &&
@@ -397,6 +422,13 @@ int32_t parse_param_specs(Symbols *symbols, Span params, Span *names,
         if (span_eq(parser_peek(&parser), ",")) (void)parser_token(&parser);
     }
     return count;
+}
+
+int32_t parse_param_specs(Symbols *symbols, Span params, Span *names,
+                                 int32_t *kinds, int32_t *sizes, Span *types,
+                                 int32_t cap) {
+    return parse_param_specs_with_generics(symbols, params, 0, 0, names,
+                                           kinds, sizes, types, cap);
 }
 
 Span cold_arena_span_copy(Arena *arena, Span text) {
@@ -549,6 +581,28 @@ ObjectDef *parser_resolve_object(Parser *parser, Span name) {
     }
     return symbols_resolve_object(parser->symbols, name);
 }
+
+ObjectDef *parser_resolve_object_constructor(Parser *parser, Span name,
+                                             Span *slot_type_out) {
+    ObjectDef *object = parser_resolve_object(parser, name);
+    if (object) {
+        if (slot_type_out) *slot_type_out = name;
+        return object;
+    }
+    Span stripped = cold_span_strip_generic_suffix(name);
+    if (!span_same(stripped, name)) {
+        object = parser_resolve_object(parser, stripped);
+        if (object && slot_type_out) *slot_type_out = name;
+        return object;
+    }
+    if (slot_type_out) *slot_type_out = name;
+    return 0;
+}
+
+bool parser_next_is_object_constructor(Parser *parser);
+int32_t parse_object_constructor_typed(Parser *parser, BodyIR *body,
+                                       Locals *locals, ObjectDef *object,
+                                       Span slot_type);
 
 Variant *parser_find_variant(Parser *parser, Span name) {
     if (parser_can_scope_bare_name(parser, name)) {
@@ -1296,8 +1350,12 @@ void cold_collect_function_signatures(Symbols *symbols, Span source) {
         Span param_types[COLD_MAX_I32_PARAMS];
         int32_t param_kinds[COLD_MAX_I32_PARAMS];
         int32_t param_sizes[COLD_MAX_I32_PARAMS];
-        int32_t arity = parse_param_specs(symbols, symbol.params, param_names, param_kinds,
-                                          param_sizes, param_types, COLD_MAX_I32_PARAMS);
+        int32_t arity = parse_param_specs_with_generics(symbols, symbol.params,
+                                                        symbol.generic_names,
+                                                        symbol.generic_count,
+                                                        param_names, param_kinds,
+                                                        param_sizes, param_types,
+                                                        COLD_MAX_I32_PARAMS);
         int32_t fi = symbols_add_fn(symbols, symbol.name, arity, param_kinds, param_sizes, symbol.return_type);
         symbols_set_fn_param_types(symbols, fi, param_types, arity);
         if (symbol.import_name.len > 0) symbols_set_fn_link_name(symbols, fi, symbol.import_name);
@@ -2427,9 +2485,19 @@ static int32_t cold_generic_template_param_index(FnDef *fn, Span generic_name) {
     return -1;
 }
 
-static Span cold_specialized_type_for_template_slot(FnDef *tmpl, FnDef *spec,
+static Span cold_specialized_type_for_template_slot(Arena *arena, FnDef *tmpl, FnDef *spec,
                                                      Span type, int32_t slot_kind) {
     type = span_trim(type);
+    bool is_var_type = false;
+    Span stripped_var = span_trim(cold_type_strip_var(type, &is_var_type));
+    if (is_var_type) {
+        Span inner = cold_specialized_type_for_template_slot(arena, tmpl, spec,
+                                                             stripped_var, slot_kind);
+        if (inner.len > 0 && !span_same(inner, stripped_var)) {
+            return cold_arena_join3(arena, cold_cstr_span("var "), "", inner);
+        }
+        return type;
+    }
     bool slot_is_ref = (slot_kind == SLOT_I32_REF || slot_kind == SLOT_I64_REF ||
                         slot_kind == SLOT_STR_REF || slot_kind == SLOT_SEQ_I32_REF ||
                         slot_kind == SLOT_SEQ_STR_REF || slot_kind == SLOT_SEQ_OPAQUE_REF ||
@@ -2451,6 +2519,20 @@ static Span cold_specialized_type_for_template_slot(FnDef *tmpl, FnDef *spec,
             if ((param_type_is_var || param_is_ref) == slot_is_ref && spec->param_type[pi].len > 0)
                 return spec->param_type[pi];
         }
+    }
+    Span base = {0};
+    Span args_span = {0};
+    if (cold_type_parse_generic_instance(type, &base, &args_span)) {
+        Span args[COLD_MAX_VARIANT_FIELDS];
+        Span specialized_args[COLD_MAX_VARIANT_FIELDS];
+        int32_t count = cold_split_top_level_commas(args_span, args, COLD_MAX_VARIANT_FIELDS);
+        bool changed = false;
+        for (int32_t i = 0; i < count; i++) {
+            specialized_args[i] = cold_specialized_type_for_template_slot(arena, tmpl, spec,
+                                                                          args[i], slot_kind);
+            if (!span_same(specialized_args[i], args[i])) changed = true;
+        }
+        if (changed) return cold_generic_join_type(arena, base, specialized_args, count);
     }
     return type;
 }
@@ -2513,7 +2595,8 @@ static BodyIR *cold_clone_specialized_body(Parser *parser, int32_t spec_index) {
     dst->slot_type = cold_clone_span_array(parser->arena, src->slot_type, src->slot_count);
     dst->slot_no_alias = cold_clone_i32_array(parser->arena, src->slot_no_alias, src->slot_count);
     for (int32_t si = 0; si < dst->slot_count; si++) {
-        Span concrete = cold_specialized_type_for_template_slot(tmpl, spec, dst->slot_type[si], dst->slot_kind[si]);
+        Span concrete = cold_specialized_type_for_template_slot(parser->arena, tmpl, spec,
+                                                                dst->slot_type[si], dst->slot_kind[si]);
         if (concrete.len > 0 && !span_same(concrete, dst->slot_type[si])) {
             int32_t kind = cold_parser_slot_kind_from_type(parser->symbols, concrete);
             dst->slot_kind[si] = kind;
@@ -3099,6 +3182,31 @@ int32_t parse_call_from_args_span(Parser *owner, BodyIR *body, Locals *locals,
         if (name.ptr[bi] == '[') { bracket = bi; break; }
     if (bracket > 0 && name.ptr[name.len - 1] == ']')
         stripped_name = span_sub(name, 0, bracket);
+    Span object_slot_type = {0};
+    ObjectDef *object = parser_resolve_object_constructor(owner, name,
+                                                          &object_slot_type);
+    if (object && !object->is_ref) {
+        if (!owner->arena) die("object constructor call requires parser arena");
+        int32_t synthetic_len = args.len + 2;
+        char *synthetic = arena_alloc(owner->arena, (size_t)synthetic_len + 1);
+        synthetic[0] = '(';
+        if (args.len > 0) memcpy(synthetic + 1, args.ptr, (size_t)args.len);
+        synthetic[synthetic_len - 1] = ')';
+        synthetic[synthetic_len] = '\0';
+        Parser ctor_parser = {{(const uint8_t *)synthetic, synthetic_len},
+                              0, owner->arena, owner->symbols,
+                              owner->import_mode, owner->import_alias};
+        if (parser_next_is_object_constructor(&ctor_parser)) {
+            int32_t slot = parse_object_constructor_typed(&ctor_parser, body,
+                                                          locals, object,
+                                                          object_slot_type);
+            parser_ws(&ctor_parser);
+            if (ctor_parser.pos != ctor_parser.source.len)
+                die("object constructor call has trailing tokens");
+            if (kind_out) *kind_out = SLOT_OBJECT;
+            return slot;
+        }
+    }
     Parser arg_parser = {args, 0, owner->arena, owner->symbols,
                          owner->import_mode, owner->import_alias};
     int32_t arg_slots[COLD_MAX_I32_PARAMS];
@@ -3439,8 +3547,8 @@ bool parser_next_is_object_constructor(Parser *parser) {
     return span_eq(parser_peek(&probe), ":");
 }
 
-int32_t parse_object_constructor(Parser *parser, BodyIR *body, Locals *locals,
-                                        ObjectDef *object) {
+int32_t parse_object_constructor_typed(Parser *parser, BodyIR *body, Locals *locals,
+                                       ObjectDef *object, Span slot_type) {
     bool curly = false;
     Span open_tok = parser_peek(parser);
     if (span_eq(open_tok, "{")) {
@@ -3526,9 +3634,14 @@ int32_t parse_object_constructor(Parser *parser, BodyIR *body, Locals *locals,
         body_call_arg_with_offset(body, payload_slots[i], payload_offsets[i]);
     }
     int32_t slot = body_slot(body, SLOT_OBJECT, symbols_object_slot_size(object));
-    body_slot_set_type(body, slot, object->name);
+    body_slot_set_type(body, slot, slot_type.len > 0 ? slot_type : object->name);
     body_op3(body, BODY_OP_MAKE_COMPOSITE, slot, 0, payload_start, payload_count);
     return slot;
+}
+
+int32_t parse_object_constructor(Parser *parser, BodyIR *body, Locals *locals,
+                                        ObjectDef *object) {
+    return parse_object_constructor_typed(parser, body, locals, object, object->name);
 }
 
 int32_t parse_i32_array_literal(Parser *parser, BodyIR *body, Locals *locals,
@@ -7149,10 +7262,13 @@ int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32_t *kin
         }
         if (!vc) {
             /* Try object constructor for qualified name (e.g. hostops.LoggedRun(label: ...)) */
-            ObjectDef *obj = symbols_find_object(parser->symbols, stripped_name);
+            Span object_slot_type = {0};
+            ObjectDef *obj = parser_resolve_object_constructor(parser, call_name,
+                                                               &object_slot_type);
             if (obj && !obj->is_ref && parser_next_is_object_constructor(parser)) {
                 *kind = SLOT_OBJECT;
-                return parse_object_constructor(parser, body, locals, obj);
+                return parse_object_constructor_typed(parser, body, locals, obj,
+                                                      object_slot_type);
             }
         }
         if (!span_eq(parser_peek(parser), "(")) {
@@ -10801,6 +10917,21 @@ int32_t parse_statement(Parser *parser, BodyIR *body, Locals *locals,
             call_name = parser_take_qualified_after_first(parser, kw);
         }
         if (!span_eq(parser_peek(parser), "(")) die("qualified statement must be a call");
+        if (parser_next_is_object_constructor(parser)) {
+            Span object_slot_type = {0};
+            ObjectDef *obj = parser_resolve_object_constructor(parser, call_name,
+                                                               &object_slot_type);
+            if (obj && !obj->is_ref) {
+                int32_t result_slot = parse_object_constructor_typed(parser, body, locals,
+                                                                     obj, object_slot_type);
+                if (!cold_return_span_is_void(body->return_type) &&
+                    span_same(span_trim(body->return_type), span_trim(object_slot_type))) {
+                    int32_t term = body_term(body, BODY_TERM_RET, result_slot, -1, 0, -1, -1);
+                    body_end_block(body, block, term);
+                }
+                return block;
+            }
+        }
         int32_t result_kind = SLOT_I32;
         int32_t result_slot = parse_call_after_name(parser, body, locals, call_name, &result_kind);
         if (span_eq(parser_peek(parser), "?")) {
@@ -10952,6 +11083,21 @@ int32_t parse_statement(Parser *parser, BodyIR *body, Locals *locals,
             parser->pos = saved;
             if (is_gen_call) {
                 Span call_name = parser_take_qualified_after_first(parser, kw);
+                if (parser_next_is_object_constructor(parser)) {
+                    Span object_slot_type = {0};
+                    ObjectDef *obj = parser_resolve_object_constructor(parser, call_name,
+                                                                       &object_slot_type);
+                    if (obj && !obj->is_ref) {
+                        int32_t result_slot = parse_object_constructor_typed(parser, body, locals,
+                                                                             obj, object_slot_type);
+                        if (!cold_return_span_is_void(body->return_type) &&
+                            span_same(span_trim(body->return_type), span_trim(object_slot_type))) {
+                            int32_t term = body_term(body, BODY_TERM_RET, result_slot, -1, 0, -1, -1);
+                            body_end_block(body, block, term);
+                        }
+                        return block;
+                    }
+                }
                 int32_t result_kind = SLOT_I32;
                 int32_t result_slot = parse_call_after_name(parser, body, locals, call_name, &result_kind);
                 if (span_eq(parser_peek(parser), "?")) {
@@ -11112,8 +11258,22 @@ BodyIR *parse_fn(Parser *parser, int32_t *symbol_index_out) {
                 param_type = cold_arena_join3(parser->arena, cold_cstr_span("var "), "", param_type);
             }
             param_types[arity] = param_type;
-            param_kinds[arity] = cold_parser_slot_kind_from_type(parser->symbols, param_type);
-            param_sizes[arity] = cold_param_size_from_type(parser->symbols, param_type, param_kinds[arity]);
+            bool generic_param = false;
+            bool generic_param_is_var = false;
+            Span param_stripped = span_trim(cold_type_strip_var(param_type, &generic_param_is_var));
+            for (int32_t gi = 0; gi < fn_generic_count; gi++) {
+                if (span_same(param_stripped, fn_generic_names[gi])) {
+                    generic_param = true;
+                    break;
+                }
+            }
+            if (generic_param) {
+                param_kinds[arity] = generic_param_is_var ? SLOT_I32_REF : SLOT_I32;
+                param_sizes[arity] = generic_param_is_var ? 8 : 4;
+            } else {
+                param_kinds[arity] = cold_parser_slot_kind_from_type(parser->symbols, param_type);
+                param_sizes[arity] = cold_param_size_from_type(parser->symbols, param_type, param_kinds[arity]);
+            }
         }
         /* Check for default value: param: Type = value */
         if (span_eq(parser_peek(parser), "=")) {
