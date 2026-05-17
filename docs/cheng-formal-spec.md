@@ -152,11 +152,13 @@
 - `share_mt(x)`：将 Owned `T` 或 `Arc[T]` 转换/克隆为 `Arc[T]`；内部使用原子 retain/release，最后一次 release 才析构。
 - `Mutex[T]`/`RwLock[T]`：跨线程可变共享的显式通道；只允许通过锁获得可变视图。
 - `Atomic[T]`：仅支持基础数值/指针/布尔类型；提供原子读写与 CAS。
+- `Thread`：真实 OS 线程句柄；`thread.Start(&fn)`/`thread.StartPtr(&fn, ctx)` 返回可 `Join` 的句柄，`thread.Spawn`/`thread.SpawnPtr` 是显式 detach 入口。
+- `Pool`：固定 worker 数的任务池；`ParallelFor(pool, count, &body, ctx)` 按原子 work counter 分配任务，body ABI 为 `fn(ctx: int64, index: int32, worker: int32): int32`，主线程 join 所有 worker 后返回。
 - 原子 RC 语义：retain 采用 relaxed；release 采用 release；当 refcount 归零时执行 acquire fence 再析构，保证跨线程可见性。
 
 #### 0.3.2 编译期约束与 `Send/Sync`
 
-- 线程边界：当前白名单为 `spawn/chanI32Send/chanI32Recv`；调用实参必须满足 `Send/Sync` 约束。
+- 线程边界：当前白名单为 `thread.Start/thread.StartPtr/thread.Spawn/thread.SpawnPtr/thread.ParallelFor/chanI32Send/chanI32Recv`；调用实参必须满足 `Send/Sync` 约束。
 - 线程边界当前通过 `@thread_boundary` 注解声明（无新增关键字），用于标记标准库/业务边界 API；未标注视为非边界；若声明了白名单并发入口但缺失标注，将在函数声明/调用处报错。
 - 构造器白名单：`chanI32New` 的返回值视为 `Send/Sync`（可跨线程传递的 channel 句柄）。
 - 函数指针：`&fnName`（函数取址）视为 `Send/Sync`；对数据取址 `&x` 仍属于原始指针，默认 `!Send/!Sync`。

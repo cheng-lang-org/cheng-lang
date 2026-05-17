@@ -1,0 +1,258 @@
+# std/datetime - Date/time formatting (pure Cheng from Unix timestamp)
+import std/system
+import std/strings
+import std/result
+import std/rawmem_support
+
+@importc("cheng_host_time")
+fn host_time(out: ptr): int64
+
+const
+    dtDaysInMonths: int32[12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    dtMonthNames: str[12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    dtDayNames: str[7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+
+const
+    dtSecondsPerMinute: int32 = 60
+    dtSecondsPerHour: int32 = 3600
+    dtSecondsPerDay: int32 = 86400
+
+type
+    DateTime =
+        year: int32
+        month: int32
+        day: int32
+        hour: int32
+        minute: int32
+        second: int32
+        weekday: int32
+
+fn dtIsLeapYear(year: int32): bool =
+    if year % 400 == 0:
+        return true
+    if year % 100 == 0:
+        return false
+    return year % 4 == 0
+
+fn dtDaysInMonth(year: int32, month: int32): int32 =
+    if month < 0 or month >= 12:
+        return 0
+    if month == 1 and dtIsLeapYear(year):
+        return 29
+    return dtDaysInMonths[month]
+
+fn dtDaysBeforeYear(year: int32): int32 =
+    let y: int32 = year - 1
+    return y * 365 + y / 4 - y / 100 + y / 400
+
+fn dtDaysInYear(year: int32): int32 =
+    return dtIsLeapYear(year) ? 366 : 365
+
+fn dtFromUnix(unixSecs: int64): DateTime =
+    var d: DateTime
+    let days: int32 = int32(unixSecs / int64(dtSecondsPerDay))
+    let daySecs: int32 = int32(unixSecs % int64(dtSecondsPerDay))
+    if daySecs < 0:
+        d.hour = 23
+        d.minute = 59
+        d.second = 60 + daySecs
+    else:
+        d.hour = daySecs / dtSecondsPerHour
+        d.minute = (daySecs % dtSecondsPerHour) / dtSecondsPerMinute
+        d.second = daySecs % dtSecondsPerMinute
+    var z: int32 = days
+    if z < 0:
+        z = z + 1
+    var estYear: int32 = int32((int64(z) * 400) / int64(146097))
+    if estYear < 0:
+        estYear = 0
+    var estDays: int32 = dtDaysBeforeYear(estYear)
+    while estDays > z:
+        estYear = estYear - 1
+        estDays = dtDaysBeforeYear(estYear)
+    while true:
+        let nextDays: int32 = dtDaysBeforeYear(estYear + 1)
+        if nextDays > z:
+            break
+        estYear = estYear + 1
+        estDays = dtDaysBeforeYear(estYear)
+    d.year = estYear
+    var dayOfYear: int32 = z - estDays
+    if dayOfYear < 0:
+        dayOfYear = 0
+    d.month = 0
+    while d.month < 12:
+        let dim: int32 = dtDaysInMonth(estYear, d.month)
+        if dayOfYear < dim:
+            break
+        dayOfYear = dayOfYear - dim
+        d.month = d.month + 1
+    d.day = dayOfYear + 1
+    if d.month == 12:
+        d.month = 0
+    if days >= 0:
+        d.weekday = (days + 4) % 7
+    else:
+        d.weekday = ((days + 4) % 7 + 7) % 7
+    return d
+
+fn dtTimestamp(): int64 =
+    let buf: ptr = HeapNewCompat(8)
+    if buf == nil:
+        return 0
+    rawmem_support.RawmemSet(buf, 0, 8)
+    let _: int64 = host_time(buf)
+    let t: int64 = *[int64](buf)
+    Free(buf)
+    return t
+
+fn dtNow(): DateTime =
+    let ts: int64 = dtTimestamp()
+    return dtFromUnix(ts)
+
+fn dtZeroPad(value: int32, width: int32): str =
+    let s: str = strings.IntToStr(value)
+    let slen: int32 = strings.Len(s)
+    if slen >= width:
+        return s
+    var out: str = NewStringAlloc(width)
+    var i: int32
+    for i in i..<width - slen:
+        rawmem_support.RawmemWriteI8(StrDataPtr(out), i, int8(int32('0')))
+    var j: int32
+    for j in j..<slen:
+        rawmem_support.RawmemWriteI8(StrDataPtr(out), width - slen + j, int8(int32(s[j])))
+    return out
+
+fn dtFormat(dt: DateTime, fmt: str): str =
+    let n: int32 = strings.Len(fmt)
+    if n <= 0:
+        return ""
+    var out: str
+    var i: int32
+    while i < n:
+        let ch: char = fmt[i]
+        if ch != '%':
+            out = Fmt"{out}{strings.CharToStr(ch)}"
+            i = i + 1
+        else:
+            i = i + 1
+            if i >= n:
+                break
+            let spec: char = fmt[i]
+            if spec == 'Y':
+                out = Fmt"{out}{dtZeroPad(dt.year, 4)}"
+            elif spec == 'y':
+                out = Fmt"{out}{dtZeroPad(dt.year % 100, 2)}"
+            elif spec == 'm':
+                out = Fmt"{out}{dtZeroPad(dt.month + 1, 2)}"
+            elif spec == 'd':
+                out = Fmt"{out}{dtZeroPad(dt.day, 2)}"
+            elif spec == 'H':
+                out = Fmt"{out}{dtZeroPad(dt.hour, 2)}"
+            elif spec == 'M':
+                out = Fmt"{out}{dtZeroPad(dt.minute, 2)}"
+            elif spec == 'S':
+                out = Fmt"{out}{dtZeroPad(dt.second, 2)}"
+            elif spec == 'b':
+                if dt.month >= 0 and dt.month < 12:
+                    out = Fmt"{out}{dtMonthNames[dt.month]}"
+            elif spec == 'a':
+                if dt.weekday >= 0 and dt.weekday < 7:
+                    out = Fmt"{out}{dtDayNames[dt.weekday]}"
+            elif spec == '%':
+                out = Fmt"{out}%"
+            else:
+                out = Fmt"{out}%{strings.CharToStr(spec)}"
+            i = i + 1
+    return out
+
+fn dtFormatISO8601(dt: DateTime): str =
+    return dtFormat(dt, "%Y-%m-%dT%H:%M:%S")
+
+fn dtFormatDate(dt: DateTime): str =
+    return dtFormat(dt, "%Y-%m-%d")
+
+fn dtFormatTime(dt: DateTime): str =
+    return dtFormat(dt, "%H:%M:%S")
+
+fn dtFormatRFC1123(dt: DateTime): str =
+    return dtFormat(dt, "%a, %d %b %Y %H:%M:%S GMT")
+
+fn dtNowISO8601(): str =
+    return dtFormatISO8601(dtNow())
+
+fn dtUnixToISO8601(unixSecs: int64): str =
+    return dtFormatISO8601(dtFromUnix(unixSecs))
+
+fn dtUnixToDate(unixSecs: int64): str =
+    return dtFormatDate(dtFromUnix(unixSecs))
+
+fn dtUnixToTime(unixSecs: int64): str =
+    return dtFormatTime(dtFromUnix(unixSecs))
+
+fn dtIsDST(dt: DateTime): bool =
+    if dt.month < 2 or dt.month > 9:
+        return false
+    if dt.month > 3 and dt.month < 10:
+        return true
+    return false
+
+# ---- Public exports ----
+
+fn Now(): DateTime =
+    return dtNow()
+
+fn FromUnix(unixSecs: int64): DateTime =
+    return dtFromUnix(unixSecs)
+
+fn Format(dt: DateTime, fmt: str): str =
+    return dtFormat(dt, fmt)
+
+fn FormatISO8601(dt: DateTime): str =
+    return dtFormatISO8601(dt)
+
+fn FormatDate(dt: DateTime): str =
+    return dtFormatDate(dt)
+
+fn FormatTime(dt: DateTime): str =
+    return dtFormatTime(dt)
+
+fn FormatRFC1123(dt: DateTime): str =
+    return dtFormatRFC1123(dt)
+
+fn NowISO8601(): str =
+    return dtNowISO8601()
+
+fn UnixToISO8601(unixSecs: int64): str =
+    return dtUnixToISO8601(unixSecs)
+
+fn UnixToDate(unixSecs: int64): str =
+    return dtUnixToDate(unixSecs)
+
+fn UnixToTime(unixSecs: int64): str =
+    return dtUnixToTime(unixSecs)
+
+fn Year(dt: DateTime): int32 =
+    return dt.year
+
+fn Month(dt: DateTime): int32 =
+    return dt.month + 1
+
+fn Day(dt: DateTime): int32 =
+    return dt.day
+
+fn Hour(dt: DateTime): int32 =
+    return dt.hour
+
+fn Minute(dt: DateTime): int32 =
+    return dt.minute
+
+fn Second(dt: DateTime): int32 =
+    return dt.second
+
+fn Weekday(dt: DateTime): int32 =
+    return dt.weekday
+
+fn Timestamp(): int64 =
+    return dtTimestamp()

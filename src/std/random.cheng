@@ -1,0 +1,142 @@
+# std/random - Random number generation (xorshift64 PRNG)
+import std/system
+import std/strings
+import std/result
+import std/rawbytes
+import std/rawmem_support
+
+@importc("cheng_host_getentropy")
+fn host_getentropy(buf: ptr, len: int32): int32
+
+type
+    Rng =
+        state: uint64
+
+fn rngNewFromEntropy(): Rng =
+    var r: Rng
+    r.state = uint64(5489)
+    var buf: rawbytes.Bytes = rawbytes.BytesAlloc(8)
+    if rawbytes.BytesLen(buf) >= 8:
+        let rc: int32 = host_getentropy(buf.data, 8)
+        if rc == 0:
+            let seed: uint64 = *[uint64](buf.data)
+            if seed != uint64(0):
+                r.state = seed
+    return r
+
+fn rngNew(seed: uint64): Rng =
+    var r: Rng
+    r.state = seed
+    return r
+
+fn rngNext(r: var Rng): uint64 =
+    var x: uint64 = r.state
+    x = x ^ (x << 13)
+    x = x ^ (x >> 7)
+    x = x ^ (x << 17)
+    r.state = x
+    return x
+
+fn rngNextInt32(r: var Rng): int32 =
+    let val: uint64 = rngNext(r)
+    return int32(val & uint64(0x7fffffff))
+
+fn rngNextInt64(r: var Rng): int64 =
+    let val: uint64 = rngNext(r)
+    return int64(val)
+
+fn rngNextFloat(r: var Rng): float64 =
+    let val: uint64 = rngNext(r)
+    let hi: uint64 = val >> 11
+    let bits: uint64 = uint64(0x3ff0000000000000) | hi
+    let f: float64 = *[float64](&bits)
+    return f - 1.0
+
+fn rngNextRange(r: var Rng, lo: int32, hi: int32): int32 =
+    if hi <= lo:
+        return lo
+    let range: uint64 = uint64(hi - lo)
+    let mask: uint64 = rngPowerOf2Mask(range)
+    while true:
+        let val: uint64 = rngNext(r) & mask
+        if val <= range:
+            return lo + int32(val)
+
+fn rngPowerOf2Mask(n: uint64): uint64 =
+    if n == uint64(0):
+        return uint64(0)
+    var mask: uint64 = n
+    mask = mask | (mask >> 1)
+    mask = mask | (mask >> 2)
+    mask = mask | (mask >> 4)
+    mask = mask | (mask >> 8)
+    mask = mask | (mask >> 16)
+    mask = mask | (mask >> 32)
+    return mask
+
+fn rngShuffle(r: var Rng, seq: var int32[]) =
+    let n: int32 = seq.len
+    if n <= 1:
+        return
+    var i: int32 = n - 1
+    while i > 0:
+        let j: int32 = rngNextRange(r, 0, i)
+        let tmp: int32 = seq[i]
+        seq[i] = seq[j]
+        seq[j] = tmp
+        i = i - 1
+
+fn rngFillBytes(r: var Rng, buf: var uint8[]) =
+    let n: int32 = buf.len
+    if n <= 0:
+        return
+    var i: int32
+    while i < n:
+        let val: uint64 = rngNext(r)
+        if buf.buffer != nil:
+            rawmem_support.RawmemWriteI8(buf.buffer, i, int8(val & uint64(255)))
+        i = i + 1
+        if i < n and buf.buffer != nil:
+            rawmem_support.RawmemWriteI8(buf.buffer, i, int8((val >> 8) & uint64(255)))
+            i = i + 1
+
+fn rngSaveState(r: Rng): uint64 =
+    return r.state
+
+fn rngRestoreState(r: var Rng, state: uint64) =
+    r.state = state
+
+# ---- Public exports ----
+
+fn NewRng(): Rng =
+    return rngNewFromEntropy()
+
+fn NewRng(seed: uint64): Rng =
+    return rngNew(seed)
+
+fn Next(r: var Rng): uint64 =
+    return rngNext(r)
+
+fn NextInt32(r: var Rng): int32 =
+    return rngNextInt32(r)
+
+fn NextInt64(r: var Rng): int64 =
+    return rngNextInt64(r)
+
+fn NextFloat(r: var Rng): float64 =
+    return rngNextFloat(r)
+
+fn NextRange(r: var Rng, lo: int32, hi: int32): int32 =
+    return rngNextRange(r, lo, hi)
+
+fn Shuffle(r: var Rng, seq: var int32[]) =
+    rngShuffle(r, seq)
+
+fn FillBytes(r: var Rng, buf: var uint8[]) =
+    rngFillBytes(r, buf)
+
+fn SaveState(r: Rng): uint64 =
+    return rngSaveState(r)
+
+fn RestoreState(r: var Rng, state: uint64) =
+    rngRestoreState(r, state)

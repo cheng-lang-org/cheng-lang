@@ -12,6 +12,9 @@
 #include <sys/random.h>
 #include <sys/wait.h>
 #include <poll.h>
+#include <pthread.h>
+#include <sched.h>
+#include <stdint.h>
 #define W __attribute__((weak))
 W void* cheng_host_fopen(const char* p, const char* m) { return fopen(p,m); }
 W int cheng_host_fclose(void* fp) { return fclose((FILE*)fp); }
@@ -94,8 +97,110 @@ W void cheng_strutils_join_bridge(void) {}
 W void cheng_str_to_cstring_temp_bridge(void) {}
 W void driver_c_str_from_utf8_copy_bridge(void) {}
 W void driver_c_get_env_bridge(void) {}
-W void* cheng_spawn(void* fn, void* arg) { return 0; }
-W int cheng_thread_parallelism(void) { return 1; }
+typedef struct ChengHostThreadTask {
+    void* fn;
+    void* arg;
+} ChengHostThreadTask;
+typedef struct ChengHostThreadI32Task {
+    void* fn;
+    int arg;
+} ChengHostThreadI32Task;
+static void cheng_host_call_indirect_void(void* fn, void* arg) {
+    if (!fn) return;
+    ((void (*)(void*))fn)(arg);
+}
+static int cheng_host_call_indirect_i32(void* fn, long long ctx, int a, int b) {
+    if (!fn) return 0;
+    return ((int (*)(long long, int, int))fn)(ctx, a, b);
+}
+static void* cheng_host_thread_entry(void* raw) {
+    ChengHostThreadTask* task = (ChengHostThreadTask*)raw;
+    if (!task) return 0;
+    void* fn = task->fn;
+    void* arg = task->arg;
+    free(task);
+    cheng_host_call_indirect_void(fn, arg);
+    return 0;
+}
+static void* cheng_host_thread_i32_entry(void* raw) {
+    ChengHostThreadI32Task* task = (ChengHostThreadI32Task*)raw;
+    if (!task) return 0;
+    void* fn = task->fn;
+    int arg = task->arg;
+    free(task);
+    (void)cheng_host_call_indirect_i32(fn, (long long)arg, 0, 0);
+    return 0;
+}
+W void __cheng_call_indirect_void(void* fn, void* arg) {
+    cheng_host_call_indirect_void(fn, arg);
+}
+W int __cheng_call_indirect_i32(void* fn, long long ctx, int a, int b) {
+    return cheng_host_call_indirect_i32(fn, ctx, a, b);
+}
+W void* cheng_thread_start(void* fn, void* arg) {
+    if (!fn) return 0;
+    ChengHostThreadTask* task = (ChengHostThreadTask*)malloc(sizeof(ChengHostThreadTask));
+    if (!task) return 0;
+    task->fn = fn;
+    task->arg = arg;
+    pthread_t thread;
+    if (pthread_create(&thread, 0, cheng_host_thread_entry, task) != 0) {
+        free(task);
+        return 0;
+    }
+    return (void*)(uintptr_t)thread;
+}
+W int cheng_thread_join(void* handle) {
+    if (!handle) return 0;
+    return pthread_join((pthread_t)(uintptr_t)handle, 0) == 0 ? 1 : 0;
+}
+W int cheng_thread_detach(void* handle) {
+    if (!handle) return 0;
+    return pthread_detach((pthread_t)(uintptr_t)handle) == 0 ? 1 : 0;
+}
+W int cheng_thread_spawn(void* fn, void* arg) {
+    void* handle = cheng_thread_start(fn, arg);
+    if (!handle) return 0;
+    if (!cheng_thread_detach(handle)) {
+        cheng_panic_cstring_and_exit("cheng_thread_detach_failed");
+    }
+    return 1;
+}
+W void* cheng_spawn(void* fn, void* arg) {
+    if (!cheng_thread_spawn(fn, arg)) {
+        cheng_panic_cstring_and_exit("cheng_thread_spawn_failed");
+    }
+    return 0;
+}
+W int cheng_thread_spawn_i32(void* fn, int arg) {
+    if (!fn) return 0;
+    ChengHostThreadI32Task* task = (ChengHostThreadI32Task*)malloc(sizeof(ChengHostThreadI32Task));
+    if (!task) return 0;
+    task->fn = fn;
+    task->arg = arg;
+    pthread_t thread;
+    if (pthread_create(&thread, 0, cheng_host_thread_i32_entry, task) != 0) {
+        free(task);
+        return 0;
+    }
+    if (pthread_detach(thread) != 0) {
+        cheng_panic_cstring_and_exit("cheng_thread_detach_failed");
+    }
+    return 1;
+}
+W int cheng_thread_parallelism(void) {
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return n > 0 && n <= 2147483647L ? (int)n : 1;
+}
+W void cheng_thread_yield(void) {
+    sched_yield();
+}
+W int OSAtomicCompareAndSwap32Barrier(int oldValue, int newValue, volatile int* value) {
+    return __sync_bool_compare_and_swap(value, oldValue, newValue);
+}
+W int OSAtomicAdd32Barrier(int amount, volatile int* value) {
+    return __sync_add_and_fetch(value, amount);
+}
 W void cheng_mm_diag_reset(void) {}
 W void cheng_mem_retain(void* p) {}
 W void cheng_mem_release(void* p) {}

@@ -1,0 +1,252 @@
+# std/http - HTTP client (minimal, IPv4, libc sockets bridge)
+import std/system
+import std/strings
+import std/strformat
+import std/result
+import std/rawbytes
+import std/rawmem_support
+
+type
+    HttpResponse =
+        statusCode: int32
+        body: str
+        headers: str
+
+type
+    HttpMethod = enum
+        hmGET
+        hmPOST
+
+importc fn libc_socket(domain: int32, typ: int32, protocol: int32): int32
+importc fn libc_connect(fd: int32, addr: ptr, addrLen: int32): int32
+importc fn libc_send(fd: int32, buf: ptr, len: int32, flags: int32): int64
+importc fn libc_recv(fd: int32, buf: ptr, len: int32, flags: int32): int64
+importc fn libc_close(fd: int32): int32
+importc fn gethostbyname(name: cstring): ptr
+
+const
+    httpAF_INET: int32 = 2
+    httpSockStream: int32 = 1
+    httpIPProtoTCP: int32 = 6
+    httpRecvBufSize: int32 = 4096
+    httpSockaddrLen: int32 = 16
+
+fn httpNewResponse(status: int32, hdrs: str, body: str): HttpResponse =
+    var resp: HttpResponse
+    resp.statusCode = status
+    resp.headers = hdrs
+    resp.body = body
+    return resp
+
+fn httpResolveHost(host: str): uint32 =
+    if strings.Len(host) <= 0:
+        return uint32(0)
+    let cstr: cstring = strToCStringTemp(host)
+    let he: ptr = gethostbyname(cstr)
+    if he == nil:
+        return uint32(0)
+    let ptrSz: int32 = elemSize[ptr]()
+    let h_addrtypeOff: int32 = ptrSz * 2
+    let h_lengthOff: int32 = h_addrtypeOff + 4
+    let h_addr_listOff: int32 = h_lengthOff + 4
+    let addrListPtr: ptr = *[ptr](rawmem_support.RawmemPtrAdd(he, h_addr_listOff))
+    if addrListPtr == nil:
+        return uint32(0)
+    let firstAddrPtr: ptr = *[ptr](addrListPtr)
+    if firstAddrPtr == nil:
+        return uint32(0)
+    let addrVal: uint32 = *[uint32](firstAddrPtr)
+    return addrVal
+
+fn httpBuildSockaddrIn(addr: uint32, port: int32, buf: var rawbytes.Bytes) =
+    let buflen: int32 = rawbytes.BytesLen(buf)
+    if buflen < httpSockaddrLen:
+        return
+    rawbytes.BytesSet(buf, 0, 0)
+    rawbytes.BytesSet(buf, 1, 2)
+    let pb0: int32 = port & 255
+    let pb1: int32 = (port >> 8) & 255
+    rawbytes.BytesSet(buf, 2, pb1)
+    rawbytes.BytesSet(buf, 3, pb0)
+    rawbytes.BytesSet(buf, 4, int32(addr & uint32(255)))
+    rawbytes.BytesSet(buf, 5, int32((addr >> 8) & uint32(255)))
+    rawbytes.BytesSet(buf, 6, int32((addr >> 16) & uint32(255)))
+    rawbytes.BytesSet(buf, 7, int32((addr >> 24) & uint32(255)))
+    for i in 8..<httpSockaddrLen:
+        rawbytes.BytesSet(buf, i, 0)
+
+fn httpConnect(host: str, port: int32): int32 =
+    let addr: uint32 = httpResolveHost(host)
+    if addr == uint32(0):
+        return -1
+    let fd: int32 = libc_socket(httpAF_INET, httpSockStream, httpIPProtoTCP)
+    if fd < 0:
+        return -1
+    var sa: rawbytes.Bytes = rawbytes.BytesAlloc(httpSockaddrLen)
+    if rawbytes.BytesLen(sa) < httpSockaddrLen:
+        libc_close(fd)
+        return -1
+    httpBuildSockaddrIn(addr, port, sa)
+    let rc: int32 = libc_connect(fd, sa.data, httpSockaddrLen)
+    if rc != 0:
+        libc_close(fd)
+        return -1
+    return fd
+
+fn httpSendAll(fd: int32, data: ptr, len: int32): bool =
+    var sent: int32
+    while sent < len:
+        let n: int64 = libc_send(fd, rawmem_support.RawmemPtrAdd(data, sent), len - sent, 0)
+        if n <= 0:
+            return false
+        sent = sent + int32(n)
+    return true
+
+fn httpRecvAll(fd: int32): str =
+    var total: rawbytes.Bytes = rawbytes.EmptyBytes()
+    var buf: rawbytes.Bytes = rawbytes.BytesAlloc(httpRecvBufSize)
+    while true:
+        let n: int64 = libc_recv(fd, buf.data, httpRecvBufSize, 0)
+        if n <= 0:
+            break
+        let chunk: rawbytes.Bytes = rawbytes.BytesSliceView(buf, 0, int32(n))
+        total = rawbytes.bytesConcat(total, chunk)
+    return rawbytes.bytesToString(total)
+
+fn httpBuildRequest(method: str, host: str, path: str, body: str, contentType: str): str =
+    let crlf: str = "\r\n"
+    if strings.Len(body) > 0:
+        return Fmt"{method} {path} HTTP/1.1{crlf}Host: {host}{crlf}Content-Type: {contentType}{crlf}Content-Length: {strings.IntToStr(strings.Len(body))}{crlf}Connection: close{crlf}{crlf}{body}"
+    return Fmt"{method} {path} HTTP/1.1{crlf}Host: {host}{crlf}Connection: close{crlf}{crlf}"
+
+fn httpParseStatusLine(raw: str): int32 =
+    let n: int32 = strings.Len(raw)
+    if n < 12:
+        return 0
+    var statusStart: int32 = -1
+    for i in 0..<n:
+        if raw[i] == ' ':
+            statusStart = i + 1
+            break
+    if statusStart < 0 || statusStart + 3 > n:
+        return 0
+    var code: int32
+    for i in statusStart..<statusStart + 3:
+        let ch: char = raw[i]
+        if ch < '0' || ch > '9':
+            return 0
+        code = code * 10 + (int32(ch) - int32('0'))
+    return code
+
+fn httpSplitResponse(raw: str, headers: var str, body: var str): int32 =
+    let n: int32 = strings.Len(raw)
+    if n <= 0:
+        return 0
+    var statusLineEnd: int32 = -1
+    for i in 0..<n - 1:
+        if raw[i] == '\r' and raw[i + 1] == '\n':
+            statusLineEnd = i
+            break
+    if statusLineEnd < 0:
+        return 0
+    let statusLine: str = strings.SliceBytes(raw, 0, statusLineEnd)
+    let code: int32 = httpParseStatusLine(statusLine)
+    var headerEnd: int32 = -1
+    for i in (statusLineEnd + 2)..<n - 3:
+        if raw[i] == '\r' and raw[i + 1] == '\n' and raw[i + 2] == '\r' and raw[i + 3] == '\n':
+            headers = strings.SliceBytes(raw, statusLineEnd + 2, i - statusLineEnd - 2)
+            headerEnd = i + 4
+            break
+    if headerEnd < 0:
+        body = ""
+        return code
+    body = strings.SliceBytes(raw, headerEnd, n - headerEnd)
+    return code
+
+fn httpRequest(method: str, host: str, port: int32, path: str, body: str, contentType: str): Result[HttpResponse] =
+    if strings.Len(host) <= 0:
+        return Err[HttpResponse]("empty host")
+    if port <= 0:
+        port = 80
+    let request: str = httpBuildRequest(method, host, path, body, contentType)
+    let fd: int32 = httpConnect(host, port)
+    if fd < 0:
+        return Err[HttpResponse]("connect failed")
+    let ok: bool = httpSendAll(fd, StrDataPtr(request), strings.Len(request))
+    if !ok:
+        libc_close(fd)
+        return Err[HttpResponse]("send failed")
+    let rawResp: str = httpRecvAll(fd)
+    libc_close(fd)
+    if strings.Len(rawResp) <= 0:
+        return Err[HttpResponse]("empty response")
+    var headers: str
+    var respBody: str
+    let code: int32 = httpSplitResponse(rawResp, headers, respBody)
+    return Ok[HttpResponse](httpNewResponse(code, headers, respBody))
+
+fn httpParseUrl(url: str, host: var str, port: var int32, path: var str): bool =
+    let n: int32 = strings.Len(url)
+    if n <= 0:
+        return false
+    var start: int32
+    if strings.HasPrefix(url, "http://"):
+        start = 7
+    else:
+        return false
+    port = 80
+    path = "/"
+    var hostEnd: int32 = n
+    for i in start..<n:
+        if url[i] == ':':
+            host = strings.SliceBytes(url, start, i - start)
+            for j in (i + 1)..<n:
+                if url[j] == '/':
+                    let ps: str = strings.SliceBytes(url, i + 1, j - i - 1)
+                    var parsedPort: int32
+                    for k in 0..<strings.Len(ps):
+                        let ch: char = ps[k]
+                        if ch >= '0' and ch <= '9':
+                            parsedPort = parsedPort * 10 + (int32(ch) - int32('0'))
+                    port = parsedPort
+                    path = strings.SliceBytes(url, j, n - j)
+                    return true
+            let ps: str = strings.SliceBytes(url, i + 1, n - i - 1)
+            var parsedPort: int32
+            for k in 0..<strings.Len(ps):
+                let ch: char = ps[k]
+                if ch >= '0' and ch <= '9':
+                    parsedPort = parsedPort * 10 + (int32(ch) - int32('0'))
+            port = parsedPort
+            return true
+        if url[i] == '/':
+            host = strings.SliceBytes(url, start, i - start)
+            path = strings.SliceBytes(url, i, n - i)
+            return true
+    host = strings.SliceBytes(url, start, n - start)
+    return strings.Len(host) > 0
+
+fn httpGet(url: str): Result[HttpResponse] =
+    var host: str
+    var port: int32
+    var path: str
+    if !httpParseUrl(url, host, port, path):
+        return Err[HttpResponse]("invalid url")
+    return httpRequest("GET", host, port, path, "", "")
+
+fn httpPost(url: str, body: str, contentType: str): Result[HttpResponse] =
+    var host: str
+    var port: int32
+    var path: str
+    if !httpParseUrl(url, host, port, path):
+        return Err[HttpResponse]("invalid url")
+    return httpRequest("POST", host, port, path, body, contentType)
+
+fn HttpResponseStatusCode(resp: HttpResponse): int32 =
+    return resp.statusCode
+
+fn HttpResponseBody(resp: HttpResponse): str =
+    return resp.body
+
+fn HttpResponseHeaders(resp: HttpResponse): str =
+    return resp.headers

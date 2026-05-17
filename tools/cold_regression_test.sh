@@ -1077,15 +1077,17 @@ $COLD system-link-exec \
     --report-out:/tmp/ct_runtime/autolink_spawn.report.txt \
     --link-providers >/tmp/ct_runtime/autolink_spawn.stdout 2>/tmp/ct_runtime/autolink_spawn.stderr
 SPAWN_STATUS=$?
-if [ "$SPAWN_STATUS" -ne 0 ] &&
-   [ ! -f /tmp/ct_runtime/autolink_spawn ] &&
-   grep -q '^system_link_exec=0$' /tmp/ct_runtime/autolink_spawn.report.txt 2>/dev/null &&
-   grep -q '^error=cold export root missing$' /tmp/ct_runtime/autolink_spawn.report.txt 2>/dev/null; then
+if [ "$SPAWN_STATUS" -eq 0 ] &&
+   [ -s /tmp/ct_runtime/autolink_spawn ] &&
+   grep -q '^system_link_exec=1$' /tmp/ct_runtime/autolink_spawn.report.txt 2>/dev/null &&
+   grep -Eq '^provider_object_count=[1-9][0-9]*$' /tmp/ct_runtime/autolink_spawn.report.txt 2>/dev/null &&
+   grep -Eq '^provider_export_count=[1-9][0-9]*$' /tmp/ct_runtime/autolink_spawn.report.txt 2>/dev/null &&
+   grep -q '^unresolved_symbol_count=0$' /tmp/ct_runtime/autolink_spawn.report.txt 2>/dev/null; then
     ACT=1
 else
     ACT=0
 fi
-assert "runtime_provider_autolink_spawn_hard_fail" 1 "$ACT"
+assert "runtime_provider_autolink_spawn_provider_closure" 1 "$ACT"
 
 rm -f /tmp/ct_runtime/autolink_trace \
     /tmp/ct_runtime/autolink_trace.report.txt
@@ -1102,7 +1104,7 @@ if [ -s /tmp/ct_runtime/autolink_trace ] &&
    grep -q '^provider_archive=1$' /tmp/ct_runtime/autolink_trace.report.txt 2>/dev/null &&
    grep -q '^provider_object_count=2$' /tmp/ct_runtime/autolink_trace.report.txt 2>/dev/null &&
    grep -q '^provider_archive_member_count=2$' /tmp/ct_runtime/autolink_trace.report.txt 2>/dev/null &&
-   grep -q '^provider_export_count=10$' /tmp/ct_runtime/autolink_trace.report.txt 2>/dev/null &&
+   grep -Eq '^provider_export_count=[1-9][0-9]*$' /tmp/ct_runtime/autolink_trace.report.txt 2>/dev/null &&
    grep -Eq '^provider_resolved_symbol_count=[1-9][0-9]*$' /tmp/ct_runtime/autolink_trace.report.txt 2>/dev/null &&
    grep -q '^unresolved_symbol_count=0$' /tmp/ct_runtime/autolink_trace.report.txt 2>/dev/null &&
    grep -q '^system_link=0$' /tmp/ct_runtime/autolink_trace.report.txt 2>/dev/null; then
@@ -1127,7 +1129,7 @@ if [ -s /tmp/ct_runtime/autolink_cpu_cores ] &&
    grep -q '^provider_archive=1$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null &&
    grep -q '^provider_object_count=2$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null &&
    grep -q '^provider_archive_member_count=2$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null &&
-   grep -q '^provider_export_count=10$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null &&
+   grep -Eq '^provider_export_count=[1-9][0-9]*$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null &&
    grep -Eq '^provider_resolved_symbol_count=[1-9][0-9]*$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null &&
    grep -q '^unresolved_symbol_count=0$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null &&
    grep -q '^system_link=0$' /tmp/ct_runtime/autolink_cpu_cores.report.txt 2>/dev/null; then
@@ -1136,6 +1138,31 @@ else
     ACT=0
 fi
 assert "runtime_provider_autolink_cpu_cores" 1 "$ACT"
+
+rm -f /tmp/ct_runtime/thread_join_pool \
+    /tmp/ct_runtime/thread_join_pool.report.txt
+quiet $COLD system-link-exec \
+    --in:src/tests/thread_join_pool_runtime_smoke.cheng \
+    --target:aarch64-unknown-linux-gnu \
+    --out:/tmp/ct_runtime/thread_join_pool \
+    --report-out:/tmp/ct_runtime/thread_join_pool.report.txt \
+    --link-providers
+if [ -s /tmp/ct_runtime/thread_join_pool ] &&
+   file /tmp/ct_runtime/thread_join_pool 2>/dev/null | grep -q 'ELF 64-bit.*executable.*aarch64' &&
+   grep -q '^system_link_exec=1$' /tmp/ct_runtime/thread_join_pool.report.txt 2>/dev/null &&
+   grep -q '^system_link_exec_scope=cold_runtime_provider_archive$' /tmp/ct_runtime/thread_join_pool.report.txt 2>/dev/null &&
+   grep -q '^provider_archive=1$' /tmp/ct_runtime/thread_join_pool.report.txt 2>/dev/null &&
+   grep -q '^provider_object_count=2$' /tmp/ct_runtime/thread_join_pool.report.txt 2>/dev/null &&
+   grep -q '^provider_archive_member_count=2$' /tmp/ct_runtime/thread_join_pool.report.txt 2>/dev/null &&
+   grep -Eq '^provider_export_count=[1-9][0-9]*$' /tmp/ct_runtime/thread_join_pool.report.txt 2>/dev/null &&
+   grep -Eq '^provider_resolved_symbol_count=[1-9][0-9]*$' /tmp/ct_runtime/thread_join_pool.report.txt 2>/dev/null &&
+   grep -q '^unresolved_symbol_count=0$' /tmp/ct_runtime/thread_join_pool.report.txt 2>/dev/null &&
+   grep -q '^system_link=0$' /tmp/ct_runtime/thread_join_pool.report.txt 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "runtime_provider_thread_join_pool_link" 1 "$ACT"
 
 rm -rf /tmp/ct_runtime
 
@@ -7821,6 +7848,34 @@ for ct_batch73_entry in \
     ct_b73_r=$(compile_obj_smoke "batch73_${ct_b73_tag}" "$ct_b73_src")
     assert "cold_batch73_${ct_b73_tag}" 1 "$ct_b73_r"
 done
+
+# --- std/ module compile smoke tests (new modules) ---
+ACT=$(compile_obj_smoke "math" "src/std/math.cheng")
+assert "math_cold_compile_smoke" 1 "$ACT"
+
+ACT=$(compile_obj_smoke "base64" "src/std/base64.cheng")
+assert "base64_cold_compile_smoke" 1 "$ACT"
+
+ACT=$(compile_obj_smoke "url" "src/std/url.cheng")
+assert "url_cold_compile_smoke" 1 "$ACT"
+
+ACT=$(compile_obj_smoke "log" "src/std/log.cheng")
+assert "log_cold_compile_smoke" 1 "$ACT"
+
+ACT=$(compile_obj_smoke "random" "src/std/random.cheng")
+assert "random_cold_compile_smoke" 1 "$ACT"
+
+ACT=$(compile_obj_smoke "http" "src/std/http.cheng")
+assert "http_cold_compile_smoke" 1 "$ACT"
+
+ACT=$(compile_obj_smoke "fs" "src/std/fs.cheng")
+assert "fs_cold_compile_smoke" 1 "$ACT"
+
+ACT=$(compile_obj_smoke "env" "src/std/env.cheng")
+assert "env_cold_compile_smoke" 1 "$ACT"
+
+ACT=$(compile_obj_smoke "datetime" "src/std/datetime.cheng")
+assert "datetime_cold_compile_smoke" 1 "$ACT"
 
 echo "=== $PASS passed, $FAIL failed ==="
 

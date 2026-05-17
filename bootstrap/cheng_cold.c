@@ -6873,6 +6873,9 @@ static uint32_t a64_cbz(int rt, int32_t offset_words, bool nonzero) {
 static uint32_t a64_svc(uint16_t imm) {
     return 0xD4000001u | ((uint32_t)imm << 5);
 }
+static uint32_t a64_clrex(void) {
+    return 0xD5033F5Fu;
+}
 
 __attribute__((unused))
 static uint32_t a64_cset(int rd, int cond) {
@@ -16404,6 +16407,7 @@ typedef struct ColdCompileStats {
     int32_t cross_block_analysis_ran;
     int32_t cross_block_safe_slots;
     int32_t cross_block_unsafe_slots;
+    int32_t system_link;
     char system_link_exec_scope[COLD_NAME_CAP];
 } ColdCompileStats;
 
@@ -18014,6 +18018,7 @@ static void cold_write_provider_manifest(const char *out_path,
                                           char ***prov_names,
                                           int32_t *prov_nc,
                                           int32_t **prov_offsets);
+static bool cold_file_exists_nonempty(const char *path);
 
 static bool cold_compile_csg_path_to_macho(const char *out_path,
                                            const char *csg_path,
@@ -20188,8 +20193,8 @@ static bool cold_write_system_link_exec_report(const char *path,
     fputs("source_storage=mmap_span\n", file);
     fputs("allocation=phase_arena\n", file);
     fputs("ir_layout=soa_dense\n", file);
-    fputs("linkerless_image=1\n", file);
-    fputs("system_link=0\n", file);
+    fprintf(file, "linkerless_image=%d\n", stats && stats->system_link ? 0 : 1);
+    fprintf(file, "system_link=%d\n", stats && stats->system_link ? 1 : 0);
     fputs("hot_path_node_malloc=0\n", file);
     cold_print_exec_phase_report(file, stats);
     cold_print_resource_report(file);
@@ -21429,7 +21434,9 @@ static bool cold_provider_external_dependency_symbol(const char *name) {
         "proc_listpids",
         "getpgid",
         "pthread_create",
+        "pthread_join",
         "pthread_detach",
+        "sched_yield",
     };
     for (size_t i = 0; i < sizeof(symbols) / sizeof(symbols[0]); i++) {
         if (strcmp(name, symbols[i]) == 0) return true;
@@ -22051,8 +22058,16 @@ static bool cold_runtime_provider_linux_root_supported(const char *symbol) {
         "cheng_realloc",
         "cheng_mem_retain",
         "cheng_mem_release",
+        "cheng_mem_refcount",
         "cheng_mem_retain_atomic",
         "cheng_mem_release_atomic",
+        "cheng_mem_refcount_atomic",
+        "cheng_mm_retain_count",
+        "cheng_mm_release_count",
+        "cheng_mm_alloc_count",
+        "cheng_mm_free_count",
+        "cheng_mm_live_count",
+        "cheng_mm_diag_reset",
         "cheng_panic_cstring_and_exit",
         "driver_c_new_string",
         "driver_c_new_string_copy_n",
@@ -22071,11 +22086,19 @@ static bool cold_runtime_provider_linux_root_supported(const char *symbol) {
         "cheng_atomic_cas_i32",
         "cheng_atomic_load_i32",
         "cheng_atomic_store_i32",
+        "__cheng_call_indirect_void",
+        "__cheng_call_indirect_i32",
         "cheng_spawn",
+        "cheng_thread_spawn",
+        "cheng_thread_start",
         "cheng_mutex_init",
         "cheng_mutex_lock",
         "cheng_mutex_unlock",
         "cheng_thread_join",
+        "cheng_thread_detach",
+        "cheng_thread_spawn_i32",
+        "cheng_thread_parallelism",
+        "cheng_thread_yield",
         "cheng_retain_atomic",
         "cheng_release_atomic",
     };
@@ -22093,8 +22116,29 @@ static bool cold_runtime_provider_program_support_root(const char *symbol) {
         "cheng_realloc",
         "cheng_mem_retain",
         "cheng_mem_release",
+        "cheng_mem_refcount",
         "cheng_mem_retain_atomic",
         "cheng_mem_release_atomic",
+        "cheng_mem_refcount_atomic",
+        "cheng_mm_retain_count",
+        "cheng_mm_release_count",
+        "cheng_mm_alloc_count",
+        "cheng_mm_free_count",
+        "cheng_mm_live_count",
+        "cheng_mm_diag_reset",
+        "cheng_atomic_cas_i32",
+        "cheng_atomic_load_i32",
+        "cheng_atomic_store_i32",
+        "__cheng_call_indirect_void",
+        "__cheng_call_indirect_i32",
+        "cheng_spawn",
+        "cheng_thread_spawn",
+        "cheng_thread_start",
+        "cheng_thread_join",
+        "cheng_thread_detach",
+        "cheng_thread_spawn_i32",
+        "cheng_thread_parallelism",
+        "cheng_thread_yield",
         "cheng_panic_cstring_and_exit",
         "driver_c_new_string",
         "driver_c_new_string_copy_n",
@@ -22138,6 +22182,10 @@ static bool cold_linux_syscall_provider_exports_symbol(const char *symbol) {
         "__cheng_linux_syscall4",
         "__cheng_linux_syscall5",
         "__cheng_linux_syscall6",
+        "__cheng_linux_atomic_cas_i32",
+        "__cheng_linux_atomic_store_i32",
+        "__cheng_linux_atomic_load_i32",
+        "__cheng_linux_thread_start",
         "write",
         "get_nprocs",
     };
@@ -22234,6 +22282,64 @@ static void cold_emit_linux_aarch64_get_nprocs_provider(Code *code) {
     code_emit(code, a64_ret());
 }
 
+static void cold_emit_linux_aarch64_atomic_cas_i32_provider(Code *code) {
+    int32_t loop = code->count;
+    code_emit(code, a64_ldaxr_w(R4, R0));
+    code_emit(code, a64_cmp_reg(R4, R1));
+    int32_t fail_ne = code->count;
+    code_emit(code, a64_bcond(0, COND_NE));
+    code_emit(code, a64_stlxr_w(R5, R2, R0));
+    code_emit(code, a64_cbz(R5, loop - code->count, true));
+    code_emit(code, a64_movz(R0, 1, 0));
+    code_emit(code, a64_ret());
+
+    int32_t fail = code->count;
+    a64_patch_bcond(code, fail_ne, fail);
+    code_emit(code, a64_clrex());
+    code_emit(code, a64_movz(R0, 0, 0));
+    code_emit(code, a64_ret());
+}
+
+static void cold_emit_linux_aarch64_atomic_store_i32_provider(Code *code) {
+    code_emit(code, a64_stlr_w(R1, R0));
+    code_emit(code, a64_ret());
+}
+
+static void cold_emit_linux_aarch64_atomic_load_i32_provider(Code *code) {
+    code_emit(code, a64_ldar_w(R0, R0));
+    code_emit(code, a64_ret());
+}
+
+static void cold_emit_linux_aarch64_thread_start_provider(Code *code) {
+    code_emit(code, a64_orr_reg_x(R9, SP, R0));   /* fn */
+    code_emit(code, a64_orr_reg_x(R10, SP, R1));  /* ctx */
+    code_emit(code, a64_orr_reg_x(R11, SP, R3));  /* handle */
+    code_emit(code, a64_add_imm(R12, R3, 16, true)); /* &handle->tidWord */
+    code_emit(code, a64_add_imm(13, R3, 20, true));  /* &handle->state */
+    code_emit(code, a64_orr_reg_x(R1, SP, R2));   /* child stack */
+    codegen_mov_i64_const(code, R0, 0x01350F00u); /* CLONE_* pthread-like flags */
+    code_emit(code, a64_orr_reg_x(R2, SP, R12));  /* parent_tid */
+    code_emit(code, a64_movz_x(R3, 0, 0));        /* tls */
+    code_emit(code, a64_orr_reg_x(R4, SP, R12));  /* child_tid */
+    code_emit(code, a64_movz_x(R8, 220, 0));      /* clone */
+    code_emit(code, a64_svc(0));
+    code_emit(code, a64_cmp_reg_x(R0, SP));
+    int32_t child_eq = code->count;
+    code_emit(code, a64_bcond(0, COND_EQ));
+    code_emit(code, a64_ret());
+
+    int32_t child = code->count;
+    a64_patch_bcond(code, child_eq, child);
+    code_emit(code, a64_orr_reg_x(R0, SP, R10));
+    code_emit(code, a64_blr(R9));
+    code_emit(code, a64_movz(14, 2, 0));
+    code_emit(code, a64_stlr_w(14, 13));
+    code_emit(code, a64_movz_x(R0, 0, 0));
+    code_emit(code, a64_movz_x(R8, 93, 0));
+    code_emit(code, a64_svc(0));
+    code_emit(code, a64_b(0));
+}
+
 static bool cold_write_linux_aarch64_syscall_provider_object(const char *out_path) {
     static const char *names[] = {
         "__cheng_linux_syscall0",
@@ -22243,15 +22349,27 @@ static bool cold_write_linux_aarch64_syscall_provider_object(const char *out_pat
         "__cheng_linux_syscall4",
         "__cheng_linux_syscall5",
         "__cheng_linux_syscall6",
+        "__cheng_linux_atomic_cas_i32",
+        "__cheng_linux_atomic_store_i32",
+        "__cheng_linux_atomic_load_i32",
+        "__cheng_linux_thread_start",
         "write",
         "get_nprocs",
     };
     enum { NAME_COUNT = (int)(sizeof(names) / sizeof(names[0])) };
-    enum { SYSCALL_COUNT = 7, WRITE_INDEX = 7, GET_NPROCS_INDEX = 8 };
+    enum {
+        SYSCALL_COUNT = 7,
+        ATOMIC_CAS_INDEX = 7,
+        ATOMIC_STORE_INDEX = 8,
+        ATOMIC_LOAD_INDEX = 9,
+        THREAD_START_INDEX = 10,
+        WRITE_INDEX = 11,
+        GET_NPROCS_INDEX = 12
+    };
     Arena *arena = mmap(0, sizeof(Arena), PROT_READ | PROT_WRITE,
                         MAP_PRIVATE | MAP_ANON, -1, 0);
     if (arena == MAP_FAILED) return false;
-    Code *code = code_new(arena, 256);
+    Code *code = code_new(arena, 512);
     int32_t offsets[NAME_COUNT];
     for (int32_t argc = 0; argc < SYSCALL_COUNT; argc++) {
         offsets[argc] = code->count;
@@ -22262,6 +22380,14 @@ static bool cold_write_linux_aarch64_syscall_provider_object(const char *out_pat
         code_emit(code, a64_svc(0));
         code_emit(code, a64_ret());
     }
+    offsets[ATOMIC_CAS_INDEX] = code->count;
+    cold_emit_linux_aarch64_atomic_cas_i32_provider(code);
+    offsets[ATOMIC_STORE_INDEX] = code->count;
+    cold_emit_linux_aarch64_atomic_store_i32_provider(code);
+    offsets[ATOMIC_LOAD_INDEX] = code->count;
+    cold_emit_linux_aarch64_atomic_load_i32_provider(code);
+    offsets[THREAD_START_INDEX] = code->count;
+    cold_emit_linux_aarch64_thread_start_provider(code);
     offsets[WRITE_INDEX] = code->count;
     cold_emit_linux_aarch64_write_provider(code);
     offsets[GET_NPROCS_INDEX] = code->count;
@@ -27502,6 +27628,105 @@ static void cold_write_provider_manifest(const char *out_path,
     fclose(f);
 }
 
+static int32_t cold_count_provider_objects_csv(const char *provider_objects) {
+    if (!provider_objects || provider_objects[0] == '\0') return 0;
+    int32_t count = 0;
+    const char *p = provider_objects;
+    while (*p) {
+        while (*p == ',') p++;
+        if (*p == '\0') break;
+        count++;
+        while (*p && *p != ',') p++;
+    }
+    return count;
+}
+
+static bool cold_macho_system_link_provider_objects(const char *primary_object,
+                                                    const char *provider_objects,
+                                                    const char *out_path,
+                                                    ColdCompileStats *stats,
+                                                    char *error_buf,
+                                                    size_t error_cap) {
+    if (!primary_object || !primary_object[0] ||
+        !provider_objects || !provider_objects[0] ||
+        !out_path || !out_path[0]) {
+        snprintf(error_buf, error_cap, "missing Darwin provider system link input");
+        return false;
+    }
+    char q_primary[PATH_MAX * 2];
+    char q_out[PATH_MAX * 2];
+    if (!cold_shell_quote(q_primary, sizeof(q_primary), primary_object) ||
+        !cold_shell_quote(q_out, sizeof(q_out), out_path)) {
+        snprintf(error_buf, error_cap, "Darwin provider system link path too long");
+        return false;
+    }
+    char providers_arg[32768];
+    providers_arg[0] = '\0';
+    int32_t provider_count = 0;
+    char paths_buf[32768];
+    size_t plen = strlen(provider_objects);
+    if (plen >= sizeof(paths_buf)) {
+        snprintf(error_buf, error_cap, "Darwin provider object list too long");
+        return false;
+    }
+    memcpy(paths_buf, provider_objects, plen + 1);
+    char *p = paths_buf;
+    while (p && *p) {
+        char *comma = strchr(p, ',');
+        if (comma) *comma = '\0';
+        if (*p) {
+            char q_provider[PATH_MAX * 2];
+            if (!cold_shell_quote(q_provider, sizeof(q_provider), p)) {
+                snprintf(error_buf, error_cap, "Darwin provider object path too long");
+                return false;
+            }
+            size_t used = strlen(providers_arg);
+            size_t add = strlen(q_provider);
+            if (used + add + 2 >= sizeof(providers_arg)) {
+                snprintf(error_buf, error_cap, "Darwin provider object command too long");
+                return false;
+            }
+            if (used > 0) providers_arg[used++] = ' ';
+            memcpy(providers_arg + used, q_provider, add + 1);
+            provider_count++;
+        }
+        p = comma ? comma + 1 : 0;
+    }
+    if (provider_count <= 0) {
+        snprintf(error_buf, error_cap, "no Darwin provider objects");
+        return false;
+    }
+    char q_log[PATH_MAX * 2];
+    char log_path[PATH_MAX];
+    int nlog = snprintf(log_path, sizeof(log_path), "%s.link.log", out_path);
+    if (nlog <= 0 || nlog >= (int)sizeof(log_path) ||
+        !cold_shell_quote(q_log, sizeof(q_log), log_path)) {
+        snprintf(error_buf, error_cap, "Darwin provider link log path too long");
+        return false;
+    }
+    char cmd[65536];
+    int n = snprintf(cmd, sizeof(cmd),
+                     "/usr/bin/cc -arch arm64 %s %s -lc -o %s > %s 2>&1",
+                     q_primary, providers_arg, q_out, q_log);
+    if (n <= 0 || n >= (int)sizeof(cmd)) {
+        snprintf(error_buf, error_cap, "Darwin provider system link command too long");
+        return false;
+    }
+    if (!cold_run_shell(cmd, "Darwin provider system link")) {
+        snprintf(error_buf, error_cap, "Darwin provider system link failed log=%s", log_path);
+        return false;
+    }
+    if (!cold_file_exists_nonempty(out_path)) {
+        snprintf(error_buf, error_cap, "Darwin provider system link output missing");
+        return false;
+    }
+    if (stats) {
+        stats->provider_object_count = provider_count;
+        stats->system_link = 1;
+    }
+    return true;
+}
+
 static int cold_cmd_system_link_exec(int argc, char **argv) {
     const char *source_path = cold_flag_value(argc, argv, "--in");
     const char *csg_in_path = cold_flag_value(argc, argv, "--csg-in");
@@ -27658,6 +27883,33 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
                                                target, emit, &stats, "--link-object requires --emit:exe");
             fprintf(stderr, "[cheng_cold] --link-object requires --emit:exe\n");
             return 2;
+        }
+        if (is_macho && provider_objects && provider_objects[0] != '\0') {
+            char link_error[COLD_NAME_CAP];
+            link_error[0] = '\0';
+            snprintf(stats.system_link_exec_scope, sizeof(stats.system_link_exec_scope),
+                     "cold_macho_provider_system_link");
+            bool linked = cold_macho_system_link_provider_objects(link_object_path,
+                                                                  provider_objects,
+                                                                  out_path,
+                                                                  &stats,
+                                                                  link_error,
+                                                                  sizeof(link_error));
+            if (!linked) {
+                const char *error = link_error[0] ? link_error : "Darwin provider system link failed";
+                cold_write_system_link_exec_report(report_path, false, link_object_path, provider_objects, out_path,
+                                                   target, emit, &stats, error);
+                fprintf(stderr, "[cheng_cold] %s: %s\n", error, link_object_path);
+                return 2;
+            }
+            cold_write_system_link_exec_report(report_path, true, link_object_path, provider_objects, out_path,
+                                               target, emit, &stats, "");
+            printf("system_link_exec=1\n");
+            printf("real_backend_codegen=1\n");
+            printf("system_link_exec_scope=cold_macho_provider_system_link\n");
+            cold_print_elapsed_ms(stdout, "cold_compile_elapsed_ms", stats.elapsed_us);
+            printf("output=%s\n", out_path);
+            return 0;
         }
         bool linked = false;
         if (is_elf) {
@@ -28257,6 +28509,10 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
                 "__cheng_linux_syscall4",
                 "__cheng_linux_syscall5",
                 "__cheng_linux_syscall6",
+                "__cheng_linux_atomic_cas_i32",
+                "__cheng_linux_atomic_store_i32",
+                "__cheng_linux_atomic_load_i32",
+                "__cheng_linux_thread_start",
                 "write",
                 "get_nprocs",
             };
@@ -28328,6 +28584,78 @@ link_providers_done:
         if (needs_linux_syscall_provider) unlink(provider_syscall_o);
         if (archive_written) unlink(provider_archive);
         return linked ? 0 : 2;
+    }
+    if (is_macho && provider_objects && provider_objects[0] != '\0' &&
+        strcmp(emit, "exe") == 0) {
+        uint64_t start_us = cold_now_us();
+        snprintf(stats.system_link_exec_scope, sizeof(stats.system_link_exec_scope),
+                 "cold_macho_provider_system_link");
+        char primary_o[PATH_MAX];
+        char link_error[COLD_NAME_CAP];
+        link_error[0] = '\0';
+        int n = snprintf(primary_o, sizeof(primary_o), "%s.primary.o", out_path);
+        if (n <= 0 || n >= (int)sizeof(primary_o)) {
+            cold_write_system_link_exec_report(report_path, false, source_path,
+                                               effective_csg_path, out_path,
+                                               target, emit, &stats,
+                                               "temporary object path too long");
+            fprintf(stderr, "[cheng_cold] temporary object path too long: %s\n", out_path);
+            return 2;
+        }
+        bool primary_ok = false;
+        if (effective_csg_path && effective_csg_path[0]) {
+            primary_ok = cold_compile_csg_path_to_macho(primary_o, effective_csg_path,
+                                                        source_path,
+                                                        workspace_root[0] ? workspace_root : 0,
+                                                        target, &stats, true,
+                                                        provider_objects);
+        } else {
+#ifndef COLD_BACKEND_ONLY
+            primary_ok = source_path && source_path[0] &&
+                         cold_compile_source_to_object(primary_o, source_path,
+                                                       target,
+                                                       export_roots_csv,
+                                                       symbol_visibility);
+#else
+            primary_ok = false;
+#endif
+        }
+        if (!primary_ok) {
+            cold_write_system_link_exec_report(report_path, false, source_path,
+                                               effective_csg_path, out_path,
+                                               target, emit, &stats,
+                                               "primary object emit failed");
+            fprintf(stderr, "[cheng_cold] primary object emit failed: %s\n",
+                    effective_csg_path && effective_csg_path[0] ? effective_csg_path : source_path);
+            unlink(primary_o);
+            return 2;
+        }
+        bool linked = cold_macho_system_link_provider_objects(primary_o,
+                                                              provider_objects,
+                                                              out_path,
+                                                              &stats,
+                                                              link_error,
+                                                              sizeof(link_error));
+        stats.elapsed_us = cold_now_us() - start_us;
+        if (!linked) {
+            const char *error = link_error[0] ? link_error : "Darwin provider system link failed";
+            cold_write_system_link_exec_report(report_path, false, source_path,
+                                               effective_csg_path, out_path,
+                                               target, emit, &stats, error);
+            fprintf(stderr, "[cheng_cold] %s\n", error);
+            unlink(primary_o);
+            return 2;
+        }
+        unlink(primary_o);
+        cold_write_system_link_exec_report(report_path, true, source_path,
+                                           effective_csg_path, out_path,
+                                           target, emit, &stats, "");
+        printf("system_link_exec=1\n");
+        printf("real_backend_codegen=1\n");
+        printf("system_link_exec_scope=cold_macho_provider_system_link\n");
+        cold_print_elapsed_ms(stdout, "cold_compile_elapsed_ms", stats.elapsed_us);
+        printf("output=%s\n", out_path);
+        return 0;
     }
     int compiled = 0;
     if (effective_csg_path && effective_csg_path[0]) {

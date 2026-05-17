@@ -1,0 +1,222 @@
+# std/fs - Extended file system operations
+import std/system
+import std/strings
+import std/result
+import std/rawmem_support
+import std/os
+
+type
+    FileStat =
+        size: int64
+        mode: int32
+        mtime: int64
+        isDir: bool
+        isFile: bool
+
+@importc("cheng_host_stat")
+fn libc_stat(path: cstring, buf: ptr): int32
+@importc("chmod")
+fn libc_chmod(path: cstring, mode: int32): int32
+@importc("realpath")
+fn libc_realpath(path: cstring, resolved: ptr): ptr
+@importc("access")
+fn libc_access(path: cstring, mode: int32): int32
+@importc("unlink")
+fn libc_unlink(path: cstring): int32
+@importc("rmdir")
+fn libc_rmdir(path: cstring): int32
+@importc("mkdir")
+fn libc_mkdir(path: cstring, mode: int32): int32
+@importc("chdir")
+fn libc_chdir(path: cstring): int32
+
+const
+    fsModeDir: int32 = 16384   # S_IFDIR
+    fsModeReg: int32 = 32768   # S_IFREG
+    fsModeMask: int32 = 61440  # S_IFMT
+
+const fsStatBufLen: int32 = 128
+
+fn readStatFieldInt64(buf: ptr, offset: int32): int64 =
+    let p: ptr = rawmem_support.RawmemPtrAdd(buf, offset)
+    return *[int64](p)
+
+fn readStatFieldInt32(buf: ptr, offset: int32): int32 =
+    let p: ptr = rawmem_support.RawmemPtrAdd(buf, offset)
+    return *[int32](p)
+
+fn stat(path: str): Result[FileStat] =
+    if strings.Len(path) <= 0:
+        return Err[FileStat]("empty path")
+    let cpath: cstring = strToCStringTemp(path)
+    let buf: ptr = HeapNewCompat(fsStatBufLen)
+    if buf == nil:
+        return Err[FileStat]("alloc failed")
+    rawmem_support.RawmemSet(buf, 0, fsStatBufLen)
+    let rc: int32 = libc_stat(cpath, buf)
+    if rc != 0:
+        Free(buf)
+        return Err[FileStat]("stat failed")
+    let stSize: int64 = readStatFieldInt64(buf, 0)
+    let stMode: int32 = readStatFieldInt32(buf, 16)
+    let stMtime: int64 = readStatFieldInt64(buf, 40)
+    let ftype: int32 = stMode & fsModeMask
+    var out: FileStat
+    out.size = stSize
+    out.mode = stMode
+    out.mtime = stMtime
+    out.isDir = ftype == fsModeDir
+    out.isFile = ftype == fsModeReg
+    Free(buf)
+    return Ok[FileStat](out)
+
+fn statSize(path: str): int64 =
+    let res: Result[FileStat] = stat(path)
+    if result.IsOk(res):
+        return result.Value[FileStat](res).size
+    return int64(-1)
+
+fn statMode(path: str): int32 =
+    let res: Result[FileStat] = stat(path)
+    if result.IsOk(res):
+        return result.Value[FileStat](res).mode
+    return 0
+
+fn statMtime(path: str): int64 =
+    let res: Result[FileStat] = stat(path)
+    if result.IsOk(res):
+        return result.Value[FileStat](res).mtime
+    return int64(-1)
+
+fn isDir(path: str): bool =
+    let res: Result[FileStat] = stat(path)
+    if result.IsOk(res):
+        return result.Value[FileStat](res).isDir
+    return false
+
+fn isFile(path: str): bool =
+    let res: Result[FileStat] = stat(path)
+    if result.IsOk(res):
+        return result.Value[FileStat](res).isFile
+    return false
+
+fn chmod(path: str, mode: int32): Result[bool] =
+    if strings.Len(path) <= 0:
+        return Err[bool]("empty path")
+    let rc: int32 = libc_chmod(strToCStringTemp(path), mode)
+    return rc == 0 ? Ok[bool](true) : Err[bool]("chmod failed")
+
+fn realpath(path: str): Result[str] =
+    if strings.Len(path) <= 0:
+        return Err[str]("empty path")
+    let buf: ptr = HeapNewCompat(4096)
+    if buf == nil:
+        return Err[str]("alloc failed")
+    rawmem_support.RawmemSet(buf, 0, 4096)
+    let res: ptr = libc_realpath(strToCStringTemp(path), buf)
+    if res == nil:
+        Free(buf)
+        return Err[str]("realpath failed")
+    let out: str = strFromCStringBorrow(res)
+    Free(buf)
+    return Ok[str](out)
+
+fn access(path: str, mode: int32): bool =
+    if strings.Len(path) <= 0:
+        return false
+    return libc_access(strToCStringTemp(path), mode) == 0
+
+fn exists(path: str): bool =
+    return access(path, 0)
+
+fn isReadable(path: str): bool =
+    return access(path, 4)
+
+fn isWritable(path: str): bool =
+    return access(path, 2)
+
+fn isExecutable(path: str): bool =
+    return access(path, 1)
+
+fn remove(path: str): Result[bool] =
+    if strings.Len(path) <= 0:
+        return Err[bool]("empty path")
+    if isDir(path):
+        let rc: int32 = libc_rmdir(strToCStringTemp(path))
+        return rc == 0 ? Ok[bool](true) : Err[bool]("rmdir failed")
+    let rc: int32 = libc_unlink(strToCStringTemp(path))
+    return rc == 0 ? Ok[bool](true) : Err[bool]("unlink failed")
+
+fn mkdir(path: str, mode: int32): Result[bool] =
+    if strings.Len(path) <= 0:
+        return Err[bool]("empty path")
+    let rc: int32 = libc_mkdir(strToCStringTemp(path), mode)
+    return rc == 0 ? Ok[bool](true) : Err[bool]("mkdir failed")
+
+fn chdir(path: str): Result[bool] =
+    if strings.Len(path) <= 0:
+        return Err[bool]("empty path")
+    let rc: int32 = libc_chdir(strToCStringTemp(path))
+    return rc == 0 ? Ok[bool](true) : Err[bool]("chdir failed")
+
+fn readDir(path: str): str[] =
+    return os.ListDir(path)
+
+# ---- Public exports ----
+
+fn Stat(path: str): Result[FileStat] =
+    return stat(path)
+
+fn StatSize(path: str): int64 =
+    return statSize(path)
+
+fn StatMode(path: str): int32 =
+    return statMode(path)
+
+fn StatMtime(path: str): int64 =
+    return statMtime(path)
+
+fn IsDir(path: str): bool =
+    return isDir(path)
+
+fn IsFile(path: str): bool =
+    return isFile(path)
+
+fn Chmod(path: str, mode: int32): Result[bool] =
+    return chmod(path, mode)
+
+fn Realpath(path: str): Result[str] =
+    return realpath(path)
+
+fn Access(path: str, mode: int32): bool =
+    return access(path, mode)
+
+fn Exists(path: str): bool =
+    return exists(path)
+
+fn IsReadable(path: str): bool =
+    return isReadable(path)
+
+fn IsWritable(path: str): bool =
+    return isWritable(path)
+
+fn IsExecutable(path: str): bool =
+    return isExecutable(path)
+
+fn Remove(path: str): Result[bool] =
+    return remove(path)
+
+fn Mkdir(path: str, mode: int32): Result[bool] =
+    return mkdir(path, mode)
+
+fn Chdir(path: str): Result[bool] =
+    return chdir(path)
+
+fn ReadDir(path: str): str[] =
+    return readDir(path)
+
+const
+    R_OK: int32 = 4
+    W_OK: int32 = 2
+    X_OK: int32 = 1
+    F_OK: int32 = 0

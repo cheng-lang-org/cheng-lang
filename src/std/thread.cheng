@@ -1,18 +1,55 @@
+import std/atomic
+import std/system as system
+
 @importc("cheng_thread_parallelism")
 fn thread_parallelism_raw(): int32
 
 @importc("cheng_thread_yield")
 fn thread_yield_raw(): void
 
-@importc("cheng_thread_spawn")
-fn thread_spawn_raw(fnPtr: ptr, ctx: ptr): int32
+@importc("cheng_thread_start")
+fn thread_start_raw(fnPtr: ptr, ctx: ptr): ptr
+
+@importc("cheng_thread_join")
+fn thread_join_raw(handle: ptr): int32
+
+@importc("cheng_thread_detach")
+fn thread_detach_raw(handle: ptr): int32
 
 @importc("cheng_panic_cstring_and_exit")
 fn thread_panic_raw(text: ptr): void
 
+@importc("__cheng_call_indirect_void")
+fn thread_call_indirect_void(fnPtr: ptr, ctx: ptr)
+
+@importc("__cheng_call_indirect_i32")
+fn thread_call_indirect_i32(fnPtr: ptr, ctx: int64, a: int32, b: int32): int32
+
 type
+    Thread = ref
+        handle: ptr
+        joined: bool
+        detached: bool
+
     SpawnTask0 = ref
         entry: fn()
+
+    SpawnTaskPtr = ref
+        entry: ptr
+        ctx: ptr
+
+    Pool = ref
+        workerCount: int32
+
+    ParallelForCtx = ref
+        count: int32
+        nextIndex: atomic.I32
+        body: ptr
+        bodyCtx: ptr
+
+    ParallelWorkerCtx = ref
+        shared: ParallelForCtx
+        workerId: int32
 
 fn thread_spawn_trampoline0(raw: ptr) =
     if raw == nil:
@@ -26,7 +63,21 @@ fn thread_spawn_trampoline0(raw: ptr) =
         task.entry()
     else:
         thread_panic_raw("cheng_thread_spawn_entry_nil")
-    memRelease(task)
+    system.memReleaseAtomic(task)
+
+fn thread_spawn_trampoline_ptr(raw: ptr) =
+    if raw == nil:
+        thread_panic_raw("cheng_thread_spawn_ptr_raw_nil")
+        return
+    let task: SpawnTaskPtr = SpawnTaskPtr(raw)
+    if task == nil:
+        thread_panic_raw("cheng_thread_spawn_ptr_task_nil")
+        return
+    if task.entry != nil:
+        thread_call_indirect_void(task.entry, task.ctx)
+    else:
+        thread_panic_raw("cheng_thread_spawn_ptr_entry_nil")
+    system.memReleaseAtomic(task)
 
 fn Parallelism(): int32 =
     return thread_parallelism_raw()
@@ -34,17 +85,175 @@ fn Parallelism(): int32 =
 fn Yield() =
     thread_yield_raw()
 
-fn Spawn(entry: fn()): bool =
+fn ThreadFromHandle(handle: ptr): Thread =
+    if handle == nil:
+        thread_panic_raw("cheng_thread_start_failed")
+        return nil
+    let t = new(Thread)
+    if t == nil:
+        thread_panic_raw("cheng_thread_handle_alloc_failed")
+        return nil
+    t.handle = handle
+    return t
+
+@thread_boundary
+fn Start(entry: ptr): Thread =
+    return StartPtr(entry, nil)
+
+@thread_boundary
+fn StartFn(entry: fn()): Thread =
     if entry == nil:
         thread_panic_raw("cheng_thread_spawn_entry_nil")
-        return false
+        return nil
     let task: SpawnTask0 = new(SpawnTask0)
     if task == nil:
         thread_panic_raw("cheng_thread_spawn_task_alloc_failed")
-        return false
+        return nil
     task.entry = entry
-    memRetain(task)
-    if thread_spawn_raw(&thread_spawn_trampoline0, task) == 0:
+    system.memRetainAtomic(task)
+    let handle = thread_start_raw(&thread_spawn_trampoline0, task)
+    if handle == nil:
         thread_panic_raw("cheng_thread_spawn_failed")
+        return nil
+    return ThreadFromHandle(handle)
+
+@thread_boundary
+fn StartPtr(entry: ptr, ctx: ptr): Thread =
+    if entry == nil:
+        thread_panic_raw("cheng_thread_spawn_ptr_entry_nil")
+        return nil
+    let task: SpawnTaskPtr = new(SpawnTaskPtr)
+    if task == nil:
+        thread_panic_raw("cheng_thread_spawn_ptr_task_alloc_failed")
+        return nil
+    task.entry = entry
+    task.ctx = ctx
+    system.memRetainAtomic(task)
+    let handle = thread_start_raw(&thread_spawn_trampoline_ptr, task)
+    if handle == nil:
+        thread_panic_raw("cheng_thread_spawn_ptr_failed")
+        return nil
+    return ThreadFromHandle(handle)
+
+fn Join(t: Thread): bool =
+    if t == nil || t.handle == nil:
+        thread_panic_raw("cheng_thread_join_nil")
         return false
+    if t.detached:
+        thread_panic_raw("cheng_thread_join_detached")
+        return false
+    if t.joined:
+        thread_panic_raw("cheng_thread_join_twice")
+        return false
+    if thread_join_raw(t.handle) == 0:
+        thread_panic_raw("cheng_thread_join_failed")
+        return false
+    t.joined = true
+    t.handle = nil
     return true
+
+fn Detach(t: Thread): bool =
+    if t == nil || t.handle == nil:
+        thread_panic_raw("cheng_thread_detach_nil")
+        return false
+    if t.joined:
+        thread_panic_raw("cheng_thread_detach_joined")
+        return false
+    if t.detached:
+        thread_panic_raw("cheng_thread_detach_twice")
+        return false
+    if thread_detach_raw(t.handle) == 0:
+        thread_panic_raw("cheng_thread_detach_failed")
+        return false
+    t.detached = true
+    t.handle = nil
+    return true
+
+@thread_boundary
+fn Spawn(entry: ptr): bool =
+    let t = Start(entry)
+    return Detach(t)
+
+@thread_boundary
+fn Spawn(entry: fn()): bool =
+    let t = StartFn(entry)
+    return Detach(t)
+
+@thread_boundary
+fn SpawnPtr(entry: ptr, ctx: ptr): bool =
+    let t = StartPtr(entry, ctx)
+    return Detach(t)
+
+fn PoolNew(workerCount: int32): Pool =
+    var count = workerCount
+    if count <= 0:
+        count = Parallelism()
+    if count <= 0:
+        count = 1
+    let p = new(Pool)
+    if p == nil:
+        thread_panic_raw("cheng_thread_pool_alloc_failed")
+        return nil
+    p.workerCount = count
+    return p
+
+fn thread_pool_worker_main(raw: ptr) =
+    if raw == nil:
+        thread_panic_raw("cheng_thread_pool_ctx_nil")
+        return
+    let worker: ParallelWorkerCtx = ParallelWorkerCtx(raw)
+    if worker == nil:
+        thread_panic_raw("cheng_thread_pool_worker_ctx_nil")
+        return
+    let ctx: ParallelForCtx = worker.shared
+    if ctx == nil || ctx.nextIndex == nil || ctx.body == nil:
+        thread_panic_raw("cheng_thread_pool_ctx_invalid")
+        return
+    let workerId = worker.workerId
+    while true:
+        let index = atomic.AddI32(ctx.nextIndex, 1) - 1
+        if index >= ctx.count:
+            break
+        let _ = thread_call_indirect_i32(ctx.body, int64(uint64(ctx.bodyCtx)), index, workerId)
+    system.memReleaseAtomic(ctx)
+    system.memReleaseAtomic(worker)
+
+@thread_boundary
+fn ParallelFor(pool: Pool,
+               count: int32,
+               body: ptr,
+               bodyCtx: ptr) =
+    if count <= 0:
+        return
+    if body == nil:
+        thread_panic_raw("cheng_thread_pool_body_nil")
+        return
+    var workerCount = 1
+    if pool != nil && pool.workerCount > 0:
+        workerCount = pool.workerCount
+    if workerCount > count:
+        workerCount = count
+    let ctx = new(ParallelForCtx)
+    if ctx == nil:
+        thread_panic_raw("cheng_thread_pool_ctx_alloc_failed")
+        return
+    ctx.count = count
+    ctx.nextIndex = atomic.NewI32(0)
+    ctx.body = body
+    ctx.bodyCtx = bodyCtx
+    if ctx.nextIndex == nil:
+        thread_panic_raw("cheng_thread_pool_atomic_alloc_failed")
+        return
+    var workers: Thread[]
+    for workerId in 0..<workerCount:
+        let workerCtx = new(ParallelWorkerCtx)
+        if workerCtx == nil:
+            thread_panic_raw("cheng_thread_pool_worker_ctx_alloc_failed")
+            return
+        workerCtx.shared = ctx
+        workerCtx.workerId = workerId
+        system.memRetainAtomic(ctx)
+        system.memRetainAtomic(workerCtx)
+        add(workers, StartPtr(&thread_pool_worker_main, workerCtx))
+    for i in 0..<workers.len:
+        let _ = Join(workers[i])

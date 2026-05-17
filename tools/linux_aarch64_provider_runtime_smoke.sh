@@ -102,7 +102,7 @@ compile_case() {
     expect_report_value "$report" "provider_archive" "1"
     expect_report_value "$report" "provider_object_count" "2"
     expect_report_value "$report" "provider_archive_member_count" "2"
-    expect_report_value "$report" "provider_export_count" "10"
+    expect_report_regex "$report" "provider_export_count" "[1-9][0-9]*"
     expect_report_regex "$report" "provider_resolved_symbol_count" "[1-9][0-9]*"
     expect_report_value "$report" "unresolved_symbol_count" "0"
     expect_report_value "$report" "system_link" "0"
@@ -150,5 +150,10 @@ if [ "$status" -lt 1 ] || [ "$status" -gt 255 ]; then
     fail "runtime_provider_autolink_cpu_cores_exit_${status}_expected_1_255"
 fi
 pass "runtime_provider_autolink_cpu_cores_run_marker"
+
+compile_case "thread_join_pool_runtime_smoke" "src/tests/thread_join_pool_runtime_smoke.cheng"
+run_case "thread_join_pool_runtime_smoke" 0
+grep -Fq ' thread_join_pool_runtime_smoke ok' "$WORK/thread_join_pool_runtime_smoke.run.stdout" || fail "thread_join_pool_runtime_smoke_missing_marker"
+pass "thread_join_pool_runtime_smoke_run_marker"
 
 pass "linux_aarch64_provider_runtime_smoke"

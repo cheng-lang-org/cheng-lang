@@ -2,12 +2,15 @@
 
 ## Active
 
+- Cheng libp2p 全球统一版本：联网只属于 resolve/fetch/world-head 更新阶段；compile/lowering/codegen/link 只消费已锁定的本地 CID 快照和 `cheng.lock.toml`。
+- cold nested import smoke 必须读写 imported alias 的真实字段；只声明未使用变量不能证明跨包类型解析。
 - CSG/lowering热路径：复用source context，勿重复建ctx；import edge用`ctx.lines`。
 - 多行字符串rewrite：测长→一次分配→线性写入+hard-fail长度合同。禁O(n²)。
 - Resolved call fact查找：按source建游标一次，路径归一化只做source级一次。
 - Self-probe超30s：先`sample`再定优化点。
 - 并行子代理改同批文件：扫冲突标记+语义断裂，不只看`git diff --check`。
 - Runtime验证：锁`provider_object_count>0`+`standalone_no_runtime=0`+真实符号。不能只看exit 0。
+- 运行时并行不能用 API 改名冒充；必须落到 `Thread/Join/Detach/Pool` 的真实 OS 线程实现，并用真实符号和 worker 侧效果验证。
 - 短smoke：要求输出marker，host gate检查marker。`mov w0,#0; ret`是假绿。
 - cold `compile_body` 已到单函数操作数/指令数安全边界；新增变量或一个 patch 调用都可能让生成二进制崩溃。先修 `cheng_cold.c` slot/register/codegen 扩容，别继续堆补丁。
 - 函数级并行：必须接入active primary task path。库级executor不算完成。

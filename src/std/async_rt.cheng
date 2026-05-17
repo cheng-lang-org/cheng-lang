@@ -1,6 +1,6 @@
 # std/async_rt (minimal, pure Cheng)
 
-import std/system as system
+import std/thread
 
 type
     ChengAwaitI32 =
@@ -25,42 +25,17 @@ type
 type
     chan_i32 = ref ChengChanI32
 
-@importc("cheng_spawn")
-fn __cheng_spawn_raw(fn_ptr: ptr, ctx: ptr): void
-
 @importc("cheng_panic_cstring_and_exit")
 fn __cheng_spawn_panic(text: ptr): void
 
-type
-    SpawnTask0 = ref
-        entry: fn()
-
-fn __spawn_trampoline0(raw: ptr) =
-    if raw == nil:
-        __cheng_spawn_panic("cheng_spawn_raw_nil")
-        return
-    let task: SpawnTask0 = SpawnTask0(raw)
-    if task == nil:
-        __cheng_spawn_panic("cheng_spawn_task_nil")
-        return
-    if task.entry != nil:
-        task.entry()
-    else:
-        __cheng_spawn_panic("cheng_spawn_entry_nil")
-    system.memRelease(task)
-
 @thread_boundary
-fn spawn(entry: fn()): void =
+fn spawn(entry: ptr): void =
     if entry == nil:
         __cheng_spawn_panic("cheng_spawn_entry_nil")
         return
-    let task: SpawnTask0 = new(SpawnTask0)
-    if task == nil:
-        __cheng_spawn_panic("cheng_spawn_task_alloc_failed")
-        return
-    task.entry = entry
-    system.memRetain(task)
-    __cheng_spawn_raw(&__spawn_trampoline0, task)
+    let ok = thread.Spawn(entry)
+    if !ok:
+        __cheng_spawn_panic("cheng_spawn_failed")
 
 @thread_boundary
 fn spawn[T](entry: fn(T), ctx: T): void =
@@ -70,38 +45,14 @@ fn spawn[T](entry: fn(T), ctx: T): void =
     let _ = ctx
     __cheng_spawn_panic("cheng_spawn_generic_ctx_unavailable")
 
-type
-    SpawnTaskPtr = ref
-        entry: fn(ptr)
-        ctx: ptr
-
-fn __spawn_trampoline_ptr(raw: ptr) =
-    if raw == nil:
-        __cheng_spawn_panic("cheng_spawn_ptr_raw_nil")
-        return
-    let task: SpawnTaskPtr = SpawnTaskPtr(raw)
-    if task == nil:
-        __cheng_spawn_panic("cheng_spawn_ptr_task_nil")
-        return
-    if task.entry != nil:
-        task.entry(task.ctx)
-    else:
-        __cheng_spawn_panic("cheng_spawn_ptr_entry_nil")
-    system.memRelease(task)
-
 @thread_boundary
-fn SpawnPtr(entry: fn(ptr), ctx: ptr): void =
+fn SpawnPtr(entry: ptr, ctx: ptr): void =
     if entry == nil:
         __cheng_spawn_panic("cheng_spawn_ptr_entry_nil")
         return
-    let task: SpawnTaskPtr = new(SpawnTaskPtr)
-    if task == nil:
-        __cheng_spawn_panic("cheng_spawn_ptr_task_alloc_failed")
-        return
-    task.entry = entry
-    task.ctx = ctx
-    system.memRetain(task)
-    __cheng_spawn_raw(&__spawn_trampoline_ptr, task)
+    let ok = thread.SpawnPtr(entry, ctx)
+    if !ok:
+        __cheng_spawn_panic("cheng_spawn_ptr_failed")
 
 @importc("cheng_sched_pending")
 fn schedPending(): int32

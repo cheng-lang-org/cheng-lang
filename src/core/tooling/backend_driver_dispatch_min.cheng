@@ -588,7 +588,7 @@ fn BackendDriverDispatchMinPrintBuildPlanCommandFromCmdline(): int32 =
 
 fn BackendDriverDispatchMinHelp(): int32 =
     BackendDriverDispatchMinPrintLine("usage: cheng <command> [args]")
-    BackendDriverDispatchMinPrintLine("core commands: status, print-build-plan, system-link-exec, emit-cold-csg-v2, run-host-smokes cold_csg_sidecar_smoke compiler_csg_egraph_active_contract_smoke")
+    BackendDriverDispatchMinPrintLine("core commands: status, print-build-plan, system-link-exec, emit-cold-csg-v2, run-host-smokes cold_csg_sidecar_smoke compiler_csg_egraph_active_contract_smoke thread_atomic_orc_runtime_gate_smoke")
     return 0
 
 fn BackendDriverDispatchMinCurrentCompiler(rootDir: str): str =
@@ -785,6 +785,9 @@ fn BackendDriverDispatchMinProviderExportRoots(modulePath: str,
             BackendDriverDispatchMinAddRootIfReferenced(roots, seen, symbol, "__cheng_call_indirect_i32")
             BackendDriverDispatchMinAddRootIfReferenced(roots, seen, symbol, "cheng_spawn")
             BackendDriverDispatchMinAddRootIfReferenced(roots, seen, symbol, "cheng_thread_spawn")
+            BackendDriverDispatchMinAddRootIfReferenced(roots, seen, symbol, "cheng_thread_start")
+            BackendDriverDispatchMinAddRootIfReferenced(roots, seen, symbol, "cheng_thread_join")
+            BackendDriverDispatchMinAddRootIfReferenced(roots, seen, symbol, "cheng_thread_detach")
             BackendDriverDispatchMinAddRootIfReferenced(roots, seen, symbol, "cheng_thread_spawn_i32")
             BackendDriverDispatchMinAddRootIfReferenced(roots, seen, symbol, "cheng_thread_parallelism")
             BackendDriverDispatchMinAddRootIfReferenced(roots, seen, symbol, "cheng_thread_yield")
@@ -2164,11 +2167,60 @@ fn BackendDriverDispatchMinRunCompilerCsgEgraphActiveContractSmoke(rootDir: str)
     BackendDriverDispatchMinPrintLine(" compiler_csg_egraph_active_contract_smoke ok")
     return 0
 
+fn BackendDriverDispatchMinRunThreadAtomicOrcRuntimeGateSmoke(rootDir: str): int32 =
+    let smokeName = "thread_atomic_orc_runtime_gate_smoke"
+    let compilerPath = BackendDriverDispatchMinCurrentCompiler(rootDir)
+    if len(compilerPath) <= 0 || !chengpath.FileExistsNonEmpty(rootDir, compilerPath):
+        return BackendDriverDispatchMinUnsupported(Fmt"backend driver direct: missing compiler: {compilerPath}")
+    let label = BackendDriverDispatchMinReadFlagOrDefault("--label", "dispatch_min")
+    let outDir = chengpath.PathAbsolute(rootDir, Fmt"artifacts/hostrun/{label}")
+    if !BackendDriverDispatchMinEnsureDir(rootDir, outDir):
+        return 1
+    let src = chengpath.PathAbsolute(rootDir, "src/tests/thread_atomic_orc_runtime_gate_smoke.cheng")
+    if !chengpath.FileExistsNonEmpty(rootDir, src):
+        BackendDriverDispatchMinPrintErr(Fmt"backend driver direct: missing source: {src}")
+        return 1
+    let outBin = chengpath.PathJoin(outDir, smokeName)
+    let reportPath = Fmt"{outBin}.compile.report.txt"
+    let compileLog = Fmt"{outBin}.compile.log"
+    let runLog = Fmt"{outBin}.run.log"
+    BackendDriverDispatchMinRemoveIfExists(outBin)
+    BackendDriverDispatchMinRemoveIfExists(reportPath)
+    BackendDriverDispatchMinRemoveIfExists(compileLog)
+    BackendDriverDispatchMinRemoveIfExists(runLog)
+    BackendDriverDispatchMinRemoveIfExists(Fmt"{outBin}.map")
+    BackendDriverDispatchMinPrintLine(Fmt"[cheng host smokes] compile {smokeName}")
+    var startNs = BackendDriverDispatchMinNowNs()
+    let compileCommand = Fmt"CHENG_NO_BACKEND_DRIVER_HANDOFF=1 CHENG_BACKEND_DRIVER_HANDOFF=0 BACKEND_INCREMENTAL=0 BACKEND_MULTI_MODULE_CACHE=0 CHENG_DISABLE_PRIMARY_OBJECT_CACHE=1 BACKEND_BUILD_DRIVER_QUICK_STAMP_CACHE=0 BACKEND_BUILD_DRIVER_QUICK_SHARED_CACHE=0 CHENG_PROGRESS=1 CHENG_PROCESS_MAX_RSS_BYTES=8589934592 {os.QuoteShell(compilerPath)} system-link-exec --root:{os.QuoteShell(rootDir)} --in:{os.QuoteShell(src)} --emit:exe --target:arm64-apple-darwin --out:{os.QuoteShell(outBin)} --report-out:{os.QuoteShell(reportPath)}"
+    let compileRun = BackendDriverDispatchMinRunShellLogged(rootDir,
+                                                            compileCommand,
+                                                            compileLog)
+    let compileRc = os.ExecCmdResultExitCode(compileRun)
+    BackendDriverDispatchMinPrintLine(Fmt"thread_atomic_orc_runtime_gate_compile_ms={BackendDriverDispatchMinElapsedMsText(startNs)} rc={compileRc}")
+    if compileRc != 0:
+        BackendDriverDispatchMinPrintErr(Fmt"backend driver direct: thread atomic ORC runtime gate compile failed log={compileLog}")
+        return compileRc
+    if !chengpath.FileExistsNonEmpty(rootDir, outBin):
+        BackendDriverDispatchMinPrintErr(Fmt"backend driver direct: thread atomic ORC runtime gate output missing: {outBin}")
+        return 1
+    startNs = BackendDriverDispatchMinNowNs()
+    let runRc = BackendDriverDispatchMinRunExecutable(rootDir, outBin, runLog)
+    BackendDriverDispatchMinPrintLine(Fmt"thread_atomic_orc_runtime_gate_run_ms={BackendDriverDispatchMinElapsedMsText(startNs)} rc={runRc}")
+    let runText = chengpath.ReadTextFile(rootDir, runLog)
+    if runRc != 0:
+        BackendDriverDispatchMinPrintErr(Fmt"backend driver direct: thread atomic ORC runtime gate run failed log={runLog}")
+        return runRc
+    if !BackendDriverDispatchMinHostSmokeExpectContains(smokeName, runText, " thread_atomic_orc_runtime_gate_smoke ok"):
+        return 1
+    BackendDriverDispatchMinPrintLine(" thread_atomic_orc_runtime_gate_smoke ok")
+    return 0
+
 fn BackendDriverDispatchMinRunHostSmokesFromCmdline(): int32 =
     let count = BackendDriverDispatchMinParamCount()
     var requestedCold = false
     var requestedSkill = false
     var requestedEgraphContract = false
+    var requestedThreadRuntime = false
     var unknown = ""
     if count >= 2:
         for i in 2..count:
@@ -2181,12 +2233,14 @@ fn BackendDriverDispatchMinRunHostSmokesFromCmdline(): int32 =
                 requestedSkill = true
             elif arg == "compiler_csg_egraph_active_contract_smoke":
                 requestedEgraphContract = true
+            elif arg == "thread_atomic_orc_runtime_gate_smoke":
+                requestedThreadRuntime = true
             else:
                 unknown = arg
     if len(unknown) > 0:
         return BackendDriverDispatchMinUnsupported(Fmt"backend driver direct: dispatch_min run-host-smokes unsupported smoke: {unknown}")
-    if !requestedCold && !requestedSkill && !requestedEgraphContract:
-        return BackendDriverDispatchMinUnsupported("backend driver direct: dispatch_min run-host-smokes requires cold_csg_sidecar_smoke, cheng_skill_consistency_smoke, or compiler_csg_egraph_active_contract_smoke")
+    if !requestedCold && !requestedSkill && !requestedEgraphContract && !requestedThreadRuntime:
+        return BackendDriverDispatchMinUnsupported("backend driver direct: dispatch_min run-host-smokes requires cold_csg_sidecar_smoke, cheng_skill_consistency_smoke, compiler_csg_egraph_active_contract_smoke, or thread_atomic_orc_runtime_gate_smoke")
     let rootDir = BackendDriverDispatchMinReadFlagOrDefault("--root", chengpath.PathCurrentDir())
     if requestedCold:
         let coldRc = BackendDriverDispatchMinRunColdCsgSidecarSmoke(rootDir)
@@ -2200,6 +2254,10 @@ fn BackendDriverDispatchMinRunHostSmokesFromCmdline(): int32 =
         let egraphRc = BackendDriverDispatchMinRunCompilerCsgEgraphActiveContractSmoke(rootDir)
         if egraphRc != 0:
             return egraphRc
+    if requestedThreadRuntime:
+        let threadRc = BackendDriverDispatchMinRunThreadAtomicOrcRuntimeGateSmoke(rootDir)
+        if threadRc != 0:
+            return threadRc
     return 0
 
 fn BackendDriverDispatchMinCommandCode(cmd: str): int32 =

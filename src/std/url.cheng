@@ -1,0 +1,236 @@
+# std/url - URL parsing and encoding (pure Cheng)
+import std/system
+import std/strings
+import std/result
+import std/seqs
+
+type
+    Url =
+        scheme: str
+        host: str
+        port: int32
+        path: str
+        query: str
+        fragment: str
+
+fn urlNew(): Url =
+    var u: Url
+    u.scheme = ""
+    u.host = ""
+    u.port = 0
+    u.path = ""
+    u.query = ""
+    u.fragment = ""
+    return u
+
+fn urlIsAlpha(ch: char): bool =
+    let c: int32 = int32(ch)
+    return (c >= int32('a') and c <= int32('z')) or (c >= int32('A') and c <= int32('Z'))
+
+fn urlIsDigit(ch: char): bool =
+    let c: int32 = int32(ch)
+    return c >= int32('0') and c <= int32('9')
+
+fn urlIsUnreserved(ch: char): bool =
+    if urlIsAlpha(ch) or urlIsDigit(ch):
+        return true
+    let c: int32 = int32(ch)
+    if c == int32('-') or c == int32('_') or c == int32('.') or c == int32('~'):
+        return true
+    return false
+
+fn urlHexDigitValue(ch: char): int32 =
+    let c: int32 = int32(ch)
+    if c >= int32('0') and c <= int32('9'):
+        return c - int32('0')
+    if c >= int32('A') and c <= int32('F'):
+        return c - int32('A') + 10
+    if c >= int32('a') and c <= int32('f'):
+        return c - int32('a') + 10
+    return 0
+
+fn urlHexChar(value: int32): char =
+    let v: int32 = value & 15
+    if v < 10:
+        return char(int32('0') + v)
+    return char(int32('A') + (v - 10))
+
+fn urlEncode(input: str): str =
+    let n: int32 = strings.Len(input)
+    if n <= 0:
+        return ""
+    var outLen: int32
+    for i in 0..<n:
+        let ch: char = input[i]
+        if urlIsUnreserved(ch):
+            outLen = outLen + 1
+        elif ch == ' ':
+            outLen = outLen + 1
+        else:
+            outLen = outLen + 3
+    let out: str = NewStringAlloc(outLen)
+    var outIdx: int32
+    for i in 0..<n:
+        let ch: char = input[i]
+        if urlIsUnreserved(ch):
+            strings.stringWriteByte(out, outIdx, int32(ch))
+            outIdx = outIdx + 1
+        elif ch == ' ':
+            strings.stringWriteByte(out, outIdx, int32('+'))
+            outIdx = outIdx + 1
+        else:
+            strings.stringWriteByte(out, outIdx, int32('%'))
+            strings.stringWriteByte(out, outIdx + 1, int32(urlHexChar(int32(ch) >> 4)))
+            strings.stringWriteByte(out, outIdx + 2, int32(urlHexChar(int32(ch))))
+            outIdx = outIdx + 3
+    return out
+
+fn urlDecode(input: str): Result[str] =
+    let n: int32 = strings.Len(input)
+    if n <= 0:
+        return Ok[str]("")
+    let out: str = NewStringAlloc(n)
+    var outIdx: int32
+    var i: int32
+    while i < n:
+        let ch: char = input[i]
+        if ch == '%':
+            if i + 2 >= n:
+                return Err[str]("truncated percent encoding")
+            let hi: int32 = urlHexDigitValue(input[i + 1])
+            let lo: int32 = urlHexDigitValue(input[i + 2])
+            strings.stringWriteByte(out, outIdx, (hi << 4) | lo)
+            i = i + 3
+            outIdx = outIdx + 1
+        elif ch == '+':
+            strings.stringWriteByte(out, outIdx, int32(' '))
+            i = i + 1
+            outIdx = outIdx + 1
+        else:
+            strings.stringWriteByte(out, outIdx, int32(ch))
+            i = i + 1
+            outIdx = outIdx + 1
+    return Ok[str](out)
+
+fn urlParse(raw: str): Result[Url] =
+    let n: int32 = strings.Len(raw)
+    if n <= 0:
+        return Err[Url]("empty url")
+    var u: Url = urlNew()
+    var pos: int32
+    # Scheme
+    if n >= 2 and urlIsAlpha(raw[0]):
+        var i: int32 = 1
+        while i < n and (urlIsAlpha(raw[i]) or urlIsDigit(raw[i]) or raw[i] == '+' or raw[i] == '-' or raw[i] == '.'):
+            i = i + 1
+        if i < n and raw[i] == ':' and i > 0:
+            u.scheme = strings.SliceBytes(raw, 0, i)
+            pos = i + 1
+    # Authority (//host[:port])
+    if n - pos >= 2 and raw[pos] == '/' and raw[pos + 1] == '/':
+        pos = pos + 2
+        let authStart: int32 = pos
+        while pos < n and raw[pos] != '/' and raw[pos] != '?' and raw[pos] != '#':
+            pos = pos + 1
+        let auth: str = strings.SliceBytes(raw, authStart, pos - authStart)
+        let authLen: int32 = strings.Len(auth)
+        var colonIdx: int32 = -1
+        for i in 0..<authLen:
+            if auth[i] == ':':
+                colonIdx = i
+                break
+        if colonIdx >= 0:
+            u.host = strings.SliceBytes(auth, 0, colonIdx)
+            var portVal: int32
+            for i in (colonIdx + 1)..<authLen:
+                let ch: char = auth[i]
+                if ch >= '0' and ch <= '9':
+                    portVal = portVal * 10 + (int32(ch) - int32('0'))
+            u.port = portVal
+        else:
+            u.host = auth
+    # Path
+    let pathStart: int32 = pos
+    while pos < n and raw[pos] != '?' and raw[pos] != '#':
+        pos = pos + 1
+    if pos > pathStart:
+        u.path = strings.SliceBytes(raw, pathStart, pos - pathStart)
+    # Query
+    if pos < n and raw[pos] == '?':
+        pos = pos + 1
+        let queryStart: int32 = pos
+        while pos < n and raw[pos] != '#':
+            pos = pos + 1
+        u.query = strings.SliceBytes(raw, queryStart, pos - queryStart)
+    # Fragment
+    if pos < n and raw[pos] == '#':
+        u.fragment = strings.SliceBytes(raw, pos + 1, n - pos - 1)
+    return Ok[Url](u)
+
+fn urlQuerySplit(query: str): str[] =
+    var out: str[]
+    let n: int32 = strings.Len(query)
+    if n <= 0:
+        return out
+    var start: int32
+    for i in 0..<n:
+        if query[i] == '&' or i == n:
+            let pair: str = strings.SliceBytes(query, start, i - start)
+            if strings.Len(pair) > 0:
+                seqs.Add(out, pair)
+            start = i + 1
+    return out
+
+fn urlSerialize(u: Url): str =
+    var out: str
+    if strings.Len(u.scheme) > 0:
+        out = Fmt"{out}{u.scheme}:"
+    if strings.Len(u.host) > 0:
+        out = Fmt"{out}//{u.host}"
+    if u.port > 0:
+        out = Fmt"{out}:{strings.IntToStr(u.port)}"
+    if strings.Len(u.path) > 0:
+        out = Fmt"{out}{u.path}"
+    if strings.Len(u.query) > 0:
+        out = Fmt"{out}?{u.query}"
+    if strings.Len(u.fragment) > 0:
+        out = Fmt"{out}#{u.fragment}"
+    return out
+
+# ---- Public exports ----
+
+fn NewUrl(): Url =
+    return urlNew()
+
+fn Encode(input: str): str =
+    return urlEncode(input)
+
+fn Decode(input: str): Result[str] =
+    return urlDecode(input)
+
+fn Parse(raw: str): Result[Url] =
+    return urlParse(raw)
+
+fn Serialize(u: Url): str =
+    return urlSerialize(u)
+
+fn QuerySplit(query: str): str[] =
+    return urlQuerySplit(query)
+
+fn UrlScheme(u: Url): str =
+    return u.scheme
+
+fn UrlHost(u: Url): str =
+    return u.host
+
+fn UrlPort(u: Url): int32 =
+    return u.port
+
+fn UrlPath(u: Url): str =
+    return u.path
+
+fn UrlQuery(u: Url): str =
+    return u.query
+
+fn UrlFragment(u: Url): str =
+    return u.fragment

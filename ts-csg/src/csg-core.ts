@@ -237,6 +237,9 @@ export function emitCsgCoreFromTs(options: CsgCoreOptions): CsgCoreResult {
 
   for (const sourceFile of sourceFiles) {
     emitModule(sourceFile);
+    if (sourceFileHasTsNoCheck(sourceFile)) {
+      addUnsupported(sourceFile, sourceFile, "ts.nocheck", "file disables TypeScript checking; CSG requires checked types", undefined);
+    }
   }
   for (const sourceFile of sourceFiles) {
     visit(sourceFile, sourceFile);
@@ -485,7 +488,12 @@ export function emitCsgCoreFromTs(options: CsgCoreOptions): CsgCoreResult {
   function emitVariable(node: ts.VariableDeclaration, sourceFile: ts.SourceFile): void {
     const name = bindingNameText(node.name, sourceFile);
     const type = checker.getTypeAtLocation(node.name);
-    addTypeFact(sourceFile, node.name, "variable", type);
+    const jsonParseInitializer = node.initializer && ts.isCallExpression(node.initializer) && isJsonParseCall(node.initializer);
+    if (jsonParseInitializer) {
+      addTypeTextFact(sourceFile, node.name, "variable", "unknown", ["Unknown"]);
+    } else {
+      addTypeFact(sourceFile, node.name, "variable", type);
+    }
     emitFact({
       kind: "csg.symbol",
       id: nodeId("csg.symbol", node, sourceFile, name),
@@ -493,14 +501,14 @@ export function emitCsgCoreFromTs(options: CsgCoreOptions): CsgCoreResult {
       name,
       symbolKind: "variable",
       declarationKind: variableDeclarationKind(node),
-      type: typeText(type),
+      type: jsonParseInitializer ? "unknown" : typeText(type),
       initializerKind: node.initializer ? syntaxKindName(node.initializer.kind) : undefined,
       exported: isExportedVariable(node),
     });
     if (!ts.isIdentifier(node.name)) {
       emitBindingFacts(node.name, sourceFile, variableDeclarationKind(node), currentOwner());
     }
-    if (containsAny(type, node.name)) {
+    if (!jsonParseInitializer && containsAny(type, node, node.type)) {
       addUnsupported(sourceFile, node, "type.any", "variable resolves to any", currentOwner());
     }
   }
@@ -531,7 +539,7 @@ export function emitCsgCoreFromTs(options: CsgCoreOptions): CsgCoreResult {
       parameters: node.parameters.map((param, index) => parameterFact(param, sourceFile, index)),
       returnType: typeText(returnType),
     });
-    if (containsAny(returnType, node)) {
+    if (containsAny(returnType, node, functionReturnTypeNode(node))) {
       addUnsupported(sourceFile, node, "type.any", "function return resolves to any", functionId);
     }
     if (hasModifier(node, ts.SyntaxKind.AsyncKeyword)) {
@@ -753,6 +761,7 @@ export function emitCsgCoreFromTs(options: CsgCoreOptions): CsgCoreResult {
 
   function emitCall(node: ts.CallExpression, sourceFile: ts.SourceFile): void {
     const signature = checker.getResolvedSignature(node);
+    const jsonParseCall = isJsonParseCall(node);
     const returnType = node.expression.kind === ts.SyntaxKind.ImportKeyword
       ? checker.getTypeAtLocation(node)
       : signature
@@ -760,7 +769,11 @@ export function emitCsgCoreFromTs(options: CsgCoreOptions): CsgCoreResult {
         : checker.getTypeAtLocation(node);
     const target = signature?.declaration ? symbolForDeclaration(signature.declaration) : checker.getSymbolAtLocation(node.expression);
     const targetFact = symbolFact(target, sourceFile);
-    addTypeFact(sourceFile, node, "call.return", returnType);
+    if (jsonParseCall) {
+      addTypeTextFact(sourceFile, node, "call.return", "unknown", ["Unknown"]);
+    } else {
+      addTypeFact(sourceFile, node, "call.return", returnType);
+    }
     emitFact({
       kind: "csg.call",
       id: nodeId("csg.call", node, sourceFile, node.expression.getText(sourceFile)),
@@ -770,15 +783,18 @@ export function emitCsgCoreFromTs(options: CsgCoreOptions): CsgCoreResult {
       calleeKind: syntaxKindName(node.expression.kind),
       target: targetFact,
       argumentCount: node.arguments.length,
-      returnType: typeText(returnType),
+      returnType: jsonParseCall ? "unknown" : typeText(returnType),
     });
+    if (jsonParseCall) {
+      addRuntimeRequirement(sourceFile, node, "json_parse", "JSON.parse", { runtime: "js-core", source: "ecmascript_json" }, currentOwner());
+    }
     if (node.expression.kind === ts.SyntaxKind.ImportKeyword) {
       const moduleName = stringModuleSpecifier(node.arguments[0]);
       if (moduleName) {
         addRuntimeRequirement(sourceFile, node, "dynamic_import", moduleName, { runtime: "js-core", source: "ecmascript_module_loader" }, currentOwner());
       }
     }
-    if (containsAny(returnType, node)) {
+    if (!jsonParseCall && containsAny(returnType, node)) {
       addUnsupported(sourceFile, node, "type.any", "call return resolves to any", currentOwner());
     }
     inspectRuntimeSymbol(sourceFile, node, target, node.expression.getText(sourceFile), "call", currentOwner());
@@ -962,6 +978,7 @@ export function emitCsgCoreFromTs(options: CsgCoreOptions): CsgCoreResult {
   }
 
   function addUnsupported(sourceFile: ts.SourceFile, node: ts.Node, code: string, message: string, owner: string | undefined): void {
+    if (code === "type.any" && sourceFileHasTsNoCheck(sourceFile)) return;
     const id = nodeId("csg.unsupported", node, sourceFile, code);
     if (unsupportedById.has(id)) return;
     const item: CsgCoreIssue = {
@@ -1003,6 +1020,10 @@ export function emitCsgCoreFromTs(options: CsgCoreOptions): CsgCoreResult {
 
   function addTypeFact(sourceFile: ts.SourceFile, node: ts.Node, typeKind: string, type: ts.Type): string {
     const text = typeText(type);
+    return addTypeTextFact(sourceFile, node, typeKind, text, typeFlags(type.flags));
+  }
+
+  function addTypeTextFact(sourceFile: ts.SourceFile, node: ts.Node, typeKind: string, text: string, flags: string[]): string {
     const id = stableId("csg.type", typeKind, text, relPath(build.cwd, sourceFile.fileName), String(node.pos), String(node.end));
     if (!typeById.has(id)) {
       typeById.set(id, {
@@ -1011,7 +1032,7 @@ export function emitCsgCoreFromTs(options: CsgCoreOptions): CsgCoreResult {
         loc: locFor(sourceFile, node),
         typeKind,
         text,
-        flags: typeFlags(type.flags),
+        flags,
       });
     }
     return id;
@@ -1138,7 +1159,8 @@ export function emitCsgCoreFromTs(options: CsgCoreOptions): CsgCoreResult {
     return `${relPath(build.cwd, sourceFile.fileName)}:${node.pos}:${node.end}`;
   }
 
-  function containsAny(root: ts.Type, location: ts.Node): boolean {
+  function containsAny(root: ts.Type, location: ts.Node, explicitAnyNode?: ts.Node | undefined): boolean {
+    if (explicitAnyNode && containsExplicitAnyKeyword(explicitAnyNode)) return true;
     const seen = new Set<ts.Type>();
     const stack: ts.Type[] = [root];
     let steps = 0;
@@ -1152,7 +1174,7 @@ export function emitCsgCoreFromTs(options: CsgCoreOptions): CsgCoreResult {
       if (steps > 256) return false;
       if (type.isUnionOrIntersection()) stack.push(...type.types);
       const reference = type as ts.TypeReference;
-      if (reference.target) {
+      if (reference.target && shouldInspectTypeReferenceArguments(reference.target)) {
         for (const arg of checker.getTypeArguments(reference)) stack.push(arg);
       }
       for (const prop of type.getProperties().slice(0, 64)) {
@@ -1162,6 +1184,13 @@ export function emitCsgCoreFromTs(options: CsgCoreOptions): CsgCoreResult {
       }
     }
     return false;
+  }
+
+  function shouldInspectTypeReferenceArguments(target: ts.Type): boolean {
+    const symbol = target.symbol ?? target.aliasSymbol;
+    const declarations = symbol?.declarations ?? [];
+    if (declarations.length === 0) return true;
+    return declarations.some((declaration) => isProjectSourceFile(build.cwd, declaration.getSourceFile()));
   }
 }
 
@@ -1352,6 +1381,10 @@ function isProjectSourceFile(cwd: string, sourceFile: ts.SourceFile): boolean {
   return isInside(cwd, resolved);
 }
 
+function sourceFileHasTsNoCheck(sourceFile: ts.SourceFile): boolean {
+  return /\/\/\s*@ts-nocheck\b|\/\*\s*@ts-nocheck\b/.test(sourceFile.text.slice(0, 2048));
+}
+
 function isInside(root: string, file: string): boolean {
   const relative = path.relative(root, file);
   return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
@@ -1421,6 +1454,27 @@ function isStringLiteralLike(node: ts.Node): node is ts.StringLiteral | ts.NoSub
   return ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node);
 }
 
+function isJsonParseCall(node: ts.CallExpression): boolean {
+  return ts.isPropertyAccessExpression(node.expression)
+    && ts.isIdentifier(node.expression.expression)
+    && node.expression.expression.text === "JSON"
+    && node.expression.name.text === "parse";
+}
+
+function containsExplicitAnyKeyword(node: ts.Node): boolean {
+  let found = false;
+  const visit = (current: ts.Node): void => {
+    if (found) return;
+    if (current.kind === ts.SyntaxKind.AnyKeyword) {
+      found = true;
+      return;
+    }
+    ts.forEachChild(current, visit);
+  };
+  visit(node);
+  return found;
+}
+
 function isLiteralExpression(node: ts.Expression): boolean {
   return isStringLiteralLike(node) || ts.isNumericLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node);
 }
@@ -1448,6 +1502,11 @@ function functionNameNode(node: FunctionLikeWithBody): ts.PropertyName | undefin
 
 function functionTypeParameters(node: FunctionLikeWithBody): ts.NodeArray<ts.TypeParameterDeclaration> | undefined {
   if ("typeParameters" in node) return node.typeParameters;
+  return undefined;
+}
+
+function functionReturnTypeNode(node: FunctionLikeWithBody): ts.TypeNode | undefined {
+  if ("type" in node) return node.type;
   return undefined;
 }
 

@@ -1,0 +1,131 @@
+# std/base64 - Base64 encode/decode (pure Cheng)
+import std/system
+import std/strings
+import std/result
+import std/rawmem_support
+
+const base64EncodeTable: str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+fn base64CharValue(ch: char): int32 =
+    let c: int32 = int32(ch)
+    if c >= int32('A') and c <= int32('Z'):
+        return c - int32('A')
+    if c >= int32('a') and c <= int32('z'):
+        return c - int32('a') + 26
+    if c >= int32('0') and c <= int32('9'):
+        return c - int32('0') + 52
+    if c == int32('+'):
+        return 62
+    if c == int32('/'):
+        return 63
+    return -1
+
+fn base64EncodedLen(srcLen: int32): int32 =
+    let chunks: int32 = (srcLen + 2) / 3
+    return chunks * 4
+
+fn base64DecodedLen(input: str): int32 =
+    let srcLen: int32 = strings.Len(input)
+    if srcLen <= 0:
+        return 0
+    var padding: int32
+    if input[srcLen - 1] == '=':
+        if srcLen >= 2 and input[srcLen - 2] == '=':
+            padding = 2
+        else:
+            padding = 1
+    return (srcLen / 4) * 3 - padding
+
+fn base64ReadByte(data: str, idx: int32): int32 =
+    let n: int32 = strings.Len(data)
+    if idx < 0 or idx >= n:
+        return 0
+    return int32(data[idx])
+
+fn base64WriteByte(out: str, idx: int32, value: int32) =
+    let n: int32 = strings.Len(out)
+    if idx < 0 or idx >= n:
+        return
+    rawmem_support.RawmemWriteI8(StrDataPtr(out), idx, int8(value))
+
+fn base64Encode(data: str): str =
+    let srcLen: int32 = strings.Len(data)
+    if srcLen <= 0:
+        return ""
+    let outLen: int32 = base64EncodedLen(srcLen)
+    let out: str = NewStringAlloc(outLen)
+    var srcIdx: int32
+    var outIdx: int32
+    while srcIdx < srcLen:
+        let b0: int32 = base64ReadByte(data, srcIdx)
+        let b1: int32 = srcIdx + 1 < srcLen ? base64ReadByte(data, srcIdx + 1) : 0
+        let b2: int32 = srcIdx + 2 < srcLen ? base64ReadByte(data, srcIdx + 2) : 0
+        let triple: int32 = (b0 << 16) | (b1 << 8) | b2
+        base64WriteByte(out, outIdx, int32(base64EncodeTable[(triple >> 18) & 63]))
+        base64WriteByte(out, outIdx + 1, int32(base64EncodeTable[(triple >> 12) & 63]))
+        if srcIdx + 1 < srcLen:
+            base64WriteByte(out, outIdx + 2, int32(base64EncodeTable[(triple >> 6) & 63]))
+        else:
+            base64WriteByte(out, outIdx + 2, int32('='))
+        if srcIdx + 2 < srcLen:
+            base64WriteByte(out, outIdx + 3, int32(base64EncodeTable[triple & 63]))
+        else:
+            base64WriteByte(out, outIdx + 3, int32('='))
+        srcIdx = srcIdx + 3
+        outIdx = outIdx + 4
+    return out
+
+fn base64EncodeBytes(data: uint8[]): str =
+    let n: int32 = data.len
+    if n <= 0:
+        return ""
+    let rawPtr: ptr = data.buffer
+    if rawPtr == nil:
+        return ""
+    let s: str = NewStringCopy(rawPtr, n)
+    return base64Encode(s)
+
+fn base64Decode(input: str): Result[str] =
+    let srcLen: int32 = strings.Len(input)
+    if srcLen <= 0:
+        return Ok[str]("")
+    let outLen: int32 = base64DecodedLen(input)
+    let out: str = NewStringAlloc(outLen)
+    var srcIdx: int32
+    var outIdx: int32
+    while srcIdx < srcLen:
+        var values: int32[4]
+        var have: int32
+        while have < 4 and srcIdx < srcLen:
+            let ch: char = input[srcIdx]
+            srcIdx = srcIdx + 1
+            if ch == '=':
+                break
+            let v: int32 = base64CharValue(ch)
+            if v < 0:
+                return Err[str]("invalid base64 character")
+            values[have] = v
+            have = have + 1
+        if have == 0:
+            break
+        let triple: int32 = (values[0] << 18) | (values[1] << 12) | (have > 2 ? (values[2] << 6) : 0) | (have > 3 ? values[3] : 0)
+        base64WriteByte(out, outIdx, (triple >> 16) & 255)
+        outIdx = outIdx + 1
+        if have > 2:
+            base64WriteByte(out, outIdx, (triple >> 8) & 255)
+            outIdx = outIdx + 1
+        if have > 3:
+            base64WriteByte(out, outIdx, triple & 255)
+            outIdx = outIdx + 1
+    return Ok[str](out)
+
+# ---- Public exports ----
+
+fn Encode(data: str): str =
+    return base64Encode(data)
+
+fn EncodeBytes(data: uint8[]): str =
+    return base64EncodeBytes(data)
+
+fn Decode(input: str): Result[str] =
+    return base64Decode(input)

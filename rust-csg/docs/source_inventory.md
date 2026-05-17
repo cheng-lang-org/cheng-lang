@@ -13,7 +13,7 @@
 | TUI frame `.txt` oracle files | 360 |
 | product `package.json` files excluding vendored cargo/node caches | 5 |
 
-这些数字是迁移基座的硬合同。源仓变化时必须先更新本文件和 smoke 常量。
+这些数字是迁移基座的硬合同。源仓变化时必须先更新本文件和 live inventory smoke 的期望值。
 
 ## Cargo workspace members
 

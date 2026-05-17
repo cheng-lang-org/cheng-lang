@@ -412,6 +412,9 @@ fn cheng_pthread_create_runtime(threadOut: ptr, attr: ptr, startRoutine: ptr, ar
 @importc("pthread_detach")
 fn cheng_pthread_detach_runtime(thread: ptr): int32
 
+@importc("pthread_join")
+fn cheng_pthread_join_runtime(thread: ptr, valuePtr: ptr): int32
+
 @importc("sched_yield")
 fn cheng_sched_yield_runtime(): int32
 
@@ -2325,11 +2328,21 @@ fn cheng_thread_entry_i32_runtime(raw: ptr): ptr =
 
 @exportc("cheng_thread_spawn")
 fn cheng_thread_spawn_export(fnPtr: ptr, ctx: ptr): int32 =
-    if fnPtr == nil:
+    let thread = cheng_thread_start_export(fnPtr, ctx)
+    if thread == nil:
         return 0
+    if cheng_thread_detach_export(thread) == 0:
+        let _ = c_puts_runtime("cheng_thread_detach_failed")
+        c_exit_runtime(1)
+    return 1
+
+@exportc("cheng_thread_start")
+fn cheng_thread_start_export(fnPtr: ptr, ctx: ptr): ptr =
+    if fnPtr == nil:
+        return nil
     let mem: ptr = c_malloc(int64(sizeof(ChengTask)))
     if mem == nil:
-        return 0
+        return nil
     let task: ChengTaskPtr = ChengTaskPtr(mem)
     task->fn_ptr = fnPtr
     task->ctx = ctx
@@ -2338,10 +2351,23 @@ fn cheng_thread_spawn_export(fnPtr: ptr, ctx: ptr): int32 =
     let createStatus = cheng_pthread_create_runtime(ptr(&thread), nil, &cheng_thread_entry_runtime, mem)
     if createStatus != 0:
         c_free(mem)
+        return nil
+    return thread
+
+@exportc("cheng_thread_join")
+fn cheng_thread_join_export(thread: ptr): int32 =
+    if thread == nil:
+        return 0
+    if cheng_pthread_join_runtime(thread, nil) != 0:
+        return 0
+    return 1
+
+@exportc("cheng_thread_detach")
+fn cheng_thread_detach_export(thread: ptr): int32 =
+    if thread == nil:
         return 0
     if cheng_pthread_detach_runtime(thread) != 0:
-        let _ = c_puts_runtime("cheng_thread_detach_failed")
-        c_exit_runtime(1)
+        return 0
     return 1
 
 @exportc("cheng_spawn")
