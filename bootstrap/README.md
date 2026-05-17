@@ -13,8 +13,8 @@
 
 - 只要仓库里已有 fresh `cheng.stage3`，`bootstrap-bridge` 就直接拿它重编 `stage1 -> stage2 -> stage3`
 - `cheng.stage0` 只再承担物化物和冷启动角色，不再是日常自举刷新时的权威真值
-- 但只要 `cheng_seed.c` 或 `stage1_bootstrap.cheng` 比 live `stage3/stage0` 新，外层薄壳就必须直接回 C seed 临时 runner 真重建，不能继续信旧 `stage3`
-- 只有完全没有 live Cheng 编译器时，外层薄壳才会回到 C seed 临时 runner
+- 但只要 `cheng_cold.c` 或 `stage1_bootstrap.cheng` 比 live `stage3/stage0` 新，外层薄壳就必须直接回 cold bootstrap 真重建，不能继续信旧 `stage3`
+- 只有完全没有 live Cheng 编译器时，外层薄壳才会回到 cold bootstrap 外根
 
 当前 bootstrap 子集源码不是完整 Cheng 语法，而是当前第一版自举子集：
 
@@ -23,7 +23,7 @@ key = value
 ```
 
 这份 `stage1_bootstrap.cheng` 是 bootstrap 合同清单，不是 lowering/codegen helper 真源码。
-真正的 helper 逻辑仍分别收在 `bootstrap/cheng_seed.c` 和 ordinary `src/**` 里。
+真正的 helper 逻辑仍分别收在 `bootstrap/cheng_cold.c` 和 ordinary `src/**` 里。
 
 规则：
 

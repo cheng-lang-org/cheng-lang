@@ -1,0 +1,272 @@
+# src/core/tooling/lsp_protocol.cheng
+# LSP protocol types and JSON-RPC message structures.
+# Facts-driven architecture: all types mirror canonical compiler facts,
+# not raw parser output.
+
+import std/json as json
+
+# --- JSON-RPC 2.0 message types ---
+
+type
+    JsonRpcMessageKind = enum
+        RpcRequest
+        RpcNotification
+        RpcResponse
+        RpcError
+
+    JsonRpcErrorCode = enum
+        ParseError = -32700
+        InvalidRequest = -32600
+        MethodNotFound = -32601
+        InvalidParams = -32602
+        InternalError = -32603
+        ServerNotInitialized = -32002
+        RequestCancelled = -32800
+        ContentModified = -32801
+
+    JsonRpcError =
+        code: int32
+        message: str
+        data: json.JsonNode
+
+# --- LSP protocol base types ---
+
+type
+    Position =
+        line: int32
+        character: int32
+
+    Range =
+        start: Position
+        end: Position
+
+    Location =
+        uri: str
+        range: Range
+
+    DiagnosticSeverity = enum
+        DsError = 1
+        DsWarning = 2
+        DsInformation = 3
+        DsHint = 4
+
+    Diagnostic =
+        range: Range
+        severity: DiagnosticSeverity
+        code: str
+        source: str
+        message: str
+        tags: int32[]
+        relatedInformation: DiagnosticRelatedInformation[]
+
+    DiagnosticRelatedInformation =
+        location: Location
+        message: str
+
+    TextDocumentItem =
+        uri: str
+        languageId: str
+        version: int32
+        text: str
+
+    VersionedTextDocumentIdentifier =
+        uri: str
+        version: int32
+
+    CompletionItemKind = enum
+        CikText = 1
+        CikMethod = 2
+        CikFunction = 3
+        CikConstructor = 4
+        CikField = 5
+        CikVariable = 6
+        CikClass = 7
+        CikInterface = 8
+        CikModule = 9
+        CikProperty = 10
+        CikUnit = 11
+        CikValue = 12
+        CikEnum = 13
+        CikKeyword = 14
+        CikSnippet = 15
+        CikColor = 16
+        CikFile = 17
+        CikReference = 18
+        CikFolder = 19
+        CikEnumMember = 20
+        CikConstant = 21
+        CikStruct = 22
+        CikEvent = 23
+        CikOperator = 24
+        CikTypeParameter = 25
+
+    CompletionItem =
+        label: str
+        kind: CompletionItemKind
+        detail: str
+        documentation: str
+        sortText: str
+        filterText: str
+        insertText: str
+        data: json.JsonNode
+
+    CompletionList =
+        isIncomplete: bool
+        items: CompletionItem[]
+
+    SymbolKind = enum
+        SkFile = 1
+        SkModule = 2
+        SkNamespace = 3
+        SkPackage = 4
+        SkClass = 5
+        SkMethod = 6
+        SkProperty = 7
+        SkField = 8
+        SkConstructor = 9
+        SkEnum = 10
+        SkInterface = 11
+        SkFunction = 12
+        SkVariable = 13
+        SkConstant = 14
+        SkString = 15
+        SkNumber = 16
+        SkBoolean = 17
+        SkArray = 18
+        SkObject = 19
+        SkKey = 20
+        SkNull = 21
+        SkEnumMember = 22
+        SkStruct = 23
+        SkEvent = 24
+        SkOperator = 25
+        SkTypeParameter = 26
+
+    ServerCapabilities =
+        textDocumentSync: int32
+        hoverProvider: bool
+        definitionProvider: bool
+        referencesProvider: bool
+        completionProvider: CompletionOptions
+        diagnosticProvider: DiagnosticOptions
+
+    CompletionOptions =
+        triggerCharacters: str[]
+        resolveProvider: bool
+
+    DiagnosticOptions =
+        identifier: str
+        interFileDependencies: bool
+        workspaceDiagnostics: bool
+
+# --- Compiler Fact types (canonical, not parser-derived) ---
+
+type
+    FactSourceLocation =
+        uri: str
+        startLine: int32
+        startCol: int32
+        endLine: int32
+        endCol: int32
+
+    FactSymbolKind = enum
+        FskModule
+        FskFunction
+        FskType
+        FskConst
+        FskVariable
+        FskField
+        FskParam
+        FskImport
+
+    FactSymbol =
+        name: str
+        kind: FactSymbolKind
+        sourceLoc: FactSourceLocation
+        typeText: str
+        modulePath: str
+        exported: bool
+        docText: str
+
+    FactReference =
+        name: str
+        sourceLoc: FactSourceLocation
+        targetSymbolId: int32
+
+    FactDiagnostic =
+        sourceLoc: FactSourceLocation
+        severity: DiagnosticSeverity
+        code: str
+        message: str
+
+    FactSnapshot =
+        format: str
+        worldHead: str
+        sourceVersion: int32
+        symbols: FactSymbol[]
+        references: FactReference[]
+        diagnostics: FactDiagnostic[]
+
+# --- Factory helpers ---
+
+fn LspMakePosition(line: int32, character: int32): Position =
+    var out: Position
+    out.line = line
+    out.character = character
+    return out
+
+fn LspMakeRange(startLine: int32, startChar: int32,
+                endLine: int32, endChar: int32): Range =
+    var out: Range
+    out.start = LspMakePosition(startLine, startChar)
+    out.end = LspMakePosition(endLine, endChar)
+    return out
+
+fn LspMakeLocation(uri: str, range: Range): Location =
+    var out: Location
+    out.uri = uri
+    out.range = range
+    return out
+
+fn LspMakeDiagnostic(range: Range, severity: DiagnosticSeverity,
+                     code: str, source: str, message: str): Diagnostic =
+    var out: Diagnostic
+    out.range = range
+    out.severity = severity
+    out.code = code
+    out.source = source
+    out.message = message
+    return out
+
+fn LspFactLocationToRange(loc: FactSourceLocation): Range =
+    return LspMakeRange(loc.startLine, loc.startCol, loc.endLine, loc.endCol)
+
+fn LspFactSymbolKindToCompletionKind(kind: FactSymbolKind): CompletionItemKind =
+    if kind == FskFunction:
+        return CikFunction
+    if kind == FskType:
+        return CikStruct
+    if kind == FskConst:
+        return CikConstant
+    if kind == FskVariable || kind == FskParam:
+        return CikVariable
+    if kind == FskField:
+        return CikField
+    if kind == FskModule:
+        return CikModule
+    return CikText
+
+fn LspFactSymbolKindToSymbolKind(kind: FactSymbolKind): SymbolKind =
+    if kind == FskModule:
+        return SkModule
+    if kind == FskFunction:
+        return SkFunction
+    if kind == FskType:
+        return SkStruct
+    if kind == FskConst:
+        return SkConstant
+    if kind == FskVariable || kind == FskParam:
+        return SkVariable
+    if kind == FskField:
+        return SkField
+    return SkObject

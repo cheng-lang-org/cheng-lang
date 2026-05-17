@@ -1,0 +1,216 @@
+import std/result
+import std/strutils as strutil
+import cheng/std/bytes_layout as layout
+import cheng/std/crypto/hash256
+import cheng/core/tooling/path as chengpath
+import cheng/core/tooling/compiler_world as cworld
+import cheng/core/tooling/world_resolver as wresolver
+import cheng/core/tooling/cheng_lock as clock
+
+type
+    // Normalized compiler facts derived from world snapshot
+    WorldFacts =
+        version: int32
+        worldHeadCid: layout.FixedBytes32
+        snapshotCid: layout.FixedBytes32
+        compilerPkgCid: layout.FixedBytes32
+        stdPkgCid: layout.FixedBytes32
+        runtimePkgCid: layout.FixedBytes32
+        manifestCid: layout.FixedBytes32
+        packageCount: int32
+        packageFacts: WorldPackageFact[]
+        factsCid: layout.FixedBytes32
+
+    WorldPackageFact =
+        packageId: str
+        modulePrefix: str
+        channel: str
+        version: str
+        snapshotCid: layout.FixedBytes32
+        syntaxSurfaceCid: layout.FixedBytes32
+        exportSurfaceCid: layout.FixedBytes32
+
+    WorldSourceFact =
+        relPath: str
+        modulePath: str
+        contentCid: layout.FixedBytes32
+        contentHash: str
+
+    WorldImportFact =
+        fromModule: str
+        toPackage: str
+        toModule: str
+
+fn WorldPackageFactMake(packageId: str,
+                         modulePrefix: str,
+                         channel: str,
+                         version: str,
+                         snapshotCid: layout.FixedBytes32,
+                         syntaxSurfaceCid: layout.FixedBytes32,
+                         exportSurfaceCid: layout.FixedBytes32): WorldPackageFact =
+    var out: WorldPackageFact
+    out.packageId = packageId
+    out.modulePrefix = modulePrefix
+    out.channel = channel
+    out.version = version
+    out.snapshotCid = snapshotCid
+    out.syntaxSurfaceCid = syntaxSurfaceCid
+    out.exportSurfaceCid = exportSurfaceCid
+    return out
+
+fn WorldSourceFactMake(relPath: str,
+                        modulePath: str,
+                        contentCid: layout.FixedBytes32,
+                        contentHash: str): WorldSourceFact =
+    var out: WorldSourceFact
+    out.relPath = relPath
+    out.modulePath = modulePath
+    out.contentCid = contentCid
+    out.contentHash = contentHash
+    return out
+
+fn WorldFactsHash(version: int32,
+                   worldHeadCid: layout.FixedBytes32,
+                   snapshotCid: layout.FixedBytes32,
+                   compilerPkgCid: layout.FixedBytes32,
+                   stdPkgCid: layout.FixedBytes32,
+                   runtimePkgCid: layout.FixedBytes32,
+                   manifestCid: layout.FixedBytes32,
+                   packageFacts: WorldPackageFact[]): layout.FixedBytes32 =
+    var buf: layout.ByteBuf = layout.ByteBufInit(256)
+    cworld.CompilerWorldAppendText(buf, "cheng.world.facts")
+    cworld.CompilerWorldAppendU32BE(buf, version)
+    cworld.CompilerWorldAppendFixed32(buf, worldHeadCid)
+    cworld.CompilerWorldAppendFixed32(buf, snapshotCid)
+    cworld.CompilerWorldAppendFixed32(buf, compilerPkgCid)
+    cworld.CompilerWorldAppendFixed32(buf, stdPkgCid)
+    cworld.CompilerWorldAppendFixed32(buf, runtimePkgCid)
+    cworld.CompilerWorldAppendFixed32(buf, manifestCid)
+    cworld.CompilerWorldAppendU32BE(buf, packageFacts.len)
+    for i in 0..<packageFacts.len:
+        cworld.CompilerWorldAppendText(buf, packageFacts[i].packageId)
+        cworld.CompilerWorldAppendFixed32(buf, packageFacts[i].snapshotCid)
+        cworld.CompilerWorldAppendFixed32(buf, packageFacts[i].syntaxSurfaceCid)
+        cworld.CompilerWorldAppendFixed32(buf, packageFacts[i].exportSurfaceCid)
+    return cworld.CompilerWorldBufCid(buf)
+
+fn WorldFactsMake(worldHeadCid: layout.FixedBytes32,
+                   snapshotCid: layout.FixedBytes32,
+                   compilerPkgCid: layout.FixedBytes32,
+                   stdPkgCid: layout.FixedBytes32,
+                   runtimePkgCid: layout.FixedBytes32,
+                   manifestCid: layout.FixedBytes32,
+                   packageFacts: WorldPackageFact[]): WorldFacts =
+    let version: int32 = 1
+    let factsCid = WorldFactsHash(version,
+                                   worldHeadCid,
+                                   snapshotCid,
+                                   compilerPkgCid,
+                                   stdPkgCid,
+                                   runtimePkgCid,
+                                   manifestCid,
+                                   packageFacts)
+    var out: WorldFacts
+    out.version = version
+    out.worldHeadCid = worldHeadCid
+    out.snapshotCid = snapshotCid
+    out.compilerPkgCid = compilerPkgCid
+    out.stdPkgCid = stdPkgCid
+    out.runtimePkgCid = runtimePkgCid
+    out.manifestCid = manifestCid
+    out.packageCount = packageFacts.len
+    out.packageFacts = packageFacts
+    out.factsCid = factsCid
+    return out
+
+fn WorldFactsFromReceipt(receipt: wresolver.WorldReceipt): WorldFacts =
+    var packageFacts: WorldPackageFact[]
+    for i in 0..<receipt.entries.len:
+        let entry = receipt.entries[i]
+        add(packageFacts,
+            WorldPackageFactMake(entry.packageId,
+                                 entry.modulePrefix,
+                                 entry.channel,
+                                 entry.version,
+                                 entry.cid,
+                                 layout.FixedBytes32(),
+                                 layout.FixedBytes32()))
+    return WorldFactsMake(receipt.worldHeadCid,
+                           receipt.snapshotCid,
+                           layout.FixedBytes32(),
+                           layout.FixedBytes32(),
+                           layout.FixedBytes32(),
+                           layout.FixedBytes32(),
+                           packageFacts)
+
+fn WorldFactsFromLock(lock: clock.ChengLock): Result[WorldFacts] =
+    let worldHeadRes = layout.FixedBytes32FromHex(lock.worldHeadCid)
+    if IsErr(worldHeadRes):
+        return Err[WorldFacts](strutil.Join([" world facts: invalid world_head_cid: ", lock.worldHeadCid], ""))
+    let compilerRes = layout.FixedBytes32FromHex(lock.compilerCid)
+    if IsErr(compilerRes):
+        return Err[WorldFacts](strutil.Join([" world facts: invalid compiler cid: ", lock.compilerCid], ""))
+    let stdRes = layout.FixedBytes32FromHex(lock.stdlibCid)
+    if IsErr(stdRes):
+        return Err[WorldFacts](strutil.Join([" world facts: invalid stdlib cid: ", lock.stdlibCid], ""))
+    let runtimeRes = layout.FixedBytes32FromHex(lock.runtimeCid)
+    if IsErr(runtimeRes):
+        return Err[WorldFacts](strutil.Join([" world facts: invalid runtime cid: ", lock.runtimeCid], ""))
+    var packageFacts: WorldPackageFact[]
+    for i in 0..<lock.packages.len:
+        let pkg = lock.packages[i]
+        let pkgCidRes = layout.FixedBytes32FromHex(pkg.cid)
+        if IsErr(pkgCidRes):
+            return Err[WorldFacts](strutil.Join([" world facts: invalid package cid for ", pkg.packageId], ""))
+        add(packageFacts,
+            WorldPackageFactMake(pkg.packageId,
+                                 pkg.modulePrefix,
+                                 pkg.channel,
+                                 pkg.version,
+                                 Value(pkgCidRes),
+                                 layout.FixedBytes32(),
+                                 layout.FixedBytes32()))
+    let result = WorldFactsMake(Value(worldHeadRes),
+                                 layout.FixedBytes32(),
+                                 Value(compilerRes),
+                                 Value(stdRes),
+                                 Value(runtimeRes),
+                                 layout.FixedBytes32(),
+                                 packageFacts)
+    return Ok[WorldFacts](result)
+
+fn WorldFactsVerify(facts: WorldFacts): bool =
+    if facts.version != 1:
+        return false
+    let expectedCid = WorldFactsHash(facts.version,
+                                      facts.worldHeadCid,
+                                      facts.snapshotCid,
+                                      facts.compilerPkgCid,
+                                      facts.stdPkgCid,
+                                      facts.runtimePkgCid,
+                                      facts.manifestCid,
+                                      facts.packageFacts)
+    return layout.FixedBytes32Equal(expectedCid, facts.factsCid)
+
+fn WorldFactsLookupPackage(facts: WorldFacts, packageId: str): Result[WorldPackageFact] =
+    for i in 0..<facts.packageFacts.len:
+        if facts.packageFacts[i].packageId == packageId:
+            return Ok[WorldPackageFact](facts.packageFacts[i])
+    return Err[WorldPackageFact](strutil.Join([" world facts: package not found: ", packageId], ""))
+
+fn WorldFactsReport(facts: WorldFacts): str =
+    var out = ""
+    out = strutil.Join([out, "version=", IntToStr(facts.version), "\n"], "")
+    out = strutil.Join([out, "world_head_cid=", layout.FixedBytes32Hex(facts.worldHeadCid), "\n"], "")
+    out = strutil.Join([out, "snapshot_cid=", layout.FixedBytes32Hex(facts.snapshotCid), "\n"], "")
+    out = strutil.Join([out, "compiler_pkg_cid=", layout.FixedBytes32Hex(facts.compilerPkgCid), "\n"], "")
+    out = strutil.Join([out, "std_pkg_cid=", layout.FixedBytes32Hex(facts.stdPkgCid), "\n"], "")
+    out = strutil.Join([out, "runtime_pkg_cid=", layout.FixedBytes32Hex(facts.runtimePkgCid), "\n"], "")
+    out = strutil.Join([out, "manifest_cid=", layout.FixedBytes32Hex(facts.manifestCid), "\n"], "")
+    out = strutil.Join([out, "package_count=", IntToStr(facts.packageCount), "\n"], "")
+    for i in 0..<facts.packageFacts.len:
+        out = strutil.Join([out, "package[", IntToStr(i), "].id=", facts.packageFacts[i].packageId, "\n"], "")
+        out = strutil.Join([out, "package[", IntToStr(i), "].version=", facts.packageFacts[i].version, "\n"], "")
+        out = strutil.Join([out, "package[", IntToStr(i), "].snapshot_cid=", layout.FixedBytes32Hex(facts.packageFacts[i].snapshotCid), "\n"], "")
+    out = strutil.Join([out, "facts_cid=", layout.FixedBytes32Hex(facts.factsCid)], "")
+    return out

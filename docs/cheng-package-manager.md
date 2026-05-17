@@ -1,54 +1,69 @@
-# Cheng 包管理器设计
+# Cheng World Resolver 与包管理设计
 
 > 2026-05-17 · 设计文档（非规范）
 > 规范以 `docs/cheng-formal-spec.md` 为准；实现状态以 `docs/roadmap.md`、当前源码和当前可执行产物为准。
 
-## 0. 评估结论
+## 0. 结论
 
-原文最大问题是把包管理器写成“Git clone + `cheng_packages/` + `@import "path"`”。这和当前正式规范冲突。
+最佳方案不是传统包管理器，而是 **World Resolver**。
 
-必须改成：
+Cheng 代码自托管在 Cheng libp2p 网络中，全球统一版本必须由 `world head -> CID 快照 -> 本地 lock/receipt -> 离线编译` 闭合。包管理器只是 World Resolver 的一部分，职责是把“可变通道”固化成“不可变世界快照”。
 
-- 包身份用 `package_id = "pkg://cheng/<name>"`，libp2p CID 快照是主来源；Git/file 只能作为迁移期镜像或本地开发源，不是语言层包身份。
-- 依赖至少声明 `package_id + channel`，可附带 SemVer 约束和校验和。
-- 锁文件固定为 `cheng.lock.toml`，记录 `cid/author_id/signature/epoch`、解析来源和校验和。
-- 用户源码只写归一化导入：`import <pkg>/<path>`、`import std/<path>`、`import pkg/[a,b]`；禁止字符串、绝对路径、相对路径导入。
-- “编译期不联网”指 lowering/codegen/link 不访问网络。`cheng build` 可以编排前置的 `deps resolve/fetch`，但进入编译器后只消费本地 lock 和本地包根。
+必须坚持：
 
-## 1. 包模型
+- 包身份用 `package_id = "pkg://cheng/<name>"`。
+- libp2p CID 快照是主来源；Git/file 只作为迁移期镜像或本地开发源。
+- `cheng.lock.toml` 承载 world snapshot，不只是依赖列表。
+- `compile/lowering/codegen/link` 不联网，只消费已锁定本地快照。
+- LSP、Debugger、编译器都读同一份 world snapshot 和 compiler canonical facts。
 
-Cheng 包 = 一个包根目录 + `cheng-package.toml` + `src/` 模块树。
+## 1. 总体数据流
+
+```
+libp2p world head
+  -> universe manifest
+  -> package snapshots
+  -> local CID cache
+  -> cheng.lock.toml / world receipt
+  -> compiler canonical facts
+      -> build/codegen/link
+      -> LSP facts
+      -> DebugFacts
+```
+
+核心区别：
+
+- `channel head` 是可变入口。
+- `CID` 是不可变内容。
+- `cheng.lock.toml` 是本次构建的世界快照。
+- `compile receipt` 是“这次编译用了什么世界、源码、compiler、stdlib、runtime、目标参数”的可验证回执。
+
+## 2. 包根与 Manifest
+
+包根仍是 `cheng-package.toml` + `src/`。
 
 ```
 <project>/
 ├── cheng-package.toml
-├── cheng.lock.toml        # 解析后生成，必须签入
+├── cheng.lock.toml
 ├── src/
 │   ├── main.cheng
 │   └── internal/
 └── tests/
 ```
 
-本地内容缓存不放进源码树。默认位置：
-
-- `PKG_ROOT` / `PKG_ROOTS` 显式指定时优先使用。
-- 未指定时使用 `~/.cheng-packages` 与 `chengcache/packages/<cid>/`。
-
-## 2. `cheng-package.toml`
-
-当前规范口径使用顶层字段，避免 `[package]` 包一层。
+`cheng-package.toml` 描述意图，不描述最终世界：
 
 ```toml
 package_id = "pkg://cheng/fs"
 module_prefix = "fs"
 edition = "2026"
-type = "lib" # lib / bin / test
+type = "lib"
 
 [[dependencies]]
 package_id = "pkg://cheng/core"
 channel = "stable"
 version = "^0.2"
-checksum = "sha256:..."
 
 [[dependencies]]
 package_id = "pkg://cheng/net"
@@ -59,50 +74,79 @@ channel = "edge"
 
 | 字段 | 说明 |
 |---|---|
-| `package_id` | 全局包身份，格式为 `pkg://cheng/<name>` |
-| `module_prefix` | 本包导入前缀，通常等于 `<name>` |
+| `package_id` | 全局包身份 |
+| `module_prefix` | 本包导入前缀 |
 | `[[dependencies]].package_id` | 依赖包身份 |
-| `[[dependencies]].channel` | 解析通道，如 `stable`、`edge` |
+| `[[dependencies]].channel` | 解析通道 |
 
 可选字段：
 
 | 字段 | 说明 |
 |---|---|
-| `version` | SemVer 约束，如 `^1.2`、`>=1.0.0` |
-| `checksum` | 源码快照或包产物校验和 |
-| `source` | libp2p、file 或迁移期 Git 镜像源，只影响获取，不影响包身份 |
+| `version` | SemVer 约束 |
+| `checksum` | 迁移源或本地源校验 |
+| `source` | `libp2p`、`file:`、迁移期 Git 镜像源 |
 
-## 3. `cheng.lock.toml`
+## 3. World Lock
 
-lock 文件记录解析后的不可变快照。生产构建只认 lock，不跟随 channel head。
+`cheng.lock.toml` 是 world snapshot。
 
 ```toml
 format_version = 1
+world_head_cid = "bafy-world..."
+channel = "stable"
+epoch = 42
+author_id = "did:key:z..."
+signature = "ed25519:..."
+
+compiler_package_id = "pkg://cheng/compiler"
+compiler_cid = "bafy-compiler..."
+stdlib_package_id = "pkg://cheng/std"
+stdlib_cid = "bafy-stdlib..."
+runtime_package_id = "pkg://cheng/runtime"
+runtime_cid = "bafy-runtime..."
 
 [[packages]]
 package_id = "pkg://cheng/core"
 module_prefix = "core"
 channel = "stable"
 version = "0.2.4"
-cid = "bafy..."
-author_id = "did:key:z..."
-signature = "ed25519:..."
-epoch = 42
+cid = "bafy-core..."
+syntax_surface_cid = "bafy-syntax..."
+export_surface_cid = "bafy-export..."
 source = "libp2p:cheng"
 checksum = "sha256:..."
 format = "source"
 ```
 
-约束：
+硬约束：
 
-- 同一 `package_id` 在同一个 lock 中只能出现一个解析结果。
-- channel 解析必须生成确定的 `cid`。
-- `format = "source"` 表示源码直发，编译器从本地包根读取 `src/`。
-- lock 缺失、签名不合法、校验和不匹配、同包多版本冲突都必须 hard-fail。
+- 同一 `package_id` 只能解析到一个 CID。
+- manifest 与 lock 不一致必须失败。
+- lock 签名、CID、checksum 不合法必须失败。
+- 本地 CID cache 缺失必须失败。
+- 编译阶段不能修改 lock。
 
-## 4. 导入映射
+## 4. Build 模式
 
-用户源码写法：
+| 模式 | 是否联网 | 行为 |
+|---|---|---|
+| `cheng deps resolve/fetch` | 是 | 解析 world head，拉取 CID 快照，验签，写候选 lock |
+| `cheng build --online` | 可联网 | 先 resolve/fetch，再以 `--locked` 同一路径编译 |
+| `cheng build --locked` | 否 | 只读 lock 和本地 CID cache |
+| release | 否 | 等同 `--locked`，额外要求签名和 receipt 完整 |
+
+`cheng build --online` 必须是组合命令：
+
+1. 解析 world head。
+2. 生成候选 `cheng.lock.toml`。
+3. 校验候选 lock 与本地 CID cache。
+4. 原子替换 lock。
+5. 进入 `--locked` 离线编译路径。
+
+## 5. 导入映射
+
+用户源码只写归一化导入：
 
 ```cheng
 import fs/path
@@ -111,14 +155,14 @@ import libp2p/[crypto,transport,swarm]
 import std/os
 ```
 
-解析规则：
+映射：
 
-| 导入 | 映射 |
+| 导入 | 本地解析 |
 |---|---|
-| `import <pkg>/<path>` | `<pkgroot>/src/<path>.cheng` |
-| `import std/<path>` | 当前仓库 `src/std/<path>.cheng` |
+| `import <pkg>/<path>` | lock 中 `<pkg>` 的 CID cache：`src/<path>.cheng` |
+| `import std/<path>` | lock 中 stdlib CID 或仓库 `src/std/<path>.cheng` |
 | `import cheng/<pkg>/<path>` | 兼容别名，归一化为 `<pkg>/<path>` |
-| `import pkg/[a,b]` | 展开为 `import pkg/a` 和 `import pkg/b` |
+| `import pkg/[a,b]` | 展开为 `import pkg/a`、`import pkg/b` |
 
 禁止：
 
@@ -129,54 +173,22 @@ import std/os
 - `from import`
 - `import A, B`
 
-仓内源码模块可按规范尝试 `<workspace>/src/<module>.cheng`。这只服务本仓开发，不改变包级导入规则。
+## 6. Compiler Facts
 
-## 5. 全球统一版本与编译边界
+World Resolver 的产物不止 lock，还要为编译器构造 canonical facts 输入：
 
-Cheng 代码自托管在 Cheng libp2p 网络中，全球统一版本靠 channel head 和 CID 快照实现，不靠编译器边编译边联网。
+| Facts | 作用 |
+|---|---|
+| `WorldFacts` | world head、package CID、compiler/std/runtime CID |
+| `SourceBundleFacts` | 每个模块的路径、源码 hash、源码文本 CID |
+| `ImportGraphFacts` | 归一化导入边、循环检测链 |
+| `ExportSurfaceFacts` | Go 风格大写导出面 |
+| `SyntaxSurfaceFacts` | parser/grammar 版本和可接受语法面 |
+| `CompileReceiptFacts` | 本次编译输入、目标、产物和 receipt CID |
 
-正确流水线：
+LSP 和 Debugger 不重新猜这些事实，只消费同一份 facts。
 
-```
-libp2p registry/channel head
-  -> deps resolve：channel/version -> CID
-  -> deps fetch：CID -> 本地内容寻址缓存
-  -> cheng.lock.toml：签名快照
-  -> compile：只读本地快照
-```
-
-因此有三种模式：
-
-| 模式 | 是否联网 | 行为 |
-|---|---|---|
-| `cheng deps resolve/fetch` | 是 | 从 libp2p 网络解析 channel head、拉取 CID 快照、验签、写 lock |
-| `cheng build --online` | 可联网 | 先跑 resolve/fetch，再进入离线编译阶段 |
-| `cheng build --locked` / release | 否 | 只读 `cheng.lock.toml` 和本地缓存，缺失即 hard-fail |
-
-编译器内层仍保持硬边界：
-
-- 不在 import 解析过程中访问网络。
-- 不在 typecheck/lowering/codegen/link 过程中更新 channel。
-- 不因缓存缺失改去远程拉取。
-- 不把“最新 stable”当成隐式输入；必须先固化为 lock 中的 CID。
-
-包管理器职责分两段：
-
-1. `cheng deps resolve/fetch`
-   - 读取 `cheng-package.toml`。
-   - 按 `package_id + channel + version/checksum` 解析依赖图。
-   - 校验作者签名、CID 和校验和。
-   - 写入 `cheng.lock.toml`。
-   - 把源码快照放到本地包缓存。
-
-2. `cheng build/run/test`
-   - 读取 `cheng.lock.toml`。
-   - 校验本地包根存在且内容匹配 lock。
-   - 构造 `PKG_ROOTS` 或等价 external package roots。
-   - 调用 `artifacts/backend_driver/cheng system-link-exec`。
-   - 编译内层不访问网络，不更新 lock。
-
-## 6. CLI 设计
+## 7. CLI
 
 ```
 cheng new <project>
@@ -186,6 +198,7 @@ cheng deps resolve
 cheng deps fetch
 cheng deps status
 cheng deps update [package-id]
+cheng world receipt
 cheng build --locked
 cheng build --online
 cheng run
@@ -193,7 +206,7 @@ cheng test
 cheng publish
 ```
 
-`cheng build` 的公开参数应贴近当前 driver：
+底层编译仍调用当前 driver：
 
 ```bash
 artifacts/backend_driver/cheng system-link-exec \
@@ -205,49 +218,36 @@ artifacts/backend_driver/cheng system-link-exec \
   --report-out:/tmp/app.report.txt
 ```
 
-## 7. 发布格式
+## 8. MVP
 
-主发布物是可验证源码快照：
+第一阶段：
 
-- `cid` 固定源码树内容。
-- `author_id/signature/epoch` 固定作者与通道更新顺序。
-- `sources.list.txt` 可列出源码闭包。
+- 把 `cheng.lock.toml` 升级为 world snapshot。
+- `cheng build --locked` 校验 world/lock/cache 后再进入 driver。
+- `cheng build --online` 只做前置 resolve/fetch 和原子 lock 更新。
+- 输出 `compile_receipt_cid`。
+- 为 import 正反例、lock 缺失、CID 缺失、签名错误加门禁。
 
-`.chenga` 是 provider archive 产物，适合预编译 runtime/provider 或离线分发。它不能替代源码 lock，也不能在没有源码快照证明时声明包闭合。
+第二阶段：
 
-## 8. MVP 范围
+- 接入 libp2p world head 解析。
+- 接入 package snapshot / syntax surface / export surface CID。
+- LSP 和 Debugger 改为消费 compiler canonical facts。
 
-第一阶段只做能闭合的最小集合：
-
-- 解析顶层 `cheng-package.toml`。
-- 解析 `[[dependencies]]` 的 `package_id/channel/version/checksum`。
-- 生成并校验 `cheng.lock.toml`。
-- 支持本地 `file:` 源和已存在的本地包缓存。
-- 支持 `PKG_ROOTS` / external package roots 映射。
-- 编译内层按 lock 校验导入，不联网。
-- `cheng build --online` 只允许在进入编译器前联网刷新 lock 和本地 CID 缓存。
-- 为 `import <pkg>/<path>`、`import std/<path>`、`import pkg/[a,b]` 加正反例。
-
-第二阶段再接入 registry/channel 到 CID 的真实解析和 libp2p 源获取。Git 只保留为导入旧生态的镜像源，不进入默认主线。
-
-## 9. 验收条件
+## 9. 验收
 
 ```bash
-cheng new my-app
-cd my-app
-cheng deps add pkg://cheng/fs --channel stable --source file:../cheng-fs
 cheng deps resolve
 cheng deps fetch
+cheng world receipt
 cheng build --locked
-cheng run
-cheng test
 ```
 
-必须额外验证：
+必须验证：
 
-- 删除本地包缓存后，`cheng build --locked` 直接失败并指出缺失包根。
-- `cheng build --online` 只能在编译前刷新 lock/cache，进入 driver 后不得联网。
-- 修改缓存源码后，lock 校验失败。
-- 同一 `package_id` 解析到两个 CID 时失败。
-- 字符串/相对/绝对 import 全部失败。
-- `cheng.lock.toml` 缺签名或校验和不匹配时失败。
+- 无网络时 `--locked` 可复现构建。
+- lock 指向的本地 CID 缺失时失败。
+- 修改本地 CID cache 内容时失败。
+- 同一 `package_id` 多 CID 冲突失败。
+- `--online` 只在编译前联网，进入 driver 后不得联网。
+- 编译报告包含 `world_head_cid`、`compile_receipt_cid`、`compiler_cid`、`stdlib_cid`、`runtime_cid`。

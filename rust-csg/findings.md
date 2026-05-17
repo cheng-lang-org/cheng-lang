@@ -10,7 +10,12 @@
 - 已修 cold import closure 的 alias 去重：不同源文件闭包内允许同名 alias 指向不同 path，去重粒度改为 `alias + path`。新增 `cold_transitive_alias_scope_smoke` 覆盖入口同时导入 `cheng/codex/protocol/types` 与 `cheng/rust-csg/core/parity` 的场景。
 - `artifacts/bootstrap/cheng.stage3 build-backend-driver --out:/tmp/rust_csg_cheng_candidate` 仍因缺失已退役的 `bootstrap/cheng_seed.c` 失败；本轮改用当前 cold 编译器直接生成候选，再按候选门禁后覆盖正式 `artifacts/backend_driver/cheng`。
 - `rust-csg/src/core/inventory.cheng` 的 live scan 已越过嵌套包导入和 alias 冲突；`rust_csg_inventory_smoke` 不再用常量假绿，已经调用真实 `inventory.RustCsgCollectSourceStats()`。
+- Cargo workspace 不再只锁数量：`RustCsgCargoMembersOk` 从源 `Cargo.toml` 解析 member 名字，逐项检查顺序、重复和未知项；当前可完成 `emit:obj` 编译验证。
+- `core/module_map.cheng` 已把 `app-server-protocol -> app_server_protocol`、`utils/path-utils -> utils_path_utils` 这类规则落成代码；migration unit 默认 `explicitly_blocked` 且必须写 reason。
 - 已补 `rust-csg/support/darwin_inventory_provider.c`，按 cold 实际 ABI 提供 `JoinPath/ReadFile/WalkDirRec/RustCsgContains/RustCsgEndsWith/StartsWith`：`str` 入参为 `(data, len/store_id)`，`str`/`str[]` 返回使用 `x8` 返回槽。
-- 真实 inventory smoke 通过路径：`rust-csg/support/run_inventory_smoke.sh` 先 `emit:obj` 产出 primary object，再用 Darwin provider object 和 `cc -arch arm64 ... -lc` 系统链接运行，输出 `rust_csg_inventory_smoke ok`。
+- 真实 inventory smoke 旧旁路已证明 Cheng primary object 与 Darwin provider object 的 ABI 能闭合：先 `emit:obj` 产出 primary object，再用 `cc -arch arm64 ... -lc` 系统链接运行，输出 `rust_csg_inventory_smoke ok`。该路径不能算正式验收。
+- `rust-csg/support/run_inventory_smoke.sh` 已改为正式门禁：直接调用 `system-link-exec --emit:exe --provider-objects`，并检查 `cold_macho_provider_system_link` 与 `provider_object_count=1`。
 - 直接 `emit:exe` 下正式 driver 仍报告首个 unresolved symbol 为 `cheng_mem_release`。`provider-archive-pack + --link-object` 能解析 rust-csg provider exports，但 linkerless Mach-O provider archive 停在 provider 的 libSystem 依赖 `closedir`。不能用假 stub；需要 Darwin provider object 系统链接主线闭合。
+- 发现 direct Mach-O 旧产物 load command 非法：`LC_LOAD_DYLINKER cmdsize=28` 不是 8 字节对齐，`nm` 报 `cmdsize not a multiple of 8`，新进程会停在 dyld。源码已改为 `cmdsize=32`，但正式 artifact 未刷新。
+- 当前宿主存在独立执行环境故障：新落盘可执行文件会卡在 `_dyld_start`/内核 `U` 状态，`kill -9` 无效；已复现到 `cc` 编译的 hello 和复制的 `/bin/echo`，不是 rust-csg 代码特有问题。继续刷新正式 artifact 前需先恢复宿主新二进制执行能力。
 - 源仓实时计数已用宿主命令核对：Cargo members=106、Rust files=1738、TypeScript files=528、snapshots=454、frames=360、product package.json=5。

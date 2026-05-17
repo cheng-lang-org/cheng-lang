@@ -3,6 +3,7 @@
 ## Active
 
 - Cheng libp2p 全球统一版本：联网只属于 resolve/fetch/world-head 更新阶段；compile/lowering/codegen/link 只消费已锁定的本地 CID 快照和 `cheng.lock.toml`。
+- LSP/Debugger/包管理最佳主线必须共享 world snapshot 与 compiler canonical facts；禁止各自二次猜源码事实。
 - cold nested import smoke 必须读写 imported alias 的真实字段；只声明未使用变量不能证明跨包类型解析。
 - CSG/lowering热路径：复用source context，勿重复建ctx；import edge用`ctx.lines`。
 - 多行字符串rewrite：测长→一次分配→线性写入+hard-fail长度合同。禁O(n²)。
@@ -107,6 +108,7 @@
 - 内联 tuple field 切分必须追踪括号深度；`[default, values]` 内的逗号不能错误分割字段。
 - LICM 必须先做只读分析（不变量计数，不移动 op），验证收敛后再启用 loop 变换。back-edge 检测是正确识别 natural loop 的前提。
 - 冷编译器 exe 路径中未解析的 codegen patch 必须在 exe 链接阶段解析到 provider 符号表；patch 需携带 unresolved 标记。
+- macOS 新落盘 Mach-O 卡在 `_dyld_start` 可由当前 session 大量并行 `cc` 编译触发的 dyld/进程/共享内存/文件描述符资源瞬态导致；先恢复宿主执行环境再重跑门禁，不要归因到 Cheng 代码或 Tailscale/Clash。
 
 ## Resolved
 

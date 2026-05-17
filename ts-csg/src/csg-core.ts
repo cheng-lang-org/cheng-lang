@@ -582,7 +582,13 @@ export function emitCsgCoreFromTs(options: CsgCoreOptions): CsgCoreResult {
       for (const declaration of node.declarationList.declarations) {
         emitVariable(declaration, sourceFile);
         const initializerOp = declaration.initializer ? emitExpression(context, blockId, declaration.initializer, sourceFile) : undefined;
-        if (!ts.isIdentifier(declaration.name)) {
+        if (ts.isIdentifier(declaration.name)) {
+          emitOp(context, blockId, declaration.name, "local_write", {
+            declarationKind: variableDeclarationKind(declaration),
+            name: declaration.name.text,
+            value: initializerOp,
+          });
+        } else {
           emitBindingExtractOps(context, blockId, declaration.name, sourceFile, initializerOp);
         }
       }
@@ -642,7 +648,7 @@ export function emitCsgCoreFromTs(options: CsgCoreOptions): CsgCoreResult {
     if (ts.isBlock(node)) {
       const nested = newBlock(context, node, "block");
       emitStatementList(context, nested, node.statements, sourceFile);
-      emitOp(context, blockId, node, "block", { block: nested });
+      emitOp(context, blockId, node, "block", { nestedBlock: nested });
       return;
     }
     if (ts.isTryStatement(node)) {
@@ -692,13 +698,21 @@ export function emitCsgCoreFromTs(options: CsgCoreOptions): CsgCoreResult {
     }
     if (ts.isCallExpression(node)) {
       emitCall(node, sourceFile);
-      for (const arg of node.arguments) emitExpression(context, blockId, arg, sourceFile);
-      return emitOp(context, blockId, node, "call", { callee: node.expression.getText(sourceFile), argumentCount: node.arguments.length });
+      const argumentOps = node.arguments.map((arg) => emitExpression(context, blockId, arg, sourceFile));
+      return emitOp(context, blockId, node, "call", {
+        callee: node.expression.getText(sourceFile),
+        argumentCount: node.arguments.length,
+        arguments: argumentOps,
+      });
     }
     if (ts.isNewExpression(node)) {
       emitNew(node, sourceFile);
-      for (const arg of node.arguments ?? []) emitExpression(context, blockId, arg, sourceFile);
-      return emitOp(context, blockId, node, "new", { constructor: node.expression.getText(sourceFile), argumentCount: node.arguments?.length ?? 0 });
+      const argumentOps = (node.arguments ?? []).map((arg) => emitExpression(context, blockId, arg, sourceFile));
+      return emitOp(context, blockId, node, "new", {
+        constructor: node.expression.getText(sourceFile),
+        argumentCount: node.arguments?.length ?? 0,
+        arguments: argumentOps,
+      });
     }
     if (ts.isJsxElement(node) || ts.isJsxSelfClosingElement(node) || ts.isJsxFragment(node)) {
       emitJsx(node, sourceFile);
@@ -1071,6 +1085,7 @@ export function emitCsgCoreFromTs(options: CsgCoreOptions): CsgCoreResult {
     const ordinal = context.nextOp;
     context.nextOp += 1;
     emitFact({
+      ...fields,
       kind: "csg.op",
       id: opId,
       loc: locFor(context.sourceFile, node),
@@ -1078,7 +1093,6 @@ export function emitCsgCoreFromTs(options: CsgCoreOptions): CsgCoreResult {
       block: blockId,
       opKind,
       ordinal,
-      ...fields,
     });
     emitFact({
       kind: "csg.debug_map",

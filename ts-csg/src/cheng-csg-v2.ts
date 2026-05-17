@@ -1,7 +1,8 @@
 import path from "node:path";
 import * as ts from "typescript";
 
-import type { ExtractOptions } from "./schema.js";
+import { emitCsgCoreFromTs } from "./csg-core.js";
+import type { CsgFact, ExtractOptions } from "./schema.js";
 
 export interface ChengCsgV2Options extends ExtractOptions {
   entry?: string;
@@ -50,47 +51,32 @@ export function emitChengCsgV2FromTs(options: ChengCsgV2Options): ChengCsgV2Resu
     return failUnsupported(`target ${target} is not supported by ts-csg Cheng CSG v2 writer`);
   }
 
-  const build = buildProgram(options);
-  if (build.diagnostics.length > 0) {
-    return { diagnostics: build.diagnostics, unsupported: [], text: "", functionCount: 0, wordCount: 0 };
+  const core = emitCsgCoreFromTs({ ...options, runtime: ["node", "browser"] });
+  if (core.diagnostics.length > 0) {
+    return { diagnostics: core.diagnostics, unsupported: [], text: "", functionCount: 0, wordCount: 0 };
+  }
+  if (core.report.unsupported.length > 0) {
+    return {
+      diagnostics: [],
+      unsupported: core.report.unsupported.map((issue) => `${issue.code}: ${issue.message}`),
+      text: "",
+      functionCount: 0,
+      wordCount: 0,
+    };
+  }
+  if (core.report.runtimeRequirements.length > 0) {
+    return {
+      diagnostics: [],
+      unsupported: core.report.runtimeRequirements.map((item) => `runtime requirement ${item.runtime}:${item.kind}:${item.name}`),
+      text: "",
+      functionCount: 0,
+      wordCount: 0,
+    };
   }
 
-  const sourceFiles = build.program
-    .getSourceFiles()
-    .filter((sourceFile) => isProjectSourceFile(build.cwd, sourceFile))
-    .sort((left, right) => relPath(build.cwd, left.fileName).localeCompare(relPath(build.cwd, right.fileName)));
-
-  if (sourceFiles.length !== 1) {
-    return failUnsupported(`expected exactly one project source file, got ${sourceFiles.length}`);
-  }
-
-  const sourceFile = sourceFiles[0];
-  if (!sourceFile) {
-    return failUnsupported("missing project source file");
-  }
-
-  const checker = build.program.getTypeChecker();
-  const collected = collectFunctions(sourceFile, checker, target, entry);
-  if (!collected.ok) {
-    return { diagnostics: [], unsupported: collected.messages ?? [collected.message], text: "", functionCount: 0, wordCount: 0 };
-  }
-
-  const compiledFunctions: CompiledFunction[] = [];
-  let wordOffset = 0;
-  for (const info of collected.functions) {
-    const compiler = new Arm64TsSubsetCompiler(sourceFile, checker, collected.byName, info);
-    const compiled = compiler.compileFunction();
-    if (!compiled.ok) {
-      return failUnsupported(`${info.name}: ${compiled.message}`);
-    }
-    compiledFunctions.push({
-      bodyKind: compiled.bodyKind,
-      info,
-      relocs: compiled.relocs,
-      words: compiled.words,
-      wordOffset,
-    });
-    wordOffset += compiled.words.length;
+  const lowered = lowerCsgCoreToChengCsgV2(core.facts, target, entry);
+  if (!lowered.ok) {
+    return failUnsupported(lowered.message);
   }
 
   const symbol = symbolForEntry(target, entry);
@@ -98,15 +84,15 @@ export function emitChengCsgV2FromTs(options: ChengCsgV2Options): ChengCsgV2Resu
   writer.stringRecord(1, target);
   writer.stringRecord(2, format);
   writer.stringRecord(3, symbol);
-  for (const item of compiledFunctions) {
+  for (const item of lowered.functions) {
     writer.functionRecord(item.info.itemId, item.wordOffset, item.words.length, item.info.symbol, item.bodyKind);
   }
-  for (const item of compiledFunctions) {
+  for (const item of lowered.functions) {
     for (const word of item.words) {
       writer.wordRecord(word);
     }
   }
-  for (const item of compiledFunctions) {
+  for (const item of lowered.functions) {
     for (const reloc of item.relocs) {
       writer.relocRecord(item.info.itemId, item.wordOffset + reloc.wordIndex, reloc.targetSymbol);
     }
@@ -116,9 +102,644 @@ export function emitChengCsgV2FromTs(options: ChengCsgV2Options): ChengCsgV2Resu
     diagnostics: [],
     unsupported: [],
     text: writer.toString(),
-    functionCount: compiledFunctions.length,
-    wordCount: wordOffset,
+    functionCount: lowered.functions.length,
+    wordCount: lowered.wordCount,
   };
+}
+
+type CoreParameter = {
+  index: number;
+  name: string;
+  optional?: boolean;
+  rest?: boolean;
+  typeSource?: string;
+};
+
+type CoreFunctionInfo = {
+  itemId: number;
+  id: string;
+  name: string;
+  symbol: string;
+  exported: boolean;
+  parameters: CoreParameter[];
+  returnType: string;
+  async: boolean;
+  generator: boolean;
+  typeParameters: unknown[];
+};
+
+type CoreBlock = {
+  id: string;
+  function: string;
+  blockKind: string;
+  ordinal: number;
+};
+
+type CoreOp = CsgFact & {
+  id: string;
+  function: string;
+  block: string;
+  opKind: string;
+  ordinal: number;
+};
+
+type CoreProgram = {
+  functions: CoreFunctionInfo[];
+  functionByName: Map<string, CoreFunctionInfo>;
+  blocksByFunction: Map<string, CoreBlock[]>;
+  opsByFunction: Map<string, CoreOp[]>;
+  opsById: Map<string, CoreOp>;
+  dataById: Map<string, CsgFact>;
+};
+
+function lowerCsgCoreToChengCsgV2(
+  facts: CsgFact[],
+  target: string,
+  entry: string,
+): CompileResult<{ functions: CompiledFunction[]; wordCount: number }> {
+  const program = readCoreProgram(facts, target);
+  if (!program.ok) return program;
+  if (program.functions.length <= 0) return failCompile("CSG-Core has no functions");
+  const entryInfo = program.functionByName.get(entry);
+  if (!entryInfo) return failCompile(`entry function must be named ${entry}`);
+  if (!entryInfo.exported) return failCompile(`${entry} must be exported`);
+  if (entryInfo.parameters.length !== 0) return failCompile(`${entry} must not have parameters`);
+
+  const compiledFunctions: CompiledFunction[] = [];
+  let wordOffset = 0;
+  for (const info of program.functions) {
+    const compiler = new CsgCoreArm64Compiler(program, info);
+    const compiled = compiler.compileFunction();
+    if (!compiled.ok) return failCompile(`${info.name}: ${compiled.message}`);
+    compiledFunctions.push({
+      bodyKind: compiled.bodyKind,
+      info: {
+        fn: undefined as unknown as ts.FunctionDeclaration,
+        itemId: info.itemId,
+        name: info.name,
+        symbol: info.symbol,
+      },
+      relocs: compiled.relocs,
+      words: compiled.words,
+      wordOffset,
+    });
+    wordOffset += compiled.words.length;
+  }
+  return { ok: true, functions: compiledFunctions, wordCount: wordOffset };
+}
+
+function readCoreProgram(facts: CsgFact[], target: string): CompileResult<CoreProgram> {
+  const moduleFacts = facts.filter((fact) => fact.kind === "csg.module");
+  if (moduleFacts.length !== 1) {
+    return failCompile(`Cheng CSG v2 native subset expects exactly one CSG-Core module, got ${moduleFacts.length}`);
+  }
+
+  const functions: CoreFunctionInfo[] = [];
+  const functionByName = new Map<string, CoreFunctionInfo>();
+  const blocksByFunction = new Map<string, CoreBlock[]>();
+  const opsByFunction = new Map<string, CoreOp[]>();
+  const opsById = new Map<string, CoreOp>();
+  const dataById = new Map<string, CsgFact>();
+
+  for (const fact of facts) {
+    if (fact.kind === "csg.data" && typeof fact.id === "string") {
+      dataById.set(fact.id, fact);
+      continue;
+    }
+    if (fact.kind === "csg.function") {
+      const id = stringField(fact, "id");
+      const name = stringField(fact, "name");
+      const returnType = stringField(fact, "returnType");
+      if (!id.ok) return id;
+      if (!name.ok) return name;
+      if (!returnType.ok) return returnType;
+      const parameters = coreParameters(fact.parameters);
+      if (!parameters.ok) return parameters;
+      const typeParameters = Array.isArray(fact.typeParameters) ? fact.typeParameters : [];
+      const info: CoreFunctionInfo = {
+        itemId: functions.length + 1,
+        id: id.value,
+        name: name.value,
+        symbol: symbolForEntry(target, name.value),
+        exported: fact.exported === true,
+        parameters: parameters.value,
+        returnType: returnType.value,
+        async: fact.async === true,
+        generator: fact.generator === true,
+        typeParameters,
+      };
+      if (functionByName.has(info.name)) return failCompile(`duplicate function: ${info.name}`);
+      if (info.async) return failCompile(`${info.name} must not be async`);
+      if (info.generator) return failCompile(`${info.name} must not be a generator`);
+      if (info.typeParameters.length > 0) return failCompile(`${info.name} must not be generic`);
+      if (info.returnType !== "number") return failCompile(`${info.name} must declare return type number`);
+      if (info.parameters.length > 8) return failCompile(`${info.name} must not have more than 8 parameters`);
+      for (const parameter of info.parameters) {
+        if (parameter.optional || parameter.rest) return failCompile(`${info.name}.${parameter.name} must be a required positional parameter`);
+        if (parameter.typeSource !== "number") return failCompile(`${info.name}.${parameter.name} must declare type number`);
+      }
+      functions.push(info);
+      functionByName.set(info.name, info);
+      continue;
+    }
+    if (fact.kind === "csg.block") {
+      const id = stringField(fact, "id");
+      const fn = stringField(fact, "function");
+      const blockKind = stringField(fact, "blockKind");
+      const ordinal = numberField(fact, "ordinal");
+      if (!id.ok) return id;
+      if (!fn.ok) return fn;
+      if (!blockKind.ok) return blockKind;
+      if (!ordinal.ok) return ordinal;
+      const block: CoreBlock = { id: id.value, function: fn.value, blockKind: blockKind.value, ordinal: ordinal.value };
+      const items = blocksByFunction.get(block.function) ?? [];
+      items.push(block);
+      blocksByFunction.set(block.function, items);
+      continue;
+    }
+    if (fact.kind === "csg.op") {
+      const id = stringField(fact, "id");
+      const fn = stringField(fact, "function");
+      const block = stringField(fact, "block");
+      const opKind = stringField(fact, "opKind");
+      const ordinal = numberField(fact, "ordinal");
+      if (!id.ok) return id;
+      if (!fn.ok) return fn;
+      if (!block.ok) return block;
+      if (!opKind.ok) return opKind;
+      if (!ordinal.ok) return ordinal;
+      const op = fact as CoreOp;
+      op.id = id.value;
+      op.function = fn.value;
+      op.block = block.value;
+      op.opKind = opKind.value;
+      op.ordinal = ordinal.value;
+      if (opsById.has(op.id)) return failCompile(`duplicate op id: ${op.id}`);
+      opsById.set(op.id, op);
+      const items = opsByFunction.get(op.function) ?? [];
+      items.push(op);
+      opsByFunction.set(op.function, items);
+    }
+  }
+
+  for (const blocks of blocksByFunction.values()) {
+    blocks.sort((left, right) => left.ordinal - right.ordinal || left.id.localeCompare(right.id));
+  }
+  for (const ops of opsByFunction.values()) {
+    ops.sort((left, right) => left.ordinal - right.ordinal || left.id.localeCompare(right.id));
+  }
+
+  return { ok: true, functions, functionByName, blocksByFunction, opsByFunction, opsById, dataById };
+}
+
+class CsgCoreArm64Compiler {
+  private readonly env = new Map<string, VarInfo>();
+  private readonly relocs: LocalReloc[] = [];
+  private readonly words: number[] = [];
+  private readonly usedExprIds = new Set<string>();
+  private readonly opsByBlock = new Map<string, CoreOp[]>();
+  private nextVarReg = 19;
+  private nextTempReg = 0;
+
+  constructor(
+    private readonly program: CoreProgram,
+    private readonly current: CoreFunctionInfo,
+  ) {
+    const ops = program.opsByFunction.get(current.id) ?? [];
+    for (const op of ops) {
+      const items = this.opsByBlock.get(op.block) ?? [];
+      items.push(op);
+      this.opsByBlock.set(op.block, items);
+      this.collectUsedExprIds(op);
+    }
+    for (const items of this.opsByBlock.values()) {
+      items.sort((left, right) => left.ordinal - right.ordinal || left.id.localeCompare(right.id));
+    }
+  }
+
+  compileFunction(): CompileResult<{ bodyKind: string; relocs: LocalReloc[]; words: number[] }> {
+    const entry = this.entryBlock();
+    if (!entry.ok) return entry;
+    this.emitPrologue();
+    const params = this.bindParameters();
+    if (!params.ok) return params;
+    const body = this.compileBlock(entry.blockId, new Set());
+    if (!body.ok) return body;
+    if (!body.terminates) return failCompile("function must return on every path");
+    return { ok: true, words: [...this.words], relocs: [...this.relocs], bodyKind: "csg_core_i32_call_cfg_v1" };
+  }
+
+  private entryBlock(): CompileResult<{ blockId: string }> {
+    const blocks = this.program.blocksByFunction.get(this.current.id) ?? [];
+    const entry = blocks.find((block) => block.blockKind === "entry") ?? blocks[0];
+    if (!entry) return failCompile("function has no entry block");
+    return { ok: true, blockId: entry.id };
+  }
+
+  private bindParameters(): CompileResult<{}> {
+    const params = [...this.current.parameters].sort((left, right) => left.index - right.index);
+    for (const parameter of params) {
+      const reg = this.allocVarReg();
+      if (!reg.ok) return reg;
+      this.emit(movReg(reg.reg, parameter.index));
+      this.env.set(parameter.name, { reg: reg.reg });
+    }
+    return { ok: true };
+  }
+
+  private compileBlock(blockId: string, visiting: Set<string>): CompileResult<{ terminates: boolean }> {
+    if (visiting.has(blockId)) return failCompile("cyclic block graph is not supported in Cheng CSG v2 mapper");
+    visiting.add(blockId);
+    const ops = this.opsByBlock.get(blockId) ?? [];
+    for (const op of ops) {
+      this.nextTempReg = 0;
+      if (this.usedExprIds.has(op.id) && isExpressionOp(op)) continue;
+      const result = this.compileStatementOp(op, visiting);
+      if (!result.ok) return result;
+      if (result.terminates) {
+        visiting.delete(blockId);
+        return { ok: true, terminates: true };
+      }
+    }
+    visiting.delete(blockId);
+    return { ok: true, terminates: false };
+  }
+
+  private compileStatementOp(op: CoreOp, visiting: Set<string>): CompileResult<{ terminates: boolean }> {
+    if (op.opKind === "var_statement") return { ok: true, terminates: false };
+    if (op.opKind === "local_write") {
+      const name = stringField(op, "name");
+      if (!name.ok) return name;
+      const value = optionalStringField(op, "value");
+      if (!value.ok) return value;
+      if (!value.value) return failCompile(`local variable ${name.value} must have an initializer`);
+      if (this.env.has(name.value)) return failCompile(`duplicate local variable: ${name.value}`);
+      const expr = this.compileExprId(value.value);
+      if (!expr.ok) return expr;
+      const reg = this.allocVarReg();
+      if (!reg.ok) return reg;
+      this.emit(movReg(reg.reg, expr.reg));
+      const info: VarInfo = { reg: reg.reg };
+      if (expr.value !== undefined) info.value = expr.value;
+      this.env.set(name.value, info);
+      return { ok: true, terminates: false };
+    }
+    if (op.opKind === "return") {
+      const value = optionalStringField(op, "value");
+      if (!value.ok) return value;
+      if (!value.value) return failCompile("return statement must return a number expression");
+      const expr = this.compileExprId(value.value);
+      if (!expr.ok) return expr;
+      if (expr.reg !== 0) this.emit(movReg(0, expr.reg));
+      this.emitEpilogue();
+      return { ok: true, terminates: true };
+    }
+    if (op.opKind === "branch_if") {
+      return this.compileBranchIf(op, visiting);
+    }
+    if (op.opKind === "block") {
+      const nested = optionalStringField(op, "nestedBlock");
+      if (!nested.ok) return nested;
+      if (!nested.value) return failCompile("block op must reference nestedBlock");
+      return this.compileBlock(nested.value, visiting);
+    }
+    if (isExpressionOp(op)) {
+      return failCompile(`expression statement is not supported: ${op.opKind}`);
+    }
+    return failCompile(`unsupported CSG-Core op: ${op.opKind}`);
+  }
+
+  private compileBranchIf(op: CoreOp, visiting: Set<string>): CompileResult<{ terminates: boolean }> {
+    const condition = optionalStringField(op, "condition");
+    const thenBlock = optionalStringField(op, "thenBlock");
+    const elseBlock = optionalStringField(op, "elseBlock");
+    if (!condition.ok) return condition;
+    if (!thenBlock.ok) return thenBlock;
+    if (!elseBlock.ok) return elseBlock;
+    if (!condition.value || !thenBlock.value) return failCompile("branch_if requires condition and thenBlock");
+
+    const branch = this.compileBranchIfFalse(condition.value);
+    if (!branch.ok) return branch;
+    const thenResult = this.compileBlock(thenBlock.value, visiting);
+    if (!thenResult.ok) return thenResult;
+
+    if (!elseBlock.value) {
+      this.patchBranch(branch.patchIndex, this.words.length);
+      return { ok: true, terminates: false };
+    }
+
+    if (thenResult.terminates) {
+      this.patchBranch(branch.patchIndex, this.words.length);
+      const elseResult = this.compileBlock(elseBlock.value, visiting);
+      if (!elseResult.ok) return elseResult;
+      return { ok: true, terminates: elseResult.terminates };
+    }
+
+    const jumpEnd = this.emitBPlaceholder();
+    this.patchBranch(branch.patchIndex, this.words.length);
+    const elseResult = this.compileBlock(elseBlock.value, visiting);
+    if (!elseResult.ok) return elseResult;
+    this.patchBranch(jumpEnd, this.words.length);
+    return { ok: true, terminates: elseResult.terminates };
+  }
+
+  private compileExprId(id: string): CompileResult<ExprValue> {
+    const op = this.program.opsById.get(id);
+    if (!op || op.function !== this.current.id) return failCompile(`unknown expression op: ${id}`);
+    return this.compileExpr(op);
+  }
+
+  private compileExpr(op: CoreOp): CompileResult<ExprValue> {
+    if (op.opKind === "literal") {
+      if (op.literalKind !== "number") return failCompile("only number literals are supported");
+      const dataId = optionalStringField(op, "data");
+      if (!dataId.ok) return dataId;
+      if (!dataId.value) return failCompile("literal op missing data id");
+      const data = this.program.dataById.get(dataId.value);
+      if (!data || data.dataKind !== "number" || typeof data.value !== "number") {
+        return failCompile("number literal data is missing");
+      }
+      const parsed = checkI32(data.value, "integer literal");
+      if (!parsed.ok) return parsed;
+      return this.loadImmediate(data.value);
+    }
+    if (op.opKind === "identifier") {
+      const name = stringField(op, "name");
+      if (!name.ok) return name;
+      const item = this.env.get(name.value);
+      if (!item) return failCompile(`unknown local variable: ${name.value}`);
+      if (item.value !== undefined) return { ok: true, reg: item.reg, value: item.value };
+      return { ok: true, reg: item.reg };
+    }
+    if (op.opKind === "binary") {
+      return this.compileBinaryExpr(op);
+    }
+    if (op.opKind === "call") {
+      return this.compileCall(op);
+    }
+    return failCompile(`unsupported expression op: ${op.opKind}`);
+  }
+
+  private compileBinaryExpr(op: CoreOp): CompileResult<ExprValue> {
+    const operator = stringField(op, "operator");
+    const leftId = stringField(op, "left");
+    const rightId = stringField(op, "right");
+    if (!operator.ok) return operator;
+    if (!leftId.ok) return leftId;
+    if (!rightId.ok) return rightId;
+    if (operator.value !== "PlusToken" &&
+        operator.value !== "MinusToken" &&
+        operator.value !== "AsteriskToken") {
+      return failCompile(`unsupported numeric operator: ${operator.value}`);
+    }
+
+    const left = this.compileExprId(leftId.value);
+    if (!left.ok) return left;
+    const leftTemp = this.ensureTemp(left);
+    if (!leftTemp.ok) return leftTemp;
+    const right = this.compileExprId(rightId.value);
+    if (!right.ok) return right;
+
+    let knownValue: number | undefined = undefined;
+    if (operator.value === "PlusToken") {
+      this.emit(addReg(leftTemp.reg, leftTemp.reg, right.reg));
+      if (leftTemp.value !== undefined && right.value !== undefined) knownValue = leftTemp.value + right.value;
+    } else if (operator.value === "MinusToken") {
+      this.emit(subReg(leftTemp.reg, leftTemp.reg, right.reg));
+      if (leftTemp.value !== undefined && right.value !== undefined) knownValue = leftTemp.value - right.value;
+    } else {
+      this.emit(mulReg(leftTemp.reg, leftTemp.reg, right.reg));
+      if (leftTemp.value !== undefined && right.value !== undefined) knownValue = leftTemp.value * right.value;
+    }
+    if (knownValue !== undefined) {
+      const checked = checkI32(knownValue, "numeric expression result");
+      if (!checked.ok) return checked;
+      return { ok: true, reg: leftTemp.reg, value: knownValue };
+    }
+    return { ok: true, reg: leftTemp.reg };
+  }
+
+  private compileCall(op: CoreOp): CompileResult<ExprValue> {
+    const callee = stringField(op, "callee");
+    if (!callee.ok) return callee;
+    const target = this.program.functionByName.get(callee.value);
+    if (!target) return failCompile(`unknown function call target: ${callee.value}`);
+    if (target.name === this.current.name) return failCompile("recursive calls are not supported");
+    const args = stringArrayField(op, "arguments");
+    if (!args.ok) return args;
+    if (args.value.length !== target.parameters.length) {
+      return failCompile(`${target.name} expects ${target.parameters.length} arguments`);
+    }
+    for (let index = 0; index < args.value.length; index += 1) {
+      this.nextTempReg = index;
+      const compiled = this.compileExprId(args.value[index] as string);
+      if (!compiled.ok) return compiled;
+      if (compiled.reg !== index) this.emit(movReg(index, compiled.reg));
+    }
+    this.nextTempReg = 0;
+    const relocWord = this.words.length;
+    this.emit(bl(0));
+    this.relocs.push({ wordIndex: relocWord, targetSymbol: target.symbol });
+    return { ok: true, reg: 0 };
+  }
+
+  private compileBranchIfFalse(conditionId: string): CompileResult<{ patchIndex: number }> {
+    const op = this.program.opsById.get(conditionId);
+    if (!op || op.function !== this.current.id) return failCompile(`unknown condition op: ${conditionId}`);
+    if (op.opKind !== "binary") return failCompile("if condition must be a numeric comparison");
+    const operator = stringField(op, "operator");
+    const leftId = stringField(op, "left");
+    const rightId = stringField(op, "right");
+    if (!operator.ok) return operator;
+    if (!leftId.ok) return leftId;
+    if (!rightId.ok) return rightId;
+    const condition = conditionForOperatorName(operator.value);
+    if (!condition.ok) return condition;
+    const left = this.compileExprId(leftId.value);
+    if (!left.ok) return left;
+    const right = this.compileExprId(rightId.value);
+    if (!right.ok) return right;
+    this.emit(cmpReg(left.reg, right.reg));
+    const patchIndex = this.emitBCondPlaceholder(invertCond(condition.cond));
+    return { ok: true, patchIndex };
+  }
+
+  private loadImmediate(value: number): CompileResult<ExprValue> {
+    const checked = checkI32(value, "integer literal");
+    if (!checked.ok) return checked;
+    const reg = this.allocTempReg();
+    if (!reg.ok) return reg;
+    for (const word of movI32(reg.reg, value)) this.emit(word);
+    return { ok: true, reg: reg.reg, value };
+  }
+
+  private ensureTemp(value: ExprValue): CompileResult<ExprValue> {
+    if (value.reg >= 0 && value.reg <= 7) return { ok: true, ...value };
+    const reg = this.allocTempReg();
+    if (!reg.ok) return reg;
+    this.emit(movReg(reg.reg, value.reg));
+    if (value.value !== undefined) return { ok: true, reg: reg.reg, value: value.value };
+    return { ok: true, reg: reg.reg };
+  }
+
+  private allocTempReg(): CompileResult<{ reg: number }> {
+    if (this.nextTempReg > 7) return failCompile("expression needs more than 8 temporary registers");
+    const reg = this.nextTempReg;
+    this.nextTempReg += 1;
+    return { ok: true, reg };
+  }
+
+  private allocVarReg(): CompileResult<{ reg: number }> {
+    if (this.nextVarReg > 26) return failCompile("function needs more than 8 parameter/local registers");
+    const reg = this.nextVarReg;
+    this.nextVarReg += 1;
+    return { ok: true, reg };
+  }
+
+  private emitPrologue(): void {
+    this.emit(stpPre64(29, 30, -16));
+    this.emit(stpPre64(19, 20, -16));
+    this.emit(stpPre64(21, 22, -16));
+    this.emit(stpPre64(23, 24, -16));
+    this.emit(stpPre64(25, 26, -16));
+    this.emit(movFpSp());
+  }
+
+  private emitEpilogue(): void {
+    this.emit(ldpPost64(25, 26, 16));
+    this.emit(ldpPost64(23, 24, 16));
+    this.emit(ldpPost64(21, 22, 16));
+    this.emit(ldpPost64(19, 20, 16));
+    this.emit(ldpPost64(29, 30, 16));
+    this.emit(ret());
+  }
+
+  private emit(word: number): void {
+    this.words.push(word >>> 0);
+  }
+
+  private emitBCondPlaceholder(cond: number): number {
+    const index = this.words.length;
+    this.emit(bCond(cond, 0));
+    return index;
+  }
+
+  private emitBPlaceholder(): number {
+    const index = this.words.length;
+    this.emit(b(0));
+    return index;
+  }
+
+  private patchBranch(index: number, target: number): void {
+    const current = this.words[index];
+    if (current === undefined) throw new Error("branch patch index out of range");
+    const offset = target - index;
+    if ((current & 0xff000010) === 0x54000000) {
+      const cond = current & 0xf;
+      this.words[index] = bCond(cond, offset);
+    } else {
+      this.words[index] = b(offset);
+    }
+  }
+
+  private collectUsedExprIds(op: CoreOp): void {
+    for (const key of ["value", "left", "right", "condition"] as const) {
+      const value = op[key];
+      if (typeof value === "string") this.usedExprIds.add(value);
+    }
+    if (Array.isArray(op.arguments)) {
+      for (const item of op.arguments) {
+        if (typeof item === "string") this.usedExprIds.add(item);
+      }
+    }
+  }
+}
+
+function stringField(fact: CsgFact, field: string): CompileResult<{ value: string }> {
+  const value = fact[field];
+  if (typeof value !== "string" || value.length === 0) {
+    return failCompile(`${fact.kind}.${field} must be a non-empty string`);
+  }
+  return { ok: true, value };
+}
+
+function optionalStringField(fact: CsgFact, field: string): CompileResult<{ value?: string }> {
+  const value = fact[field];
+  if (value === undefined || value === null) return { ok: true };
+  if (typeof value !== "string") return failCompile(`${fact.kind}.${field} must be a string`);
+  return { ok: true, value };
+}
+
+function numberField(fact: CsgFact, field: string): CompileResult<{ value: number }> {
+  const value = fact[field];
+  if (!Number.isInteger(value)) return failCompile(`${fact.kind}.${field} must be an integer`);
+  return { ok: true, value: value as number };
+}
+
+function stringArrayField(fact: CsgFact, field: string): CompileResult<{ value: string[] }> {
+  const value = fact[field];
+  if (!Array.isArray(value)) return failCompile(`${fact.kind}.${field} must be a string array`);
+  const items: string[] = [];
+  for (const item of value) {
+    if (typeof item !== "string") return failCompile(`${fact.kind}.${field} must contain only strings`);
+    items.push(item);
+  }
+  return { ok: true, value: items };
+}
+
+function coreParameters(value: unknown): CompileResult<{ value: CoreParameter[] }> {
+  if (!Array.isArray(value)) return failCompile("csg.function.parameters must be an array");
+  const params: CoreParameter[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object") return failCompile("csg.function parameter must be an object");
+    const param = item as Record<string, unknown>;
+    if (!Number.isInteger(param.index)) return failCompile("csg.function parameter index must be an integer");
+    if (typeof param.name !== "string" || param.name.length === 0) return failCompile("csg.function parameter name must be a string");
+    const out: CoreParameter = {
+      index: param.index as number,
+      name: param.name,
+      optional: param.optional === true,
+      rest: param.rest === true,
+    };
+    if (typeof param.typeSource === "string") out.typeSource = param.typeSource;
+    params.push(out);
+  }
+  params.sort((left, right) => left.index - right.index || left.name.localeCompare(right.name));
+  for (let index = 0; index < params.length; index += 1) {
+    const param = params[index];
+    if (!param || param.index !== index) return failCompile("csg.function parameter indexes must be dense from zero");
+  }
+  return { ok: true, value: params };
+}
+
+function isExpressionOp(op: CoreOp): boolean {
+  return op.opKind === "literal" ||
+    op.opKind === "identifier" ||
+    op.opKind === "binary" ||
+    op.opKind === "call" ||
+    op.opKind === "property_read" ||
+    op.opKind === "element_read" ||
+    op.opKind === "new" ||
+    op.opKind === "unary";
+}
+
+function conditionForOperatorName(name: string): CompileResult<{ cond: number }> {
+  switch (name) {
+    case "EqualsEqualsEqualsToken":
+      return { ok: true, cond: 0 };
+    case "ExclamationEqualsEqualsToken":
+      return { ok: true, cond: 1 };
+    case "LessThanToken":
+      return { ok: true, cond: 11 };
+    case "LessThanEqualsToken":
+      return { ok: true, cond: 13 };
+    case "GreaterThanToken":
+      return { ok: true, cond: 12 };
+    case "GreaterThanEqualsToken":
+      return { ok: true, cond: 10 };
+    default:
+      return failCompile(`unsupported comparison operator: ${name}`);
+  }
 }
 
 function collectFunctions(

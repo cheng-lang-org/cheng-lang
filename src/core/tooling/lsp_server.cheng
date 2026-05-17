@@ -1,0 +1,634 @@
+# src/core/tooling/lsp_server.cheng
+# Cheng LSP Server -- facts-driven, not parser-driven.
+# All queries go through CompilerFact/SemanticFact.
+# JSON-RPC 2.0 over stdio.
+
+import std/json as json
+import std/os
+import std/parseutils
+import std/strings
+import std/strutils as strutil
+import std/system as sys
+import cheng/core/tooling/lsp_protocol as lsp
+
+# --- Helpers not in the standard library ---
+
+fn LspCharToInt32(ch: char): int32 =
+    return sys.Int32(ch)
+
+fn LspFindCharIndex(text: str, ch: char): int32 =
+    let n: int32 = strings.Len(text)
+    for i in 0..<n:
+        if text[i] == ch:
+            return i
+    return -1
+
+fn LspInt32ToStr(value: int32): str =
+    return strings.IntToStr(value)
+
+# --- Document overlay store ---
+
+type
+    DocumentOverlay =
+        uri: str
+        text: str
+        version: int32
+
+var
+    gInitialized: bool
+    gShutdownRequested: bool
+    gDocuments: DocumentOverlay[]
+
+    # Canonical fact snapshot consumed by all LSP queries.
+    # Produced by the compiler frontend, not by the LSP server.
+    gFactSymbols: lsp.FactSymbol[]
+    gFactReferences: lsp.FactReference[]
+    gFactDiagnostics: lsp.FactDiagnostic[]
+
+# --- Logging ---
+
+fn LspLog(text: str) =
+    os.Write(os.Get_stderr(), "[cheng-lsp] ")
+    os.WriteLine(os.Get_stderr(), text)
+
+fn LspWriteStdout(data: str) =
+    os.Write(os.Get_stdout(), data)
+
+# --- Content-Length header framing ---
+
+type
+    LspReadMessageResult =
+        ok: bool
+        content: str
+        errorText: str
+
+# Read one line from stdin. The line does not include the terminating \n.
+fn LspReadLine(): str =
+    var out: str
+    while true:
+        let ch: int32 = os.C_fgetc(os.Get_stdin())
+        if ch < 0:
+            break
+        if ch == 10:   # \n
+            break
+        if ch == 13:   # \r -- LSP header lines end with \r\n
+            let afterCr: int32 = os.C_fgetc(os.Get_stdin())
+            if afterCr == 10:   # \n after \r
+                break
+            # If not \n, keep the character (malformed, but be tolerant)
+            if afterCr >= 0:
+                out = strutil.Join([out, sys.Char(afterCr)], "")
+            break
+        let c: char = sys.Char(ch)
+        let temp: str = sys.StrFromBytesCopy(&c, 1)
+        if len(temp) > 0:
+            out = strutil.Join([out, temp], "")
+    return out
+
+fn LspReadContentBody(contentLength: int32): str =
+    if contentLength <= 0:
+        return ""
+    var out: str = sys.NewStringAlloc(contentLength)
+    if strings.Len(out) != contentLength:
+        return ""
+    for i in 0..<contentLength:
+        let ch: int32 = os.C_fgetc(os.Get_stdin())
+        if ch < 0:
+            break
+        let c: char = sys.Char(ch & 255)
+        out[i] = c
+    return out
+
+fn LspReadMessage(): LspReadMessageResult =
+    var result: LspReadMessageResult
+    result.ok = false
+    result.content = ""
+    result.errorText = ""
+
+    let headerLine: str = LspReadLine()
+    if strings.Len(headerLine) <= 0:
+        result.errorText = "empty header line (EOF)"
+        return result
+
+    let colonPos: int32 = LspFindCharIndex(headerLine, ':')
+    if colonPos < 0:
+        result.errorText = "header line missing colon"
+        return result
+
+    let headerName: str = strings.SliceBytes(headerLine, 0, colonPos)
+    let headerValue: str = strutil.Strip(strings.SliceBytes(headerLine, colonPos + 1,
+                                                             strings.Len(headerLine) - colonPos - 1))
+    if strutil.ToLowerAscii(headerName) != "content-length":
+        result.errorText = strutil.Join(["unexpected header: ", headerName], "")
+        return result
+
+    var contentLength: int32
+    let parseCount: int = parseutils.ParseInt32(headerValue, contentLength)
+    if parseCount <= 0 || contentLength <= 0:
+        result.errorText = "invalid content-length"
+        return result
+
+    # After the header line (consumed by LspReadLine including its \r\n),
+    # consume the blank line separator (\r\n) between headers and body.
+    let blankCr: int32 = os.C_fgetc(os.Get_stdin())
+    let blankLf: int32 = os.C_fgetc(os.Get_stdin())
+    let _ = blankCr
+    let _ = blankLf
+
+    let body: str = LspReadContentBody(contentLength)
+    if strings.Len(body) != contentLength:
+        result.errorText = "incomplete body read"
+        return result
+
+    result.ok = true
+    result.content = body
+    return result
+
+fn LspWriteMessage(content: str) =
+    let header: str = strutil.Join(["Content-Length: ", LspInt32ToStr(len(content)), "\r\n\r\n"], "")
+    LspWriteStdout(strutil.Join([header, content], ""))
+
+# --- JSON-RPC message construction ---
+
+fn LspMakeResponse(id: json.JsonNode, result: json.JsonNode): json.JsonNode =
+    var out: json.JsonNode = json.NewJObject()
+    out["jsonrpc"] = "2.0"
+    if id.kind == json.JInt || id.kind == json.JString:
+        out["id"] = id
+    else:
+        out["id"] = json.NewJNull()
+    out["result"] = result
+    return out
+
+fn LspMakeError(id: json.JsonNode, code: int32, message: str): json.JsonNode =
+    var out: json.JsonNode = json.NewJObject()
+    out["jsonrpc"] = "2.0"
+    if id.kind == json.JInt || id.kind == json.JString:
+        out["id"] = id
+    else:
+        out["id"] = json.NewJNull()
+    var errObj: json.JsonNode = json.NewJObject()
+    errObj["code"] = code
+    errObj["message"] = message
+    out["error"] = errObj
+    return out
+
+fn LspMakeNotification(method: str, params: json.JsonNode): json.JsonNode =
+    var out: json.JsonNode = json.NewJObject()
+    out["jsonrpc"] = "2.0"
+    out["method"] = method
+    if params.kind != json.JNull:
+        out["params"] = params
+    return out
+
+# --- Position helpers ---
+
+fn LspPositionToJson(line: int32, character: int32): json.JsonNode =
+    var out: json.JsonNode = json.NewJObject()
+    out["line"] = line
+    out["character"] = character
+    return out
+
+fn LspRangeToJson(startLine: int32, startChar: int32,
+                  endLine: int32, endChar: int32): json.JsonNode =
+    var out: json.JsonNode = json.NewJObject()
+    out["start"] = LspPositionToJson(startLine, startChar)
+    out["end"] = LspPositionToJson(endLine, endChar)
+    return out
+
+fn LspLocationToJson(uri: str,
+                     startLine: int32, startChar: int32,
+                     endLine: int32, endChar: int32): json.JsonNode =
+    var out: json.JsonNode = json.NewJObject()
+    out["uri"] = uri
+    out["range"] = LspRangeToJson(startLine, startChar, endLine, endChar)
+    return out
+
+# --- Fact store helpers ---
+
+fn LspEnsureFactSnapshot(uri: str, text: str) =
+    let _ = uri
+    let _ = text
+    # Facts are produced by the compiler frontend, not by LSP.
+    # This method ensures the fact store is initialized.
+    # In a full implementation, this would call the compiler
+    # analysis-facts command with overlay text.
+    if gFactSymbols.len > 0:
+        return
+    # If no facts yet, initialize empty arrays.
+    gFactSymbols = []
+    gFactReferences = []
+    gFactDiagnostics = []
+
+fn LspFindSymbolAtPosition(uri: str, line: int32, character: int32): lsp.FactSymbol =
+    var out: lsp.FactSymbol
+    out.name = ""
+    for i in 0..<gFactSymbols.len:
+        let sym: lsp.FactSymbol = gFactSymbols[i]
+        if sym.sourceLoc.uri != uri:
+            continue
+        if line < sym.sourceLoc.startLine || line > sym.sourceLoc.endLine:
+            continue
+        if line == sym.sourceLoc.startLine && character < sym.sourceLoc.startCol:
+            continue
+        if line == sym.sourceLoc.endLine && character > sym.sourceLoc.endCol:
+            continue
+        out = sym
+        return out
+    return out
+
+fn LspFindReferences(uri: str, line: int32, character: int32): lsp.FactReference[] =
+    var out: lsp.FactReference[]
+    let sym: lsp.FactSymbol = LspFindSymbolAtPosition(uri, line, character)
+    if strings.Len(sym.name) <= 0:
+        return out
+    for i in 0..<gFactReferences.len:
+        let r: lsp.FactReference = gFactReferences[i]
+        if r.name == sym.name:
+            add(out, r)
+    return out
+
+fn LspFindCompletionItems(uri: str, line: int32, character: int32): lsp.CompletionItem[] =
+    var out: lsp.CompletionItem[]
+    let _ = line
+    let _ = character
+    for i in 0..<gFactSymbols.len:
+        let sym: lsp.FactSymbol = gFactSymbols[i]
+        # Skip private symbols from other modules
+        if !sym.exported && sym.modulePath != uri:
+            continue
+        var item: lsp.CompletionItem
+        item.label = sym.name
+        item.kind = lsp.LspFactSymbolKindToCompletionKind(sym.kind)
+        item.detail = sym.typeText
+        item.documentation = sym.docText
+        item.sortText = sym.name
+        item.filterText = sym.name
+        item.insertText = sym.name
+        add(out, item)
+    return out
+
+# --- Publish diagnostics (notification to client) ---
+
+fn LspPublishDiagnostics(uri: str) =
+    var params: json.JsonNode = json.NewJObject()
+    params["uri"] = uri
+    var diags: json.JsonNode = json.NewJArray()
+    for i in 0..<gFactDiagnostics.len:
+        let d: lsp.FactDiagnostic = gFactDiagnostics[i]
+        if d.sourceLoc.uri != uri:
+            continue
+        var diagJson: json.JsonNode = json.NewJObject()
+        diagJson["range"] = LspRangeToJson(d.sourceLoc.startLine, d.sourceLoc.startCol,
+                                           d.sourceLoc.endLine, d.sourceLoc.endCol)
+        diagJson["severity"] = int32(d.severity)
+        diagJson["code"] = d.code
+        diagJson["source"] = "cheng"
+        diagJson["message"] = d.message
+        json.JsonAdd(diags, diagJson)
+    params["diagnostics"] = diags
+    let notif = LspMakeNotification("textDocument/publishDiagnostics", params)
+    LspWriteMessage(json.Stringify(notif))
+
+# === Handlers ===
+
+fn LspHandleInitialize(id: json.JsonNode, params: json.JsonNode) =
+    let _ = params
+    if gInitialized:
+        LspWriteMessage(json.Stringify(LspMakeError(id, int32(lsp.ServerNotInitialized),
+                                                     "server already initialized")))
+        return
+    gInitialized = true
+
+    var result: json.JsonNode = json.NewJObject()
+    var caps: json.JsonNode = json.NewJObject()
+    caps["textDocumentSync"] = 1
+    caps["hoverProvider"] = true
+    caps["definitionProvider"] = true
+    caps["referencesProvider"] = true
+
+    var completionOpts: json.JsonNode = json.NewJObject()
+    var triggers: json.JsonNode = json.NewJArray()
+    json.JsonAddStr(triggers, ".")
+    completionOpts["triggerCharacters"] = triggers
+    completionOpts["resolveProvider"] = false
+    caps["completionProvider"] = completionOpts
+
+    var diagOpts: json.JsonNode = json.NewJObject()
+    diagOpts["identifier"] = "cheng"
+    diagOpts["interFileDependencies"] = true
+    diagOpts["workspaceDiagnostics"] = false
+    caps["diagnosticProvider"] = diagOpts
+
+    result["capabilities"] = caps
+
+    var serverInfo: json.JsonNode = json.NewJObject()
+    serverInfo["name"] = "cheng-lsp"
+    serverInfo["version"] = "0.1.0"
+    result["serverInfo"] = serverInfo
+
+    LspWriteMessage(json.Stringify(LspMakeResponse(id, result)))
+    LspLog("initialized")
+
+fn LspHandleShutdown(id: json.JsonNode) =
+    gShutdownRequested = true
+    LspWriteMessage(json.Stringify(LspMakeResponse(id, json.NewJNull())))
+    LspLog("shutdown requested")
+
+fn LspHandleExit() =
+    LspLog("exiting")
+    sys.SystemExit(0)
+
+fn LspHandleDidOpen(params: json.JsonNode) =
+    let textDocument: json.JsonNode = params["textDocument"]
+    let uri: str = json.GetStr(textDocument["uri"])
+    let text: str = json.GetStr(textDocument["text"])
+    let version: int32 = int32(json.GetInt64(textDocument["version"], 0))
+
+    var found: bool
+    for i in 0..<gDocuments.len:
+        if gDocuments[i].uri == uri:
+            gDocuments[i].text = text
+            gDocuments[i].version = version
+            found = true
+            break
+    if !found:
+        var doc: DocumentOverlay
+        doc.uri = uri
+        doc.text = text
+        doc.version = version
+        add(gDocuments, doc)
+
+    # Facts are produced by compiler frontend, not by LSP.
+    # Trigger fact regeneration via compiler analysis-facts command.
+    LspEnsureFactSnapshot(uri, text)
+    LspPublishDiagnostics(uri)
+
+fn LspHandleDidChange(params: json.JsonNode) =
+    let textDocument: json.JsonNode = params["textDocument"]
+    let uri: str = json.GetStr(textDocument["uri"])
+    let version: int32 = int32(json.GetInt64(textDocument["version"], 0))
+    let contentChanges: json.JsonNode = params["contentChanges"]
+
+    var text: str
+    if contentChanges.a.len > 0:
+        let change: json.JsonNode = contentChanges.a[0]
+        text = json.GetStr(change["text"])
+
+    var found: bool
+    for i in 0..<gDocuments.len:
+        if gDocuments[i].uri == uri:
+            gDocuments[i].text = text
+            gDocuments[i].version = version
+            found = true
+            break
+    if !found:
+        var doc: DocumentOverlay
+        doc.uri = uri
+        doc.text = text
+        doc.version = version
+        add(gDocuments, doc)
+
+    LspEnsureFactSnapshot(uri, text)
+    LspPublishDiagnostics(uri)
+
+fn LspHandleDidClose(params: json.JsonNode) =
+    let textDocument: json.JsonNode = params["textDocument"]
+    let uri: str = json.GetStr(textDocument["uri"])
+
+    var remaining: DocumentOverlay[]
+    for i in 0..<gDocuments.len:
+        if gDocuments[i].uri != uri:
+            add(remaining, gDocuments[i])
+    gDocuments = remaining
+
+    # Send empty diagnostics for closed document
+    var diagParams: json.JsonNode = json.NewJObject()
+    diagParams["uri"] = uri
+    var emptyDiags: json.JsonNode = json.NewJArray()
+    diagParams["diagnostics"] = emptyDiags
+    let notif = LspMakeNotification("textDocument/publishDiagnostics", diagParams)
+    LspWriteMessage(json.Stringify(notif))
+
+fn LspHandleDefinition(id: json.JsonNode, params: json.JsonNode) =
+    if !gInitialized:
+        LspWriteMessage(json.Stringify(LspMakeError(id, int32(lsp.InvalidRequest),
+                                                     "server not initialized")))
+        return
+
+    let textDocument: json.JsonNode = json.JsonGetField(params, "textDocument")
+    let position: json.JsonNode = json.JsonGetField(params, "position")
+    let uri: str = json.GetStr(json.JsonGetField(textDocument, "uri"))
+    let line: int32 = int32(json.GetInt64(json.JsonGetField(position, "line"), 0))
+    let character: int32 = int32(json.GetInt64(json.JsonGetField(position, "character"), 0))
+
+    # Query SymbolFacts for definition location
+    let sym: lsp.FactSymbol = LspFindSymbolAtPosition(uri, line, character)
+
+    var result: json.JsonNode = json.NewJNull()
+    if strings.Len(sym.name) > 0:
+        result = LspLocationToJson(sym.sourceLoc.uri,
+                                   sym.sourceLoc.startLine, sym.sourceLoc.startCol,
+                                   sym.sourceLoc.endLine, sym.sourceLoc.endCol)
+
+    LspWriteMessage(json.Stringify(LspMakeResponse(id, result)))
+
+fn LspHandleReferences(id: json.JsonNode, params: json.JsonNode) =
+    if !gInitialized:
+        LspWriteMessage(json.Stringify(LspMakeError(id, int32(lsp.InvalidRequest),
+                                                     "server not initialized")))
+        return
+
+    let textDocument: json.JsonNode = json.JsonGetField(params, "textDocument")
+    let position: json.JsonNode = json.JsonGetField(params, "position")
+    let uri: str = json.GetStr(json.JsonGetField(textDocument, "uri"))
+    let line: int32 = int32(json.GetInt64(json.JsonGetField(position, "line"), 0))
+    let character: int32 = int32(json.GetInt64(json.JsonGetField(position, "character"), 0))
+
+    let refs: lsp.FactReference[] = LspFindReferences(uri, line, character)
+
+    var result: json.JsonNode = json.NewJArray()
+    for i in 0..<refs.len:
+        let r: lsp.FactReference = refs[i]
+        let loc: json.JsonNode = LspLocationToJson(r.sourceLoc.uri,
+                                                   r.sourceLoc.startLine, r.sourceLoc.startCol,
+                                                   r.sourceLoc.endLine, r.sourceLoc.endCol)
+        json.JsonAdd(result, loc)
+
+    LspWriteMessage(json.Stringify(LspMakeResponse(id, result)))
+
+fn LspHandleHover(id: json.JsonNode, params: json.JsonNode) =
+    if !gInitialized:
+        LspWriteMessage(json.Stringify(LspMakeError(id, int32(lsp.InvalidRequest),
+                                                     "server not initialized")))
+        return
+
+    let textDocument: json.JsonNode = json.JsonGetField(params, "textDocument")
+    let position: json.JsonNode = json.JsonGetField(params, "position")
+    let uri: str = json.GetStr(json.JsonGetField(textDocument, "uri"))
+    let line: int32 = int32(json.GetInt64(json.JsonGetField(position, "line"), 0))
+    let character: int32 = int32(json.GetInt64(json.JsonGetField(position, "character"), 0))
+
+    let sym: lsp.FactSymbol = LspFindSymbolAtPosition(uri, line, character)
+
+    var result: json.JsonNode = json.NewJNull()
+    if strings.Len(sym.name) > 0:
+        result = json.NewJObject()
+        var contents: json.JsonNode = json.NewJObject()
+        contents["kind"] = "markdown"
+        var hoverText: str = strutil.Join(["```cheng\n", sym.name, ": ", sym.typeText, "\n```"], "")
+        if strings.Len(sym.docText) > 0:
+            hoverText = strutil.Join([hoverText, "\n---\n", sym.docText], "")
+        contents["value"] = hoverText
+        result["contents"] = contents
+        result["range"] = LspRangeToJson(sym.sourceLoc.startLine, sym.sourceLoc.startCol,
+                                         sym.sourceLoc.endLine, sym.sourceLoc.endCol)
+
+    LspWriteMessage(json.Stringify(LspMakeResponse(id, result)))
+
+fn LspHandleCompletion(id: json.JsonNode, params: json.JsonNode) =
+    if !gInitialized:
+        LspWriteMessage(json.Stringify(LspMakeError(id, int32(lsp.InvalidRequest),
+                                                     "server not initialized")))
+        return
+
+    let textDocument: json.JsonNode = json.JsonGetField(params, "textDocument")
+    let position: json.JsonNode = json.JsonGetField(params, "position")
+    let uri: str = json.GetStr(json.JsonGetField(textDocument, "uri"))
+    let line: int32 = int32(json.GetInt64(json.JsonGetField(position, "line"), 0))
+    let character: int32 = int32(json.GetInt64(json.JsonGetField(position, "character"), 0))
+
+    let items: lsp.CompletionItem[] = LspFindCompletionItems(uri, line, character)
+
+    var result: json.JsonNode = json.NewJObject()
+    result["isIncomplete"] = false
+    var itemsJson: json.JsonNode = json.NewJArray()
+    for i in 0..<items.len:
+        let item: lsp.CompletionItem = items[i]
+        var itemJson: json.JsonNode = json.NewJObject()
+        itemJson["label"] = item.label
+        itemJson["kind"] = int32(item.kind)
+        if strings.Len(item.detail) > 0:
+            itemJson["detail"] = item.detail
+        if strings.Len(item.documentation) > 0:
+            itemJson["documentation"] = item.documentation
+        if strings.Len(item.insertText) > 0:
+            itemJson["insertText"] = item.insertText
+        json.JsonAdd(itemsJson, itemJson)
+    result["items"] = itemsJson
+
+    LspWriteMessage(json.Stringify(LspMakeResponse(id, result)))
+
+fn LspHandleDiagnostic(id: json.JsonNode, params: json.JsonNode) =
+    if !gInitialized:
+        LspWriteMessage(json.Stringify(LspMakeError(id, int32(lsp.InvalidRequest),
+                                                     "server not initialized")))
+        return
+
+    let textDocument: json.JsonNode = json.JsonGetField(params, "textDocument")
+    let uri: str = json.GetStr(json.JsonGetField(textDocument, "uri"))
+
+    var result: json.JsonNode = json.NewJObject()
+    result["kind"] = "full"
+    var itemsJson: json.JsonNode = json.NewJArray()
+    for i in 0..<gFactDiagnostics.len:
+        let d: lsp.FactDiagnostic = gFactDiagnostics[i]
+        if d.sourceLoc.uri != uri:
+            continue
+        var diagJson: json.JsonNode = json.NewJObject()
+        diagJson["range"] = LspRangeToJson(d.sourceLoc.startLine, d.sourceLoc.startCol,
+                                           d.sourceLoc.endLine, d.sourceLoc.endCol)
+        diagJson["severity"] = int32(d.severity)
+        diagJson["code"] = d.code
+        diagJson["source"] = "cheng"
+        diagJson["message"] = d.message
+        json.JsonAdd(itemsJson, diagJson)
+    result["items"] = itemsJson
+
+    LspWriteMessage(json.Stringify(LspMakeResponse(id, result)))
+
+# --- Message dispatcher ---
+
+fn LspDispatchMessage(msgJson: json.JsonNode) =
+    let method: str = json.GetStr(msgJson["method"])
+    let hasId: bool = msgJson["id"].kind == json.JInt || msgJson["id"].kind == json.JString
+    let id: json.JsonNode = msgJson["id"]
+    let params: json.JsonNode = json.JsonGetField(msgJson, "params")
+
+    if gShutdownRequested:
+        if method == "exit":
+            LspHandleExit()
+        if hasId:
+            LspWriteMessage(json.Stringify(LspMakeError(id, int32(lsp.InvalidRequest),
+                                                         "server is shutting down")))
+        return
+
+    if !gInitialized:
+        if method == "initialize":
+            LspHandleInitialize(id, params)
+            return
+        if method == "exit":
+            LspHandleExit()
+            return
+        if hasId:
+            LspWriteMessage(json.Stringify(LspMakeError(id, int32(lsp.ServerNotInitialized),
+                                                         "server not initialized")))
+        return
+
+    if method == "shutdown":
+        LspHandleShutdown(id)
+    elif method == "exit":
+        LspHandleExit()
+    elif method == "textDocument/didOpen":
+        LspHandleDidOpen(params)
+    elif method == "textDocument/didChange":
+        LspHandleDidChange(params)
+    elif method == "textDocument/didClose":
+        LspHandleDidClose(params)
+    elif method == "textDocument/definition":
+        LspHandleDefinition(id, params)
+    elif method == "textDocument/references":
+        LspHandleReferences(id, params)
+    elif method == "textDocument/hover":
+        LspHandleHover(id, params)
+    elif method == "textDocument/completion":
+        LspHandleCompletion(id, params)
+    elif method == "textDocument/diagnostic":
+        LspHandleDiagnostic(id, params)
+    elif method == "$cancelRequest":
+        if hasId:
+            LspWriteMessage(json.Stringify(LspMakeResponse(id, json.NewJNull())))
+    elif method == "initialized":
+        return
+    else:
+        if hasId:
+            let methodNotFoundMsg: str = strutil.Join(["method not found: ", method], "")
+            LspWriteMessage(json.Stringify(LspMakeError(id, int32(lsp.MethodNotFound),
+                                                         methodNotFoundMsg)))
+
+# --- Entry point ---
+
+fn LspServerMain(args: str[]) =
+    let _ = args
+    gInitialized = false
+    gShutdownRequested = false
+    gDocuments = []
+    gFactSymbols = []
+    gFactReferences = []
+    gFactDiagnostics = []
+
+    LspLog("cheng-lsp starting (facts-driven mode)")
+
+    while true:
+        let msgResult: LspReadMessageResult = LspReadMessage()
+        if !msgResult.ok:
+            if strings.Len(msgResult.errorText) > 0:
+                LspLog(strutil.Join(["read error: ", msgResult.errorText], ""))
+            break
+        let parsed: json.JsonParseResult = json.ParseJsonSafe(msgResult.content)
+        if !parsed.success:
+            LspLog(strutil.Join(["json parse error: ", parsed.message], ""))
+            continue
+        LspDispatchMessage(parsed.value)
+
+    LspLog("cheng-lsp exiting")

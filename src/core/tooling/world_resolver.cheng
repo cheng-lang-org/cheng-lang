@@ -1,0 +1,182 @@
+import std/os
+import std/result
+import std/strutils as strutil
+import cheng/std/bytes_layout as layout
+import cheng/std/crypto/hash256
+import cheng/core/tooling/path as chengpath
+import cheng/core/tooling/compiler_world as cworld
+
+type
+    // Content-addressed source file entry
+    WorldSnapshotEntry =
+        relPath: str
+        contentCid: layout.FixedBytes32
+        contentHash: str
+
+    // CID-based content-addressed tree of all source files in a world
+    WorldSnapshot =
+        version: int32
+        rootDir: str
+        entryCount: int32
+        entries: WorldSnapshotEntry[]
+        snapshotCid: layout.FixedBytes32
+
+    // Lock-format receipt mapping packages to CIDs
+    WorldReceipt =
+        version: int32
+        worldHeadCid: layout.FixedBytes32
+        snapshotCid: layout.FixedBytes32
+        entryCount: int32
+        entries: WorldReceiptEntry[]
+        receiptCid: layout.FixedBytes32
+
+    WorldReceiptEntry =
+        packageId: str
+        modulePrefix: str
+        channel: str
+        version: str
+        cid: layout.FixedBytes32
+        checksum: str
+
+fn WorldSnapshotEntryMake(relPath: str,
+                           contentCid: layout.FixedBytes32,
+                           contentHash: str): WorldSnapshotEntry =
+    var out: WorldSnapshotEntry
+    out.relPath = relPath
+    out.contentCid = contentCid
+    out.contentHash = contentHash
+    return out
+
+fn WorldReceiptEntryMake(packageId: str,
+                          modulePrefix: str,
+                          channel: str,
+                          version: str,
+                          cid: layout.FixedBytes32,
+                          checksum: str): WorldReceiptEntry =
+    var out: WorldReceiptEntry
+    out.packageId = packageId
+    out.modulePrefix = modulePrefix
+    out.channel = channel
+    out.version = version
+    out.cid = cid
+    out.checksum = checksum
+    return out
+
+fn WorldResolveCollectSourcePaths(rootDir: str): Result[str[]] =
+    let srcDir = os.JoinPath(rootDir, "src")
+    if !chengpath.PathDirExists(srcDir):
+        return Err[str[]](strutil.Join([" world resolver: missing src directory: ", srcDir], ""))
+    let rawEntries = os.ListDir(srcDir)
+    var paths: str[]
+    for i in 0..<rawEntries.len:
+        let entry = rawEntries[i]
+        let fullPath = os.JoinPath(srcDir, entry)
+        if !chengpath.PathFileExists(fullPath):
+            continue
+        if !strutil.EndsWith(entry, ".cheng"):
+            continue
+        let relPath = os.JoinPath("src", entry)
+        add(paths, relPath)
+    if paths.len <= 0:
+        return Err[str[]](" world resolver: no .cheng source files found in src/")
+    return Ok[str[]](paths)
+
+fn WorldResolveContentCid(sourceText: str): layout.FixedBytes32 =
+    var buf: layout.ByteBuf = layout.ByteBufInit(sourceText.len + 32)
+    cworld.CompilerWorldAppendText(buf, "cheng.source.content")
+    cworld.CompilerWorldAppendText(buf, sourceText)
+    return cworld.CompilerWorldBufCid(buf)
+
+fn WorldResolveContentHash(sourceText: str): str =
+    let cid = WorldResolveContentCid(sourceText)
+    return layout.FixedBytes32Hex(cid)
+
+fn WorldResolveSnapshotCid(entries: WorldSnapshotEntry[]): layout.FixedBytes32 =
+    var buf: layout.ByteBuf = layout.ByteBufInit(256)
+    cworld.CompilerWorldAppendText(buf, "cheng.world.snapshot")
+    cworld.CompilerWorldAppendU32BE(buf, entries.len)
+    for i in 0..<entries.len:
+        cworld.CompilerWorldAppendText(buf, entries[i].relPath)
+        cworld.CompilerWorldAppendFixed32(buf, entries[i].contentCid)
+    return cworld.CompilerWorldBufCid(buf)
+
+fn WorldResolveReceiptCid(worldHeadCid: layout.FixedBytes32,
+                            snapshotCid: layout.FixedBytes32,
+                            entries: WorldReceiptEntry[]): layout.FixedBytes32 =
+    var buf: layout.ByteBuf = layout.ByteBufInit(256)
+    cworld.CompilerWorldAppendText(buf, "cheng.world.receipt")
+    cworld.CompilerWorldAppendFixed32(buf, worldHeadCid)
+    cworld.CompilerWorldAppendFixed32(buf, snapshotCid)
+    cworld.CompilerWorldAppendU32BE(buf, entries.len)
+    for i in 0..<entries.len:
+        cworld.CompilerWorldAppendText(buf, entries[i].packageId)
+        cworld.CompilerWorldAppendFixed32(buf, entries[i].cid)
+    return cworld.CompilerWorldBufCid(buf)
+
+fn WorldResolve(rootDir: str): Result[WorldReceipt] =
+    let pathsRes = WorldResolveCollectSourcePaths(rootDir)
+    if IsErr(pathsRes):
+        return Err[WorldReceipt](Error(pathsRes))
+    let paths = Value(pathsRes)
+    var snapshotEntries: WorldSnapshotEntry[]
+    for i in 0..<paths.len:
+        let sourcePath = os.JoinPath(rootDir, paths[i])
+        let text = chengpath.ReadTextFile("", sourcePath)
+        let contentCid = WorldResolveContentCid(text)
+        let contentHash = WorldResolveContentHash(text)
+        add(snapshotEntries, WorldSnapshotEntryMake(paths[i], contentCid, contentHash))
+    let snapshotCid = WorldResolveSnapshotCid(snapshotEntries)
+    var worldHeadCid = layout.FixedBytes32()
+    let lockPath = os.JoinPath(rootDir, "cheng.lock.toml")
+    if chengpath.PathFileExists(lockPath):
+        let lockRes = cworld.CompilerLockSnapshotRead(rootDir, "cheng.lock.toml")
+        if !IsErr(lockRes):
+            worldHeadCid = Value(lockRes).worldHeadCid
+    var receiptEntries: WorldReceiptEntry[]
+    add(receiptEntries, WorldReceiptEntryMake("cheng/compiler",
+                                               "cheng",
+                                               "stable",
+                                               "1.0.0",
+                                               snapshotCid,
+                                               ""))
+    let receiptCid = WorldResolveReceiptCid(worldHeadCid, snapshotCid, receiptEntries)
+    var out: WorldReceipt
+    out.version = 1
+    out.worldHeadCid = worldHeadCid
+    out.snapshotCid = snapshotCid
+    out.entryCount = receiptEntries.len
+    out.entries = receiptEntries
+    out.receiptCid = receiptCid
+    return Ok[WorldReceipt](out)
+
+fn WorldVerify(receipt: WorldReceipt): bool =
+    if receipt.version != 1:
+        return false
+    if receipt.entryCount != receipt.entries.len:
+        return false
+    let expectedCid = WorldResolveReceiptCid(receipt.worldHeadCid,
+                                              receipt.snapshotCid,
+                                              receipt.entries)
+    return layout.FixedBytes32Equal(expectedCid, receipt.receiptCid)
+
+fn WorldSnapshotReport(snapshot: WorldSnapshot): str =
+    var out = ""
+    out = strutil.Join([out, "version=1\n"], "")
+    out = strutil.Join([out, "entry_count=", IntToStr(snapshot.entryCount), "\n"], "")
+    for i in 0..<snapshot.entries.len:
+        out = strutil.Join([out, "entry[", IntToStr(i), "].rel_path=", snapshot.entries[i].relPath, "\n"], "")
+        out = strutil.Join([out, "entry[", IntToStr(i), "].content_cid=", layout.FixedBytes32Hex(snapshot.entries[i].contentCid), "\n"], "")
+    out = strutil.Join([out, "snapshot_cid=", layout.FixedBytes32Hex(snapshot.snapshotCid)], "")
+    return out
+
+fn WorldReceiptReport(receipt: WorldReceipt): str =
+    var out = ""
+    out = strutil.Join([out, "version=1\n"], "")
+    out = strutil.Join([out, "world_head_cid=", layout.FixedBytes32Hex(receipt.worldHeadCid), "\n"], "")
+    out = strutil.Join([out, "snapshot_cid=", layout.FixedBytes32Hex(receipt.snapshotCid), "\n"], "")
+    out = strutil.Join([out, "entry_count=", IntToStr(receipt.entryCount), "\n"], "")
+    for i in 0..<receipt.entries.len:
+        out = strutil.Join([out, "entry[", IntToStr(i), "].package_id=", receipt.entries[i].packageId, "\n"], "")
+        out = strutil.Join([out, "entry[", IntToStr(i), "].cid=", layout.FixedBytes32Hex(receipt.entries[i].cid), "\n"], "")
+    out = strutil.Join([out, "receipt_cid=", layout.FixedBytes32Hex(receipt.receiptCid)], "")
+    return out

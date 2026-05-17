@@ -83,6 +83,8 @@ assert.equal(coreReport.counts.unsupported, 0);
 assert.ok(coreReport.counts.types > 0);
 assert.ok((coreKinds.get("csg.binding") ?? 0) >= 4);
 assert.ok(coreFacts.some((fact) => fact.kind === "csg.op" && fact.opKind === "binding_extract"));
+assert.ok(coreFacts.some((fact) => fact.kind === "csg.op" && fact.opKind === "local_write"));
+assert.ok(coreFacts.some((fact) => fact.kind === "csg.op" && fact.opKind === "call" && Array.isArray(fact.arguments)));
 
 const unsupportedCoreOut = join(root, "tmp/unsupported.csgcore");
 const unsupportedCoreReport = join(root, "tmp/unsupported.report.json");
@@ -108,7 +110,7 @@ const unsupportedCsg = spawnSync(process.execPath, ["dist/cli.js", "--emit", "ch
   encoding: "utf8",
 });
 assert.equal(unsupportedCsg.status, 1);
-assert.match(unsupportedCsg.stderr, /unsupported expression|unsupported numeric operator|only direct calls/);
+assert.match(unsupportedCsg.stderr, /unsupported expression|unsupported numeric operator|only direct calls|runtime requirement/);
 
 assert.equal(process.platform, "darwin", "CHENG_CSG_V2 execution smoke currently targets arm64-apple-darwin");
 execFileSync("cc", ["-std=c11", "-O2", "-o", coldPath, "../bootstrap/cheng_cold.c"], {
@@ -123,6 +125,7 @@ execFileSync(coldPath, [
   "--target:arm64-apple-darwin",
 ], {
   cwd: root,
+  timeout: 10000,
   stdio: ["ignore", "pipe", "pipe"],
 });
 execFileSync("cc", [objPath, "-o", exePath], {
@@ -143,6 +146,7 @@ assert.equal(Number.isInteger(expected), true);
 const run = spawnSync(exePath, [], {
   cwd: root,
   encoding: "utf8",
+  timeout: 10000,
 });
 assert.equal(run.status, expected);
 

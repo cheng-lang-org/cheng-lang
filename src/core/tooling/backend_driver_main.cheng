@@ -1722,15 +1722,15 @@ fn BackendDriverRunSeedMinimizationBoundarySmoke(rootDir: str,
 
     let backendDriverMainText = chengpath.ReadTextFile(rootDir, "src/core/tooling/backend_driver_main.cheng")
     let compilerMainText = chengpath.ReadTextFile(rootDir, "src/core/tooling/compiler_main.cheng")
-    let seedText = chengpath.ReadTextFile(rootDir, "bootstrap/cheng_seed.c")
+    let coldText = chengpath.ReadTextFile(rootDir, "bootstrap/cheng_cold.c")
     if !BackendDriverAssertNoSeedHiddenSurface("seed minimization boundary backend driver source", backendDriverMainText):
         return 1
     if !BackendDriverAssertNoSeedHiddenSurface("seed minimization boundary compiler source", compilerMainText):
         return 1
-    if !BackendDriverAssertNoSeedHiddenSurface("seed minimization boundary c seed source", seedText):
+    if !BackendDriverAssertNoSeedHiddenSurface("seed minimization boundary cold bootstrap source", coldText):
         return 1
-    if !BackendDriverExpectNotContains("seed minimization boundary c seed source",
-                                       seedText,
+    if !BackendDriverExpectNotContains("seed minimization boundary cold bootstrap source",
+                                       coldText,
                                        "cheng_seed_invoke_with_fresh_compile_env(cheng_seed_cmd_system_link_exec"):
         return 1
 
@@ -1772,7 +1772,7 @@ fn BackendDriverRunSeedMinimizationBoundarySmoke(rootDir: str,
         return 1
     if !BackendDriverExpectContains("seed minimization boundary hidden command",
                                     hiddenRun.output,
-                                    strutil.Join(["[cheng_seed] unknown command: ", hiddenCommand], "")):
+                                    strutil.Join(["unknown command: ", hiddenCommand], "")):
         return 1
     let noHandoffLog = os.JoinPath(smokeDir, "no_handoff_non_bootstrap.log")
     BackendDriverRemoveFileIfPresent(noHandoffLog)
@@ -2207,6 +2207,47 @@ fn BackendDriverRunColdCsgSidecarSmoke(rootDir: str,
     BackendDriverPrintLine(" cold_csg_sidecar_smoke ok")
     return 0
 
+fn BackendDriverRunCompileObjSmoke(rootDir: str,
+                                     compilerPath: str,
+                                     outDir: str,
+                                     label: str): int32 =
+    let src = chengpath.PathAbsolute(rootDir, "src/tests/lsp_server_smoke.cheng")
+    let outObj = os.JoinPath(outDir, "lsp_server_smoke.o")
+    let reportPath = strutil.Join([outObj, ".report.txt"], "")
+    let compileLog = strutil.Join([outObj, ".compile.log"], "")
+    BackendDriverRemoveFileIfPresent(outObj)
+    BackendDriverRemoveFileIfPresent(reportPath)
+    BackendDriverRemoveFileIfPresent(compileLog)
+    var compileArgs: str[]
+    add(compileArgs, "system-link-exec")
+    add(compileArgs, strutil.Join(["--root:", rootDir], ""))
+    add(compileArgs, strutil.Join(["--in:", src], ""))
+    add(compileArgs, "--emit:obj")
+    add(compileArgs, "--target:arm64-apple-darwin")
+    add(compileArgs, strutil.Join(["--out:", outObj], ""))
+    add(compileArgs, strutil.Join(["--report-out:", reportPath], ""))
+    let compileRun = hostops.RunFileLogged(rootDir,
+                                             strutil.Join(["compile_obj_smoke_compile_", label], ""),
+                                             compilerPath,
+                                             compileArgs,
+                                             BackendDriverHostSmokeCompileEnv(),
+                                             rootDir,
+                                             420,
+                                             compileLog)
+    if !hostops.LoggedRunOk(compileRun):
+        let outputText = strutil.Strip(compileRun.output)
+        if len(outputText) > 0:
+            BackendDriverPrintErr(outputText)
+        return compileRun.exitCode
+    if !chengpath.FileExistsNonEmpty(rootDir, outObj):
+        BackendDriverPrintErr(strutil.Join(["compile obj smoke: missing object: ", outObj], ""))
+        return 1
+    if !chengpath.FileExistsNonEmpty(rootDir, reportPath):
+        BackendDriverPrintErr(strutil.Join(["compile obj smoke: missing report: ", reportPath], ""))
+        return 1
+    BackendDriverPrintLine(" compile_obj_smoke ok")
+    return 0
+
 fn BackendDriverRunOneHostSmoke(rootDir: str,
                                   compilerPath: str,
                                   outDir: str,
@@ -2225,6 +2266,8 @@ fn BackendDriverRunOneHostSmoke(rootDir: str,
         return BackendDriverRunBuildPlanReportSmoke(rootDir)
     if smokeName == "cold_csg_sidecar_smoke":
         return BackendDriverRunColdCsgSidecarSmoke(rootDir, compilerPath, outDir, label)
+    if smokeName == "compile_obj_smoke":
+        return BackendDriverRunCompileObjSmoke(rootDir, compilerPath, outDir, label)
     let src = chengpath.PathAbsolute(rootDir, strutil.Join(["src/tests/", smokeName, ".cheng"], ""))
     if !chengpath.FileExistsNonEmpty(rootDir, src):
         BackendDriverPrintErr(strutil.Join(["backend driver host smokes: missing source: ", src], ""))
@@ -3141,10 +3184,19 @@ fn BackendDriverCacheAppendSourceFile(buf: var layout.ByteBuf,
 
 fn BackendDriverCacheCodegenCid(rootDir: str): Result[layout.FixedBytes32] =
     var buf = layout.ByteBufInit(4096)
-    BackendDriverCacheAppendText(buf, "backend-driver-system-link-exec-codegen-v4")
-    let seedRes = BackendDriverCacheAppendSourceFile(buf, rootDir, "bootstrap/cheng_seed.c")
-    if IsErr(seedRes):
-        return Err[layout.FixedBytes32](Error(seedRes))
+    BackendDriverCacheAppendText(buf, "backend-driver-system-link-exec-codegen-v5-cold")
+    let coldRes = BackendDriverCacheAppendSourceFile(buf, rootDir, "bootstrap/cheng_cold.c")
+    if IsErr(coldRes):
+        return Err[layout.FixedBytes32](Error(coldRes))
+    let machoDirectRes = BackendDriverCacheAppendSourceFile(buf, rootDir, "bootstrap/macho_direct.h")
+    if IsErr(machoDirectRes):
+        return Err[layout.FixedBytes32](Error(machoDirectRes))
+    let elfDirectRes = BackendDriverCacheAppendSourceFile(buf, rootDir, "bootstrap/elf64_direct.h")
+    if IsErr(elfDirectRes):
+        return Err[layout.FixedBytes32](Error(elfDirectRes))
+    let coldParserRes = BackendDriverCacheAppendSourceFile(buf, rootDir, "bootstrap/cold_parser.c")
+    if IsErr(coldParserRes):
+        return Err[layout.FixedBytes32](Error(coldParserRes))
     let driverRes = BackendDriverCacheAppendSourceFile(buf, rootDir, "src/core/tooling/backend_driver_main.cheng")
     if IsErr(driverRes):
         return Err[layout.FixedBytes32](Error(driverRes))

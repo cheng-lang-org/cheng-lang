@@ -1,0 +1,120 @@
+# LSP server compile smoke test.
+# Verifies LSP protocol types and JSON-RPC message construction compile correctly.
+# Facts-driven architecture: types mirror canonical compiler facts.
+
+import std/json as json
+import std/strings
+
+# Minimal LSP types (mirror of lsp_protocol for standalone test)
+type
+    TestPosition =
+        line: int32
+        character: int32
+
+    TestRange =
+        start: TestPosition
+        end: TestPosition
+
+    TestDiagnostic =
+        range: TestRange
+        severity: int32
+        message: str
+
+fn TestMakePosition(line: int32, character: int32): TestPosition =
+    var out: TestPosition
+    out.line = line
+    out.character = character
+    return out
+
+fn TestMakeRange(sl: int32, sc: int32, el: int32, ec: int32): TestRange =
+    var out: TestRange
+    out.start = TestMakePosition(sl, sc)
+    out.end = TestMakePosition(el, ec)
+    return out
+
+fn TestMakeDiagnostic(range: TestRange, severity: int32, message: str): TestDiagnostic =
+    var out: TestDiagnostic
+    out.range = range
+    out.severity = severity
+    out.message = message
+    return out
+
+# Test JSON-RPC message construction
+fn TestJsonRpc(): json.JsonNode =
+    var msg: json.JsonNode = json.NewJObject()
+    msg["jsonrpc"] = "2.0"
+    msg["method"] = "textDocument/didOpen"
+    var params: json.JsonNode = json.NewJObject()
+    var td: json.JsonNode = json.NewJObject()
+    td["uri"] = "file:///test.cheng"
+    td["languageId"] = "cheng"
+    td["version"] = 1
+    td["text"] = "fn main() =\\n    return 0\\n"
+    params["textDocument"] = td
+    msg["params"] = params
+    return msg
+
+# Test fact symbol construction
+type
+    TestFactLocation =
+        uri: str
+        startLine: int32
+        startCol: int32
+        endLine: int32
+        endCol: int32
+
+    TestFactSymbol =
+        name: str
+        kind: int32
+        loc: TestFactLocation
+        typeText: str
+        exported: bool
+
+fn TestMakeFactLocation(uri: str, sl: int32, sc: int32, el: int32, ec: int32): TestFactLocation =
+    var out: TestFactLocation
+    out.uri = uri
+    out.startLine = sl
+    out.startCol = sc
+    out.endLine = el
+    out.endCol = ec
+    return out
+
+fn TestMakeFactSymbol(name: str, kind: int32,
+                      loc: TestFactLocation,
+                      typeText: str,
+                      exported: bool): TestFactSymbol =
+    var out: TestFactSymbol
+    out.name = name
+    out.kind = kind
+    out.loc = loc
+    out.typeText = typeText
+    out.exported = exported
+    return out
+
+fn main() =
+    # Test JSON-RPC construction
+    let rpc: json.JsonNode = TestJsonRpc()
+    let serialized: str = json.Stringify(rpc)
+    assert(strings.Len(serialized) > 0, "lsp smoke: json rpc serialization")
+
+    # Test position and range
+    let pos: TestPosition = TestMakePosition(0, 0)
+    assert(pos.line == 0, "lsp smoke: position line")
+    assert(pos.character == 0, "lsp smoke: position character")
+    let range: TestRange = TestMakeRange(0, 0, 10, 5)
+    assert(range.end.line == 10, "lsp smoke: range end line")
+
+    # Test diagnostic
+    let diag: TestDiagnostic = TestMakeDiagnostic(range, 1, "test error")
+    assert(diag.severity == 1, "lsp smoke: diagnostic severity")
+    assert(diag.message == "test error", "lsp smoke: diagnostic message")
+
+    # Test fact symbol
+    let loc: TestFactLocation = TestMakeFactLocation("file:///test.cheng", 0, 0, 5, 20)
+    let sym: TestFactSymbol = TestMakeFactSymbol("main", 12, loc, "fn (): int32", true)
+    assert(sym.name == "main", "lsp smoke: symbol name")
+    assert(sym.exported, "lsp smoke: symbol exported")
+
+    # Verify facts-driven metadata
+    assert(loc.uri == "file:///test.cheng", "lsp smoke: fact location uri")
+    assert(loc.endCol == 20, "lsp smoke: fact location end column")

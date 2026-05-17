@@ -1,0 +1,362 @@
+import std/result
+import std/strformat
+import std/strutils as strutil
+import cheng/core/tooling/path as chengpath
+import cheng/core/backend/compiler_facts as facts
+import cheng/core/lang/parser
+import cheng/core/lang/typed_expr as texpr
+import cheng/std/bytes_layout as layout
+
+// SemanticFact -- type-resolved facts (beyond parse-level).
+// Produced by semanticFactsFromCompilerFacts().
+// Includes:
+//   - type resolution
+//   - import resolution (follow edges to resolved targets)
+//   - overload resolution (disambiguate call targets)
+
+type
+    SemanticFactKind = enum
+        SemanticFactKindNone
+        SemanticFactKindResolvedType
+        SemanticFactKindResolvedImport
+        SemanticFactKindResolvedOverload
+        SemanticFactKindCallGraph
+        SemanticFactKindDiagnostic
+
+    ResolvedTypeFact =
+        sourcePath: str
+        lineNumber: int32
+        exprId: str
+        resolvedTypeName: str
+        resolvedTypeKind: int32
+        resolvedTypeSize: int32
+        resolvedTypeAlign: int32
+        abiClass: int32
+        valueKind: int32
+        placeKind: int32
+        loweringMode: int32
+        returnKind: int32
+
+    ResolvedImportFact =
+        ownerModulePath: str
+        targetModulePath: str
+        resolvedModulePath: str
+        resolved: bool
+        errorMessage: str
+
+    ResolvedOverloadFact =
+        sourcePath: str
+        lineNumber: int32
+        callExprId: str
+        callTarget: str
+        resolvedFnName: str
+        resolvedModulePath: str
+        argCount: int32
+        resolved: bool
+
+    CallGraphEdgeFact =
+        callerFnName: str
+        callerModulePath: str
+        calleeFnName: str
+        calleeModulePath: str
+        callSitePath: str
+        callSiteLine: int32
+        callKind: int32
+
+    SemanticDiagnosticFact =
+        sourcePath: str
+        lineNumber: int32
+        column: int32
+        severity: int32
+        code: str
+        message: str
+
+    SemanticFact =
+        kind: SemanticFactKind
+        factVersion: int32
+
+        resolvedTypeFact: ResolvedTypeFact
+        resolvedImportFact: ResolvedImportFact
+        resolvedOverloadFact: ResolvedOverloadFact
+        callGraphEdgeFact: CallGraphEdgeFact
+        semanticDiagnosticFact: SemanticDiagnosticFact
+
+    SemanticFactBundle =
+        factVersion: int32
+        sourceVersion: int32
+        factCount: int32
+        facts: SemanticFact[]
+
+// ---- Constants ----
+const
+    SemanticAbiScalar: int32 = 0
+    SemanticAbiComposite: int32 = 1
+    SemanticAbiPointerLike: int32 = 2
+    SemanticAbiPolymorphic: int32 = 3
+
+    SemanticValueScalar: int32 = 0
+    SemanticValueComposite: int32 = 1
+    SemanticValuePointerLike: int32 = 2
+
+    SemanticPlaceLocal: int32 = 0
+    SemanticPlaceGlobal: int32 = 1
+    SemanticPlaceField: int32 = 2
+    SemanticPlaceTemporary: int32 = 3
+    SemanticPlaceCallResult: int32 = 4
+
+    SemanticLowerReg: int32 = 0
+    SemanticLowerLocalAddress: int32 = 1
+    SemanticLowerSret: int32 = 2
+    SemanticLowerImportBuffer: int32 = 3
+    SemanticLowerDeferred: int32 = 4
+
+    SemanticReturnReg: int32 = 0
+    SemanticReturnCompositeLocal: int32 = 1
+    SemanticReturnSret: int32 = 2
+    SemanticReturnImportBuffer: int32 = 3
+
+    SemanticCallKindLocal: int32 = 0
+    SemanticCallKindExternal: int32 = 1
+    SemanticCallKindImportc: int32 = 2
+    SemanticCallKindMember: int32 = 3
+
+    SemanticSeverityError: int32 = 0
+    SemanticSeverityWarning: int32 = 1
+    SemanticSeverityInfo: int32 = 2
+
+// ---- Helpers ----
+
+fn SemanticFactNew(kind: SemanticFactKind): SemanticFact =
+    var out: SemanticFact
+    out.kind = kind
+    out.factVersion = 1
+    return out
+
+fn SemanticFactKindText(kind: SemanticFactKind): str =
+    if kind == SemanticFactKindResolvedType:
+        return "resolved_type"
+    if kind == SemanticFactKindResolvedImport:
+        return "resolved_import"
+    if kind == SemanticFactKindResolvedOverload:
+        return "resolved_overload"
+    if kind == SemanticFactKindCallGraph:
+        return "call_graph"
+    if kind == SemanticFactKindDiagnostic:
+        return "diagnostic"
+    return "none"
+
+fn SemanticFactAppend(out: var SemanticFact[], sf: SemanticFact) =
+    add(out, sf)
+
+fn SemanticFactNewResolvedType(sourcePath: str, lineNumber: int32,
+                                exprId: str, typeName: str): SemanticFact =
+    var out = SemanticFactNew(SemanticFactKindResolvedType)
+    var rt: ResolvedTypeFact
+    rt.sourcePath = sourcePath
+    rt.lineNumber = lineNumber
+    rt.exprId = exprId
+    rt.resolvedTypeName = typeName
+    rt.resolvedTypeKind = 1
+    out.resolvedTypeFact = rt
+    return out
+
+fn SemanticFactNewResolvedImport(ownerModule: str, targetModule: str): SemanticFact =
+    var out = SemanticFactNew(SemanticFactKindResolvedImport)
+    var ri: ResolvedImportFact
+    ri.ownerModulePath = ownerModule
+    ri.targetModulePath = targetModule
+    ri.resolved = targetModule != "" && targetModule != ownerModule
+    if !ri.resolved:
+        ri.errorMessage = strutil.Join(["unresolved import: ", targetModule], "")
+    out.resolvedImportFact = ri
+    return out
+
+fn SemanticFactNewCallGraphEdge(caller: str, callee: str): SemanticFact =
+    var out = SemanticFactNew(SemanticFactKindCallGraph)
+    var cg: CallGraphEdgeFact
+    cg.callerFnName = caller
+    cg.calleeFnName = callee
+    out.callGraphEdgeFact = cg
+    return out
+
+fn SemanticFactNewDiagnostic(sourcePath: str, lineNumber: int32,
+                              severity: int32, code: str, message: str): SemanticFact =
+    var out = SemanticFactNew(SemanticFactKindDiagnostic)
+    var sd: SemanticDiagnosticFact
+    sd.sourcePath = sourcePath
+    sd.lineNumber = lineNumber
+    sd.severity = severity
+    sd.code = code
+    sd.message = message
+    out.semanticDiagnosticFact = sd
+    return out
+
+// ---- Public API: semanticFactsFromCompilerFacts ----
+
+fn semanticFactsFromCompilerFacts(factBundle: facts.CompilerFactBundle): SemanticFactBundle =
+    var bundle: SemanticFactBundle
+    bundle.factVersion = 1
+    bundle.sourceVersion = factBundle.sourceVersion
+
+    var fi: int32 = 0
+    while fi < factBundle.facts.len:
+        let fkind = factBundle.facts[fi].kind
+
+        if fkind == facts.FactKindImportEdge:
+            let targetModule = factBundle.facts[fi].importEdgeFact.targetModulePath
+            let ownerModule = factBundle.facts[fi].importEdgeFact.ownerModulePath
+            var sf = SemanticFactNewResolvedImport(ownerModule, targetModule)
+            SemanticFactAppend(bundle.facts, sf)
+
+        if fkind == facts.FactKindSymbol:
+            let symName = factBundle.facts[fi].symbolFact.name
+            let symIsDef = factBundle.facts[fi].symbolFact.isDefinition
+            if symIsDef:
+                let symTypeText = factBundle.facts[fi].symbolFact.typeText
+                let symLine = factBundle.facts[fi].symbolFact.startLine
+                let symPath = factBundle.facts[fi].symbolFact.sourcePath
+                var rf = SemanticFactNewResolvedType(symPath, symLine,
+                                                      symName, symTypeText)
+                if symTypeText == "":
+                    rf.resolvedTypeFact.resolvedTypeKind = 0
+                add(bundle.facts, rf)
+
+        if fkind == facts.FactKindTypeDef:
+            let typeName = factBundle.facts[fi].typeDefFact.name
+            let typeLine = factBundle.facts[fi].typeDefFact.startLine
+            let typeKind = factBundle.facts[fi].typeDefFact.kind
+            let typePath = factBundle.facts[fi].typeDefFact.sourcePath
+            var rf = SemanticFactNewResolvedType(typePath, typeLine,
+                                                  typeName, typeName)
+            rf.resolvedTypeFact.resolvedTypeKind = typeKind
+            add(bundle.facts, rf)
+
+        fi = fi + 1
+
+    bundle.factCount = bundle.facts.len
+    return bundle
+
+fn semanticFactsFromTypedExprFacts(typedFacts: texpr.TypedExprFact[],
+                                    sourcePath: str): SemanticFactBundle =
+    var bundle: SemanticFactBundle
+    bundle.factVersion = 1
+
+    for i in 0..<typedFacts.len:
+        let tf = typedFacts[i]
+        if tf.sourcePath != sourcePath:
+            continue
+
+        // Create resolved type fact
+        var sf = SemanticFactNew(SemanticFactKindResolvedType)
+        var rt: ResolvedTypeFact
+        rt.sourcePath = tf.sourcePath
+        rt.lineNumber = tf.lineNumber
+        rt.exprId = tf.exprId
+        rt.resolvedTypeName = tf.typeText
+        rt.resolvedTypeKind = 1
+
+        // Map ABI class
+        if tf.abiClass == texpr.TypedExprAbiScalar:
+            rt.abiClass = SemanticAbiScalar
+        elif tf.abiClass == texpr.TypedExprAbiComposite:
+            rt.abiClass = SemanticAbiComposite
+        elif tf.abiClass == texpr.TypedExprAbiPointerLike:
+            rt.abiClass = SemanticAbiPointerLike
+        elif tf.abiClass == texpr.TypedExprAbiPolymorphic:
+            rt.abiClass = SemanticAbiPolymorphic
+
+        // Map value kind
+        if tf.valueKind == texpr.TypedExprValueScalar:
+            rt.valueKind = SemanticValueScalar
+        elif tf.valueKind == texpr.TypedExprValueComposite:
+            rt.valueKind = SemanticValueComposite
+        elif tf.valueKind == texpr.TypedExprValuePointerLike:
+            rt.valueKind = SemanticValuePointerLike
+
+        // Map place kind
+        if tf.placeKind == texpr.TypedExprPlaceLocal:
+            rt.placeKind = SemanticPlaceLocal
+        elif tf.placeKind == texpr.TypedExprPlaceGlobal:
+            rt.placeKind = SemanticPlaceGlobal
+        elif tf.placeKind == texpr.TypedExprPlaceField:
+            rt.placeKind = SemanticPlaceField
+        elif tf.placeKind == texpr.TypedExprPlaceTemporary:
+            rt.placeKind = SemanticPlaceTemporary
+        elif tf.placeKind == texpr.TypedExprPlaceCallResult:
+            rt.placeKind = SemanticPlaceCallResult
+
+        // Map lowering mode
+        if tf.loweringMode == texpr.TypedExprLowerReg:
+            rt.loweringMode = SemanticLowerReg
+        elif tf.loweringMode == texpr.TypedExprLowerLocalAddress:
+            rt.loweringMode = SemanticLowerLocalAddress
+        elif tf.loweringMode == texpr.TypedExprLowerSret:
+            rt.loweringMode = SemanticLowerSret
+        elif tf.loweringMode == texpr.TypedExprLowerImportBuffer:
+            rt.loweringMode = SemanticLowerImportBuffer
+        elif tf.loweringMode == texpr.TypedExprLowerDeferred:
+            rt.loweringMode = SemanticLowerDeferred
+
+        // Map return kind
+        if tf.returnKind == texpr.TypedExprReturnReg:
+            rt.returnKind = SemanticReturnReg
+        elif tf.returnKind == texpr.TypedExprReturnCompositeLocal:
+            rt.returnKind = SemanticReturnCompositeLocal
+        elif tf.returnKind == texpr.TypedExprReturnSret:
+            rt.returnKind = SemanticReturnSret
+        elif tf.returnKind == texpr.TypedExprReturnImportBuffer:
+            rt.returnKind = SemanticReturnImportBuffer
+
+        sf.resolvedTypeFact = rt
+        add(bundle.facts, sf)
+
+        // Build call graph edges for resolved calls
+        if tf.kind == parser.NormalizedExprCall && tf.callResolved:
+            var cg = SemanticFactNew(SemanticFactKindCallGraph)
+            var cge: CallGraphEdgeFact
+            cge.callerFnName = sourcePath
+            cge.calleeFnName = tf.typeText
+            cge.callSitePath = tf.sourcePath
+            cge.callSiteLine = tf.lineNumber
+            cge.callKind = SemanticCallKindLocal
+            if tf.callKind == texpr.TypedExprSurfaceCallExternal:
+                cge.callKind = SemanticCallKindExternal
+            elif tf.callKind == texpr.TypedExprSurfaceCallImportc:
+                cge.callKind = SemanticCallKindImportc
+            elif tf.callKind == texpr.TypedExprSurfaceCallMember:
+                cge.callKind = SemanticCallKindMember
+            cg.callGraphEdgeFact = cge
+            add(bundle.facts, cg)
+
+    bundle.factCount = bundle.facts.len
+    return bundle
+
+fn semanticFactsReportText(bundle: SemanticFactBundle): str =
+    var out = strutil.Join(["semantic_facts_version=", IntToStr(bundle.factVersion), "\n"], "")
+    out = strutil.Join([out, "semantic_fact_count=", IntToStr(bundle.factCount), "\n"], "")
+    var typeCount: int32 = 0
+    var importCount: int32 = 0
+    var overloadCount: int32 = 0
+    var callGraphCount: int32 = 0
+    var diagCount: int32 = 0
+    for i in 0..<bundle.facts.len:
+        let kind = bundle.facts[i].kind
+        if kind == SemanticFactKindResolvedType:
+            typeCount = typeCount + 1
+        elif kind == SemanticFactKindResolvedImport:
+            importCount = importCount + 1
+        elif kind == SemanticFactKindResolvedOverload:
+            overloadCount = overloadCount + 1
+        elif kind == SemanticFactKindCallGraph:
+            callGraphCount = callGraphCount + 1
+        elif kind == SemanticFactKindDiagnostic:
+            diagCount = diagCount + 1
+    out = strutil.Join([out, "resolved_type_fact_count=", IntToStr(typeCount), "\n"], "")
+    out = strutil.Join([out, "resolved_import_fact_count=", IntToStr(importCount), "\n"], "")
+    out = strutil.Join([out, "resolved_overload_fact_count=", IntToStr(overloadCount), "\n"], "")
+    out = strutil.Join([out, "call_graph_edge_count=", IntToStr(callGraphCount), "\n"], "")
+    out = strutil.Join([out, "semantic_diagnostic_count=", IntToStr(diagCount), "\n"], "")
+    return out
+
+fn semanticFactsBundleAppendText(bundle: SemanticFactBundle, text: var str) =
+    text = strutil.Join([text, semanticFactsReportText(bundle)], "")

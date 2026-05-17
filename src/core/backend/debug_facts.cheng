@@ -1,0 +1,402 @@
+import std/result
+import std/strformat
+import std/strutils as strutil
+import cheng/core/tooling/path as chengpath
+import cheng/core/backend/compiler_facts as facts
+import cheng/core/backend/semantic_facts as semfacts
+import cheng/core/lang/parser
+import cheng/core/lang/typed_expr as texpr
+
+// DebugFact -- unified debug information.
+// Produced by debugFactsFromCompilerFacts().
+// Can be consumed to emit:
+//   - line-map (source location -> instruction)
+//   - crash/panic trace mapping
+//   - DWARF .debug_* sections
+//   - variable location tracking
+
+type
+    DebugFactKind = enum
+        DebugFactKindNone
+        DebugFactKindFunction
+        DebugFactKindLineMapping
+        DebugFactKindVariable
+        DebugFactKindTypeInfo
+
+    DebugFunctionFact =
+        packageId: str
+        modulePath: str
+        sourcePath: str
+        functionName: str
+        linkName: str
+        symbolId: int32
+        lineStart: int32
+        lineEnd: int32
+        lowPc: int64
+        highPc: int64
+        frameSize: int32
+        hasBody: bool
+
+    DebugLineMappingFact =
+        sourcePath: str
+        sourceLine: int32
+        addressOffset: int64
+        instructionOffset: int32
+        opIndex: int32
+
+    DebugVariableFact =
+        name: str
+        typeName: str
+        symbolId: int32
+        functionSymbolId: int32
+        slot: int32
+        offset: int32
+        size: int32
+        lineStart: int32
+        lineEnd: int32
+        isParameter: bool
+        isLocal: bool
+        register: int32
+
+    DebugTypeInfoFact =
+        typeName: str
+        size: int32
+        align: int32
+        kind: int32
+        fieldCount: int32
+        fieldNames: str[]
+        fieldOffsets: int32[]
+        fieldSizes: int32[]
+
+    DebugFact =
+        kind: DebugFactKind
+        factVersion: int32
+
+        functionFact: DebugFunctionFact
+        lineMappingFact: DebugLineMappingFact
+        variableFact: DebugVariableFact
+        typeInfoFact: DebugTypeInfoFact
+
+    DebugFactBundle =
+        factVersion: int32
+        sourceVersion: int32
+        packageId: str
+        sourcePath: str
+        factCount: int32
+        facts: DebugFact[]
+
+// ---- Constants ----
+const
+    DebugTypeKindPrimitive: int32 = 0
+    DebugTypeKindObject: int32 = 1
+    DebugTypeKindEnum: int32 = 2
+    DebugTypeKindAlias: int32 = 3
+    DebugTypeKindArray: int32 = 4
+    DebugTypeKindPointer: int32 = 5
+    DebugTypeKindFunction: int32 = 6
+
+// ---- Helpers ----
+
+fn DebugFactNew(kind: DebugFactKind): DebugFact =
+    var out: DebugFact
+    out.kind = kind
+    out.factVersion = 1
+    return out
+
+fn DebugFactKindText(kind: DebugFactKind): str =
+    if kind == DebugFactKindFunction:
+        return "function"
+    if kind == DebugFactKindLineMapping:
+        return "line_mapping"
+    if kind == DebugFactKindVariable:
+        return "variable"
+    if kind == DebugFactKindTypeInfo:
+        return "type_info"
+    return "none"
+
+fn DebugFactAppend(out: var DebugFact[], df: DebugFact) =
+    add(out, df)
+
+fn DebugFactNewFunction(name: str, linkName: str, sourcePath: str,
+                         lineStart: int32, lineEnd: int32): DebugFact =
+    var out = DebugFactNew(DebugFactKindFunction)
+    var ff: DebugFunctionFact
+    ff.functionName = name
+    ff.linkName = linkName
+    ff.sourcePath = sourcePath
+    ff.lineStart = lineStart
+    ff.lineEnd = lineEnd
+    ff.hasBody = true
+    ff.frameSize = 0
+    out.functionFact = ff
+    return out
+
+fn DebugFactNewLineMapping(sourcePath: str, sourceLine: int32,
+                            addressOffset: int64): DebugFact =
+    var out = DebugFactNew(DebugFactKindLineMapping)
+    var lm: DebugLineMappingFact
+    lm.sourcePath = sourcePath
+    lm.sourceLine = sourceLine
+    lm.addressOffset = addressOffset
+    out.lineMappingFact = lm
+    return out
+
+fn DebugFactNewVariable(name: str, typeName: str, slot: int32): DebugFact =
+    var out = DebugFactNew(DebugFactKindVariable)
+    var vf: DebugVariableFact
+    vf.name = name
+    vf.typeName = typeName
+    vf.slot = slot
+    vf.register = -1
+    out.variableFact = vf
+    return out
+
+fn DebugFactNewTypeInfo(typeName: str, size: int32, align: int32,
+                         kind: int32): DebugFact =
+    var out = DebugFactNew(DebugFactKindTypeInfo)
+    var ti: DebugTypeInfoFact
+    ti.typeName = typeName
+    ti.size = size
+    ti.align = align
+    ti.kind = kind
+    out.typeInfoFact = ti
+    return out
+
+// ---- Function facts ----
+
+fn debugFunctionSymbolLinkName(name: str): str =
+    return strutil.Join(["_cheng_fn_", name], "")
+
+fn debugFunctionFactsFromDecls(decls: parser.NormalizedFunctionDecl[],
+                                sourcePath: str): DebugFact[] =
+    var out: DebugFact[]
+    for i in 0..<decls.len:
+        let decl = decls[i]
+        let linkName = debugFunctionSymbolLinkName(decl.name)
+        if decl.importc:
+            var df = DebugFactNew(DebugFactKindFunction)
+            var ff: DebugFunctionFact
+            ff.functionName = decl.name
+            ff.linkName = decl.name
+            ff.sourcePath = sourcePath
+            ff.lineStart = decl.lineNumber
+            ff.lineEnd = decl.lineNumber
+            ff.hasBody = false
+            ff.frameSize = 0
+            df.functionFact = ff
+            DebugFactAppend(out, df)
+        else:
+            var df = DebugFactNewFunction(decl.name, linkName, sourcePath,
+                                           decl.lineNumber, decl.lineNumber)
+            DebugFactAppend(out, df)
+    return out
+
+// ---- Line mapping ----
+
+fn debugLineMappingFromSource(text: str, functionName: str,
+                                functionLineStart: int32): DebugFact[] =
+    var out: DebugFact[]
+    var inFunction = false
+    var braceDepth: int32 = 0
+    var lineNumber: int32 = 0
+    var pos: int32 = 0
+    while pos < text.len:
+        var lineEnd = pos
+        while lineEnd < text.len && text[lineEnd] != '\n':
+            lineEnd = lineEnd + 1
+        var lineText: str
+        if lineEnd > pos:
+            lineText = text[pos..<lineEnd]
+        if !inFunction && lineNumber == functionLineStart:
+            var trimmedStart: int32 = 0
+            while trimmedStart < lineText.len &&
+                  (lineText[trimmedStart] == ' ' || lineText[trimmedStart] == '\t'):
+                trimmedStart = trimmedStart + 1
+            if trimmedStart + 2 <= lineText.len &&
+               lineText[trimmedStart] == 'f' && lineText[trimmedStart + 1] == 'n':
+                inFunction = true
+                braceDepth = 0
+        if inFunction:
+            for chPos in 0..<lineText.len:
+                if lineText[chPos] == '{':
+                    braceDepth = braceDepth + 1
+                elif lineText[chPos] == '}':
+                    braceDepth = braceDepth - 1
+            var hasContent = false
+            if lineText.len > 0:
+                for chPos in 0..<lineText.len:
+                    let c = lineText[chPos]
+                    if c != ' ' && c != '\t' && c != '{' && c != '}' && c != '\n':
+                        hasContent = true
+                        break
+            if hasContent:
+                let addrOffset: int64 = lineNumber - functionLineStart
+                if addrOffset >= 0:
+                    var lm = DebugFactNewLineMapping("", lineNumber, addrOffset * 4)
+                    DebugFactAppend(out, lm)
+            if braceDepth <= 0 && lineNumber > functionLineStart:
+                inFunction = false
+        lineNumber = lineNumber + 1
+        pos = lineEnd
+        if pos < text.len && text[pos] == '\n':
+            pos = pos + 1
+    return out
+
+// ---- Type info ----
+
+fn debugTypeInfoFactsFromDecls(typeDecls: parser.NormalizedTypeDecl[]): DebugFact[] =
+    var out: DebugFact[]
+    for i in 0..<typeDecls.len:
+        let td = typeDecls[i]
+        var df = DebugFactNewTypeInfo(td.name, 0, 0, DebugTypeKindObject)
+        DebugFactAppend(out, df)
+    return out
+
+// ---- Public API ----
+
+fn debugFactsFromCompilerFacts(factBundle: facts.CompilerFactBundle,
+                                sourceText: str): DebugFactBundle =
+    var bundle: DebugFactBundle
+    bundle.factVersion = 1
+    bundle.sourceVersion = factBundle.sourceVersion
+    bundle.packageId = factBundle.packageId
+
+    var currentFunctionSymbolId: int32 = 0
+    var seenTypes: str[]
+    var fi: int32 = 0
+    while fi < factBundle.facts.len:
+        let fkind = factBundle.facts[fi].kind
+        if fkind == facts.FactKindSymbol:
+            let sfIsDef = factBundle.facts[fi].symbolFact.isDefinition
+            if sfIsDef:
+                let symName = factBundle.facts[fi].symbolFact.name
+                let symPath = factBundle.facts[fi].symbolFact.sourcePath
+                let symLine = factBundle.facts[fi].symbolFact.startLine
+                let linkName = debugFunctionSymbolLinkName(symName)
+                var df = DebugFactNewFunction(symName, linkName,
+                                               symPath, symLine, symLine)
+                DebugFactAppend(bundle.facts, df)
+
+                if sourceText != "":
+                    let lineMaps = debugLineMappingFromSource(sourceText,
+                                                               symName, symLine)
+                    var lmIdx: int32 = 0
+                    while lmIdx < lineMaps.len:
+                        DebugFactAppend(bundle.facts, lineMaps[lmIdx])
+                        lmIdx = lmIdx + 1
+
+                currentFunctionSymbolId = currentFunctionSymbolId + 1
+        else:
+            let fk2 = factBundle.facts[fi].kind
+            if fk2 == facts.FactKindTypeDef:
+                let typeName = factBundle.facts[fi].typeDefFact.name
+                var alreadySeen = false
+                var sj: int32 = 0
+                while sj < seenTypes.len:
+                    if seenTypes[sj] == typeName:
+                        alreadySeen = true
+                        break
+                    sj = sj + 1
+                if !alreadySeen:
+                    add(seenTypes, typeName)
+                    var ti = DebugFactNewTypeInfo(typeName, 0, 0, DebugTypeKindObject)
+                    DebugFactAppend(bundle.facts, ti)
+        fi = fi + 1
+
+    bundle.factCount = bundle.facts.len
+    return bundle
+
+fn debugFactsFromDeclsAndSource(text: str, sourcePath: str): DebugFactBundle =
+    var bundle: DebugFactBundle
+    bundle.factVersion = 1
+
+    var decls: parser.NormalizedFunctionDecl[]
+    var declErr: str
+    if parser.ParserReadNormalizedFunctionDecls(text, decls, declErr):
+        let funcFacts = debugFunctionFactsFromDecls(decls, sourcePath)
+        for j in 0..<funcFacts.len:
+            DebugFactAppend(bundle.facts, funcFacts[j])
+        for j in 0..<decls.len:
+            let lineMaps = debugLineMappingFromSource(text, decls[j].name,
+                                                       decls[j].lineNumber)
+            for k in 0..<lineMaps.len:
+                DebugFactAppend(bundle.facts, lineMaps[k])
+
+    // Split text into lines
+    var textLines: str[]
+    var lineStart: int32 = 0
+    var scanPos: int32 = 0
+    while scanPos < text.len:
+        if text[scanPos] == '\n':
+            add(textLines, text[lineStart..<scanPos])
+            lineStart = scanPos + 1
+        scanPos = scanPos + 1
+    if lineStart < text.len:
+        add(textLines, text[lineStart..<text.len])
+    var typeDecls: parser.NormalizedTypeDecl[]
+    parser.ParserReadNormalizedTypeDeclsLines(textLines, typeDecls)
+    let typeInfos = debugTypeInfoFactsFromDecls(typeDecls)
+    for j in 0..<typeInfos.len:
+        DebugFactAppend(bundle.facts, typeInfos[j])
+
+    bundle.factCount = bundle.facts.len
+    return bundle
+
+fn debugFactsReportText(bundle: DebugFactBundle): str =
+    var out = strutil.Join(["debug_facts_version=", IntToStr(bundle.factVersion), "\n"], "")
+    out = strutil.Join([out, "debug_fact_count=", IntToStr(bundle.factCount), "\n"], "")
+    var funcCount: int32 = 0
+    var lineMapCount: int32 = 0
+    var varCount: int32 = 0
+    var typeInfoCount: int32 = 0
+    for i in 0..<bundle.facts.len:
+        let kind = bundle.facts[i].kind
+        if kind == DebugFactKindFunction:
+            funcCount = funcCount + 1
+        elif kind == DebugFactKindLineMapping:
+            lineMapCount = lineMapCount + 1
+        elif kind == DebugFactKindVariable:
+            varCount = varCount + 1
+        elif kind == DebugFactKindTypeInfo:
+            typeInfoCount = typeInfoCount + 1
+    out = strutil.Join([out, "debug_function_fact_count=", IntToStr(funcCount), "\n"], "")
+    out = strutil.Join([out, "debug_line_mapping_fact_count=", IntToStr(lineMapCount), "\n"], "")
+    out = strutil.Join([out, "debug_variable_fact_count=", IntToStr(varCount), "\n"], "")
+    out = strutil.Join([out, "debug_type_info_fact_count=", IntToStr(typeInfoCount), "\n"], "")
+    return out
+
+fn debugFactsLineMapText(bundle: DebugFactBundle): str =
+    var out = "cheng_line_map_v1\n"
+    out = strutil.Join([out, "entry_count=", IntToStr(DebugFactFuncCount(bundle)), "\n"], "")
+    for i in 0..<bundle.facts.len:
+        if bundle.facts[i].kind == DebugFactKindFunction:
+            let df = bundle.facts[i].functionFact
+            out = strutil.Join([out, "entry\t", df.linkName,
+                               "\t", df.functionName,
+                               "\t", df.sourcePath,
+                               "\t", IntToStr(df.lineStart),
+                               "\t", IntToStr(df.lineEnd), "\n"], "")
+    return out
+
+fn DebugFactFuncCount(bundle: DebugFactBundle): int32 =
+    var count: int32 = 0
+    for i in 0..<bundle.facts.len:
+        if bundle.facts[i].kind == DebugFactKindFunction:
+            count = count + 1
+    return count
+
+fn debugFactsDWARFCompatible(bundle: DebugFactBundle): bool =
+    if bundle.factCount <= 0:
+        return false
+    var hasFunctions = false
+    var hasLineMappings = false
+    for i in 0..<bundle.facts.len:
+        if bundle.facts[i].kind == DebugFactKindFunction:
+            hasFunctions = true
+        if bundle.facts[i].kind == DebugFactKindLineMapping:
+            hasLineMappings = true
+    return hasFunctions && hasLineMappings
+
+fn debugFactsBundleAppendText(bundle: DebugFactBundle, text: var str) =
+    text = strutil.Join([text, debugFactsReportText(bundle)], "")
+    text = strutil.Join([text, debugFactsLineMapText(bundle)], "")

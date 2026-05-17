@@ -1,0 +1,273 @@
+import std/os
+import std/result
+import std/strutils as strutil
+import cheng/std/bytes_layout as layout
+import cheng/core/tooling/path as chengpath
+import cheng/core/tooling/world_resolver as wresolver
+
+type
+    // TOML-compatible lock file representation
+    ChengLockPackage =
+        packageId: str
+        modulePrefix: str
+        channel: str
+        version: str
+        cid: str
+        checksum: str
+        source: str
+        format: str
+
+    ChengLock =
+        formatVersion: int32
+        worldHeadCid: str
+        channel: str
+        epoch: int32
+        compilerPackageId: str
+        compilerCid: str
+        stdlibPackageId: str
+        stdlibCid: str
+        runtimePackageId: str
+        runtimeCid: str
+        packageCount: int32
+        packages: ChengLockPackage[]
+
+    ChengLockDependency =
+        packageId: str
+        channel: str
+        version: str
+
+fn ChengLockPackageMake(packageId: str,
+                         modulePrefix: str,
+                         channel: str,
+                         version: str,
+                         cid: str,
+                         checksum: str,
+                         source: str,
+                         format: str): ChengLockPackage =
+    var out: ChengLockPackage
+    out.packageId = packageId
+    out.modulePrefix = modulePrefix
+    out.channel = channel
+    out.version = version
+    out.cid = cid
+    out.checksum = checksum
+    out.source = source
+    out.format = format
+    return out
+
+fn ChengLockMake(formatVersion: int32,
+                  worldHeadCid: str,
+                  channel: str,
+                  epoch: int32,
+                  compilerPackageId: str,
+                  compilerCid: str,
+                  stdlibPackageId: str,
+                  stdlibCid: str,
+                  runtimePackageId: str,
+                  runtimeCid: str,
+                  packages: ChengLockPackage[]): ChengLock =
+    var out: ChengLock
+    out.formatVersion = formatVersion
+    out.worldHeadCid = worldHeadCid
+    out.channel = channel
+    out.epoch = epoch
+    out.compilerPackageId = compilerPackageId
+    out.compilerCid = compilerCid
+    out.stdlibPackageId = stdlibPackageId
+    out.stdlibCid = stdlibCid
+    out.runtimePackageId = runtimePackageId
+    out.runtimeCid = runtimeCid
+    out.packageCount = packages.len
+    out.packages = packages
+    return out
+
+fn ChengLockSerialize(lock: ChengLock): str =
+    var out = ""
+    out = strutil.Join([out, "format_version = ", IntToStr(lock.formatVersion), "\n"], "")
+    out = strutil.Join([out, "world_head_cid = \"", lock.worldHeadCid, "\"\n"], "")
+    out = strutil.Join([out, "channel = \"", lock.channel, "\"\n"], "")
+    out = strutil.Join([out, "epoch = ", IntToStr(lock.epoch), "\n"], "")
+    out = strutil.Join([out, "\n"], "")
+    out = strutil.Join([out, "[compiler]\n"], "")
+    out = strutil.Join([out, "  package_id = \"", lock.compilerPackageId, "\"\n"], "")
+    out = strutil.Join([out, "  cid = \"", lock.compilerCid, "\"\n"], "")
+    out = strutil.Join([out, "\n"], "")
+    out = strutil.Join([out, "[stdlib]\n"], "")
+    out = strutil.Join([out, "  package_id = \"", lock.stdlibPackageId, "\"\n"], "")
+    out = strutil.Join([out, "  cid = \"", lock.stdlibCid, "\"\n"], "")
+    out = strutil.Join([out, "\n"], "")
+    out = strutil.Join([out, "[runtime]\n"], "")
+    out = strutil.Join([out, "  package_id = \"", lock.runtimePackageId, "\"\n"], "")
+    out = strutil.Join([out, "  cid = \"", lock.runtimeCid, "\"\n"], "")
+    out = strutil.Join([out, "\n"], "")
+    for i in 0..<lock.packages.len:
+        let pkg = lock.packages[i]
+        out = strutil.Join([out, "[[packages]]\n"], "")
+        out = strutil.Join([out, "  package_id = \"", pkg.packageId, "\"\n"], "")
+        out = strutil.Join([out, "  module_prefix = \"", pkg.modulePrefix, "\"\n"], "")
+        out = strutil.Join([out, "  channel = \"", pkg.channel, "\"\n"], "")
+        out = strutil.Join([out, "  version = \"", pkg.version, "\"\n"], "")
+        out = strutil.Join([out, "  cid = \"", pkg.cid, "\"\n"], "")
+        out = strutil.Join([out, "  source = \"", pkg.source, "\"\n"], "")
+        out = strutil.Join([out, "  format = \"", pkg.format, "\"\n"], "")
+        if pkg.checksum.len > 0:
+            out = strutil.Join([out, "  checksum = \"", pkg.checksum, "\"\n"], "")
+    return out
+
+fn ChengLockLineValue(text: str, key: str): str =
+    let lines = strutil.Split(text, '\n')
+    for i in 0..<lines.len:
+        let line = strutil.Strip(lines[i])
+        var match = false
+        if line.len > key.len:
+            if line[key.len] == '=':
+                match = true
+                for j in 0..<key.len:
+                    if line[j] != key[j]:
+                        match = false
+                        break
+        if match:
+            let rawValue = strutil.Strip(chengpath.TextSlice(line, key.len + 1, line.len - (key.len + 1)))
+            let valLen = rawValue.len
+            if valLen >= 2:
+                if rawValue[0] == '\"' && rawValue[valLen - 1] == '\"':
+                    return chengpath.TextSlice(rawValue, 1, valLen - 2)
+            return rawValue
+    return ""
+
+fn ChengLockDeserialize(text: str): Result[ChengLock] =
+    let versionText = ChengLockLineValue(text, "format_version")
+    if versionText.len <= 0:
+        return Err[ChengLock](" cheng lock: missing format_version")
+    let formatVersion = parseInt(versionText)
+    let worldHeadCid = ChengLockLineValue(text, "world_head_cid")
+    let channel = ChengLockLineValue(text, "channel")
+    let epochText = ChengLockLineValue(text, "epoch")
+    var epoch = 0
+    if epochText.len > 0:
+        epoch = parseInt(epochText)
+    let compilerPackageId = ChengLockLineValue(text, "compiler.package_id")
+    let compilerCid = ChengLockLineValue(text, "compiler.cid")
+    let stdlibPackageId = ChengLockLineValue(text, "stdlib.package_id")
+    let stdlibCid = ChengLockLineValue(text, "stdlib.cid")
+    let runtimePackageId = ChengLockLineValue(text, "runtime.package_id")
+    let runtimeCid = ChengLockLineValue(text, "runtime.cid")
+
+    // Count package sections by scanning for [[packages]] headers
+    var packages: ChengLockPackage[]
+    let lines = strutil.Split(text, '\n')
+    var i = 0
+    while i < lines.len:
+        let line = strutil.Strip(lines[i])
+        if line == "[[packages]]":
+            i = i + 1
+            var pkgId = ""
+            var pkgPrefix = ""
+            var pkgChannel = ""
+            var pkgVersion = ""
+            var pkgCid = ""
+            var pkgChecksum = ""
+            var pkgSource = ""
+            var pkgFormat = ""
+            while i < lines.len:
+                let innerLine = strutil.Strip(lines[i])
+                if innerLine.len <= 0 || innerLine[0] == '[':
+                    break
+                let eqPos = -1
+                for j in 0..<innerLine.len:
+                    if innerLine[j] == '=':
+                        let key = strutil.Strip(chengpath.TextSlice(innerLine, 0, j))
+                        let rawValue = strutil.Strip(chengpath.TextSlice(innerLine, j + 1, innerLine.len - (j + 1)))
+                        let valLen = rawValue.len
+                        var value = rawValue
+                        if valLen >= 2 && rawValue[0] == '\"' && rawValue[valLen - 1] == '\"':
+                            value = chengpath.TextSlice(rawValue, 1, valLen - 2)
+                        if key == "package_id":
+                            pkgId = value
+                        elif key == "module_prefix":
+                            pkgPrefix = value
+                        elif key == "channel":
+                            pkgChannel = value
+                        elif key == "version":
+                            pkgVersion = value
+                        elif key == "cid":
+                            pkgCid = value
+                        elif key == "checksum":
+                            pkgChecksum = value
+                        elif key == "source":
+                            pkgSource = value
+                        elif key == "format":
+                            pkgFormat = value
+                        break
+                i = i + 1
+            if pkgId.len > 0:
+                add(packages, ChengLockPackageMake(pkgId,
+                                                    pkgPrefix,
+                                                    pkgChannel,
+                                                    pkgVersion,
+                                                    pkgCid,
+                                                    pkgChecksum,
+                                                    pkgSource,
+                                                    pkgFormat))
+        else:
+            i = i + 1
+    var out: ChengLock
+    out.formatVersion = formatVersion
+    out.worldHeadCid = worldHeadCid
+    out.channel = channel
+    out.epoch = epoch
+    out.compilerPackageId = compilerPackageId
+    out.compilerCid = compilerCid
+    out.stdlibPackageId = stdlibPackageId
+    out.stdlibCid = stdlibCid
+    out.runtimePackageId = runtimePackageId
+    out.runtimeCid = runtimeCid
+    out.packageCount = packages.len
+    out.packages = packages
+    return Ok[ChengLock](out)
+
+fn ChengLockWrite(rootDir: str, lock: ChengLock): bool =
+    let text = ChengLockSerialize(lock)
+    let lockPath = os.JoinPath(rootDir, "cheng.lock.toml")
+    return chengpath.WriteTextFile("", lockPath, text)
+
+fn ChengLockRead(rootDir: str): Result[ChengLock] =
+    let lockPath = os.JoinPath(rootDir, "cheng.lock.toml")
+    if !chengpath.PathFileExists(lockPath):
+        return Err[ChengLock](strutil.Join([" cheng lock: missing lock file: ", lockPath], ""))
+    let text = chengpath.ReadTextFile("", lockPath)
+    return ChengLockDeserialize(text)
+
+fn ChengLockFindPackage(lock: ChengLock, packageId: str): Result[ChengLockPackage] =
+    for i in 0..<lock.packages.len:
+        if lock.packages[i].packageId == packageId:
+            return Ok[ChengLockPackage](lock.packages[i])
+    return Err[ChengLockPackage](strutil.Join([" cheng lock: package not found: ", packageId], ""))
+
+fn ChengLockPinVersion(lock: var ChengLock, packageId: str, version: str): bool =
+    for i in 0..<lock.packages.len:
+        if lock.packages[i].packageId == packageId:
+            lock.packages[i].version = version
+            return true
+    return false
+
+fn ChengLockHasPackage(lock: ChengLock, packageId: str): bool =
+    for i in 0..<lock.packages.len:
+        if lock.packages[i].packageId == packageId:
+            return true
+    return false
+
+fn ChengLockReport(lock: ChengLock): str =
+    var out = ""
+    out = strutil.Join([out, "format_version=", IntToStr(lock.formatVersion), "\n"], "")
+    out = strutil.Join([out, "world_head_cid=", lock.worldHeadCid, "\n"], "")
+    out = strutil.Join([out, "channel=", lock.channel, "\n"], "")
+    out = strutil.Join([out, "epoch=", IntToStr(lock.epoch), "\n"], "")
+    out = strutil.Join([out, "compiler=", lock.compilerCid, "\n"], "")
+    out = strutil.Join([out, "stdlib=", lock.stdlibCid, "\n"], "")
+    out = strutil.Join([out, "runtime=", lock.runtimeCid, "\n"], "")
+    out = strutil.Join([out, "package_count=", IntToStr(lock.packageCount), "\n"], "")
+    for i in 0..<lock.packages.len:
+        out = strutil.Join([out, "package[", IntToStr(i), "].id=", lock.packages[i].packageId, "\n"], "")
+        out = strutil.Join([out, "package[", IntToStr(i), "].version=", lock.packages[i].version, "\n"], "")
+    return out

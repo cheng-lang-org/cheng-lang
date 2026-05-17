@@ -1,0 +1,617 @@
+import std/result
+import std/strformat
+import std/strutils as strutil
+import cheng/core/tooling/path as chengpath
+import cheng/core/lang/parser
+import cheng/core/lang/typed_expr as texpr
+import cheng/std/bytes_layout as layout
+
+// CompilerFact -- unified canonical fact consumed by LSP, Debugger, World Resolver.
+// Version 1. All positions are 0-based line/column.
+// Can be emitted as CSG v2 facts via CompilerColdCsgFactsFromCompilerCsgInto.
+//
+// Fact categories (from docs/cheng-lsp.md):
+//   TokenFacts, ParseFacts, ImportGraphFacts, SymbolFacts,
+//   TypeFacts, ExportSurfaceFacts, OwnershipFacts, ConcurrencyFacts, WorldFacts
+
+type
+    // FactKind -- discriminator for CompilerFact kind field
+    FactKind = enum
+        FactKindNone
+        FactKindToken
+        FactKindParseDiagnostic
+        FactKindImportEdge
+        FactKindSymbol
+        FactKindTypeDef
+        FactKindExportSurface
+        FactKindOwnership
+        FactKindConcurrency
+        FactKindWorld
+
+    // SourceLocation -- 0-based line and column
+    SourceLocation =
+        line: int32
+        column: int32
+
+    // SourceSpan -- inclusive start, exclusive end
+    SourceSpan =
+        startLine: int32
+        startColumn: int32
+        endLine: int32
+        endColumn: int32
+
+    // TokenFact -- a single semantic token
+    TokenFact =
+        sourcePath: str
+        startLine: int32
+        startColumn: int32
+        endLine: int32
+        endColumn: int32
+        tokenKind: int32
+        tokenText: str
+
+    // ParseDiagnosticFact -- syntax or semantic diagnostic
+    ParseDiagnosticFact =
+        sourcePath: str
+        startLine: int32
+        startColumn: int32
+        endLine: int32
+        endColumn: int32
+        severity: int32
+        code: int32
+        message: str
+
+    // ImportEdgeFact -- a single import edge between modules
+    ImportEdgeFact =
+        ownerModulePath: str
+        targetModulePath: str
+        sourcePath: str
+        startLine: int32
+        startColumn: int32
+        endLine: int32
+        endColumn: int32
+        resolved: bool
+        cycleDetected: bool
+
+    // SymbolFact -- a symbol definition or reference
+    SymbolFact =
+        name: str
+        kind: int32
+        modulePath: str
+        sourcePath: str
+        startLine: int32
+        startColumn: int32
+        endLine: int32
+        endColumn: int32
+        symbolId: int32
+        isDefinition: bool
+        typeText: str
+        visibility: int32
+
+    // TypeDefFact -- a type definition
+    TypeDefFact =
+        name: str
+        modulePath: str
+        sourcePath: str
+        startLine: int32
+        startColumn: int32
+        kind: int32
+        size: int32
+        align: int32
+
+    // ExportSurfaceFact -- visible symbols of a package
+    ExportSurfaceFact =
+        packageId: str
+        sourcePath: str
+        exportedSymbolCount: int32
+        exportedSymbols: str[]
+        exportedTargetNames: str[]
+        exportedLayouts: int32[]
+        exportedEffects: int32[]
+        exportedCapabilities: int32[]
+
+    // OwnershipFact -- borrow/escape diagnostic
+    OwnershipFact =
+        sourcePath: str
+        startLine: int32
+        startColumn: int32
+        endLine: int32
+        endColumn: int32
+        ownershipKind: int32
+        message: str
+
+    // ConcurrencyFact -- Send/Sync diagnostic
+    ConcurrencyFact =
+        sourcePath: str
+        startLine: int32
+        startColumn: int32
+        endLine: int32
+        endColumn: int32
+        concurrencyKind: int32
+        message: str
+
+    // WorldFact -- package/world snapshot identity
+    WorldFact =
+        worldHeadCid: str
+        packageId: str
+        sourceVersion: int32
+        sourceBundleCid: str
+
+    // CompilerFact -- unified fact record (kind discriminates which payload is active)
+    CompilerFact =
+        kind: FactKind
+        factVersion: int32
+        sourceVersion: int32
+
+        tokenFact: TokenFact
+        parseDiagnosticFact: ParseDiagnosticFact
+        importEdgeFact: ImportEdgeFact
+        symbolFact: SymbolFact
+        typeDefFact: TypeDefFact
+        exportSurfaceFact: ExportSurfaceFact
+        ownershipFact: OwnershipFact
+        concurrencyFact: ConcurrencyFact
+        worldFact: WorldFact
+
+    // CompilerFactBundle -- a complete fact set for one compilation
+    CompilerFactBundle =
+        factVersion: int32
+        sourceVersion: int32
+        worldHeadCid: str
+        packageId: str
+        facts: CompilerFact[]
+        factCount: int32
+
+// ---- Constants ----
+const
+    FactTokenKindKeyword: int32 = 0
+    FactTokenKindIdentifier: int32 = 1
+    FactTokenKindString: int32 = 2
+    FactTokenKindNumber: int32 = 3
+    FactTokenKindOperator: int32 = 4
+    FactTokenKindType: int32 = 5
+    FactTokenKindComment: int32 = 6
+
+    FactSymbolKindFn: int32 = 0
+    FactSymbolKindType: int32 = 1
+    FactSymbolKindConst: int32 = 2
+    FactSymbolKindVar: int32 = 3
+    FactSymbolKindParam: int32 = 4
+    FactSymbolKindField: int32 = 5
+    FactSymbolKindModule: int32 = 6
+
+    FactTypeKindPrimitive: int32 = 0
+    FactTypeKindObject: int32 = 1
+    FactTypeKindEnum: int32 = 2
+    FactTypeKindAlias: int32 = 3
+    FactTypeKindGeneric: int32 = 4
+    FactTypeKindFunction: int32 = 5
+
+    FactVisibilityPublic: int32 = 0
+    FactVisibilityPrivate: int32 = 1
+    FactVisibilityExported: int32 = 2
+
+    FactSeverityError: int32 = 0
+    FactSeverityWarning: int32 = 1
+    FactSeverityInfo: int32 = 2
+
+    FactOwnershipBorrow: int32 = 0
+    FactOwnershipMove: int32 = 1
+    FactOwnershipEscape: int32 = 2
+    FactOwnershipRelease: int32 = 3
+
+    FactConcurrencySend: int32 = 0
+    FactConcurrencySync: int32 = 1
+    FactConcurrencyThreadBoundary: int32 = 2
+
+// ---- Helpers ----
+
+fn FactNew(kind: FactKind): CompilerFact =
+    var out: CompilerFact
+    out.kind = kind
+    out.factVersion = 1
+    return out
+
+fn FactKindText(kind: FactKind): str =
+    if kind == FactKindToken:
+        return "token"
+    if kind == FactKindParseDiagnostic:
+        return "diagnostic"
+    if kind == FactKindImportEdge:
+        return "import"
+    if kind == FactKindSymbol:
+        return "symbol"
+    if kind == FactKindTypeDef:
+        return "type_def"
+    if kind == FactKindExportSurface:
+        return "export_surface"
+    if kind == FactKindOwnership:
+        return "ownership"
+    if kind == FactKindConcurrency:
+        return "concurrency"
+    if kind == FactKindWorld:
+        return "world"
+    return "none"
+
+fn FactAppend(out: var CompilerFact[], fact: CompilerFact) =
+    add(out, fact)
+
+// ---- Source helpers ----
+
+fn compilerFactLineFromPos(text: str, pos: int32): int32 =
+    var line: int32 = 0
+    var i: int32 = 0
+    while i < pos && i < text.len:
+        if text[i] == '\n':
+            line = line + 1
+        i = i + 1
+    return line
+
+fn compilerFactColumnFromPos(text: str, pos: int32): int32 =
+    var col: int32 = 0
+    var i: int32 = pos - 1
+    while i >= 0:
+        if text[i] == '\n':
+            break
+        col = col + 1
+        i = i - 1
+    return col
+
+// ---- Token scanning ----
+
+fn FactTokenKindFromChar(ch: char): int32 =
+    if ch == '"' || ch == Char(39):
+        return FactTokenKindString
+    if ch >= '0' && ch <= '9':
+        return FactTokenKindNumber
+    if ch == '(' || ch == ')' || ch == '{' || ch == '}' || ch == '[' || ch == ']':
+        return FactTokenKindOperator
+    if ch == '+' || ch == '-' || ch == '*' || ch == '/' || ch == '%':
+        return FactTokenKindOperator
+    if ch == '=' || ch == '<' || ch == '>' || ch == '!' || ch == '&' || ch == '|' || ch == '^':
+        return FactTokenKindOperator
+    if ch == ':' || ch == ',' || ch == '.' || ch == '@' || ch == '?' || ch == '~' || ch == ';':
+        return FactTokenKindOperator
+    return FactTokenKindIdentifier
+
+fn compilerFactTokenEnd(text: str, start: int32): int32 =
+    if start >= text.len:
+        return start
+    let ch = text[start]
+    if ch == '"':
+        var pos = start + 1
+        while pos < text.len:
+            if text[pos] == '"' && !parser.ParserQuoteIsEscaped(text, pos):
+                pos = pos + 1
+                return pos
+            pos = pos + 1
+        return text.len
+    if ch == Char(39):
+        var pos = start + 1
+        while pos < text.len:
+            if text[pos] == Char(39) && !parser.ParserQuoteIsEscaped(text, pos):
+                pos = pos + 1
+                return pos
+            pos = pos + 1
+        return text.len
+    if ch == '/' && start + 1 < text.len:
+        if text[start + 1] == '/':
+            var pos = start + 2
+            while pos < text.len && text[pos] != '\n':
+                pos = pos + 1
+            return pos
+        if text[start + 1] == '*':
+            var pos = start + 2
+            while pos + 1 < text.len && !(text[pos] == '*' && text[pos + 1] == '/'):
+                pos = pos + 1
+            if pos + 1 <= text.len:
+                pos = pos + 2
+            return pos
+    var pos = start
+    while pos < text.len:
+        let c = text[pos]
+        if c == ' ' || c == '\t' || c == '\n':
+            break
+        if c == '(' || c == ')' || c == '{' || c == '}' || c == '[' || c == ']':
+            break
+        if c == ':' || c == ',' || c == ';' || c == '@' || c == '~':
+            break
+        if c == '"' || c == Char(39):
+            break
+        if c == '+' || c == '-' || c == '*' || c == '/' || c == '%':
+            break
+        if c == '=' || c == '<' || c == '>' || c == '!' || c == '&' || c == '|' || c == '^':
+            break
+        pos = pos + 1
+    return pos
+
+fn compilerFactSkipWhitespace(text: str, pos: int32): int32 =
+    var p = pos
+    while p < text.len:
+        let ch = text[p]
+        if ch != ' ' && ch != '\t' && ch != '\n':
+            break
+        p = p + 1
+    return p
+
+// ---- Text helpers ----
+
+fn compilerFactSplitLines(text: str): str[] =
+    var lines: str[]
+    var start: int32 = 0
+    var i: int32 = 0
+    while i < text.len:
+        if text[i] == '\n':
+            add(lines, text[start..<i])
+            start = i + 1
+        i = i + 1
+    if start < text.len:
+        add(lines, text[start..<text.len])
+    else if i == text.len && text.len > 0 && text[text.len - 1] == '\n':
+        add(lines, "")
+    return lines
+
+fn compilerFactHasImportPrefix(line: str): bool =
+    if line.len < 6:
+        return false
+    if !parser.ParserTextEqualsAt(line, 0, "import"):
+        return false
+    if line.len > 6 && !parser.ParserIsInlineSpace(line[6]):
+        return false
+    return true
+
+// ---- Build facts from source ----
+
+fn compilerFactsFromSource(source: str): CompilerFact[] =
+    var facts: CompilerFact[]
+
+    // Parse function declarations for symbol facts
+    var decls: parser.NormalizedFunctionDecl[]
+    var declErr: str
+    if parser.ParserReadNormalizedFunctionDecls(source, decls, declErr):
+        for i in 0..<decls.len:
+            let decl = decls[i]
+            var sym = FactNew(FactKindSymbol)
+            var sf: SymbolFact
+            sf.name = decl.name
+            sf.kind = FactSymbolKindFn
+            sf.isDefinition = true
+            sf.startLine = decl.lineNumber
+            if decl.importc:
+                sf.visibility = FactVisibilityExported
+            else:
+                sf.visibility = FactVisibilityPublic
+            sym.symbolFact = sf
+            add(facts, sym)
+
+    // Parse type declarations
+    let sourceLines = compilerFactSplitLines(source)
+    var typeDecls: parser.NormalizedTypeDecl[]
+    parser.ParserReadNormalizedTypeDeclsLines(sourceLines, typeDecls)
+    for i in 0..<typeDecls.len:
+        var td = FactNew(FactKindTypeDef)
+        var tdf: TypeDefFact
+        tdf.name = typeDecls[i].name
+        tdf.kind = FactTypeKindObject
+        tdf.size = 0
+        tdf.align = 0
+        td.typeDefFact = tdf
+        add(facts, td)
+
+    // Scan import edges line by line
+    for lineIdx in 0..<sourceLines.len:
+        let line = sourceLines[lineIdx]
+        if compilerFactHasImportPrefix(line):
+            var targetStart: int32 = 6
+            while targetStart < line.len && parser.ParserIsInlineSpace(line[targetStart]):
+                targetStart = targetStart + 1
+            var importTarget = ""
+            if targetStart < line.len:
+                importTarget = line[targetStart..<line.len]
+            var importFact = FactNew(FactKindImportEdge)
+            var imf: ImportEdgeFact
+            imf.targetModulePath = importTarget
+            imf.startLine = lineIdx
+            imf.resolved = importTarget != ""
+            importFact.importEdgeFact = imf
+            add(facts, importFact)
+
+    // Build token facts by scanning the full source
+    var scanPos: int32 = 0
+    while scanPos < source.len:
+        scanPos = compilerFactSkipWhitespace(source, scanPos)
+        if scanPos >= source.len:
+            break
+
+        let startLine = compilerFactLineFromPos(source, scanPos)
+        let startCol = compilerFactColumnFromPos(source, scanPos)
+
+        // Comment
+        if scanPos + 1 < source.len && source[scanPos] == '/' &&
+           (source[scanPos + 1] == '/' || source[scanPos + 1] == '*'):
+            let endPos = compilerFactTokenEnd(source, scanPos)
+            var tf = FactNew(FactKindToken)
+            var tkf: TokenFact
+            tkf.tokenKind = FactTokenKindComment
+            tkf.startLine = startLine
+            tkf.startColumn = startCol
+            tkf.endLine = compilerFactLineFromPos(source, endPos)
+            tkf.endColumn = compilerFactColumnFromPos(source, endPos)
+            tkf.tokenText = source[scanPos..<endPos]
+            tf.tokenFact = tkf
+            add(facts, tf)
+            scanPos = endPos
+            continue
+
+        let ch = source[scanPos]
+
+        // String/char literal
+        if ch == '"' || ch == Char(39):
+            let endPos = compilerFactTokenEnd(source, scanPos)
+            var tf = FactNew(FactKindToken)
+            var tkf: TokenFact
+            tkf.tokenKind = FactTokenKindString
+            tkf.startLine = startLine
+            tkf.startColumn = startCol
+            tkf.endLine = compilerFactLineFromPos(source, endPos)
+            tkf.endColumn = compilerFactColumnFromPos(source, endPos)
+            tkf.tokenText = source[scanPos..<endPos]
+            tf.tokenFact = tkf
+            add(facts, tf)
+            scanPos = endPos
+            continue
+
+        // Operator
+        let tokenKind = FactTokenKindFromChar(ch)
+        if tokenKind != FactTokenKindIdentifier:
+            var endPos = scanPos + 1
+            if endPos < source.len:
+                let nextCh = source[endPos]
+                if (ch == '=' && nextCh == '=') ||
+                   (ch == '!' && nextCh == '=') ||
+                   (ch == '<' && nextCh == '=') ||
+                   (ch == '>' && nextCh == '=') ||
+                   (ch == '&' && nextCh == '&') ||
+                   (ch == '|' && nextCh == '|'):
+                    endPos = endPos + 1
+            var tf = FactNew(FactKindToken)
+            var tkf: TokenFact
+            tkf.tokenKind = tokenKind
+            tkf.startLine = startLine
+            tkf.startColumn = startCol
+            tkf.endLine = compilerFactLineFromPos(source, endPos)
+            tkf.endColumn = compilerFactColumnFromPos(source, endPos)
+            tkf.tokenText = source[scanPos..<endPos]
+            tf.tokenFact = tkf
+            add(facts, tf)
+            scanPos = endPos
+            continue
+
+        // Identifier or number
+        let endPos = compilerFactTokenEnd(source, scanPos)
+        if endPos > scanPos:
+            let tokenText = source[scanPos..<endPos]
+            var actualKind = tokenKind
+
+            if tokenText == "fn" || tokenText == "type" || tokenText == "const" ||
+               tokenText == "import" || tokenText == "let" || tokenText == "var" ||
+               tokenText == "if" || tokenText == "elif" || tokenText == "else" ||
+               tokenText == "for" || tokenText == "while" || tokenText == "return" ||
+               tokenText == "match" || tokenText == "enum" || tokenText == "true" ||
+               tokenText == "false" || tokenText == "nil" || tokenText == "and" ||
+               tokenText == "or" || tokenText == "not" || tokenText == "in" ||
+               tokenText == "as" || tokenText == "struct" || tokenText == "iterator":
+                actualKind = FactTokenKindKeyword
+            elif ch >= '0' && ch <= '9':
+                actualKind = FactTokenKindNumber
+
+            var tf = FactNew(FactKindToken)
+            var tkf: TokenFact
+            tkf.tokenKind = actualKind
+            tkf.startLine = startLine
+            tkf.startColumn = startCol
+            tkf.endLine = compilerFactLineFromPos(source, endPos)
+            tkf.endColumn = compilerFactColumnFromPos(source, endPos)
+            tkf.tokenText = tokenText
+            tf.tokenFact = tkf
+            add(facts, tf)
+            scanPos = endPos
+        else:
+            scanPos = scanPos + 1
+
+    return facts
+
+fn compilerFactsFromSourceWithMeta(source: str,
+                                    worldHeadCid: str,
+                                    packageId: str,
+                                    sourceVersion: int32): CompilerFactBundle =
+    var bundle: CompilerFactBundle
+    bundle.factVersion = 1
+    bundle.sourceVersion = sourceVersion
+    bundle.worldHeadCid = worldHeadCid
+    bundle.packageId = packageId
+
+    let facts = compilerFactsFromSource(source)
+    bundle.facts = facts
+    bundle.factCount = facts.len
+
+    var wf = FactNew(FactKindWorld)
+    var wfa: WorldFact
+    wfa.worldHeadCid = worldHeadCid
+    wfa.packageId = packageId
+    wfa.sourceVersion = sourceVersion
+    wf.worldFact = wfa
+    add(bundle.facts, wf)
+    bundle.factCount = bundle.factCount + 1
+
+    return bundle
+
+fn compilerFactReportText(bundle: CompilerFactBundle): str =
+    var out = strutil.Join(["compiler_facts_version=", IntToStr(bundle.factVersion), "\n"], "")
+    out = strutil.Join([out, "source_version=", IntToStr(bundle.sourceVersion), "\n"], "")
+    out = strutil.Join([out, "package_id=", bundle.packageId, "\n"], "")
+    out = strutil.Join([out, "world_head_cid=", bundle.worldHeadCid, "\n"], "")
+    out = strutil.Join([out, "fact_count=", IntToStr(bundle.factCount), "\n"], "")
+    var tokenCount: int32 = 0
+    var diagCount: int32 = 0
+    var importCount: int32 = 0
+    var symbolCount: int32 = 0
+    var typeDefCount: int32 = 0
+    var exportCount: int32 = 0
+    var ownershipCount: int32 = 0
+    var concurrencyCount: int32 = 0
+    var worldCount: int32 = 0
+    for i in 0..<bundle.facts.len:
+        let kind = bundle.facts[i].kind
+        if kind == FactKindToken:
+            tokenCount = tokenCount + 1
+        elif kind == FactKindParseDiagnostic:
+            diagCount = diagCount + 1
+        elif kind == FactKindImportEdge:
+            importCount = importCount + 1
+        elif kind == FactKindSymbol:
+            symbolCount = symbolCount + 1
+        elif kind == FactKindTypeDef:
+            typeDefCount = typeDefCount + 1
+        elif kind == FactKindExportSurface:
+            exportCount = exportCount + 1
+        elif kind == FactKindOwnership:
+            ownershipCount = ownershipCount + 1
+        elif kind == FactKindConcurrency:
+            concurrencyCount = concurrencyCount + 1
+        elif kind == FactKindWorld:
+            worldCount = worldCount + 1
+    out = strutil.Join([out, "token_fact_count=", IntToStr(tokenCount), "\n"], "")
+    out = strutil.Join([out, "diagnostic_fact_count=", IntToStr(diagCount), "\n"], "")
+    out = strutil.Join([out, "import_fact_count=", IntToStr(importCount), "\n"], "")
+    out = strutil.Join([out, "symbol_fact_count=", IntToStr(symbolCount), "\n"], "")
+    out = strutil.Join([out, "type_def_fact_count=", IntToStr(typeDefCount), "\n"], "")
+    out = strutil.Join([out, "export_surface_fact_count=", IntToStr(exportCount), "\n"], "")
+    out = strutil.Join([out, "ownership_fact_count=", IntToStr(ownershipCount), "\n"], "")
+    out = strutil.Join([out, "concurrency_fact_count=", IntToStr(concurrencyCount), "\n"], "")
+    out = strutil.Join([out, "world_fact_count=", IntToStr(worldCount), "\n"], "")
+    return out
+
+fn compilerFactsFromCompilerCsg(csgFacts: texpr.TypedExprFact[]): CompilerFact[] =
+    var facts: CompilerFact[]
+    for i in 0..<csgFacts.len:
+        let src = csgFacts[i]
+        var sym = FactNew(FactKindSymbol)
+        var sf: SymbolFact
+        sf.name = src.exprId
+        sf.sourcePath = src.sourcePath
+        sf.startLine = src.lineNumber
+        sf.isDefinition = true
+        sf.typeText = src.typeText
+        sf.visibility = FactVisibilityPublic
+        sym.symbolFact = sf
+        add(facts, sym)
+    return facts
+
+fn compilerFactsEmpty(): CompilerFactBundle =
+    var bundle: CompilerFactBundle
+    bundle.factVersion = 1
+    return bundle
+
+fn compilerFactsFromBundleAppendText(bundle: CompilerFactBundle, text: var str) =
+    text = strutil.Join([text, compilerFactReportText(bundle)], "")

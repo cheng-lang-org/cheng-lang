@@ -2610,6 +2610,18 @@ assert "handle_table_cold_compile_smoke" 1 "$ACT"
 ACT=$(compile_obj_smoke "path" "src/core/tooling/path.cheng")
 assert "path_cold_compile_smoke" 1 "$ACT"
 
+# --- world_resolver.cheng cold compile smoke ---
+ACT=$(compile_obj_smoke "world_resolver" "src/core/tooling/world_resolver.cheng")
+assert "world_resolver_cold_compile_smoke" 1 "$ACT"
+
+# --- cheng_lock.cheng cold compile smoke ---
+ACT=$(compile_obj_smoke "cheng_lock" "src/core/tooling/cheng_lock.cheng")
+assert "cheng_lock_cold_compile_smoke" 1 "$ACT"
+
+# --- world_facts.cheng cold compile smoke ---
+ACT=$(compile_obj_smoke "world_facts" "src/core/tooling/world_facts.cheng")
+assert "world_facts_cold_compile_smoke" 1 "$ACT"
+
 # --- line_map.cheng cold compile smoke ---
 ACT=$(compile_obj_smoke "line_map" "src/core/backend/line_map.cheng")
 assert "line_map_cold_compile_smoke" 1 "$ACT"
@@ -2715,6 +2727,18 @@ assert "native_link_plan_cold_compile_smoke" 1 "$ACT"
 # --- system_link_plan.cheng cold compile smoke ---
 ACT=$(compile_obj_smoke "system_link_plan" "src/core/backend/system_link_plan.cheng")
 assert "system_link_plan_cold_compile_smoke" 1 "$ACT"
+
+# --- compiler_facts.cheng cold compile smoke ---
+ACT=$(compile_obj_smoke "compiler_facts" "src/core/backend/compiler_facts.cheng")
+assert "compiler_facts_cold_compile_smoke" 1 "$ACT"
+
+# --- semantic_facts.cheng cold compile smoke ---
+ACT=$(compile_obj_smoke "semantic_facts" "src/core/backend/semantic_facts.cheng")
+assert "semantic_facts_cold_compile_smoke" 1 "$ACT"
+
+# --- debug_facts.cheng cold compile smoke ---
+ACT=$(compile_obj_smoke "debug_facts" "src/core/backend/debug_facts.cheng")
+assert "debug_facts_cold_compile_smoke" 1 "$ACT"
 
 # --- cross-compilation smoke (arm64-apple-darwin explicit target) ---
 cat > /tmp/ct_cross_target.cheng << 'EOF'

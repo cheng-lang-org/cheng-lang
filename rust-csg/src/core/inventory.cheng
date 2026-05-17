@@ -31,10 +31,27 @@ fn RustCsgSkipVendoredPackageJson(path: str): bool =
     return false
 
 fn RustCsgCountCargoMembers(cargoTomlPath: str): int32 =
+    let members = RustCsgCollectCargoMembers(cargoTomlPath)
+    return int32(members.len)
+
+fn RustCsgCargoMemberLineName(lineRaw: str): str =
+    let line = strutil.Strip(lineRaw)
+    if line.len < 2:
+        return ""
+    if line[0] != '"':
+        return ""
+    var stop = line.len - 1
+    if line[stop] == ',':
+        stop = stop - 1
+    if stop <= 0 || line[stop] != '"':
+        return ""
+    return strutil.SliceStr(line, 1, stop - 1)
+
+fn RustCsgCollectCargoMembers(cargoTomlPath: str): str[] =
     let body = os.ReadFile(cargoTomlPath)
     let lines = strutil.Split(body, '\n')
+    var out: str[]
     var inside: bool
-    var count: int32
     for i in 0..<lines.len:
         let line = strutil.Strip(lines[i])
         if line == "members = [":
@@ -42,9 +59,159 @@ fn RustCsgCountCargoMembers(cargoTomlPath: str): int32 =
             continue
         if inside && line == "]":
             break
-        if inside && strutil.StartsWith(line, "\""):
-            count = count + 1
-    return count
+        if inside:
+            let name = RustCsgCargoMemberLineName(line)
+            if name != "":
+                add(out, name)
+    return out
+
+fn RustCsgExpectedCargoMembersList(): str[] =
+    return [
+        "aws-auth",
+        "analytics",
+        "agent-graph-store",
+        "agent-identity",
+        "backend-client",
+        "ansi-escape",
+        "async-utils",
+        "app-server",
+        "app-server-transport",
+        "app-server-client",
+        "app-server-protocol",
+        "app-server-test-client",
+        "debug-client",
+        "apply-patch",
+        "arg0",
+        "feedback",
+        "features",
+        "install-context",
+        "codex-backend-openapi-models",
+        "code-mode",
+        "cloud-requirements",
+        "cloud-tasks",
+        "cloud-tasks-client",
+        "cloud-tasks-mock-client",
+        "cli",
+        "collaboration-mode-templates",
+        "connectors",
+        "config",
+        "device-key",
+        "shell-command",
+        "shell-escalation",
+        "skills",
+        "core",
+        "core-api",
+        "core-plugins",
+        "core-skills",
+        "hooks",
+        "secrets",
+        "exec",
+        "file-system",
+        "exec-server",
+        "execpolicy",
+        "execpolicy-legacy",
+        "external-agent-migration",
+        "external-agent-sessions",
+        "keyring-store",
+        "file-search",
+        "linux-sandbox",
+        "lmstudio",
+        "login",
+        "codex-mcp",
+        "mcp-server",
+        "memories/read",
+        "memories/write",
+        "model-provider-info",
+        "models-manager",
+        "network-proxy",
+        "ollama",
+        "process-hardening",
+        "protocol",
+        "realtime-webrtc",
+        "rollout",
+        "rollout-trace",
+        "rmcp-client",
+        "responses-api-proxy",
+        "response-debug-context",
+        "sandboxing",
+        "stdio-to-uds",
+        "otel",
+        "tui",
+        "tools",
+        "v8-poc",
+        "utils/absolute-path",
+        "utils/cargo-bin",
+        "git-utils",
+        "utils/cache",
+        "utils/image",
+        "utils/json-to-toml",
+        "utils/home-dir",
+        "utils/pty",
+        "utils/readiness",
+        "utils/rustls-provider",
+        "utils/string",
+        "utils/cli",
+        "utils/elapsed",
+        "utils/sandbox-summary",
+        "utils/sleep-inhibitor",
+        "utils/approval-presets",
+        "utils/oss",
+        "utils/output-truncation",
+        "utils/path-utils",
+        "utils/plugins",
+        "utils/fuzzy-match",
+        "utils/stream-parser",
+        "utils/template",
+        "codex-client",
+        "codex-api",
+        "state",
+        "terminal-detection",
+        "test-binary-support",
+        "thread-manager-sample",
+        "thread-store",
+        "uds",
+        "codex-experimental-api-macros",
+        "plugin",
+        "model-provider"
+    ]
+
+fn RustCsgStringSeqContainsExact(items: str[], needle: str): bool =
+    for i in 0..<items.len:
+        if items[i] == needle:
+            return true
+    return false
+
+fn RustCsgCargoMembersOk(outReason: var str): bool =
+    outReason = ""
+    let expected = RustCsgExpectedCargoMembersList()
+    let found = RustCsgCollectCargoMembers(os.JoinPath(RustCsgCodexRsRoot, "Cargo.toml"))
+    if found.len != expected.len:
+        outReason = strutil.Join([
+            "cargo_member_name_count=",
+            RustCsgInt32Text(int32(found.len)),
+            " expected=",
+            RustCsgInt32Text(int32(expected.len))
+        ], "")
+        return false
+    for i in 0..<found.len:
+        for j in i + 1..<found.len:
+            if found[i] == found[j]:
+                outReason = strutil.Join(["duplicate_cargo_member=", found[i]], "")
+                return false
+        if found[i] != expected[i]:
+            outReason = strutil.Join([
+                "cargo_member[",
+                RustCsgInt32Text(int32(i)),
+                "]=",
+                found[i],
+                " expected=",
+                expected[i]
+            ], "")
+            return false
+        if !RustCsgStringSeqContainsExact(expected, found[i]):
+            outReason = strutil.Join(["unknown_cargo_member=", found[i]], "")
+            return false
+    return true
 
 fn RustCsgCollectSourceStats(): types.RustCsgSourceStats =
     var out: types.RustCsgSourceStats

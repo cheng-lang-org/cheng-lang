@@ -13,15 +13,15 @@ cc -arch arm64 -O2 \
 "$ROOT/artifacts/backend_driver/cheng" system-link-exec \
   --root:"$ROOT" \
   --in:"$ROOT/rust-csg/src/tests/rust_csg_inventory_smoke.cheng" \
-  --emit:obj \
+  --emit:exe \
   --target:arm64-apple-darwin \
-  --out:"$OUT_DIR/rust_csg_inventory_smoke.o" \
-  --report-out:"$OUT_DIR/rust_csg_inventory_smoke.obj.report.txt"
+  --provider-objects:"$OUT_DIR/darwin_inventory_provider.o" \
+  --out:"$OUT_DIR/rust_csg_inventory_smoke" \
+  --report-out:"$OUT_DIR/rust_csg_inventory_smoke.report.txt"
 
-cc -arch arm64 \
-  "$OUT_DIR/rust_csg_inventory_smoke.o" \
-  "$OUT_DIR/darwin_inventory_provider.o" \
-  -lc \
-  -o "$OUT_DIR/rust_csg_inventory_smoke"
+rg -q '^system_link_exec_scope=cold_macho_provider_system_link$' \
+  "$OUT_DIR/rust_csg_inventory_smoke.report.txt"
+rg -q '^provider_object_count=1$' \
+  "$OUT_DIR/rust_csg_inventory_smoke.report.txt"
 
 "$OUT_DIR/rust_csg_inventory_smoke"

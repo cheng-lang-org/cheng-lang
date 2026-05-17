@@ -5,7 +5,7 @@ Cheng 当前主线已经收口到仓库根包 `pkg://cheng` 和根源码树 `src
 ## 入口
 
 ```sh
-cc -std=c11 -O2 -Wall -Wextra -pedantic bootstrap/cheng_seed.c -o artifacts/bootstrap/cheng.stage0
+cc -std=c11 -O2 -Wall -Wextra -pedantic bootstrap/cheng_cold.c -o artifacts/bootstrap/cheng.stage0
 artifacts/bootstrap/cheng.stage0 bootstrap-bridge
 artifacts/bootstrap/cheng.stage3 build-backend-driver
 artifacts/backend_driver/cheng status

@@ -15723,6 +15723,7 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
 
     bool use_rv64 = target && strstr(target, "riscv64") != 0;
     bool use_linux = target && strstr(target, "linux") != 0;
+    bool use_darwin = target && strstr(target, "apple-darwin") != 0;
 
     /* Entry trampoline: architecture-specific */
     int32_t entry_call_pos = 0;
@@ -15747,6 +15748,10 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
         if (use_linux) {
             code_emit(code, a64_movz_x(8, 93, 0)); /* sys_exit */
             code_emit(code, a64_svc(0));
+        } else if (use_darwin) {
+            code_emit(code, a64_movz_x(16, 1, 0)); /* Darwin exit */
+            code_emit(code, a64_svc(0x80));
+            code_emit(code, a64_brk(0xa55e));
         } else {
             code_emit(code, a64_add_imm(LR, 21, 0, true));
             code_emit(code, a64_ret());
@@ -22314,8 +22319,8 @@ static void cold_emit_linux_aarch64_thread_start_provider(Code *code) {
     code_emit(code, a64_orr_reg_x(R9, SP, R0));   /* fn */
     code_emit(code, a64_orr_reg_x(R10, SP, R1));  /* ctx */
     code_emit(code, a64_orr_reg_x(R11, SP, R3));  /* handle */
-    code_emit(code, a64_add_imm(R12, R3, 16, true)); /* &handle->tidWord */
-    code_emit(code, a64_add_imm(13, R3, 20, true));  /* &handle->state */
+    code_emit(code, a64_add_imm(R12, R3, 32, true)); /* &handle->tidWord */
+    code_emit(code, a64_add_imm(13, R3, 36, true));  /* &handle->state */
     code_emit(code, a64_orr_reg_x(R1, SP, R2));   /* child stack */
     codegen_mov_i64_const(code, R0, 0x01350F00u); /* CLONE_* pthread-like flags */
     code_emit(code, a64_orr_reg_x(R2, SP, R12));  /* parent_tid */
@@ -22332,8 +22337,48 @@ static void cold_emit_linux_aarch64_thread_start_provider(Code *code) {
     a64_patch_bcond(code, child_eq, child);
     code_emit(code, a64_orr_reg_x(R0, SP, R10));
     code_emit(code, a64_blr(R9));
+
+    int32_t state_loop = code->count;
+    code_emit(code, a64_ldaxr_w(14, 13));
+    code_emit(code, a64_cmp_imm(14, 1));
+    int32_t detached_eq = code->count;
+    code_emit(code, a64_bcond(0, COND_EQ));
+    code_emit(code, a64_cmp_imm(14, 0));
+    int32_t state_done_ne = code->count;
+    code_emit(code, a64_bcond(0, COND_NE));
     code_emit(code, a64_movz(14, 2, 0));
+    code_emit(code, a64_stlxr_w(16, 14, 13));
+    code_emit(code, a64_cbnz(16, state_loop - code->count));
+    int32_t normal_exit_b = code->count;
+    code_emit(code, a64_b(0));
+
+    int32_t detached_cleanup = code->count;
+    a64_patch_bcond(code, detached_eq, detached_cleanup);
+    code_emit(code, a64_clrex());
+    code_emit(code, a64_movz(14, 3, 0));
     code_emit(code, a64_stlr_w(14, 13));
+    code_emit(code, a64_movz_x(R0, 0, 0));
+    code_emit(code, a64_movz_x(R8, 96, 0));           /* set_tid_address(NULL) */
+    code_emit(code, a64_svc(0));
+    code_emit(code, a64_ldr_imm(17, R11, 8, true));   /* cleanupStackBase */
+    code_emit(code, a64_add_imm_shifted(SP, 17, 16, true)); /* cleanup top: +64KiB */
+    code_emit(code, a64_ldr_imm(R0, R11, 0, true));   /* stackBase */
+    code_emit(code, a64_ldr_imm(R1, R11, 16, true));  /* stackSize */
+    code_emit(code, a64_movz_x(R8, 215, 0));          /* munmap */
+    code_emit(code, a64_svc(0));
+    code_emit(code, a64_ldr_imm(R0, R11, 8, true));   /* cleanupStackBase */
+    codegen_mov_i64_const(code, R1, 65536);
+    code_emit(code, a64_movz_x(R8, 215, 0));          /* munmap */
+    code_emit(code, a64_svc(0));
+    code_emit(code, a64_orr_reg_x(R0, SP, R11));      /* handle */
+    code_emit(code, a64_movz_x(R1, 4096, 0));
+    code_emit(code, a64_movz_x(R8, 215, 0));          /* munmap */
+    code_emit(code, a64_svc(0));
+
+    int32_t normal_exit = code->count;
+    a64_patch_bcond(code, state_done_ne, normal_exit);
+    a64_patch_b(code, normal_exit_b, normal_exit);
+    code_emit(code, a64_clrex());
     code_emit(code, a64_movz_x(R0, 0, 0));
     code_emit(code, a64_movz_x(R8, 93, 0));
     code_emit(code, a64_svc(0));
@@ -26506,6 +26551,10 @@ bool cold_compile_source_to_object(const char *out_path,
         if (is_elf) {
             code_emit(shared, a64_movz_x(8, 93, 0)); /* sys_exit */
             code_emit(shared, a64_svc(0));
+        } else if (!is_coff && !use_x64) {
+            code_emit(shared, a64_movz_x(16, 1, 0)); /* Darwin exit */
+            code_emit(shared, a64_svc(0x80));
+            code_emit(shared, a64_brk(0xa55e));
         } else {
             code_emit(shared, a64_add_imm(LR, 21, 0, true));
             code_emit(shared, a64_ret());
@@ -27714,6 +27763,10 @@ static bool cold_macho_system_link_provider_objects(const char *primary_object,
     }
     if (!cold_run_shell(cmd, "Darwin provider system link")) {
         snprintf(error_buf, error_cap, "Darwin provider system link failed log=%s", log_path);
+        return false;
+    }
+    if (!cold_sign_executable(out_path)) {
+        snprintf(error_buf, error_cap, "Darwin provider system link codesign failed");
         return false;
     }
     if (!cold_file_exists_nonempty(out_path)) {

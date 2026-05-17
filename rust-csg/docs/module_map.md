@@ -19,3 +19,9 @@
 ## rule
 
 No implicit fallback. If a source member has no mapped Cheng module, inventory smoke must report it as `explicitly_blocked`.
+
+## Cheng contract
+
+- `core/module_map.cheng` is the executable contract for this document.
+- `RustCsgNormalizeSourceName` applies the `-` and `/` to `_` mapping.
+- `RustCsgCargoMemberUnit` returns `explicitly_blocked` with a non-empty reason until the member is truly ported.

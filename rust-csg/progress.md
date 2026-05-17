@@ -10,6 +10,11 @@
 - 已补 `cold_transitive_alias_scope_smoke`：入口同时导入 `cheng/codex/protocol/types` 和 `cheng/rust-csg/core/parity`，覆盖跨源同名 `types` alias。
 - 已刷新正式 `artifacts/backend_driver/cheng`：候选先通过 nested import、transitive alias、rust-csg parity、rust-csg inventory static 四个 smoke，覆盖正式入口后同一组 smoke 再次通过。
 - `artifacts/bootstrap/cheng.stage3 build-backend-driver --out:/tmp/rust_csg_cheng_candidate` 仍因缺失已退役的 `bootstrap/cheng_seed.c` 失败；当前可用刷新路径是 cold 编译器直接 `build-backend-driver`。
-- 已接入真实 live scan：`rust_csg_inventory_smoke` 现在调用 `inventory.RustCsgCollectSourceStats()`，通过显式 Darwin provider object + 系统链接跑完，输出 `rust_csg_inventory_smoke ok`。
-- 已补复现脚本：`rust-csg/support/run_inventory_smoke.sh` 固定执行 provider 编译、Cheng object 编译、系统链接和 smoke 运行。
+- 已接入真实 live scan：`rust_csg_inventory_smoke` 现在调用 `inventory.RustCsgCollectSourceStats()`；旧旁路曾用显式 Darwin provider object + 手工 `cc` 系统链接跑完，输出 `rust_csg_inventory_smoke ok`。
+- 已补 Cargo member 名单合同：`RustCsgCargoMembersOk` 按源 `Cargo.toml` 逐项校验 106 个 workspace member 的顺序、重复和未知项；`emit:obj` 编译已通过。
+- 已落地模块映射核心：`core/module_map.cheng` 实现 `-`、`/` 到 `_` 的 crate bucket 归一化，blocked migration unit 必须带 reason；`rust_csg_module_map_smoke` `emit:obj` 编译通过。
+- 已收紧复现脚本：`rust-csg/support/run_inventory_smoke.sh` 现在直接调用正式 `system-link-exec --emit:exe --provider-objects`，并检查 `cold_macho_provider_system_link` 与 `provider_object_count=1`，不再允许手工 `emit:obj + cc` 旁路冒充正式通过。
+- 已在 cold 源码补 Darwin `--provider-objects` 系统链接分支；正式 artifact 尚未刷新。
+- 刷新 blocker：direct Mach-O 的 `LC_LOAD_DYLINKER` `cmdsize=28` 非 8 字节对齐已在源码修为 `32`，需要刷新 backend driver 后验证 while/for smoke 和 provider smoke。
+- 当前宿主额外阻塞：新落盘 Mach-O（包括 `cc` 编译的最小 hello 和复制的 `/bin/echo`）会卡在 `_dyld_start`/内核 `U` 状态，`kill -9` 无效。正式 artifact 刷新与新二进制运行验证必须等宿主执行校验恢复后继续。
 - 暂未闭合：正式 `system-link-exec --emit:exe` 直接编译 live inventory 仍卡在 `first_unresolved_symbol=cheng_mem_release`；`--link-object + provider-archive` 可解析 rust-csg provider exports，但停在 provider 的 libSystem 依赖 `closedir`。下一步必须把 Darwin provider object 纳入真实系统链接主线，不能用假 stub。

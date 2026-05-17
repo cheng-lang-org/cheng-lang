@@ -238,9 +238,9 @@ static bool macho_write_exec(const char *path, const uint32_t *code, int32_t cod
         for (int i = 2; i < 20; i++) w[i] = 0;
     }
     
-    /* LOAD_DYLINKER: path to dyld */
+    /* LOAD_DYLINKER: path to dyld. cmdsize must stay 8-byte aligned. */
     {
-        int32_t off = macho_append_cmd(&mw, LC_LOAD_DYLINKER, 28);
+        int32_t off = macho_append_cmd(&mw, LC_LOAD_DYLINKER, 32);
         uint32_t *w = (uint32_t*)(mw.buf + off);
         w[2] = 12; /* offset to path string (right after cmdsize) */
         memcpy(mw.buf + off + 12, "/usr/lib/dyld\0", 14);

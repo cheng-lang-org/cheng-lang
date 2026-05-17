@@ -125,6 +125,7 @@ const
 
     cheng_page_size: int64 = 4096
     cheng_thread_stack_size: int64 = 1048576
+    cheng_thread_cleanup_stack_size: int64 = 65536
     cheng_ptrmap_tomb: uint64 = 1
     chengStrFlagOwned: int32 = 1
 
@@ -246,7 +247,9 @@ type
         fSpare3: int64
     ChengLinuxThreadHandle =
         stackBase: ptr
+        cleanupStackBase: ptr
         stackSize: int64
+        cleanupStackSize: int64
         tidWord: int32
         state: int32
 
@@ -1162,10 +1165,16 @@ fn cheng_thread_handle_destroy(handle: ChengLinuxThreadHandlePtr) =
         return
     let stackBase = handle->stackBase
     let stackSize = handle->stackSize
+    let cleanupStackBase = handle->cleanupStackBase
+    let cleanupStackSize = handle->cleanupStackSize
     handle->stackBase = nil
+    handle->cleanupStackBase = nil
     handle->stackSize = 0
+    handle->cleanupStackSize = 0
     if stackBase != nil && stackSize > 0:
         let _ = cheng_munmap_region(stackBase, stackSize)
+    if cleanupStackBase != nil && cleanupStackSize > 0:
+        let _ = cheng_munmap_region(cleanupStackBase, cleanupStackSize)
     let _ = cheng_munmap_region(ptr(handle), cheng_page_size)
 
 fn cheng_thread_tid_addr(handle: ChengLinuxThreadHandlePtr): ptr =
@@ -1193,13 +1202,16 @@ fn cheng_thread_wait_tid_zero(handle: ChengLinuxThreadHandlePtr): bool =
 
 @exportc("cheng_spawn")
 fn cheng_spawn(fn_ptr: ptr, ctx: ptr) =
-    cheng_puts("cheng_spawn unsupported on no-libc linux aarch64 provider")
-    cheng_exit(1)
+    if cheng_thread_spawn(fn_ptr, ctx) == 0:
+        cheng_puts("cheng_thread_spawn_failed")
+        cheng_exit(1)
 
 @exportc("cheng_thread_spawn")
 fn cheng_thread_spawn(fn_ptr: ptr, ctx: ptr): int32 =
-    cheng_spawn(fn_ptr, ctx)
-    return 0
+    let thread = cheng_thread_start(fn_ptr, ctx)
+    if thread == nil:
+        return 0
+    return cheng_thread_detach(thread)
 
 @exportc("cheng_thread_start")
 fn cheng_thread_start(fn_ptr: ptr, ctx: ptr): ptr =
@@ -1212,14 +1224,22 @@ fn cheng_thread_start(fn_ptr: ptr, ctx: ptr): ptr =
     if stack == nil:
         let _ = cheng_munmap_region(handleMem, cheng_page_size)
         return nil
+    let cleanupStack = chengMapPages(cheng_thread_cleanup_stack_size)
+    if cleanupStack == nil:
+        let _ = cheng_munmap_region(stack, cheng_thread_stack_size)
+        let _ = cheng_munmap_region(handleMem, cheng_page_size)
+        return nil
     let handle: ChengLinuxThreadHandlePtr = ChengLinuxThreadHandlePtr(handleMem)
     handle->stackBase = stack
+    handle->cleanupStackBase = cleanupStack
     handle->stackSize = cheng_thread_stack_size
+    handle->cleanupStackSize = cheng_thread_cleanup_stack_size
     handle->tidWord = 0
     handle->state = 0
     let stackTop = ptr(uint64(stack) + uint64(cheng_thread_stack_size))
     let tid = cheng_linux_thread_start_raw(fn_ptr, ctx, stackTop, handleMem)
     if tid <= 0 || cheng_sys_is_err(tid):
+        let _ = cheng_munmap_region(cleanupStack, cheng_thread_cleanup_stack_size)
         let _ = cheng_munmap_region(stack, cheng_thread_stack_size)
         let _ = cheng_munmap_region(handleMem, cheng_page_size)
         return nil
@@ -1240,16 +1260,25 @@ fn cheng_thread_join(handle: ptr): int32 =
 
 @exportc("cheng_thread_detach")
 fn cheng_thread_detach(handle: ptr): int32 =
-    handle
-    cheng_puts("cheng_thread_detach unsupported on no-libc linux aarch64 provider: use Join")
-    cheng_exit(1)
+    if handle == nil:
+        return 0
+    let h: ChengLinuxThreadHandlePtr = ChengLinuxThreadHandlePtr(handle)
+    let statePtr = ptr(&h->state)
+    if cheng_atomic_cas_i32(statePtr, 0, 1) != 0:
+        return 1
+    if cheng_atomic_load_i32(statePtr) == 2:
+        if !cheng_thread_wait_tid_zero(h):
+            return 0
+        cheng_thread_handle_destroy(h)
+        return 1
     return 0
 
 @exportc("cheng_thread_spawn_i32")
 fn cheng_thread_spawn_i32(fn_ptr: ptr, ctx: int32): int32 =
-    cheng_puts("cheng_thread_spawn_i32 unsupported on no-libc linux aarch64 provider")
-    cheng_exit(1)
-    return 0
+    let thread = cheng_thread_start(fn_ptr, ptr(uint64(uint32(ctx))))
+    if thread == nil:
+        return 0
+    return cheng_thread_detach(thread)
 
 @exportc("cheng_thread_parallelism")
 fn cheng_thread_parallelism(): int32 =
