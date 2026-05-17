@@ -29064,7 +29064,7 @@ static int32_t cold_materialize_self_exec(Parser *parser, BodyIR *body) {
     int32_t li = body_string_literal(body, cold_cached_minimal_macho);
     int32_t bin_slot = body_slot(body, SLOT_STR, COLD_STR_SLOT_SIZE);
     body_op(body, BODY_OP_STR_LITERAL, bin_slot, li, 0);
-    int32_t temp_path = cold_make_str_literal_cstr_slot(body, "/tmp/cold_probe_self");
+    int32_t temp_path = cold_make_str_literal_cstr_slot(body, "/tmp/cheng-probe-self");
     int32_t write_dst = body_slot(body, SLOT_I32, 4);
     body_op(body, BODY_OP_PATH_WRITE_TEXT, write_dst, temp_path, bin_slot);
     body_op(body, BODY_OP_CHMOD_X, write_dst, temp_path, 0);
@@ -29088,7 +29088,7 @@ static int32_t cold_materialize_direct_emit(Parser *parser, BodyIR *body, int32_
     int32_t chmod_slot = body_slot(body, SLOT_I32, 4);
     body_op(body, BODY_OP_CHMOD_X, chmod_slot, output, 0);
     /* Also write to a fixed temp path for self-exec chain */
-    int32_t temp_path = cold_make_str_literal_cstr_slot(body, "/tmp/cold_probe_self");
+    int32_t temp_path = cold_make_str_literal_cstr_slot(body, "/tmp/cheng-probe-self");
     int32_t write2_dst = body_slot(body, SLOT_I32, 4);
     body_op(body, BODY_OP_PATH_WRITE_TEXT, write2_dst, temp_path, bin_slot);
     body_op(body, BODY_OP_CHMOD_X, write2_dst, temp_path, 0);
